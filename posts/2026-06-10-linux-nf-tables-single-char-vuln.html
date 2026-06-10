@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>一个感叹号引发的 root 提权：CVE-2026-23111 与 nf_tables 的单字符灾难 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>一个感叹号引发的 root 提权：CVE-2026-23111 与 nf_tables 的单字符灾难</h1>
+<time>2026-06-10</time>
+<ul>
+<li>Linux</li>
+<li>安全</li>
+<li>内核</li>
+<li>nf_tables</li>
+<li>CVE</li>
+</ul>
+<hr />
+<p>昨天 Ars Technica 的 Dan Goodin 报了一个漏洞，标题很有画面感：High-severity vulnerability in Linux caused by a single faulty character。一个感叹号，把 Linux 内核的 nf_tables 子系统变成了提权工具。</p>
+<p>CVE-2026-23111，nf_tables 里的一个 use-after-free，非特权用户可以直接拿 root。听起来像是经典内核漏洞叙事，但这次的 root cause 让人无语——代码里多了一个 <code>!</code>。</p>
+<h2>nf_tables 是什么</h2>
+<p>先说背景。nf_tables 是 Linux 内核的 netfilter 框架里用来替代 iptables 的新一代包过滤子系统。从 3.13 内核开始引入，到现在已经全面接管了防火墙规则管理。你在服务器上敲的 <code>nft</code> 命令，背后就是 nf_tables 在干活。</p>
+<p>它比 iptables 更灵活，支持集合（sets）、映射（maps）、更复杂的规则表达式。架构上分三层：nf_tables 核心（内核态）、netlink 接口（用户态通信）、表达式/对象模块（匹配与动作）。用户态通过 netlink socket 向内核发送规则操作请求，内核解析后更新内核态的规则链表。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 典型的 nft 用法</span>
+nft<span class="w"> </span>add<span class="w"> </span>table<span class="w"> </span>inet<span class="w"> </span>filter
+nft<span class="w"> </span>add<span class="w"> </span>chain<span class="w"> </span>inet<span class="w"> </span>filter<span class="w"> </span>input<span class="w"> </span><span class="o">{</span><span class="w"> </span><span class="nb">type</span><span class="w"> </span>filter<span class="w"> </span>hook<span class="w"> </span>input<span class="w"> </span>priority<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\;</span><span class="w"> </span><span class="o">}</span>
+nft<span class="w"> </span>add<span class="w"> </span>rule<span class="w"> </span>inet<span class="w"> </span>filter<span class="w"> </span>input<span class="w"> </span>tcp<span class="w"> </span>dport<span class="w"> </span><span class="m">22</span><span class="w"> </span>accept
+</code></pre></div>
+
+<p>这几行命令背后涉及内核态的内存分配、引用计数、对象生命周期管理。任何一个环节出问题，都是安全事件。</p>
+<p>近几年 nf_tables 已经成为内核漏洞的重灾区。2022 年有 5 个 CVE，2023 年有 8 个，2024 年更多。攻击面大是一方面，代码复杂度高才是根本原因——规则对象的创建、替换、删除、垃圾回收，每一步都要正确处理引用关系。</p>
+<h2>一个 <code>!</code> 怎么搞出 use-after-free</h2>
+<p>use-after-free（UAF）的原理不复杂：一块内存被释放了，但程序还保留着指向它的指针。攻击者在原地重新分配一块恶意数据，程序再通过旧指针访问时，读到的就是攻击者的内容。</p>
+<p>CVE-2026-23111 的问题出在 nf_tables 规则处理的一个条件判断上。代码里某个地方多了一个 <code>!</code>（感叹号），把整个条件语义翻转了。</p>
+<p>用伪代码还原这个场景：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 正确逻辑：如果引用计数不为零，不要释放</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">refcount</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">kfree</span><span class="p">(</span><span class="n">rule</span><span class="p">);</span><span class="w">  </span><span class="c1">// 只有引用归零才释放</span>
+
+<span class="c1">// 实际代码（有 bug）：多了一个 !，逻辑翻转</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">refcount</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w">  </span><span class="c1">// !!! 这个 ! 把条件翻转了</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="o">-</span><span class="n">EBUSY</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">kfree</span><span class="p">(</span><span class="n">rule</span><span class="p">);</span><span class="w">  </span><span class="c1">// 引用非零时反而会释放</span>
+</code></pre></div>
+
+<p>实际的代码路径比这复杂得多，但本质一样——条件翻转导致内核在引用计数还没归零时就执行了 kfree，留下了一个悬空指针。</p>
+<p>正常流程下，当一个规则被删除或替换时，内核需要遍历所有持有该规则引用的对象（链表、集合、映射等），确保引用全部解除，然后才能释放底层内存。这个 <code>!</code> 把"引用未释放则中止"变成了"引用已释放则中止"——正好反了。</p>
+<p>一个感叹号。ASCII 表里的第 33 号字符。整个漏洞的 root cause 就这一个字节。</p>
+<h2>利用条件与影响范围</h2>
+<p>CVE-2026-23111 的利用门槛不算高：</p>
+<ul>
+<li>非特权用户即可触发，不需要 root 或 CAP_NET_ADMIN</li>
+<li>需要能访问 nftables 的 netlink 接口（默认允许本地用户）</li>
+<li>触发路径涉及构造特定的规则添加/删除序列</li>
+</ul>
+<p>利用链大致分三步：</p>
+<p>第一步，触发 UAF。构造一个包含嵌套规则引用的 nftables 集合（set），然后在特定的时序下删除父规则。条件翻转导致父规则被提前释放，但集合里的引用指针还指向已释放的内存。关键在于时序控制——需要在 kfree 和后续访问之间有一个足够大的窗口来完成堆喷射。</p>
+<p>第二步，堆喷射（heap spray）。在父规则被释放后，攻击者通过大量小对象分配占满同一个 slab 缓存，把精心构造的假数据放到刚才被释放的内存位置。nf_tables 的规则对象通常从 kmalloc-256 或 kmalloc-512 分配，这些 slab 是高频使用的，喷射成功率很高。常用的喷射对象包括 msgsnd 系统调用的 msg_msg 结构、pipe_buffer、setsockopt 的 optval 缓冲区——这些都是内核利用的老朋友了。</p>
+<p>第三步，劫持控制流。当内核再次通过悬空指针访问这个规则对象时，读到的是攻击者写入的假数据。通过精心构造假的函数指针表（nft_expr_ops），攻击者可以让内核调用任意地址。配合内核 ROP 链或 commit_creds(prepare_kernel_cred(NULL)) 的经典组合，就能完成从非特权用户到 root 的提权。</p>
+<p>影响范围覆盖所有启用了 nf_tables 的 Linux 发行版——基本上是 2014 年以后的所有主流版本。内核 6.x 系列尤其受影响，因为 nf_tables 的新特性在这个版本线上增加最多。</p>
+<p>提权到 root 意味着攻击者获得完整的系统控制权。在容器环境里，如果容器共享了宿主机的网络命名空间（<code>--net=host</code>），这个漏洞也能逃逸。</p>
+<h2>检测：你的机器是否在射程内</h2>
+<p>快速排查：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检查内核版本</span>
+uname<span class="w"> </span>-r
+
+<span class="c1"># 检查 nf_tables 模块是否加载</span>
+lsmod<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>nf_tables
+
+<span class="c1"># 检查是否有活跃的 nftables 规则</span>
+nft<span class="w"> </span>list<span class="w"> </span>ruleset<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-20
+
+<span class="c1"># 检查容器网络模式</span>
+docker<span class="w"> </span>ps<span class="w"> </span>-q<span class="w"> </span><span class="p">|</span><span class="w"> </span>xargs<span class="w"> </span>-I<span class="w"> </span><span class="o">{}</span><span class="w"> </span>docker<span class="w"> </span>inspect<span class="w"> </span>--format<span class="w"> </span><span class="s1">&#39;{{.Name}}: {{.HostConfig.NetworkMode}}&#39;</span><span class="w"> </span><span class="o">{}</span>
+</code></pre></div>
+
+<p>如果 nf_tables 模块已加载且有活跃规则，你的机器就在这次漏洞的射程内。如果还有容器以 <code>--net=host</code> 运行，风险更高——容器内的非特权进程可以触发宿主机上的漏洞。</p>
+<h2>这不是第一次了</h2>
+<p>内核代码里出单字符 bug 的历史由来已久。</p>
+<p>2014 年的 CVE-2014-9322（"BadIRET"），一个符号扩展错误导致 #SS 异常处理路径上的栈溢出。root cause 是一个 <code>sign_extend32</code> 函数调用少了一层类型检查，一行代码的事。</p>
+<p>2016 年 OpenSSL 的 CVE-2016-2108，ASN.1 编码器里一个 <code>&amp;&amp;</code> 写成了 <code>&amp;</code>（位运算 vs 逻辑运算），可以导致堆溢出。OpenSSL 团队事后承认，这段代码已经有十多年没人动过了。</p>
+<p>2021 年 sudo 的 CVE-2021-3156（"Baron Samedit"），堆溢出，触发路径涉及反斜杠转义字符处理的边界条件。一个 <code>\</code> 的位置错了，sudo 变成了提权工具。</p>
+<p>这些案例的共同点：代码审查很难发现，因为单个字符的变化在 diff 里几乎不可见。你需要理解整个控制流才能意识到条件翻转是错的。而大部分代码审查看的是"这段代码做了什么"，不是"这个条件表达式在边界情况下是否正确"。</p>
+<h2>代码审计的教训</h2>
+<p>这个漏洞暴露的核心问题是：关键路径上的条件判断缺乏形式化验证。</p>
+<p>几个可以落地的改进方向：</p>
+<p><strong>单元测试覆盖边界条件。</strong> nf_tables 的规则生命周期管理应该有专门的测试用例，覆盖"引用计数未归零时尝试释放"这类场景。如果有一个测试用例能检测到 UAF，这个 bug 在代码进入内核之前就会被拦住。现有的 kselftest 框架可以覆盖一部分，但对这种深层条件翻转，需要更精细的测试设计。</p>
+<p><strong>静态分析工具。</strong> Coccinelle 是内核社区常用的代码匹配工具，可以写语义规则检测特定的条件翻转模式。比如这条规则可以检测"在 kfree 前的条件判断中使用 <code>!</code> 取反"的模式：</p>
+<div class="highlight"><pre><span></span><code>@@
+<span class="nv">expression</span><span class="w"> </span><span class="nv">E</span><span class="c1">;</span>
+@@
+<span class="o">-</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="ss">(</span><span class="o">!</span><span class="nv">E</span><span class="ss">)</span>
+<span class="o">+</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="ss">(</span><span class="nv">E</span><span class="ss">)</span>
+<span class="w">  </span>{
+<span class="w">      </span>...<span class="w"> </span><span class="nv">when</span><span class="w"> </span><span class="nv">any</span>
+<span class="w">      </span><span class="nv">kfree</span><span class="ss">(</span>...<span class="ss">)</span>
+<span class="w">  </span>}
+</code></pre></div>
+
+<p>当然实际的 Coccinelle 规则要比这复杂，但思路是一样的——让工具帮你找到所有"条件取反后紧跟内存释放"的模式。</p>
+<p><strong>代码审查规范化。</strong> 涉及内存释放的条件判断应该强制要求双人审查。一个 <code>!</code> 的变化在 GitHub diff 里很容易被忽略——它看起来和格式调整没什么区别。可以写一个 git hook，在 diff 中检测到 <code>!</code> 在条件表达式中的增删时自动标记为高风险变更。</p>
+<p><strong>模糊测试。</strong> syzkaller 已经在持续 fuzzing nf_tables，但覆盖率仍有提升空间。针对条件翻转类 bug 的定向 fuzzing 策略值得投入——比如变异已有测试用例中的条件表达式，观察是否能触发不同的内存行为。</p>
+<h2>快速响应</h2>
+<p>如果你负责 Linux 服务器运维，几件事可以马上做：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. 检查内核版本</span>
+uname<span class="w"> </span>-r
+
+<span class="c1"># 2. 检查 nf_tables 是否加载</span>
+lsmod<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>nf_tables
+
+<span class="c1"># 3. 如果不需要 nf_tables，可以卸载模块（注意：会清除所有 nft 规则）</span>
+<span class="c1"># modprobe -r nf_tables</span>
+
+<span class="c1"># 4. 检查是否有容器以 host 网络运行</span>
+docker<span class="w"> </span>ps<span class="w"> </span>-q<span class="w"> </span><span class="p">|</span><span class="w"> </span>xargs<span class="w"> </span>-I<span class="w"> </span><span class="o">{}</span><span class="w"> </span>docker<span class="w"> </span>inspect<span class="w"> </span>--format<span class="w"> </span><span class="s1">&#39;{{.Name}}: {{.HostConfig.NetworkMode}}&#39;</span><span class="w"> </span><span class="o">{}</span>
+</code></pre></div>
+
+<p>如果 nf_tables 已加载且无法立即打补丁，临时缓解措施是限制非特权用户的 netlink 访问。但最好的方案还是尽快升级到修复版本。</p>
+<h2>我的看法</h2>
+<p>说实话，看到这个漏洞报告的第一反应是"又来"。nf_tables 这几年贡献的 CVE 数量已经快赶上整个 OpenSSL 了。但回头想想，这也是正常的——复杂度越高的代码，出 bug 的概率越大，而出单字符 bug 的概率尤其高，因为人眼不擅长在密密麻麻的条件表达式里找一个取反符号。</p>
+<p>对开发者来说，这个案例最值得记住的一点是：代码审查工具和流程应该对关键路径上的单字符变化有更高的敏感度。一个拼写错误最多导致功能异常，但一个逻辑运算符的变化可以是安全灾难。写安全相关的代码时，条件表达式的正确性应该像密码学实现一样被严格对待。</p>
+<p>对运维来说，保持内核更新仍然是最有效的防御手段。不是因为你有多勤快，而是因为你没法赌你管的几千台机器里没有一台刚好踩到那个 <code>!</code>。</p>
+<p>顺便说一句，如果你用的是云厂商的托管 Kubernetes，大部分主流云厂商已经在跟进修复了。但自建集群的用户需要自己盯着上游补丁。别等安全公告刷屏了才动手——内核漏洞的窗口期通常很短，从公开到野外利用可能只有几天。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<hr />
+<p>参考链接：
+- <a href="https://arstechnica.com/security/2026/06/a-single-errant-character-in-the-linux-kernel-allows-attacker-to-gain-root/">Ars Technica - High-severity vulnerability in Linux caused by a single faulty character</a>
+- <a href="https://nvd.nist.gov/vuln/detail/CVE-2026-23111">CVE-2026-23111 - NVD</a>
+- <a href="https://wiki.nftables.org/">nftables wiki</a></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
