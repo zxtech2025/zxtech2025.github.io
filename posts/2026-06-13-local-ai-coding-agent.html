@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>把 AI 编程助手搬回本地：Gemma 4 + MTP 投机解码提速 24% 的实战记录 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>把 AI 编程助手搬回本地：Gemma 4 + MTP 投机解码提速 24% 的实战记录</h1>
+<time>2026-06-13</time>
+<ul>
+<li>AI编程</li>
+<li>本地部署</li>
+<li>性能优化</li>
+<li>llama.cpp</li>
+</ul>
+<hr />
+<p>上周家里的网断了几次，我盯着终端里转圈的 Cursor，第一次认真问自己：AI 编程助手为什么非要依赖云端？</p>
+<p>这个问题把我推进了一个周末的折腾。结果还行——我在一台 M1 Max 上跑起了 26B 参数的 Gemma 4，生成速度从 58 tok/s 提到了 72 tok/s，支持截图输入，用 Pi 做终端编程代理。整个过程踩了不少坑，也搞清楚了一些之前没深究过的性能细节。</p>
+<p>这篇文章是个实战记录。不聊「要不要用 AI 写代码」这种大话题，只讲怎么把一个大模型塞进本地机器里，并且让它快得能用。</p>
+<h2>为什么选本地模型</h2>
+<p>理由其实很朴素：</p>
+<p>首先是可用性。网络断了，或者 API 限流了，你就完了。Claude Code 上周重置了周限额，Meta 也开始限制 AI 使用量——云端模型的服务质量比很多人以为的更脆弱。</p>
+<p>其次是速度。云端 API 的延迟在 200-500ms 之间波动，加上网络往返，交互体验明显不如本地。当你频繁做小修改——改一行代码、写个注释、补全函数名——云端延迟累积起来很折磨人。</p>
+<p>第三是成本。不是说 API 贵，而是说你可以用闲置的硬件资源换免费的推理。M1 Max 的 GPU 平时根本用不满，跑模型刚好。</p>
+<h2>技术栈：llama.cpp + Gemma 4 + MTP + Pi</h2>
+<p>最终选定的组合是这样的：</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>选择</th>
+<th>为什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>推理运行时</td>
+<td>llama.cpp</td>
+<td>Metal 后端优化好，支持 MTP</td>
+</tr>
+<tr>
+<td>主模型</td>
+<td>Gemma 4 26B-A4B Q4_K_XL</td>
+<td>26B 参数，实际激活约 4B，推理快</td>
+</tr>
+<tr>
+<td>投机解码</td>
+<td>Q8 MTP draft model</td>
+<td>提升 24% 生成速度</td>
+</tr>
+<tr>
+<td>多模态</td>
+<td>mmproj-BF16.gguf</td>
+<td>支持截图输入</td>
+</tr>
+<tr>
+<td>代理框架</td>
+<td>Pi</td>
+<td>终端原生，配置简单</td>
+</tr>
+</tbody>
+</table>
+<p>全部跑在本地，通过 OpenAI 兼容 API（<code>http://127.0.0.1:8080/v1</code>）暴露，跟调用云端 API 一样的体验。</p>
+<h2>MTP 投机解码：24% 提速是怎么来的</h2>
+<p>这是整个方案里最有意思的部分。</p>
+<p><strong>投机解码（Speculative Decoding）</strong> 的原理不复杂：用一个小型「草案模型」快速生成几个候选 token，然后主模型一次性验证它们。如果草案猜对了，主模型一次能接受多个 token——理论上，一次前向传播产出 N 个 token，速度最多提升 N 倍。</p>
+<p><strong>MTP（Multi-Token Prediction）</strong> 是 Gemma 4 特有的变体。它不是一个独立的草案模型，而是主模型的一个额外「预测头」——和主模型共享大部分权重，只在最后几层分叉出来预测后续 token。好处是：</p>
+<ul>
+<li>不需要额外加载一个完整的草案模型</li>
+<li>草案质量和主模型高度对齐（共享表示）</li>
+<li>显存开销极小（Q8 版本只有几百 MB）</li>
+</ul>
+<p>实际测试数据：</p>
+<div class="highlight"><pre><span></span><code>配置                               | 生成速度 (tok/s) | 加速比
+----------------------------------|-----------------|-------
+Gemma 4 Q4 (基础)                  | 58.2            | 1.00x
+Gemma 4 Q4 + MTP draft (n=2)      | 72.0            | 1.24x
+Gemma 4 Q4 + MTP draft (n=3)      | 72.2            | 1.24x
+Gemma 4 Q4 + MTP draft (n=6)      | 61.2            | 1.05x
+</code></pre></div>
+
+<p>关键发现：<code>--spec-draft-n-max</code> 不是越大越好。M1 Max 上的最优值是 3，设太大反而变慢。为什么？因为草案模型猜错时，主模型需要回退重算——猜得越多，猜错的概率越大，浪费的计算也越多。</p>
+<p>这个 24% 的提升不是数字游戏。从 58 到 72 tok/s 意味着 AI 生成响应的时间从 ~3 秒降到 ~2 秒——刚好跨过「可以接受」到「感觉流畅」的阈值。</p>
+<h2>量化选型：Q4 够不够用</h2>
+<p>26B 参数的 Gemma 4，Q4_K_XL 量化后是 16GB。加上 MTP draft 和多模态投影器，总共约 17GB。</p>
+<p>Q4 听起来很低，但实际编码质量损失不大。A4B（4B 活跃参数）架构本身就是稀疏激活的——大部分参数在推理时不参与计算。所以量化对输出质量的影响比全激活模型小得多。</p>
+<p>对于代码生成这种场景，速度和质量的权衡是明确的：你宁愿要一个快 40% 的 Q4 模型，还是一个慢吞吞的 Q8 模型？在交互式编程中，响应速度直接决定了你是否愿意继续用。</p>
+<p>如果你显存充裕（64GB+），可以试试 Qwen 3.6 35B-A3B：
+- 编码能力比 Gemma 4 强一档
+- 但生成速度降到 55 tok/s
+- 3B 活跃参数比 Gemma 的 4B 更少</p>
+<p>选择其实很简单：够快就用强的，不够快就用快的。</p>
+<h2>配置 Pi：让本地模型接上终端</h2>
+<p>Pi 是最近冒出来的一个终端 AI 编程代理，配合本地模型用起来很顺手。</p>
+<p>核心配置在 <code>~/.pi/agent/models.json</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;providers&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;gemma4-local&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Gemma 4 Local&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;baseUrl&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;http://127.0.0.1:8080/v1&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;api&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;openai-completions&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;apiKey&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;local&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;authHeader&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;compat&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;supportsDeveloperRole&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;supportsReasoningEffort&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">      </span><span class="p">},</span>
+<span class="w">      </span><span class="nt">&quot;models&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[{</span>
+<span class="w">        </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Gemma 4 26B-A4B Q4 + MTP&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;input&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;text&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;image&quot;</span><span class="p">],</span>
+<span class="w">        </span><span class="nt">&quot;contextWindow&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">65536</span><span class="p">,</span>
+<span class="w">        </span><span class="nt">&quot;maxTokens&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">8192</span>
+<span class="w">      </span><span class="p">}]</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>注意两个坑：</p>
+<ol>
+<li><code>"input": ["text", "image"]</code>——如果不加 <code>"image"</code>，Pi 会把模型当纯文本处理，截图功能完全失效。这个地方文档不够醒目，我折腾了半天。</li>
+<li><code>"authHeader": false</code>——本地模型不需要认证，但有些代理框架默认会带 <code>Authorization</code> 头，llama.cpp 的 server 会直接拒绝。</li>
+</ol>
+<p>启动服务器：</p>
+<div class="highlight"><pre><span></span><code>llama-server<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-m<span class="w"> </span>gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-draft<span class="w"> </span>gemma-4-26B-A4B-it-Q8_0-MTP.gguf<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mmproj<span class="w"> </span>mmproj-BF16.gguf<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--spec-type<span class="w"> </span>draft-mtp<span class="w"> </span>--spec-draft-n-max<span class="w"> </span><span class="m">3</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-ngl<span class="w"> </span><span class="m">999</span><span class="w"> </span>-fa<span class="w"> </span>on<span class="w"> </span>-c<span class="w"> </span><span class="m">65536</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--host<span class="w"> </span><span class="m">127</span>.0.0.1<span class="w"> </span>--port<span class="w"> </span><span class="m">8080</span>
+</code></pre></div>
+
+<p>然后 <code>pi --offline --provider gemma4-local</code>，就跟用云端模型一样了。</p>
+<h2>几个实测数据</h2>
+<p>做完这套配置后，我跑了一些实际使用场景的对比：</p>
+<p>场景 1：写一个解析 unified diff 的函数
+- 云端 Claude：~1.5 秒首 token + 流式输出
+- 本地 Gemma 4 + MTP：~2 秒首 token + 连续输出
+- 体感差异：几乎无感</p>
+<p>场景 2：重构一个 200 行的 Python 文件
+- 本地模型在逻辑完整性上稍弱，需要多给一轮反馈
+- 但因为是本地，你不会心疼 token——随便重试</p>
+<p>场景 3：截图 → 描述 UI 布局
+- 多模态投影器工作正常，能识别按钮、表单、布局结构
+- 代码级别的视觉细节（像素对齐、颜色值）不如 GPT-4o，但够用</p>
+<h2>MLX vs llama.cpp：意外但清晰的结论</h2>
+<p>很多人（包括我）直觉上认为：Mac 上的 MLX（Apple 官方优化框架）应该更快——它专门为 Apple Silicon 设计。实际测试打了脸：</p>
+<div class="highlight"><pre><span></span><code>运行时                   | 生成速度 (tok/s)
+------------------------|-----------------
+llama.cpp + MTP draft   | 72.2
+llama.cpp (纯模型)       | 58.2
+MLX-LM (Unsloth 4-bit)  | 45.8
+MLX-LM (社区 4-bit)      | 43.9
+MLX-LM (OptiQ 4-bit)    | 38.1
+</code></pre></div>
+
+<p>llama.cpp 比最快的 MLX 配置快了 58%。为什么？llama.cpp 是社区驱动的项目，几年迭代下来针对 Metal 的算子优化非常深入——flash attention、KV cache 量化、连续批处理这些优化都是几千个 commit 堆出来的。MLX 作为较新的框架，生态和优化深度暂时还追不上。</p>
+<p>这个结果也提醒了一件事：在 AI 推理领域，「官方推荐」不等于「最快」。社区驱动的项目往往因为更残酷的竞争而优化得更狠。</p>
+<h2>内存管理的几个细节</h2>
+<p>跑本地模型最怕的就是 OOM（Out of Memory）。几个省显存的技巧：</p>
+<p>KV Cache 量化。llama.cpp 支持 KV cache 的 8-bit 甚至 4-bit 量化（<code>--cache-type-k q8_0 --cache-type-v q8_0</code>），对长上下文场景影响明显。65536 的 context window 如果用全精度 KV cache，光缓存就要占十几 GB。</p>
+<p>MLock 的取舍。<code>--mlock</code> 会把模型权重锁在内存里防止 swap，代价是启动时强制吃满显存。对于 64GB 的 M1 Max 来说 17GB 完全扛得住，锁上没坏处。但如果你只有 32GB 而且还要跑浏览器和 IDE，建议别锁——让 OS 自己管理 swap 更灵活。</p>
+<p>并行度陷阱。<code>--parallel</code> 控制并发请求数。对于单人编程助手场景，设 1 就够了。设高了会让 KV cache 按倍数膨胀，反而拖慢速度。</p>
+<p>多模态投影器的惊喜。加载 mmproj 投影器后，文本生成速度从 71.4 tok/s 变成 72.2 tok/s——几乎没影响。这和很多人的直觉相反：多模态能力几乎是「免费」的，没有理由不带上。</p>
+<h2>我的做法</h2>
+<p>这套方案我用了快一周，最大的感受不是「省了 API 钱」，而是「AI 变成了一种本地能力」。</p>
+<p>以前用云端 API，总觉得 AI 是个外部服务——用的时候调用，不用的时候它不存在。现在本地常驻一个 26B 的模型，空闲时 0 功耗（GPU 自动降频），需要时秒回。这种体验的改变比省几块钱 API 费用重要得多。</p>
+<p>我的建议是：如果你有一台 32GB 以上统一内存的 Mac，或者一张 24GB 以上的 NVIDIA 卡，花一个下午搭一套本地编程助手是值得的。不要指望它完全替代云端——它在复杂任务上不如 Opus 或 Fable——但作为「日常 80% 工作量」的处理器，它绰绰有余。</p>
+<p>更重要的是，这种本地 AI 能力正在快速普及。Gemma 4 的 MTP 加速、llama.cpp 的 Metal/ROCm 优化、Qwen 系列的开源——每个季度本地推理都在变快变好。六个月后，本地 72 tok/s 的上限可能会翻倍。</p>
+<p>一个我自己的 checklist，供参考：</p>
+<ul>
+<li>选模型时优先看「实际激活参数」而非总参数量——A4B/A3B 架构在这个场景下是真正的优势</li>
+<li>MTP draft n_max 要针对自己的硬件调，不要照搬文档里的建议值</li>
+<li>本地模型优先 Q4_K_XL 量化——质量损失最小、速度提升最大</li>
+<li>多模态投影器几乎不影响生成速度，建议带上</li>
+<li>用 tmux 管理 llama-server，开机自启，省去每次手动启动</li>
+</ul>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
