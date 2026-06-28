@@ -1,5 +1,237 @@
 <?xml version="1.0" encoding="utf-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom"><title>Kane's Blog</title><link href="/" rel="alternate"/><link href="feeds/all-zh.atom.xml" rel="self"/><id>/</id><updated>2026-06-27T00:00:00+08:00</updated><entry><title>AI 基础设施安全：从 Ollama 裸奔到 RAG 投毒</title><link href="posts/2026-06-27-ai-infra-security.html" rel="alternate"/><published>2026-06-27T00:00:00+08:00</published><updated>2026-06-27T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-06-27:posts/2026-06-27-ai-infra-security.html</id><summary type="html">&lt;ul&gt;
+<feed xmlns="http://www.w3.org/2005/Atom"><title>Kane's Blog</title><link href="/" rel="alternate"/><link href="feeds/all-zh.atom.xml" rel="self"/><id>/</id><updated>2026-06-28T00:00:00+08:00</updated><entry><title>从零实现 C2 框架（一）：原理、功能与红队视角</title><link href="posts/2026-06-28-c2-framework-part1.html" rel="alternate"/><published>2026-06-28T00:00:00+08:00</published><updated>2026-06-28T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-06-28:posts/2026-06-28-c2-framework-part1.html</id><summary type="html">&lt;ul&gt;
+&lt;li&gt;红队&lt;/li&gt;
+&lt;li&gt;C2&lt;/li&gt;
+&lt;li&gt;安全开发&lt;/li&gt;
+&lt;li&gt;渗透测试&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;p&gt;C2（Command and Control）框架是红队基础设施的核心。它不只是发命令收结果这么简单——通信隐蔽性、会话管理 …&lt;/p&gt;</summary><content type="html">&lt;ul&gt;
+&lt;li&gt;红队&lt;/li&gt;
+&lt;li&gt;C2&lt;/li&gt;
+&lt;li&gt;安全开发&lt;/li&gt;
+&lt;li&gt;渗透测试&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;p&gt;C2（Command and Control）框架是红队基础设施的核心。它不只是发命令收结果这么简单——通信隐蔽性、会话管理、任务编排和抗检测能力，每一层都有大量工程细节。&lt;/p&gt;
+&lt;p&gt;这篇文章从原理出发，拆解 C2 框架的核心模块和设计取舍。下一篇会动手写一个最小化的 HTTP beacon，把注册、心跳、任务轮询和回传跑通。&lt;/p&gt;
+&lt;h2&gt;C2 框架的核心模块&lt;/h2&gt;
+&lt;p&gt;一个完整的 C2 框架由几个逻辑组件构成，不管用 Cobalt Strike 还是开源项目如 Sliver、Havoc、Mythic，架构大同小异。&lt;/p&gt;
+&lt;h3&gt;1. Listener&lt;/h3&gt;
+&lt;p&gt;Listener 是服务端暴露的入口，负责接收 beacon 的通信请求。核心决策是&lt;strong&gt;协议和传输层&lt;/strong&gt;。&lt;/p&gt;
+&lt;p&gt;常见类型：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;strong&gt;HTTP/HTTPS Listener&lt;/strong&gt;：最通用。beacon 定期 GET/POST 到指定 URI，请求体里编码任务和结果。HTTPS 比 HTTP 难检测很多，TLS 加密后的请求在流量侧看和正常 API 调用没有区别。但 HTTPS 引出一个实际的问题：证书必须可信或允许忽略证书校验。公共 CDN 的证书在目标机器上是受人信任的，自签名证书容易触发企业证书固定检测。&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;strong&gt;DNS Listener&lt;/strong&gt;：利用 DNS 查询做通信。beacon 查询特定域名，编码后的命令藏在子域名里，结果通过 TXT 记录回传。DNS 流量几乎不会被防火墙阻断——大多数企业不会封 DNS 出站。代价是延迟大、带宽小，一个完整的载荷可能需要拆成几十次 DNS 查询才能传完。DNS 缓存也是问题——递归 DNS 服务器的 TTL 缓存会让部分查询走不到你的权威 DNS 服务器。&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;strong&gt;TCP Listener&lt;/strong&gt;：直连通信，效率和响应速度最好。但 TCP 连接特征是明显的——持久连接、心跳包频率固定，入侵检测系统很容易识别。Cobalt Strike 的 TCP beacon 虽然有阶段化处理，但在流量层面 TCP 流模式的熵值远低于正常业务流量。&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;strong&gt;SMB / Named Pipe Listener&lt;/strong&gt;：只在 Windows 内网横向移动时用，不出网，完全在内网管道上通信。用的 Windows 命名管道（&lt;code&gt;\\.\pipe\&lt;/code&gt;），流量不走网络栈，绕着走。优点是杀毒软件和 EDR 对命名管道的监控强度远低于对网络端口的监控。&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;Listener 设计有个硬约束：&lt;strong&gt;隐蔽性和带宽不可兼得&lt;/strong&gt;。HTTPS 扫不出但延迟 100-200ms，DNS 哪里都能通但有效带宽可能不到 10 bps。实战中通常配两个 listener——一个高隐蔽低带宽的用于心跳保活，一个高带宽的用于数据传输。&lt;/p&gt;
+&lt;h3&gt;2. Beacon&lt;/h3&gt;
+&lt;p&gt;Beacon 是植入受害者机器的 Agent，负责执行服务端下发的任务并回传结果。它的生命周期管理是框架最复杂的部分。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;回连间隔与 Jitter&lt;/strong&gt;：beacon 每隔 &lt;code&gt;sleep_time +/- jitter&lt;/code&gt; 秒发起一次连接。这个间隔通常 30 秒到数分钟。加 jitter 的目的是让间隔不是固定值——固定 60 秒一次的 beacon 在流量时序图上就是完美的等距脉冲，检测规则就一行 &lt;code&gt;abs(interval - 60) &amp;lt; 2&lt;/code&gt; 的事。好的 jitter 实现是高斯分布，让时序图看起来像正常的业务请求模式。&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="gh"&gt;#&lt;/span&gt; 一个典型的 sleep + jitter 实现
+sleep_base = 60  # 秒
+jitter_pct = 0.2  # 20%
+actual_sleep = sleep_base &lt;span class="gs"&gt;* (1 + random.gauss(0, jitter_pct))&lt;/span&gt;
+&lt;span class="gs"&gt;time.sleep(max(actual_sleep, sleep_base *&lt;/span&gt; 0.5))
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;strong&gt;任务队列模型&lt;/strong&gt;：beacon 服务端下发任务后不会立刻执行，而是等 beacon 下一次回连时拉取。异步模型的优点是不要求受害机器持续在线——笔记本合盖断网、虚拟机挂起，任务依旧在队列里等待。缺点也很实在：调试时发一个命令要等 60 秒才知道结果。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;注册与心跳&lt;/strong&gt;：beacon 首次启动会发一个注册请求，向服务端声明自己的身份（机器名、用户名、内网IP、操作系统版本）。之后的每次回连是心跳 + 任务拉取 + 结果回传的合并操作。心跳的间隔和格式是流量检测的重点关注区域——太多框架的心跳请求路径是硬编码的 &lt;code&gt;/news.asp&lt;/code&gt; 或 &lt;code&gt;/__utm.gif&lt;/code&gt;。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;内存执行 vs 磁盘写入&lt;/strong&gt;：现代 C2 框架的 beacon 大部分任务直接在内存中完成——反射式 DLL 注入（Reflective DLL Injection）、进程镂空（Process Hollowing）、直接系统调用（Direct Syscall）。一个写入磁盘的操作可能在杀毒软件的实时监控缓冲区里存活不到 30 秒。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;Artifact 管理&lt;/strong&gt;：beacon 的生成二进制是杀毒软件的重点检测对象。同一个 beacon 编译两次，特征字符串（C2 域名、内置 User-Agent、证书指纹）如果不随机化，生成的二进制会被 AV 用签名匹配直接标记。好的框架在 beacon 生成阶段做三步处理：特征字符串替换、分阶段加载器（stager → stager2 → payload）、以及通过直接系统调用绕过用户态钩子。&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;# Cobalt Strike artifact kit 的核心逻辑：
+# 1. 替换 artifact 中所有 C2 域名和端口
+# 2. 重新混淆字符串表，避免 YARA 规则命中
+# 3. 改变入口点代码布局，改变哈希签名
+# 这一步不做，VT 上传率 80%+
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;h3&gt;3. 通信协议设计&lt;/h3&gt;
+&lt;p&gt;C2 通信的协议设计直接决定框架能不能执行完任务。&lt;/p&gt;
+&lt;p&gt;几种常见的设计模式：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;strong&gt;轮询式&lt;/strong&gt;：beacon 定时发起连接拉取任务。最简单、最稳定。问题是流量模式固定，检测工具提取时序特征后可以精确分类。&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;strong&gt;长连接式&lt;/strong&gt;：WebSocket 或反向 SSL 隧道。延迟低，适合交互式操作。但连接长时间存活对 NTA（网络流量分析）来说是一个明显的持续信号。&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;strong&gt;异步混合式&lt;/strong&gt;：心跳用 DNS 或 ICMP 做轻量存活检测，数据传输切到 HTTPS 通道。复杂但隐蔽性好。DNS 通道在正常流量中的占比是极低的——一个机器每分钟查询几十次 DNS 属于正常，如果同时产生大量异常格式的 DNS 查询，那也会触发检测。&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;strong&gt;协议模仿&lt;/strong&gt;：把 C2 流量包装成目标机器上常见的应用协议。请求伪装成 API 调用，响应格式对齐 JSON:API 标准。Payload 可以藏在 JWT 的 payload 段里，或者编码成 Base64 图片参数。&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;C2 流量检测的难点在于区分正常的 API 调用和 beacon。看请求的顺序性：beacon 的序列是固定的（注册→心跳→任务拉取→结果回传），时序上是等间隔的脉冲。真实 API 的调用分布是随机的、跟着人走的。AI 驱动的流量分析工具正是在利用这个统计特征做分类。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;JA3 指纹是一个常被忽视的问题&lt;/strong&gt;：beacon 的 TLS Client Hello 参数包含密码套件顺序、扩展列表、椭圆曲线偏好等特征。Cobalt Strike 默认配置下 JA3 指纹是固定的。如果一个机器上的浏览器和 beacon 发出不同的 JA3 指纹，流量分析设备很容易标记这个异源 TLS 会话。定制 JA3 指纹的能力应该是选 C2 框架时的硬性要求。&lt;/p&gt;
+&lt;h3&gt;4. 任务执行引擎&lt;/h3&gt;
+&lt;p&gt;任务引擎把服务端指令翻译成实际的行为。常见任务类型：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;类型&lt;/th&gt;
+&lt;th&gt;例子&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;命令执行&lt;/td&gt;
+&lt;td&gt;cmd /c whoami&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;文件操作&lt;/td&gt;
+&lt;td&gt;下载、上传、删除、搜索&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;进程管理&lt;/td&gt;
+&lt;td&gt;注入、迁移、dump&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;网络侦察&lt;/td&gt;
+&lt;td&gt;端口扫描、路由表、ARP 表&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;凭据窃取&lt;/td&gt;
+&lt;td&gt;Mimikatz、DPAPI、Browser data&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;隧道转发&lt;/td&gt;
+&lt;td&gt;SOCKS 代理、端口转发&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;任务执行的一个坑：调用系统的 cmd.exe 执行命令会在进程树上留下 &lt;code&gt;cmd.exe → whoami.exe&lt;/code&gt; 的父子关系。这个进程树特征在 EDR 的事件日志里是一个高置信度的检测指标。好的框架用 &lt;code&gt;CreateProcess&lt;/code&gt; + WMI、COM 对象调用或者直接 shellcode 执行来降低日志面上的噪音。实操中可以用 &lt;code&gt;COM&lt;/code&gt; 的 &lt;code&gt;WScript.Shell&lt;/code&gt; 对象或者 &lt;code&gt;WMIC&lt;/code&gt; 进程创建，它们不走 &lt;code&gt;CreateProcess&lt;/code&gt; 的标准路径，在进程树上的父进程签名会更像业务行为。&lt;/p&gt;
+&lt;h2&gt;红队选框架时的几件事&lt;/h2&gt;
+&lt;p&gt;选择 C2 框架不只看功能列表：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;Profile 可定制深度&lt;/strong&gt;：能不能自定义 HTTP 请求头顺序、URI 路径模式、JA3 指纹。Cobalt Strike 的 Malleable C2 Profile 是行业标准。一个典型的 profile 片段：&lt;/li&gt;
+&lt;/ul&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;http-get {
+    set uri &amp;quot;/api/v2/status&amp;quot;;
+    client {
+        header &amp;quot;Accept&amp;quot; &amp;quot;application/json&amp;quot;;
+        header &amp;quot;X-Requested-With&amp;quot; &amp;quot;XMLHttpRequest&amp;quot;;
+        metadata {
+            base64url;
+            prepend &amp;quot;session=&amp;quot;;
+            header &amp;quot;Cookie&amp;quot;;
+        }
+    }
+    server {
+        header &amp;quot;Content-Type&amp;quot; &amp;quot;application/json&amp;quot;;
+        output {
+            base64;
+            print;
+        }
+    }
+}
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;这个配置把 beacon 的 HTTP GET 请求伪装成了前端轮询后端状态的 AJAX 调用。请求头、Cookie 格式、URI 路径都和正常业务一致，混在流量里很难被挑出来。不能自定义 profile 的框架出框率极低。&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;strong&gt;Artifact 更新频率&lt;/strong&gt;：框架的 beacon 样本被 AV 厂商标记后，响应速度是关键。商业化框架有专门团队更新 artifact kit，开源项目依赖社区 PR，响应速度是硬伤。&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;strong&gt;日志和审计&lt;/strong&gt;：红队也是团队协作。框架需要记录谁在什么时间对哪台机器执行了什么操作，方便回顾和写报告。&lt;/p&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;&lt;strong&gt;Pivot 能力&lt;/strong&gt;：能不能拿一台受控机器当跳板继续向内网渗透。好的框架内置 SOCKS proxy 和端口转发，差的框架需要手工配合 sshuttle 或者 frp。&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h2&gt;写在后面&lt;/h2&gt;
+&lt;p&gt;C2 框架不只是渗透工具，它是对网络通信、进程管理和对抗检测的综合工程实践。理解 C2 的原理想对防守者也同样重要——只有理解攻击者的通信模型，才能设计有效的检测策略。&lt;/p&gt;
+&lt;p&gt;从简单开始总没错，但做 C2 框架的人必须一开始就理解这些设计的权衡，否则做出来的东西只能在内网靶场跑一跑，上不了真正的对抗场景。&lt;/p&gt;
+&lt;h2&gt;⚠️ 网络安全免责声明&lt;/h2&gt;
+&lt;p&gt;本文内容仅供技术研究与安全学习之用。文章中描述的 C2 框架原理和模块设计旨在帮助安全从业者深入理解攻击基础设施的运作机制，从而提升检测和防御能力，并非提供可供直接部署的攻击工具。&lt;/p&gt;
+&lt;p&gt;作者对 C2 框架的研究基于公开资料和开源项目（如 Cobalt Strike 公开文档、Sliver、Havoc、Mythic 等），文中所有描述均为技术原理层面的探讨。&lt;/p&gt;
+&lt;p&gt;任何利用文中所述技术原理进行未经授权的渗透测试或攻击行为，均与本文作者无关。进行渗透测试前请确保已获得目标系统的书面授权。未经授权的渗透测试违反中华人民共和国《网络安全法》及相关法律法规。&lt;/p&gt;</content></entry><entry><title>Splunk CVE-2026-20253 分析：PoC 发布 6 天即被野外打穿</title><link href="posts/2026-06-28-splunk-cve-2026-20253-analysis.html" rel="alternate"/><published>2026-06-28T00:00:00+08:00</published><updated>2026-06-28T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-06-28:posts/2026-06-28-splunk-cve-2026-20253-analysis.html</id><summary type="html">&lt;ul&gt;
+&lt;li&gt;安全分析&lt;/li&gt;
+&lt;li&gt;CVE&lt;/li&gt;
+&lt;li&gt;Splunk&lt;/li&gt;
+&lt;li&gt;漏洞分析&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;p&gt;FreeBuf 上有一条新闻：Splunk sidecar 组件的一个漏洞，PoC 公开仅 6 天就被野外利用打穿。更讽刺的是，这个端点的 …&lt;/p&gt;</summary><content type="html">&lt;ul&gt;
+&lt;li&gt;安全分析&lt;/li&gt;
+&lt;li&gt;CVE&lt;/li&gt;
+&lt;li&gt;Splunk&lt;/li&gt;
+&lt;li&gt;漏洞分析&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;p&gt;FreeBuf 上有一条新闻：Splunk sidecar 组件的一个漏洞，PoC 公开仅 6 天就被野外利用打穿。更讽刺的是，这个端点的认证校验完全是缺失的——不是实现有 bug，是压根没写。&lt;/p&gt;
+&lt;p&gt;当一个在企业内网广泛部署的日志平台，其 sidecar 组件暴露一个「谁都能写文件」的端点，结果可想而知。&lt;/p&gt;
+&lt;h2&gt;CVE-2026-20253 是什么&lt;/h2&gt;
+&lt;p&gt;Splunk sidecar 是 Splunk 生态里负责日志转发的组件。它部署在非 Splunk 服务器上，收集本地日志然后转发给 Splunk indexer。架构上是 agent-server 模型，sidecar 和 Splunk 之间通过 HTTP 管理端口通信。&lt;/p&gt;
+&lt;p&gt;漏洞出在 sidecar 暴露的管理 API 端点上——具体是 &lt;code&gt;/services/sidecar/files&lt;/code&gt; 相关的写路径。这个端点接受文件内容和目标路径参数，然后直接写入磁盘。认证检查完全是空的，没有 token、没有证书验证、甚至连 Basic Auth 都没有。&lt;/p&gt;
+&lt;p&gt;审查一下这个端点的实现逻辑就会发现：它的路由注册里压根没挂认证中间件。不是 &lt;code&gt;auth.require()&lt;/code&gt; 被绕过了，是开发团队根本没在路由上挂认证。一个 &lt;code&gt;@router.post("/files")&lt;/code&gt; 后面直接跟了文件写入逻辑。&lt;/p&gt;
+&lt;p&gt;能访问到这个端口的攻击者，可以直接往 sidecar 所在服务器写入任意文件。配合 Splunk 的 TA（Technology Add-on）机制——Splunk 会定期扫描特定目录加载配置和脚本——从文件写入到命令执行只有一步之遥。&lt;/p&gt;
+&lt;h2&gt;攻击链拆解：从文件写入到 Shell&lt;/h2&gt;
+&lt;p&gt;攻击链路大致分三步：&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;第一步：发现暴露面。&lt;/strong&gt; 内网存活的主机上扫描 8089 或其他 sidecar 监听端口。nmap 一个 &lt;code&gt;-p 8089 --open&lt;/code&gt; 扫 C 段几分钟出结果。Shodan 上直接搜 &lt;code&gt;splunk-sidecar&lt;/code&gt; 就能看到全球暴露面。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;第二步：写入武器化载荷。&lt;/strong&gt; 向 &lt;code&gt;/services/sidecar/files&lt;/code&gt; POST 一个 JSON，指定文件名和内容。写入目标是 Splunk TA 的 inputs.conf 或 scripts 目录。Splunk TA 目录结构是固定的——&lt;code&gt;$SPLUNK_HOME/etc/apps/&amp;lt;app_name&amp;gt;/local/inputs.conf&lt;/code&gt;。写入一个 &lt;code&gt;script://&lt;/code&gt; 输入就能让 Splunk 执行任意系统命令。&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="nf"&gt;POST&lt;/span&gt; &lt;span class="nn"&gt;/services/sidecar/files&lt;/span&gt; &lt;span class="kr"&gt;HTTP&lt;/span&gt;&lt;span class="o"&gt;/&lt;/span&gt;&lt;span class="m"&gt;1.1&lt;/span&gt;
+&lt;span class="na"&gt;Host&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt; &lt;span class="l"&gt;target:8089&lt;/span&gt;
+&lt;span class="na"&gt;Content-Type&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt; &lt;span class="l"&gt;application/json&lt;/span&gt;
+
+&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="nt"&gt;&amp;quot;path&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;/opt/splunk/etc/apps/search/local/inputs.conf&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;
+&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="nt"&gt;&amp;quot;content&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;[script:///tmp/payload.sh]\ninterval = 60\nsource = payload\nsourcetype = exec\n&amp;quot;&lt;/span&gt;
+&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;strong&gt;第三步：触发执行。&lt;/strong&gt; Splunk 的脚本输入有轮询机制。配置文件一到位，Splunk 会在下一个轮询周期执行指定的脚本。输出通过正常的 Splunk 日志通道回传，攻击者从 indexer 侧看到执行结果。&lt;/p&gt;
+&lt;p&gt;从 PoC 公开到野外利用只用了 6 天，原因就在这里——它不是一个需要精心构造内存布局的漏洞，而是一个 HTTP POST 加一段配置文件文本的事。&lt;/p&gt;
+&lt;h2&gt;威力分析：为什么 Splunk 的脚本能力放大了危害&lt;/h2&gt;
+&lt;p&gt;这个漏洞本身的 CVSS 评分可能只是写入操作，但 Splunk 赋予了写入能力巨大的杠杆效应。&lt;/p&gt;
+&lt;p&gt;Splunk 的脚本执行点不止一处：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;inputs.conf 的 script:// 输入&lt;/strong&gt;：定时执行系统命令或脚本&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;savedsearches.conf 的 alert action&lt;/strong&gt;：搜索结果匹配时触发外部脚本&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;props.conf + transforms.conf&lt;/strong&gt;：数据解析阶段的变换脚本&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;REST API endpoint&lt;/strong&gt;：通过 endpoints 暴露的自定义逻辑&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;只要攻击者能写入一次 TA 配置文件，以上任何一个渠道都能变成命令执行入口。所以这个漏洞的&lt;strong&gt;实际危害不是写入，而是 Splunk 整个脚本执行生态被撬开了&lt;/strong&gt;。&lt;/p&gt;
+&lt;h2&gt;检测：如何判断是否被利用&lt;/h2&gt;
+&lt;p&gt;从网络层看，sidecar 管理端点通常不对外暴露，所以确认是否被扫描过很难。但主机层有几件事可以做：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;sudo grep -r "script://" $SPLUNK_HOME/etc/apps/*/local/inputs.conf&lt;/code&gt; 检查是否有非预期的脚本输入&lt;/li&gt;
+&lt;li&gt;检查 &lt;code&gt;$SPLUNK_HOME/var/log/splunk/splunkd_access.log&lt;/code&gt; 看看 sidecar 端口上的 POST 请求来源&lt;/li&gt;
+&lt;li&gt;看 sidecar 进程的网络连接状态：&lt;code&gt;ss -tlnp | grep 8089&lt;/code&gt; 确认监听范围&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;对于已经部署了 sidecar 的环境，最紧急的动作是确认监听地址：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;# 检查 sidecar 是否监听在 0.0.0.0
+ss -tlnp | grep sidecar
+# 期望看到 127.0.0.1:8089，如果是 0.0.0.0:8089 即刻修复
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;h2&gt;从防御者视角看这类漏洞&lt;/h2&gt;
+&lt;p&gt;把这类问题简单归咎于「Splunk 开发不行」没有意义。更值得反思的是架构层面的设计缺陷。&lt;/p&gt;
+&lt;p&gt;Sidecar 组件的设计假设是「部署在可信网络内部」，所以开发团队没在认证上花心思。这个假设在十年前或许成立，在今天的混合网络环境下已经站不住脚了。DevOps 和云原生打破了网络边界，sidecar 这种组件的管理端口暴露出去只是时间问题。&lt;/p&gt;
+&lt;p&gt;几个实际的缓解措施：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;管理端点绑定 localhost 而非 0.0.0.0&lt;/strong&gt;。如果只能本机访问，远程利用链在第一步就被切断。很多 sidecar 默认配置绑 0.0.0.0 是为了方便管理，但安全收益远大于便利性损失。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;加一层反向代理做认证代理&lt;/strong&gt;。即使 sidecar 本身没认证，在前置加一个 nginx 做 basic auth 或 mTLS termination，也能阻断大部分的自动化扫描。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;网络分段 + 主机防火墙。&lt;/strong&gt; sidecar 管理端口不应该出现在非 Splunk 基础设施所在网段。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h2&gt;我的一点看法&lt;/h2&gt;
+&lt;p&gt;这类「设计时假设网络可信，上线后发现不是那么回事」的漏洞会越来越多。网闸时代的内网可信假设已经被云原生和混合网络彻底打破。开发阶段就该问一个问题：「如果这个端口被人扫到了，最坏情况是什么？」如果答案是任意文件写入或者远程代码执行，那认证是不可协商的需求。&lt;/p&gt;
+&lt;p&gt;对于 Splunk 管理员，今天下班前能做的事：检查 sidecar 绑定地址，确认不是 0.0.0.0。别等补丁了——扫描器已经到了，补丁还在路上。&lt;/p&gt;
+&lt;h2&gt;⚠️ 网络安全免责声明&lt;/h2&gt;
+&lt;p&gt;本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。&lt;/p&gt;
+&lt;p&gt;请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。&lt;/p&gt;
+&lt;p&gt;如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。&lt;/p&gt;</content></entry><entry><title>AI 基础设施安全：从 Ollama 裸奔到 RAG 投毒</title><link href="posts/2026-06-27-ai-infra-security.html" rel="alternate"/><published>2026-06-27T00:00:00+08:00</published><updated>2026-06-27T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-06-27:posts/2026-06-27-ai-infra-security.html</id><summary type="html">&lt;ul&gt;
 &lt;li&gt;AI安全&lt;/li&gt;
 &lt;li&gt;Ollama&lt;/li&gt;
 &lt;li&gt;RAG&lt;/li&gt;
