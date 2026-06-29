@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>从被坑到真相：Multi-Prime RSA 入门与 0CTF 2016 rsa-2 完整折腾实录 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>从被坑到真相：Multi-Prime RSA 入门与 0CTF 2016 rsa-2 完整折腾实录</h1>
+<time>2026-06-29</time>
+<ul>
+<li>CTF</li>
+<li>RSA</li>
+<li>Crypto</li>
+<li>Writeup</li>
+<li>Multi-Prime RSA</li>
+</ul>
+<hr />
+<p>一道看似简单实则暗藏杀机的 RSA 题。我从"n 不是两个素数乘积"开始掉坑，一路挣扎到"gcd(e, φ(n)) ≠ 1"才发现标准解密路被堵死，最后又在 flag 前缀上踩了最后一个坑……本文记录全过程，力求让纯小白也能看懂。</p>
+<h2>00 前言：我为什么被坑了</h2>
+<p>拿到这道题的时候，我看了一眼提示：</p>
+<div class="highlight"><pre><span></span><code><span class="n">Tip</span><span class="o">:</span><span class="w"> </span><span class="n">openssl</span><span class="w"> </span><span class="n">rsautl</span><span class="w"> </span><span class="o">-</span><span class="n">encrypt</span><span class="w"> </span><span class="o">-</span><span class="k">in</span><span class="w"> </span><span class="n">FLAG</span><span class="w"> </span><span class="o">-</span><span class="n">inkey</span><span class="w"> </span><span class="kd">public</span><span class="o">.</span><span class="na">pem</span><span class="w"> </span><span class="o">-</span><span class="n">pubin</span><span class="w"> </span><span class="o">-</span><span class="n">out</span><span class="w"> </span><span class="n">flag</span><span class="o">.</span><span class="na">enc</span>
+</code></pre></div>
+
+<p>心里暗想：RSA 嘛，提取公钥 → 分解 n → 求 d → 解密。常规操作，稳了。</p>
+<p>结果一路踩了三个大坑：</p>
+<ol>
+<li><strong>n 不是两个素数的乘积，是三个</strong> — 标准 RSA 的模数 n = p × q。但这题的 n 居然分解出了 三个素数。</li>
+<li><strong>e = 3 与 φ(n) 不互质，标准解密路被彻底堵死</strong> — 求私钥 d 需要 e⁻¹ mod φ(n)，但 gcd(3, φ(n)) = 3，逆元根本不存在。</li>
+<li><strong>好不容易解出明文，flag 前缀却看错了</strong> — 解密结果明明是 0ctf{...}，我却硬是把开头的 0 当成填充残留给扔了，提交了 ctf{...}，反复失败。</li>
+</ol>
+<p>这三个坑，每一个都值得好好说道说道。下面我就按时间线，把整个折腾过程原原本本地记录下来。</p>
+<h2>01 题目给了什么</h2>
+<p>解压后得到两个文件：</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>public.pem</td>
+<td>RSA 公钥文件</td>
+</tr>
+<tr>
+<td>flag.enc</td>
+<td>加密后的 Flag，40 字节</td>
+</tr>
+</tbody>
+</table>
+<p>提示命令：</p>
+<div class="highlight"><pre><span></span><code>openssl rsautl -encrypt -in FLAG -inkey public.pem -pubin -out flag.enc
+</code></pre></div>
+
+<p>这说明加密方用的是 <code>openssl rsautl</code> 命令，用公钥对 FLAG 文件进行了加密。我们的目标就是解密 <code>flag.enc</code>。</p>
+<h2>02 第一步：分析公钥</h2>
+<p>公钥是公开信息，直接用 OpenSSL 解析：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>openssl<span class="w"> </span>rsa<span class="w"> </span>-pubin<span class="w"> </span>-in<span class="w"> </span>public.pem<span class="w"> </span>-text<span class="w"> </span>-noout
+Public-Key:<span class="w"> </span><span class="o">(</span><span class="m">314</span><span class="w"> </span>bit<span class="o">)</span>
+Modulus:
+<span class="w">    </span><span class="m">02</span>:ca:a9:c0:9d:c1:06:1e:50:7e:5b:7f:39:dd:e3:
+<span class="w">    </span><span class="m">45</span>:5f:cf:e1:27:a2:c6:9b:62:1c:83:fd:9d:3d:3e:
+<span class="w">    </span>aa:3a:ac:42:14:7c:d7:18:8c:53
+Exponent:<span class="w"> </span><span class="m">3</span><span class="w"> </span><span class="o">(</span>0x3<span class="o">)</span>
+</code></pre></div>
+
+<p>提取出两个关键参数：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>n（模数）</td>
+<td>23292710978670380403641273270002884747060006568046290011918413375473934024039715180540887338067</td>
+<td>RSA 的模数，314 bit</td>
+</tr>
+<tr>
+<td>e（公钥指数）</td>
+<td>3</td>
+<td>极小指数</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p><strong>危险信号</strong> — n 只有 314 bit，远低于现代 RSA 的安全标准（2048 bit 起步）。e = 3 也是经典低指数。这两个信号说明 n 大概率可以被分解，而且可能存在低指数攻击。</p>
+</blockquote>
+<h2>03 第二步：分解模数 n</h2>
+<p>拿到 n 后，第一个任务就是把它分解成素因子的乘积。我尝试了多条路径：</p>
+<h3>3.1 在线数据库 FactorDB（最快）</h3>
+<p>FactorDB 是一个预先计算了大量整数因子分解结果的在线数据库。对于小于 ~100 位的整数，它通常已经有记录。</p>
+<p>访问 <code>factordb.com</code>，输入 n，<strong>秒出结果</strong>：</p>
+<div class="highlight"><pre><span></span><code>n = 26440615366395242196516853423447
+    × 27038194053540661979045656526063
+    × 32581479300404876772405716877547
+</code></pre></div>
+
+<p>三个因子都是 32 位十进制数，验证：</p>
+<div class="highlight"><pre><span></span><code>&gt;&gt;&gt; p1 = 26440615366395242196516853423447
+&gt;&gt;&gt; p2 = 27038194053540661979045656526063
+&gt;&gt;&gt; p3 = 32581479300404876772405716877547
+&gt;&gt;&gt; p1 <span class="gs">* p2 *</span> p3 == n
+True
+&gt;&gt;&gt; is_prime(p1), is_prime(p2), is_prime(p3)
+(True, True, True)
+</code></pre></div>
+
+<h3>3.2 不用 FactorDB 怎么办？本地工具也能打</h3>
+<p>为了回答 "如果不用 FactorDB 呢？" 这个问题，我实际测试了多种本地分解工具：</p>
+<p>| 工具 | 方法 | 结果 |
+| --- | --- |
+| Pollard Rho (Python) | 随机游走找因子 | 20 次尝试全部失败（因子太大且均匀） |
+| GMP-ECM | 椭圆曲线方法 | 30 次随机曲线未命中（32 位因子需 ~6000 条曲线） |
+| PARI/GP factor | 内置 ECM + MPQS/SIQS | 3 分钟超时未完成 |
+| primefac (Python) | 多算法整合 | 300 秒超时 |
+| YAFU (SIQS) | 自初始化二次筛 | ETA ~60 分钟（对 95 位十进制数最有效） |</p>
+<blockquote>
+<p><strong>小白贴士</strong> — 你不需要先验地知道 n 有几个素因子。 分解工具的输出会明确列出每个素因子及其重数。FactorDB 查出来是三个，yafu 跑完也会告诉你三个。</p>
+</blockquote>
+<h3>3.3 多素数 RSA（Multi-Prime RSA）</h3>
+<p>你可能会有疑问：标准 RSA 不是 n = p × q 吗？怎么这里变成了三个素数？</p>
+<p>答案是：<strong>RSA 的数学结构允许多个素因子</strong>。使用三个或更多素数的技术叫做 <strong>Multi-Prime RSA</strong>。它的优势是可以用 CRT（中国剩余定理）并行加速私钥运算；劣势是素数越多、越短，越容易分解。</p>
+<p>本题故意使用三个短素数，既让 n 可被分解，又为后续攻击埋下了伏笔。</p>
+<h2>04 第三步：标准 RSA 为什么走不通</h2>
+<p>按照标准 RSA 流程，下一步应该是求私钥 d：</p>
+<p>$$ d ≡ e⁻¹ (mod φ(n)) $$</p>
+<p>其中 φ(n) 是欧拉函数。对于 n = p₁ × p₂ × p₃：</p>
+<p>$$ φ(n) = (p₁ - 1)(p₂ - 1)(p₃ - 1) $$</p>
+<p>让我们计算一下 gcd(3, φ(n))：</p>
+<div class="highlight"><pre><span></span><code>&gt;&gt;&gt; phi = (p1 - 1) <span class="gs">* (p2 - 1) *</span> (p3 - 1)
+&gt;&gt;&gt; gcd(3, phi)
+3
+</code></pre></div>
+
+<blockquote>
+<p><strong>致命问题</strong> — gcd(e, φ(n)) = 3 ≠ 1，这意味着 3 在模 φ(n) 下没有乘法逆元，私钥 d 根本求不出来！标准 RSA 解密路径被彻底堵死。</p>
+</blockquote>
+<h3>为什么 gcd 不为 1？</h3>
+<p>检查每个素因子减 1 后对 3 的余数：</p>
+<table>
+<thead>
+<tr>
+<th>因子</th>
+<th>(p - 1) mod 3</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>p₁ = 26440615366395242196516853423447</td>
+<td>0</td>
+<td>3 整除 (p₁ - 1)</td>
+</tr>
+<tr>
+<td>p₂ = 27038194053540661979045656526063</td>
+<td>1</td>
+<td>3 不整除 (p₂ - 1)</td>
+</tr>
+<tr>
+<td>p₃ = 32581479300404876772405716877547</td>
+<td>0</td>
+<td>3 整除 (p₃ - 1)</td>
+</tr>
+</tbody>
+</table>
+<p>因为 p₁ 和 p₃ 的 (p-1) 都是 3 的倍数，所以 3 整除 φ(n) = (p₁-1)(p₂-1)(p₃-1)。</p>
+<p>这是出题人精心设计的陷阱：<strong>用三个素数确保 gcd(e, φ(n)) &gt; 1</strong>，迫使你放弃标准 RSA 解密路线，回到更底层的数学方法。</p>
+<h2>05 第四步：多素数 RSA 的解密方法</h2>
+<p>既然求不出 d，怎么办？</p>
+<p>别忘了 RSA 加密的本质是：</p>
+<p>$$ c ≡ m³ (mod n) $$</p>
+<p>由于 n = p₁ × p₂ × p₃，我们可以分别在每个素数域中求 c 的 <strong>立方根</strong>，然后用 CRT 组合回模 n 下的候选明文。</p>
+<h3>5.1 模素数域的立方根</h3>
+<p>对于素数 p，求 a 的立方根（即解 x³ ≡ a (mod p)），解的数量取决于 p mod 3 的值：</p>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>立方根数量</th>
+<th>求解方法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>p ≡ 2 (mod 3)</td>
+<td>1（唯一）</td>
+<td>d = 3⁻¹ mod (p-1)，然后 x = a^d mod p</td>
+</tr>
+<tr>
+<td>p ≡ 1 (mod 3)</td>
+<td>0 或 3</td>
+<td>先检验 a^((p-1)/3) ≡ 1 (mod p)，再用 Tonelli-Shanks 变体或 sympy 的 nthroot_mod</td>
+</tr>
+</tbody>
+</table>
+<h3>5.2 本题的具体计算</h3>
+<p><strong>p₂ 域（唯一立方根）</strong>：</p>
+<div class="highlight"><pre><span></span><code>&gt;&gt;&gt; d2 = pow(3, -1, p2 - 1)       # 3 在模 (p2-1) 下的逆元
+&gt;&gt;&gt; r2 = pow(c, d2, p2)            # c^(1/3) mod p2
+&gt;&gt;&gt; r2
+19616973567618515464515107624812
+</code></pre></div>
+
+<p><strong>p₁ 和 p₃ 域（各 3 个立方根）</strong>：</p>
+<p>由于 p₁ ≡ p₃ ≡ 1 (mod 3)，立方根不唯一。我用 sympy 的 <code>nthroot_mod</code> 来求解：</p>
+<div class="highlight"><pre><span></span><code><span class="o">&gt;&gt;&gt;</span> <span class="kn">from</span><span class="w"> </span><span class="nn">sympy</span><span class="w"> </span><span class="kn">import</span> <span class="n">nthroot_mod</span>
+<span class="o">&gt;&gt;&gt;</span> <span class="n">r1_list</span> <span class="o">=</span> <span class="n">nthroot_mod</span><span class="p">(</span><span class="n">c</span> <span class="o">%</span> <span class="n">p1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">p1</span><span class="p">,</span> <span class="n">all_roots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="o">&gt;&gt;&gt;</span> <span class="n">r1_list</span>
+<span class="p">[</span><span class="mi">13374868592866626517389128266735</span><span class="p">,</span>
+ <span class="mi">19722834945917837883299946044598</span><span class="p">,</span>
+ <span class="mi">22982635323400908786226917550586</span><span class="p">]</span>
+
+<span class="o">&gt;&gt;&gt;</span> <span class="n">r3_list</span> <span class="o">=</span> <span class="n">nthroot_mod</span><span class="p">(</span><span class="n">c</span> <span class="o">%</span> <span class="n">p3</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">p3</span><span class="p">,</span> <span class="n">all_roots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="o">&gt;&gt;&gt;</span> <span class="n">r3_list</span>
+<span class="p">[</span><span class="mi">6149264605288583791069539134541</span><span class="p">,</span>
+ <span class="mi">13028011585706956936052628027629</span><span class="p">,</span>
+ <span class="mi">13404203109409336045283549715377</span><span class="p">]</span>
+</code></pre></div>
+
+<h3>5.3 中国剩余定理（CRT）组合</h3>
+<p>现在我们有 3 × 1 × 3 = <strong>9 种组合</strong>。对每一种组合，用 CRT 求出模 n 下的候选 m：</p>
+<div class="highlight"><pre><span></span><code>def crt(m1, m2, m3):
+    M1, M2, M3 = p2*p3, p1*p3, p1*p2
+    inv = lambda a,m: pow(a, -1, m)
+    return (m1*M1*inv(M1,p1) + m2*M2*inv(M2,p2) + m3*M3*inv(M3,p3)) % n
+</code></pre></div>
+
+<p>遍历 9 种组合，筛选出包含 <code>flag</code> 或 <code>ctf</code> 字样的明文。</p>
+<h2>06 第五步：踩坑——我以为 flag 是 ctf{...}</h2>
+<p>解密原始密文后，我得到了以下结果：</p>
+<div class="highlight"><pre><span></span><code>[原始密文解密] i=0, j=1
+  完整填充数据 (39 bytes): 02d15ecb84845243f34a00306374667b4861684121546869355f31735f6e30545f7253617e7d0a
+  明文: b&#39;0ctf{HahA!Thi5_1s_n0T_rSa~}\\n&#39;
+</code></pre></div>
+
+<p>这里我犯了一个低级错误：我看到填充数据里 <code>0x00</code> 后面跟着 <code>30 63 74 66 ...</code>，下意识地认为 <code>30</code>（ASCII '0'）是填充残留，于是只提取了 <code>ctf{...}</code>。</p>
+<blockquote>
+<p><strong>致命误判</strong> — 我以为 flag 是 ctf{HahA!Thi5_1s_n0T_rSa~}，反复提交都失败。实际上，开头的 '0' 是 flag 的一部分，正确的 flag 是 0ctf{HahA!Thi5_1s_n0T_rSa~}。</p>
+</blockquote>
+<p>为什么会误判？因为我先入为主地假设 flag 格式是 <code>ctf{...}</code> 或 <code>flag{...}</code>，而看到 '0' 时大脑自动把它归类为"非 flag 字符"。</p>
+<p>后来搜索到原题 writeup，才恍然大悟：这道题来自 <strong>0CTF 2016 Quals</strong>，flag 前缀自然是 <code>0ctf</code>！</p>
+<ul>
+<li>❌ <strong>错误答案（我最初提交的）</strong>: ~~ctf{HahA!Thi5_1s_n0T_rSa~}~~</li>
+<li>✅ <strong>正确答案</strong>: <code>0ctf{HahA!Thi5_1s_n0T_rSa~}</code></li>
+</ul>
+<h2>06.5 真实的踩坑记录：四个脚本与终端操作</h2>
+<p>下面是我在本地真实尝试的全过程，不是事后补写的。每一个报错、每一次 Ctrl+C、每一个"找不到命令"都是原汁原味的现场记录。</p>
+<h3>第一次尝试：solve.py（标准 RSA 思路）</h3>
+<p>我最开始的思路是标准的：提取公钥 → 分解 n → 求 d → 解密。写了一个脚本，核心逻辑是：</p>
+<ol>
+<li><strong>从 public.pem 读取公钥，获取 n 和 e</strong> — 这一步成功了，n = 314 bit，e = 3。</li>
+<li><strong>尝试 FactorDB 在线分解</strong> — 脚本调用 factordb.com/api，但返回了 JSON 解析错误：
+[!] Factordb 查询失败: Expecting value: line 1 column 1 (char 0)
+[!] Factordb 未找到分解结果。
+原因：FactorDB 的 API 偶尔会返回非 JSON 内容（可能是被拦截或限流）。</li>
+<li><strong>手动输入 p 和 q</strong> — 脚本让我手动输入 p 和 q。我随手试了 2 和 3：
+请输入 p (十进制): 2
+请输入 q (十进制): 3
+[!] p*q != N，请检查。
+这时我还没意识到 n 不是两个素数的乘积，脚本里写的也是 if len(factors) == 2，根本没有处理三素数的情况。</li>
+</ol>
+<h3>第二次尝试：solve2.py（增加本地分解）</h3>
+<p>FactorDB 失败了，那我就在本地分解。安装了 <code>primefac</code> 和 <code>sympy</code>，写了一个自动尝试多种方法的脚本：</p>
+<ul>
+<li>先试 FactorDB 在线查询</li>
+<li>再试 primefac 本地 Pollard Rho</li>
+<li>最后试 sympy 的 factorint</li>
+</ul>
+<p>结果 primefac 的 Pollard Rho 跑 Pollard Rho 时卡住了：</p>
+<div class="highlight"><pre><span></span><code>[*] 尝试 primefac 本地分解...
+^CTraceback (most recent call last):
+  File &quot;solve2.py&quot;, line 144, in 
+    ...
+  File &quot;primefac/__init__.py&quot;, line 317, in pollardrho_brent
+    y = (y**2 + c) % n
+KeyboardInterrupt
+</code></pre></div>
+
+<p>我按了 Ctrl+C 中断。对于 95 位十进制数、三个均匀分布的 32 位素因子，Pollard Rho 确实很难在合理时间内找到因子。</p>
+<blockquote>
+<p><strong>关键盲点</strong> — solve.py 和 solve2.py 都假设 n = p × q（两个素数）。它们的代码里检查的是 len(factors) == 2，如果 FactorDB 返回了三个因子，这些脚本会直接忽略。这是导致它们"看似失败"的根本原因。</p>
+</blockquote>
+<h3>第三次尝试：s1.py（直接求 d 解密）</h3>
+<p>我在网上查到了 n 的三个素因子，直接硬编码到脚本里，尝试用标准 RSA 解密：</p>
+<div class="highlight"><pre><span></span><code>phi = (p - 1) <span class="gs">* (q - 1) *</span> (r - 1)
+d = inverse(e, phi)
+</code></pre></div>
+
+<p>结果运行时 <code>inverse(e, phi)</code> 抛出异常，因为 <strong>gcd(3, φ(n)) = 3</strong>，3 在模 φ(n) 下没有逆元。标准 RSA 解密路被彻底堵死。</p>
+<p>这个脚本让我真正意识到了问题的严重性：这不是一道"套公式"的 RSA 题。</p>
+<h3>第四次尝试：solve3.py（立方根 + CRT，终于成功）</h3>
+<p>换了思路：不求 d，直接在每个素数域上求 c 的立方根，然后用 CRT 组合。</p>
+<p>运行结果：</p>
+<div class="highlight"><pre><span></span><code><span class="k">[*] p 的立方根: [5686385026105901867473638678946, 7379361747422713811654086477766, 13374868592866626517389128266735]</span>
+<span class="k">[*] q 的立方根: [19616973567618515464515107624812]</span>
+<span class="k">[*] r 的立方根: [6149264605288583791069539134541, 13028011585706956936052628027629, 13404203109409336045283549715377]</span>
+
+<span class="na">[-] 未找到有效填充，可能是立方根不全或填充格式不同。</span>
+<span class="w">   </span><span class="na">打印所有候选明文（调试）：</span>
+<span class="na">0</span><span class="o">:</span><span class="w"> </span><span class="s">b&#39;\x02\x9d\xb0\xda\xb3...&#39;</span>
+<span class="na">1</span><span class="o">:</span><span class="w"> </span><span class="s">b&#39;\x02\xd1^\xcb\x84\x84RC\xf3J\x000ctf{HahA!Thi5_1s_n0T_rSa~}\n&#39;</span>
+<span class="na">2</span><span class="o">:</span><span class="w"> </span><span class="s">b&#39;.\x82\x7fY~U\xff\xaa...&#39;</span>
+<span class="na">...</span>
+</code></pre></div>
+
+<p><strong>候选 1 直接出现了 flag！</strong>但脚本的 PKCS#1 v1.5 剥离逻辑却没有匹配到它。为什么呢？</p>
+<p>因为脚本里写的是：</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="nv">data</span>[<span class="mi">0</span>]<span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="nv">x00</span><span class="w"> </span><span class="nv">or</span><span class="w"> </span><span class="nv">data</span>[<span class="mi">1</span>]<span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="nv">x02</span>:
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nv">None</span>
+</code></pre></div>
+
+<p>它要求填充格式必须以 <code>0x00 0x02</code> 开头，但实际解密出的 m_bytes 是 <code>0x02 ...</code> 开头（前面没有 0x00）。这是因为 m 的 bit_length = 296 bit = 37 字节，而 n 是 314 bit = 40 字节，m 作为整数没有占满 40 字节，所以转换成的 bytes 不以 0x00 开头。</p>
+<p>幸好脚本在剥离失败后会打印所有候选，我就是在调试输出中一眼看到了 <code>0ctf{...}</code>。</p>
+<h3>终端上的其他尝试</h3>
+<p><strong>尝试 openssl rsautl 解密</strong>（没有私钥，当然失败）：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>openssl<span class="w"> </span>rsautl<span class="w"> </span>-decrypt<span class="w"> </span>-in<span class="w"> </span>flag.enc<span class="w"> </span>-inkey<span class="w"> </span>public.pem<span class="w"> </span>-out<span class="w"> </span>flag.txt
+Could<span class="w"> </span>not<span class="w"> </span>find<span class="w"> </span>private<span class="w"> </span>key<span class="w"> </span>from<span class="w"> </span>public.pem
+</code></pre></div>
+
+<p><strong>尝试 openssl 重新加密</strong>，bash 历史扩展坑了我：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>openssl<span class="w"> </span>rsautl<span class="w"> </span>-encrypt<span class="w"> </span>-in<span class="w"> </span>ctf<span class="o">{</span>HahA!Thi5_1s_n0T_rSa~<span class="o">}</span><span class="w"> </span>-inkey<span class="w"> </span>public.pem<span class="w"> </span>-pubin<span class="w"> </span>-out<span class="w"> </span>flag.enc2
+bash:<span class="w"> </span>!Thi5_1s_n0T_rSa~<span class="o">}</span>:<span class="w"> </span>event<span class="w"> </span>not<span class="w"> </span>found
+</code></pre></div>
+
+<p>bash 把 <code>!</code> 当成历史事件扩展了。后来我用 <code>nano flag1</code> 写入内容，再用文件作为输入，成功加密：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>openssl<span class="w"> </span>rsautl<span class="w"> </span>-encrypt<span class="w"> </span>-in<span class="w"> </span>flag1<span class="w"> </span>-inkey<span class="w"> </span>public.pem<span class="w"> </span>-pubin<span class="w"> </span>-out<span class="w"> </span>flag.enc2
+</code></pre></div>
+
+<p><strong>比较两次加密的密文</strong>：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>hexdump<span class="w"> </span>-C<span class="w"> </span>flag.enc<span class="w"> </span><span class="p">|</span><span class="w"> </span>head
+<span class="m">00000000</span><span class="w">  </span><span class="m">00</span><span class="w"> </span>4c<span class="w"> </span><span class="m">41</span><span class="w"> </span><span class="m">62</span><span class="w"> </span>a0<span class="w"> </span>7a<span class="w"> </span><span class="m">01</span><span class="w"> </span><span class="m">11</span><span class="w">  </span>b8<span class="w"> </span><span class="m">34</span><span class="w"> </span>4c<span class="w"> </span><span class="m">68</span><span class="w"> </span>b1<span class="w"> </span><span class="m">18</span><span class="w"> </span>bd<span class="w"> </span><span class="m">05</span><span class="w">  </span><span class="p">|</span>.LAb.z...4Lh....<span class="p">|</span>
+
+$<span class="w"> </span>hexdump<span class="w"> </span>-C<span class="w"> </span>flag.enc2<span class="w"> </span><span class="p">|</span><span class="w"> </span>head
+<span class="m">00000000</span><span class="w">  </span><span class="m">01</span><span class="w"> </span><span class="m">98</span><span class="w"> </span>c5<span class="w"> </span><span class="m">27</span><span class="w"> </span><span class="m">29</span><span class="w"> </span>4a<span class="w"> </span>c7<span class="w"> </span><span class="m">79</span><span class="w">  </span><span class="m">71</span><span class="w"> </span>ae<span class="w"> </span>af<span class="w"> </span><span class="m">84</span><span class="w"> </span><span class="m">22</span><span class="w"> </span>f5<span class="w"> </span><span class="m">90</span><span class="w"> </span>de<span class="w">  </span><span class="p">|</span>...<span class="err">&#39;</span><span class="o">)</span>J.yq...<span class="s2">&quot;...|</span>
+</code></pre></div>
+
+<p>两个密文完全不同，验证了 PKCS#1 v1.5 随机填充的特性。</p>
+<h2>07 第六步：正向验证与最终真相</h2>
+<p>为了彻底确认，我做了正向验证：</p>
+<h3>7.1 用 openssl 重新加密</h3>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="nb">printf</span><span class="w"> </span><span class="s1">&#39;0ctf{HahA!Thi5_1s_n0T_rSa~}\n&#39;</span><span class="w"> </span>&gt;<span class="w"> </span>FLAG
+$<span class="w"> </span>openssl<span class="w"> </span>rsautl<span class="w"> </span>-encrypt<span class="w"> </span>-in<span class="w"> </span>FLAG<span class="w"> </span>-inkey<span class="w"> </span>public.pem<span class="w"> </span>-pubin<span class="w"> </span>-out<span class="w"> </span>flag_new.enc
+</code></pre></div>
+
+<p>注意：由于 PKCS#1 v1.5 填充使用了<strong>随机非零字节</strong>，每次加密生成的密文都不同。所以 <code>flag_new.enc</code> 和原始 <code>flag.enc</code> 的二进制内容<strong>不会相同</strong>。这是正常的。</p>
+<h3>7.2 解密新密文验证</h3>
+<p>用同样的立方根 + CRT 方法解密新密文：</p>
+<div class="highlight"><pre><span></span><code>[重加密密文解密] i=1, j=1
+  完整填充: 024fe3ce50b85c8f840100306374667b4861684121546869355f31735f6e30545f7253617e7d0a
+  明文: b&#39;0ctf{HahA!Thi5_1s_n0T_rSa~}\n&#39;
+</code></pre></div>
+
+<p>解密成功，明文完全一致！</p>
+<h3>7.3 最直接的数学验证</h3>
+<p>把原始解密出的完整 39 字节填充数据直接代入 <code>c = m³ mod n</code>：</p>
+<div class="highlight"><pre><span></span><code>&gt;&gt;&gt; m_bytes = bytes.fromhex(&#39;02d15ecb84845243f34a00306374667b4861684121546869355f31735f6e30545f7253617e7d0a&#39;)
+&gt;&gt;&gt; m = int.from_bytes(m_bytes, &#39;big&#39;)
+&gt;&gt;&gt; c_recalc = pow(m, 3, n)
+&gt;&gt;&gt; c_orig = int.from_bytes(open(&#39;flag.enc&#39;,&#39;rb&#39;).read(), &#39;big&#39;)
+&gt;&gt;&gt; c_recalc == c_orig
+True
+</code></pre></div>
+
+<blockquote>
+<p><strong>验证通过</strong> — 原始解密出的 39 字节数据直接做 m³ mod n，结果与原始密文 完全一致。解密没有任何错误，flag 就是 0ctf{HahA!Thi5_1s_n0T_rSa~}。</p>
+</blockquote>
+<div class="highlight"><pre><span></span><code><span class="n">flowchart</span><span class="w"> </span><span class="n">TD</span>
+<span class="w">    </span><span class="n">A</span><span class="p">[</span><span class="err">创建</span><span class="w"> </span><span class="n">FLAG</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="n">ctf</span><span class="p">{...}]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">B</span><span class="p">[</span><span class="n">openssl</span><span class="w"> </span><span class="n">rsautl</span><span class="w"> </span><span class="o">-</span><span class="kr">encrypt</span><span class="p">]</span>
+<span class="w">    </span><span class="n">B</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">C</span><span class="p">[</span><span class="n">flag_new</span><span class="p">.</span><span class="n">enc与原始密文不同PKCS</span><span class="err">#</span><span class="mi">1</span><span class="w"> </span><span class="n">v1</span><span class="mf">.5</span><span class="w"> </span><span class="err">随机填充</span><span class="p">]</span>
+<span class="w">    </span><span class="n">C</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">D</span><span class="p">[</span><span class="err">立方根</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">CRT</span><span class="w"> </span><span class="err">解密</span><span class="p">]</span>
+<span class="w">    </span><span class="n">D</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">E</span><span class="p">[</span><span class="err">明文</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="n">ctf</span><span class="p">{...}</span><span class="err">与原始</span><span class="w"> </span><span class="n">FLAG</span><span class="w"> </span><span class="err">一致</span><span class="p">]</span>
+<span class="w">    </span><span class="n">F</span><span class="p">[</span><span class="err">原始</span><span class="w"> </span><span class="n">flag</span><span class="p">.</span><span class="n">enc</span><span class="p">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">G</span><span class="p">[</span><span class="err">立方根</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">CRT</span><span class="w"> </span><span class="err">解密</span><span class="p">]</span>
+<span class="w">    </span><span class="n">G</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">H</span><span class="p">[</span><span class="err">明文</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="n">ctf</span><span class="p">{...}]</span>
+<span class="w">    </span><span class="n">H</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">I</span><span class="p">[</span><span class="n">m³</span><span class="w"> </span><span class="n">mod</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">flag</span><span class="p">.</span><span class="n">enc数学验证通过</span><span class="p">]</span>
+</code></pre></div>
+
+<p><em>图 1: 正向验证流程</em></p>
+<h2>08 完整可运行代码（纯 Python，零依赖）</h2>
+<p>把下面这段代码保存为 <code>solve.py</code>，放在与 <code>flag.enc</code> 同目录下，运行 <code>python3 solve.py flag.enc</code> 即可：</p>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">0CTF 2016 Quals rsa-2 解密脚本（纯 Python，无需 gmpy2）</span>
+<span class="sd">用法: python3 solve.py flag.enc</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">sympy</span><span class="w"> </span><span class="kn">import</span> <span class="n">nthroot_mod</span>
+
+<span class="c1"># ========== 1. 参数（从 public.pem 解析 + FactorDB 分解） ==========</span>
+<span class="n">n</span> <span class="o">=</span> <span class="mi">23292710978670380403641273270002884747060006568046290011918413375473934024039715180540887338067</span>
+<span class="n">p1</span> <span class="o">=</span> <span class="mi">26440615366395242196516853423447</span>
+<span class="n">p2</span> <span class="o">=</span> <span class="mi">27038194053540661979045656526063</span>
+<span class="n">p3</span> <span class="o">=</span> <span class="mi">32581479300404876772405716877547</span>
+
+<span class="c1"># ========== 2. 读取密文 ==========</span>
+<span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span> <span class="s1">&#39;rb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+    <span class="n">c</span> <span class="o">=</span> <span class="nb">int</span><span class="o">.</span><span class="n">from_bytes</span><span class="p">(</span><span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">(),</span> <span class="s1">&#39;big&#39;</span><span class="p">)</span>
+
+<span class="c1"># ========== 3. 各素数域的立方根 ==========</span>
+<span class="c1"># p2: 唯一立方根（因为 p2 % 3 == 2，3 与 p2-1 互质）</span>
+<span class="n">d2</span> <span class="o">=</span> <span class="nb">pow</span><span class="p">(</span><span class="mi">3</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">p2</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+<span class="n">r2</span> <span class="o">=</span> <span class="nb">pow</span><span class="p">(</span><span class="n">c</span><span class="p">,</span> <span class="n">d2</span><span class="p">,</span> <span class="n">p2</span><span class="p">)</span>
+
+<span class="c1"># p1, p3: 各有 3 个立方根（因为 p1 % 3 == p3 % 3 == 1）</span>
+<span class="n">r1_list</span> <span class="o">=</span> <span class="n">nthroot_mod</span><span class="p">(</span><span class="n">c</span> <span class="o">%</span> <span class="n">p1</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">p1</span><span class="p">,</span> <span class="n">all_roots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">r3_list</span> <span class="o">=</span> <span class="n">nthroot_mod</span><span class="p">(</span><span class="n">c</span> <span class="o">%</span> <span class="n">p3</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">p3</span><span class="p">,</span> <span class="n">all_roots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+<span class="c1"># ========== 4. 中国剩余定理（CRT）==========</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">crt</span><span class="p">(</span><span class="n">m1</span><span class="p">,</span> <span class="n">m2</span><span class="p">,</span> <span class="n">m3</span><span class="p">):</span>
+    <span class="n">M1</span><span class="p">,</span> <span class="n">M2</span><span class="p">,</span> <span class="n">M3</span> <span class="o">=</span> <span class="n">p2</span> <span class="o">*</span> <span class="n">p3</span><span class="p">,</span> <span class="n">p1</span> <span class="o">*</span> <span class="n">p3</span><span class="p">,</span> <span class="n">p1</span> <span class="o">*</span> <span class="n">p2</span>
+    <span class="n">inv</span> <span class="o">=</span> <span class="k">lambda</span> <span class="n">a</span><span class="p">,</span> <span class="n">m</span><span class="p">:</span> <span class="nb">pow</span><span class="p">(</span><span class="n">a</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">m</span><span class="p">)</span>
+    <span class="k">return</span> <span class="p">(</span><span class="n">m1</span> <span class="o">*</span> <span class="n">M1</span> <span class="o">*</span> <span class="n">inv</span><span class="p">(</span><span class="n">M1</span><span class="p">,</span> <span class="n">p1</span><span class="p">)</span> <span class="o">+</span>
+            <span class="n">m2</span> <span class="o">*</span> <span class="n">M2</span> <span class="o">*</span> <span class="n">inv</span><span class="p">(</span><span class="n">M2</span><span class="p">,</span> <span class="n">p2</span><span class="p">)</span> <span class="o">+</span>
+            <span class="n">m3</span> <span class="o">*</span> <span class="n">M3</span> <span class="o">*</span> <span class="n">inv</span><span class="p">(</span><span class="n">M3</span><span class="p">,</span> <span class="n">p3</span><span class="p">))</span> <span class="o">%</span> <span class="n">n</span>
+
+<span class="c1"># ========== 5. 遍历 9 种组合，筛选明文 ==========</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;正在遍历 3×1×3 = 9 种 CRT 组合...&quot;</span><span class="p">)</span>
+<span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">m1</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">r1_list</span><span class="p">):</span>
+    <span class="k">for</span> <span class="n">j</span><span class="p">,</span> <span class="n">m3</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">r3_list</span><span class="p">):</span>
+        <span class="n">m</span> <span class="o">=</span> <span class="n">crt</span><span class="p">(</span><span class="n">m1</span><span class="p">,</span> <span class="n">r2</span><span class="p">,</span> <span class="n">m3</span><span class="p">)</span>
+        <span class="n">length</span> <span class="o">=</span> <span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">bit_length</span><span class="p">()</span> <span class="o">+</span> <span class="mi">7</span><span class="p">)</span> <span class="o">//</span> <span class="mi">8</span>
+        <span class="n">m_bytes</span> <span class="o">=</span> <span class="n">m</span><span class="o">.</span><span class="n">to_bytes</span><span class="p">(</span><span class="n">length</span><span class="p">,</span> <span class="s1">&#39;big&#39;</span><span class="p">)</span>
+
+        <span class="c1"># 尝试剥离 PKCS#1 v1.5 填充</span>
+        <span class="k">if</span> <span class="n">m_bytes</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="sa">b</span><span class="s1">&#39;</span><span class="se">\x02</span><span class="s1">&#39;</span><span class="p">):</span>
+            <span class="n">sep</span> <span class="o">=</span> <span class="n">m_bytes</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="sa">b</span><span class="s1">&#39;</span><span class="se">\x00</span><span class="s1">&#39;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">sep</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
+                <span class="n">plaintext</span> <span class="o">=</span> <span class="n">m_bytes</span><span class="p">[</span><span class="n">sep</span> <span class="o">+</span> <span class="mi">1</span><span class="p">:]</span>
+                <span class="k">if</span> <span class="sa">b</span><span class="s1">&#39;ctf&#39;</span> <span class="ow">in</span> <span class="n">plaintext</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">or</span> <span class="sa">b</span><span class="s1">&#39;flag&#39;</span> <span class="ow">in</span> <span class="n">plaintext</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
+                    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[FOUND] i=</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">, j=</span><span class="si">{</span><span class="n">j</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  完整填充数据: </span><span class="si">{</span><span class="n">m_bytes</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  明文 bytes:   </span><span class="si">{</span><span class="n">plaintext</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                    <span class="k">try</span><span class="p">:</span>
+                        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  明文 text:    </span><span class="si">{</span><span class="n">plaintext</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s1">&#39;ascii&#39;</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+                        <span class="k">pass</span>
+
+                    <span class="c1"># 验证：重新加密看是否等于原始密文</span>
+                    <span class="n">m_int</span> <span class="o">=</span> <span class="nb">int</span><span class="o">.</span><span class="n">from_bytes</span><span class="p">(</span><span class="n">m_bytes</span><span class="p">,</span> <span class="s1">&#39;big&#39;</span><span class="p">)</span>
+                    <span class="k">if</span> <span class="nb">pow</span><span class="p">(</span><span class="n">m_int</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">n</span><span class="p">)</span> <span class="o">==</span> <span class="n">c</span><span class="p">:</span>
+                        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;  [验证通过] m³ mod n == c&quot;</span><span class="p">)</span>
+                    <span class="k">else</span><span class="p">:</span>
+                        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;  [验证失败] m³ mod n != c&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>运行前准备</strong> — 代码使用了 sympy 的 nthroot_mod 来求模素数域的立方根。如果没有 sympy，先安装：
+<code>pip install sympy</code></p>
+</blockquote>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的 RSA 弱点分析、Multi-Prime 攻击链拆解和代码示例均基于公开的 CTF 赛题（0CTF 2016 Quals），旨在帮助开发者理解 RSA 密码学原理、提升密码安全意识。</p>
+<p>请勿将本文所述技术用于任何未经授权的系统测试或非法用途。</p>
+<h2>09 知识点总结</h2>
+<h3>9.1 本题涉及的安全缺陷</h3>
+<table>
+<thead>
+<tr>
+<th>缺陷</th>
+<th>描述</th>
+<th>利用方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>模数过短</td>
+<td>n 仅 314 bit，远低于 2048 bit 安全标准</td>
+<td>FactorDB / SIQS 直接分解</td>
+</tr>
+<tr>
+<td>e = 3 极小</td>
+<td>导致 m³ 较小，且可分域开立方根</td>
+<td>模素数域立方根 + CRT</td>
+</tr>
+<tr>
+<td>三素数乘积</td>
+<td>n = p₁ × p₂ × p₃ 而非 p × q</td>
+<td>gcd(e, φ(n)) ≠ 1，阻断标准解密</td>
+</tr>
+<tr>
+<td>PKCS#1 v1.5 填充</td>
+<td>随机填充导致密文不可复现</td>
+<td>解密验证而非密文比对</td>
+</tr>
+</tbody>
+</table>
+<h3>9.2 核心知识点</h3>
+<ul>
+<li>Multi-Prime RSA：RSA 数学上允许任意多个素因子。素数越多、越短，越容易被分解。</li>
+<li>gcd(e, φ(n)) ≠ 1 的后果：当公钥指数 e 与 φ(n) 不互质时，e 在模 φ(n) 下没有逆元，标准 RSA 解密失效。</li>
+<li>模素数域的立方根：p ≡ 2 (mod 3) 时唯一，p ≡ 1 (mod 3) 时有 0 或 3 个。可用 sympy 的 nthroot_mod 或 PARI/GP 的 sqrtn 求解。</li>
+<li>中国剩余定理（CRT）：将各素数域上的部分解合并为模 n 的全局解。3 × 1 × 3 = 9 种组合中筛选出有效明文。</li>
+<li>PKCS#1 v1.5 填充：格式为 0x00 0x02 [随机非零字节...] 0x00 [明文]。每次加密的随机字节不同，密文也不同。</li>
+</ul>
+<h3>9.3 踩坑教训</h3>
+<blockquote>
+<p><strong>经验之谈</strong> — 不要预设 flag 格式。 解密出的每一个字节都要仔细检查，不要因为 "看起来不像 flag" 就随意丢弃。CTF 题目的 flag 前缀千变万化，这道题的 0ctf 就是一个典型例子。</p>
+</blockquote>
+<h2>10 参考资料</h2>
+<ol>
+<li>0CTF 2016 Quals – RSA? (Crypto 2 pts) 官方 Writeup — hellman, MSLC
+          原题解析，包含 Cipolla-Lehmer 立方根算法和 Sage 代码。
+https://mslc.ctf.su/wp/0ctf-2016-quals-rsa-crypto-2-pts/</li>
+<li>FactorDB — 在线整数因子分解数据库
+https://factordb.com</li>
+<li>YAFU — Yet Another Factoring Utility
+          支持 SIQS、ECM 等多种分解算法，对 90-100 位十进制数非常有效。
+https://github.com/bbuhrow/yafu</li>
+<li>SymPy Documentation — nthroot_mod
+          Python 中求模素数域 n 次根的实用函数。
+https://docs.sympy.org/latest/modules/ntheory.html</li>
+</ol>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
