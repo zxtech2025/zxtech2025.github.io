@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>训推解耦的3.8倍：昇腾AsyncFlow如何打破RL训练的长尾诅咒 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>训推解耦的3.8倍：昇腾AsyncFlow如何打破RL训练的长尾诅咒</h1>
+<time>2026-07-06</time>
+<ul>
+<li>AI训练</li>
+<li>强化学习</li>
+<li>硬件架构</li>
+<li>分布式系统</li>
+</ul>
+<hr />
+<p>华为计算今天放出了一组数据：在昇腾全系列硬件上，AsyncFlow异步流式RL将训练吞吐从59.3提升到226.8，相对提升3.81倍。测试条件是prompt 2k → response 16k的长序列场景，收敛精度保持不变。</p>
+<p>3.81倍在AI基础设施领域是什么概念？15%的提升值得发篇论文，50%能上头条，接近4倍通常意味着架构级别的重写。这篇文章拆一下AsyncFlow到底做了什么，以及为什么这件事对RL训练来说是个拐点。</p>
+<h2>RL训练的同步诅咒</h2>
+<p>大模型从能用走到好用，强化学习是绕不开的一环。GPT-4o、Claude、Gemini的推理能力不是靠堆更多预训练数据堆出来的，是RLHF和GRPO这类后训练方法打磨的。RL训练有个结构性问题，一直在拖后腿。</p>
+<p>RL训练流程分两步：Rollout（推理）和Trainer（训练）。Rollout阶段让模型生成回复，Trainer阶段用这些回复计算奖励并更新权重。同步模式下，这两步是串行的。Rollout跑完一批数据，Trainer才开始干活。Trainer训练的时候，推理引擎闲着；Rollout生成的时候，训练引擎干等。</p>
+<p>这就产生了一个恶性循环。模型越来越大、生成序列越来越长，Rollout阶段的耗时指数级增长。一个2k token的prompt让模型生成16k token的回复，Rollout可能要跑几十秒甚至几分钟。这段时间里，Atlas 900 A3 SuperPoD级别的液冷超节点有相当比例的算力在空转。</p>
+<p>这不是某个厂商的问题。NVIDIA的集群也一样：同步模式下的GPU利用率曲线像心电图，峰值和谷底交替出现，平均利用率远低于硬件能力。RL训练的水龙头一直被一只看不见的手拧着。</p>
+<h2>AsyncFlow的方案：把推和训彻底拆开</h2>
+<p>AsyncFlow的核心思路就四个字：训推解耦。不是在同步管线上修修补补，而是把Rollout和Trainer拆成两个完全独立的子系统，中间用一个异步数据通道连接。</p>
+<p>实现上分两大组件。</p>
+<p><strong>TransferQueue，数据中枢。</strong> Rollout引擎生成完一批数据后，不直接递给Trainer，而是写入TransferQueue。这是一个高性能的异步数据队列，承担生产者和消费者之间的缓冲角色。Trainer不关心数据什么时候生成完毕，只从队列里拉。Rollout也不关心Trainer处理到哪了，只管持续生成。</p>
+<p>这个设计消除了流水线的木桶效应。同步模式里，最慢的一次Rollout决定整批的完成时间。异步模式下，Rollout按自己的节奏跑，Trainer也按自己的节奏训。TransferQueue承担了所有同步协调的成本。</p>
+<p><strong>CheckpointEngine，权重引擎。</strong> 训推解耦之后出现一个新问题：Rollout用的模型权重和Trainer更新的权重不是同一份。Rollout需要稳定的、一致的权重来生成回复；Trainer在不断更新权重。如果Rollout期间权重被Trainer修改，生成的回复会出现不一致，奖励信号就乱了。</p>
+<p>CheckpointEngine解决这个一致性难题。它维护权重的快照版本，Rollout始终读取快照，Trainer写入新权重。Trainer完成一轮更新后，CheckpointEngine原子性地把新权重推给Rollout。不是每步都推，是按epoch或固定步数对齐。这个机制和数据库的MVCC（多版本并发控制）本质上是同一个思路，只是操作对象从数据行变成了模型权重。</p>
+<p>我在第一次看到这个设计的时候愣了一下，然后发现它确实很自然。做过后端的人对「读写分离+版本控制」不会陌生，但把它搬到RL训练的权重管理上，需要同时理解训练框架和分布式系统的工程约束。这两拨人平时不太坐在一起开会。</p>
+<h2>3.81倍不是终点</h2>
+<p>回看实测数据。昇腾在prompt 2k → response 16k配置下的结果：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>同步方案</th>
+<th>AsyncFlow</th>
+<th>提升</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>训练吞吐</td>
+<td>59.3</td>
+<td>226.8</td>
+<td>3.81×</td>
+</tr>
+<tr>
+<td>收敛精度</td>
+<td>基准</td>
+<td>对齐</td>
+<td>✅</td>
+</tr>
+</tbody>
+</table>
+<p>16k response已经是长文本推理的典型场景了。代码生成、数学证明、多步推理都会产出这个长度的输出。同步模式在这种场景下被Rollout的长尾延迟折磨得最惨，AsyncFlow的提升也最明显。换成更短的response，提升幅度会减小，但不会消失。训推耦合本身就是效率杀手，跟序列长度无关。</p>
+<p>测试覆盖了昇腾全系列产品线，从Atlas 900 A3 SuperPoD（液冷超节点）到Atlas 800 A3（风冷超节点）。不同冷却方案、不同互联拓扑的硬件上表现一致，说明AsyncFlow是架构层面的优化，不挑硬件配置。</p>
+<p>目前AsyncFlow已经支持 verl 框架。verl 是火山引擎开源的RL后训练框架，GitHub上22k+ star，是当前RL训练的主流选择之一。接入 verl 意味着AsyncFlow有明确的工程接口，开发者可以基于现有工作流直接适配，不用从头搭训练管线。</p>
+<h2>超越昇腾</h2>
+<p>从更大的视角看，AsyncFlow解决的是一个跨硬件平台、跨模型架构的通用问题。</p>
+<p>RL训练正处在爆发前夜。DeepSeek-R1用GRPO证明了纯RL可以让模型自己学会推理，OpenAI和Anthropic在后训练上的投入逐年翻倍，中小团队也在用 verl + 开源模型跑自己的RL管线。同步训练的效率瓶颈一直是隐形成本。团队买得起卡，利用率上不去，单位算力的产出被流水线阻塞吃掉。</p>
+<p>训推解耦这个方向，NVIDIA也在探索。Megatron-LM和NeMo框架都有异步训练的尝试，但大多停留在小规模实验阶段。昇腾这次直接在全系列硬件上量产部署，给出明确的性能数据和框架支持，相当于先把工程落地这条路趟通了。</p>
+<p>对开发者来说，最直接的影响是RL训练的硬件门槛实际降低了。原来需要堆更多卡来弥补利用率损失，同样的硬件现在能跑出接近4倍的吞吐。小团队用几台Atlas 800 A3就能跑以前需要半个机柜才能支撑的RL训练任务。</p>
+<h2>几个值得继续关注的点</h2>
+<p>AsyncFlow的架构方向是对的，有几个地方还需要更多数据。</p>
+<p>TransferQueue的性能上限。在极小batch或极高吞吐场景下，队列本身会不会成为瓶颈？目前的数据是在2k→16k序列长度下测的，如果Rollout速度远快于Trainer处理速度，队列会不会堆积？</p>
+<p>CheckpointEngine的权重一致性。官方说「保持收敛精度对齐」，但没有公开严格的消融实验数据。在多机多卡场景下，权重版本不一致的边界情况——比如某个Rollout worker刚好在权重切换瞬间读取了过渡态——需要更多细节。</p>
+<p>生态兼容性。目前只确认支持 verl，其他RL框架（TRL、OpenRLHF、DeepSpeed-Chat）的适配进度还没公布。</p>
+<p>但这些不影响AsyncFlow的核心价值。它把RL训练从同步范式中解放了出来，给了一个经过量产验证的异步方案。3.81倍的数据摆在那里，剩下的优化是锦上添花。</p>
+<p>如果你在用 verl 跑RL训练，尤其是长序列生成的场景，AsyncFlow值得第一时间尝试。训推解耦的架构思路本身和硬件无关。理解了TransferQueue和CheckpointEngine的设计逻辑，在CUDA生态里复现也不难。关键不在于跑在什么卡上，在于把串行水管换成异步队列这个决定本身。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
