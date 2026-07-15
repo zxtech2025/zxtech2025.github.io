@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Microsoft Gigawiper深度技术分析——按需破坏的新型后门恶意软件 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Microsoft Gigawiper深度技术分析——按需破坏的新型后门恶意软件</h1>
+<time>2026-07-09</time>
+<ul>
+<li>技术
+Slug: blog-54-microsoft-gigawiper-wiper</li>
+</ul>
+<hr />
+<p>2026年7月9日，Microsoft Threat Intelligence发布了一份极具分量的技术分析报告，披露了一种名为 <strong>GigaWiper</strong> 的新型恶意软件。这并非传统意义上的wiper（擦除器），也不是普通的远程访问后门（RAT），而是一个<strong>将至少三个已知恶意软件家族缝合进单一植入物的模块化破坏平台</strong>。攻击者可以在长达数月的时间里安静地进行网络间谍活动，然后在任意时刻通过一条C2命令将受控主机瞬间切换到毁灭模式——擦除物理磁盘、不可逆加密文件、触发蓝屏死机、清除所有日志证据。</p>
+<p>这种"间谍先行、按需毁灭"的架构设计，模糊了网络间谍软件与破坏性恶意软件之间的界限，标志着wiper类恶意软件从"一次性武器"向"持久化多模式作战平台"的重大范式转变。本文将从技术特征、攻击链、破坏机制、历史对比、归因分析以及检测防御六个维度，对GigaWiper进行全面深度解析。</p>
+<hr />
+<h2>一、技术特征：何为"按需破坏"</h2>
+<h3>1.1 架构概述</h3>
+<p>GigaWiper是用 <strong>Go (Golang)</strong> 语言编写的Windows后门恶意软件，Microsoft在受害环境中观察到两种样本形态：</p>
+<ul>
+<li><strong>独立wiper二进制文件</strong>：仅包含物理磁盘擦除功能</li>
+<li><strong>全功能后门植入物</strong>：将独立wiper的完整代码作为后门命令之一嵌入</li>
+</ul>
+<p>后门支持最多 <strong>20个命令码</strong>，其中三个命令（Command 1、Command 3、Command 12）分别对应来自三个不同恶意软件家族的破坏能力 [1][2][5]。</p>
+<h3>1.2 三大破坏组件的来源</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>对应后门命令</th>
+<th>来源恶意软件家族</th>
+<th>核心功能</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>独立物理磁盘Wiper</td>
+<td>Command 1</td>
+<td>独立开发的物理磁盘擦除器</td>
+<td>通过WMI枚举磁盘、销毁分区表、覆写数据</td>
+</tr>
+<tr>
+<td>伪勒索软件</td>
+<td>Command 3</td>
+<td><strong>Crucio</strong> 勒索软件（CISA AA23-335A，2023年12月）</td>
+<td>使用随机AES密钥加密文件但<strong>从不保存密钥</strong>，不可逆</td>
+</tr>
+<tr>
+<td>多遍安全擦除器</td>
+<td>Command 12</td>
+<td><strong>FlockWiper</strong>（C语言编写，2025年6月首次上传VirusTotal）</td>
+<td>多遍覆写Windows分区（0x00 → 0xFF → 随机字节）</td>
+</tr>
+</tbody>
+</table>
+<p>Microsoft通过代码级分析确认了这些关联 [1]：</p>
+<ul>
+<li>Command 3中的函数 <code>BigBangExtortMain</code> 与Crucio勒索软件中的同名函数<strong>完全一致</strong></li>
+<li>Command 12中的 <code>WipeCMain</code> 与FlockWiper的代码逻辑<strong>几乎完全相同</strong>，只是从C语言重写为Go语言，并增加了多遍覆写能力</li>
+<li>FlockWiper样本的PDB路径中包含 <code>GRAT</code> 字符串（如 <code>A:\GRAT\CWipeNew\Release\CWipeNew.pdb</code>），而GigaWiper的函数命名中也大量出现 <code>GRAT</code> 字符串——这暗示可能存在一个尚未被发现的<strong>更大规模恶意软件框架（代号GRAT）</strong></li>
+</ul>
+<h3>1.3 间谍能力模块</h3>
+<p>除了破坏功能外，GigaWiper还集成了一套完整的网络间谍工具包：</p>
+<table>
+<thead>
+<tr>
+<th>命令</th>
+<th>功能</th>
+<th>技术细节</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Command 9</td>
+<td>截屏</td>
+<td>对每个活动显示器截图，保存为 <code>.&lt;timestamp&gt;&lt;index&gt;.png</code></td>
+</tr>
+<tr>
+<td>Command 10</td>
+<td>屏幕录制</td>
+<td>在用户活跃且机器未锁定时持续录制，保存至 <code>C:\ProgramData\output</code></td>
+</tr>
+<tr>
+<td>Command 15</td>
+<td>系统信息采集（<code>GRATClientInfo</code>）</td>
+<td>收集IP、机器GUID、CPU、操作系统、网络配置、固件信息、用户信息及<strong>杀毒软件产品信息</strong></td>
+</tr>
+<tr>
+<td>Command 16</td>
+<td>进程管理器</td>
+<td>创建/恢复/挂起/列表/终止/进程信息</td>
+</tr>
+<tr>
+<td>Command 17</td>
+<td>服务管理器</td>
+<td>创建/删除/重启/查询/启动/列表/停止</td>
+</tr>
+<tr>
+<td>Command 18</td>
+<td>注册表浏览器</td>
+<td>交互式会话，支持导航/创建/删除/设置值</td>
+</tr>
+<tr>
+<td>Command 19</td>
+<td>清除Windows事件日志</td>
+<td>通过 <code>wevtutil.exe</code> 删除System/Setup/Application/ForwardedEvents/Security日志</td>
+</tr>
+<tr>
+<td>Command 20</td>
+<td>VNC远程控制</td>
+<td>屏幕流传输+鼠标键盘控制，创建伪装为 <code>Microsoft.Windows.CloudExperienceHost</code> 的防火墙规则</td>
+</tr>
+<tr>
+<td>Command 7</td>
+<td>PowerShell执行</td>
+<td>支持任意PowerShell命令执行</td>
+</tr>
+</tbody>
+</table>
+<h3>1.4 "按需破坏"的核心设计理念</h3>
+<p>GigaWiper的本质创新在于其<strong>双模式架构</strong>：</p>
+<ol>
+<li><strong>潜伏侦察模式</strong>：植入后，攻击者可以通过间谍模块（截屏、录屏、系统信息采集、VNC控制）长期监控受害组织，评估情报价值</li>
+<li><strong>毁灭模式</strong>：当攻击者判断情报收集完毕或需要执行破坏任务时，发送一条C2命令即可在数秒内切换到毁灭模式</li>
+</ol>
+<p>这种"<strong>先观察，后毁灭</strong>"的模式与传统wiper的一次性投放、立即执行形成鲜明对比。攻击者无需部署额外的破坏载荷，一个植入物即可完成从间谍到毁灭的全生命周期操作 [1][2]。</p>
+<hr />
+<h2>二、攻击链分析</h2>
+<h3>2.1 持久化机制</h3>
+<p>GigaWiper通过以下机制实现持久化驻留 [1]：</p>
+<ul>
+<li><strong>伪装的计划任务</strong>：创建名为 <code>OneDrive Update</code> 的计划任务，配置为<strong>每分钟运行一次</strong>并在系统启动时执行。这个名称伪装成OneDrive的更新任务，在缺乏深入检查的环境中极具欺骗性。</li>
+<li><strong>注册表执行计数器</strong>：通过注册表键 <code>HKCU\SOFTWARE\OneDrive\Environment</code> 记录执行次数。</li>
+</ul>
+<h3>2.2 命令与控制（C2）架构</h3>
+<p>GigaWiper的C2通信采用<strong>双通道设计</strong>，这在后门恶意软件中相对少见 [1][5]：</p>
+<table>
+<thead>
+<tr>
+<th>通道</th>
+<th>协议</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RabbitMQ over AMQP（端口5544）</td>
+<td>消息队列</td>
+<td>接收来自C2服务器的命令</td>
+</tr>
+<tr>
+<td>Redis（端口7542）</td>
+<td>键值存储</td>
+<td>更新命令状态和执行输出</td>
+</tr>
+</tbody>
+</table>
+<p>C2配置通过<strong>AES固定密钥加密</strong>硬编码在样本中。已知的C2基础设施包括：
+- <code>185.182.193[.]21</code>（RabbitMQ:5544 / Redis:7542）
+- <code>212.8.248[.]104</code></p>
+<p>消息分发采用两种交换模式：
+- <strong>fanout交换 "All"</strong>：广播模式，向所有绑定队列的受感染客户端发送命令——这意味着攻击者可以用<strong>一条命令同时触发所有受害主机的毁灭</strong>
+- <strong>topic交换 "Topic"</strong>：定向模式，针对特定目标发送非广播命令</p>
+<h3>2.3 BSOD触发与引导破坏（Command 2）</h3>
+<p>Command 2是一个独立的系统破坏命令，其行为链如下 [1][2]：</p>
+<ol>
+<li>禁用Windows恢复环境（Windows Recovery）</li>
+<li>获取关键系统文件所有权</li>
+<li>删除关键引导和内核文件</li>
+<li>触发蓝屏死机（BSOD）</li>
+<li>受害机器重启后无法正常引导</li>
+</ol>
+<h3>2.4 文件上传与数据外泄（Command 4）</h3>
+<p>Command 4使用 <strong>MinIO Client (<code>mc.exe</code>)</strong> 将文件上传到远程存储，参数包括：IP/端口、别名、用户名/密码、存储桶、源路径。这表明GigaWiper不仅具备破坏能力，还能执行结构化的数据窃取操作 [1]。</p>
+<h3>2.5 防御规避手段</h3>
+<p>GigaWiper在隐蔽性方面投入了大量设计精力 [1][2]：</p>
+<ul>
+<li><strong>随机化首字节覆写</strong>：物理磁盘擦除时，每个缓冲区的首字节通过 <code>crypto/rand.Read</code> 随机生成，剩余字节填充零值。如果随机生成失败则使用字节值 <code>1</code>。这种模式旨在规避针对全盘归零行为的检测规则。</li>
+<li><strong>计划任务伪装</strong>：<code>OneDrive Update</code> 名称模仿合法的OneDrive更新</li>
+<li><strong>防火墙规则伪装</strong>：VNC远程控制的防火墙规则伪装为 <code>Microsoft.Windows.CloudExperienceHost</code>（合法的Windows组件名称）</li>
+<li><strong>事件日志清除</strong>：Command 19通过 <code>wevtutil.exe</code> 或直接删除 <code>Security.evtx</code> 来清除所有安全审计日志</li>
+<li><strong>Golang编译</strong>：Go语言编译的二进制文件相对难以逆向分析，且跨平台编译便捷</li>
+</ul>
+<h3>2.6 MITRE ATT&amp;CK映射</h3>
+<table>
+<thead>
+<tr>
+<th>战术</th>
+<th>技术ID</th>
+<th>技术名称</th>
+<th>在攻击活动中的具体表现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>持久化</td>
+<td>T1053.005</td>
+<td>Scheduled Task</td>
+<td><code>OneDrive Update</code> 每分钟+启动时运行</td>
+</tr>
+<tr>
+<td>持久化</td>
+<td>T1547</td>
+<td>Boot or Logon Autostart Execution</td>
+<td>结合 <code>HKCU\...\OneDrive\Environment</code> 注册表键</td>
+</tr>
+<tr>
+<td>命令与控制</td>
+<td>T1071</td>
+<td>Application Layer Protocol</td>
+<td>RabbitMQ (AMQP) + Redis</td>
+</tr>
+<tr>
+<td>收集</td>
+<td>T1113</td>
+<td>Screen Capture</td>
+<td>截屏 + 屏幕录制</td>
+</tr>
+<tr>
+<td>收集</td>
+<td>T1082</td>
+<td>System Information Discovery</td>
+<td>系统及杀毒软件信息采集</td>
+</tr>
+<tr>
+<td>防御规避</td>
+<td>T1070.001</td>
+<td>Clear Windows Event Logs</td>
+<td>清除System/Setup/Application/Security日志</td>
+</tr>
+<tr>
+<td>防御规避</td>
+<td>T1036</td>
+<td>Masquerading</td>
+<td>伪装计划任务和防火墙规则</td>
+</tr>
+<tr>
+<td>影响</td>
+<td>T1561.001</td>
+<td>Disk Content Wipe</td>
+<td>物理磁盘内容覆写</td>
+</tr>
+<tr>
+<td>影响</td>
+<td>T1561.002</td>
+<td>Disk Structure Wipe</td>
+<td>分区表擦除</td>
+</tr>
+<tr>
+<td>影响</td>
+<td>T1486</td>
+<td>Data Encrypted for Impact</td>
+<td>不可逆伪勒索软件加密</td>
+</tr>
+<tr>
+<td>影响</td>
+<td>T1529</td>
+<td>System Shutdown/Reboot</td>
+<td>擦除后强制重启</td>
+</tr>
+<tr>
+<td>影响</td>
+<td>T1499</td>
+<td>Endpoint Denial of Service</td>
+<td>触发BSOD、阻止引导</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>三、破坏机制深度解析</h2>
+<h3>3.1 独立物理磁盘Wiper（Command 1）</h3>
+<p>这是GigaWiper最具破坏性的组件之一，其操作<strong>在物理磁盘层面</strong>进行，而非文件系统层面 [1]：</p>
+<div class="highlight"><pre><span></span><code><span class="err">执行流程</span><span class="o">:</span>
+<span class="mi">1</span><span class="o">.</span><span class="w"> </span><span class="n">WMI查询</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">枚举所有磁盘设备标识符和元数据</span>
+<span class="mi">2</span><span class="o">.</span><span class="w"> </span><span class="n">FindWindowsDrive</span><span class="o">()</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">定位</span><span class="n">Windows安装所在驱动器</span>
+<span class="mi">3</span><span class="o">.</span><span class="w"> </span><span class="err">遍历非</span><span class="n">Windows驱动器</span><span class="o">:</span>
+<span class="w">   </span><span class="n">a</span><span class="o">.</span><span class="w"> </span><span class="n">unallocateDrive</span><span class="o">()</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">DeviceIoControl</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">IOCTL_DISK_CREATE_DISK</span>
+<span class="w">      </span><span class="err">重新初始化分区元数据，擦除分区表条目</span>
+<span class="w">      </span><span class="err">输出</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;Partitions removed successfully.&quot;</span>
+<span class="w">   </span><span class="n">b</span><span class="o">.</span><span class="w"> </span><span class="n">writeRandToDrive</span><span class="o">()</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">以</span><span class="w"> </span><span class="mi">0</span><span class="n">xA00000</span><span class="w"> </span><span class="err">字节为单位分块覆写</span>
+<span class="w">      </span><span class="err">首字节</span><span class="o">:</span><span class="w"> </span><span class="n">crypto</span><span class="o">/</span><span class="n">rand</span><span class="o">.</span><span class="na">Read</span><span class="w"> </span><span class="err">随机化</span>
+<span class="w">      </span><span class="err">其余字节</span><span class="o">:</span><span class="w"> </span><span class="mh">0x00</span><span class="w"> </span><span class="err">填充</span>
+<span class="w">      </span><span class="err">随机失败时</span><span class="o">:</span><span class="w"> </span><span class="err">使用字节值</span><span class="w"> </span><span class="mh">0x01</span>
+<span class="mi">4</span><span class="o">.</span><span class="w"> </span><span class="n">Windows</span><span class="w"> </span><span class="n">shutdown</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">立即重启（零延迟）</span>
+</code></pre></div>
+
+<p>关键设计细节：<strong>分区表擦除 + 数据覆写的双重破坏</strong>。先通过 <code>IOCTL_DISK_CREATE_DISK</code> 销毁分区结构，再逐块覆写数据。随机化首字节的设计是为了避免被检测为明显的全盘归零行为 [1]。</p>
+<h3>3.2 伪勒索软件（Command 3）</h3>
+<p>Command 3是基于Crucio勒索软件的代码构建的，但进行了<strong>关键性的恶意改造</strong> [1][2][5]：</p>
+<ul>
+<li>使用<strong>随机生成的AES密钥和IV</strong>对文件进行加密</li>
+<li>加密后的文件被重命名为 <code>.candy</code> 扩展名</li>
+<li>桌面壁纸被替换为 <code>./image_danger.jpg</code>（一张警告图片）</li>
+<li><strong>密钥在生成后立即丢弃，从未保存到任何位置</strong></li>
+</ul>
+<p>这意味着加密是<strong>完全不可逆的</strong>——即使安全厂商获得了恶意软件样本，也无法开发解密工具。这不仅是破坏数据的手段，更是一种<strong>欺骗战术</strong>：</p>
+<ol>
+<li>受害组织的应急响应团队在最初的几个小时里，会误以为这是一起普通的勒索软件事件</li>
+<li>团队会浪费时间寻找解密工具或尝试谈判</li>
+<li>实际上数据已经被永久销毁，没有任何恢复可能</li>
+</ol>
+<p>这种"<strong>穿着勒索软件外衣的wiper</strong>"设计模式并非GigaWiper首创——2017年的NotPetya就使用了相同的手法。但GigaWiper将其整合为一个可按需调用的命令，增加了战术灵活性 [2][4]。</p>
+<h3>3.3 多遍安全擦除器（Command 12）</h3>
+<p>Command 12是对FlockWiper逻辑的Go语言重写，专门针对Windows系统驱动器 [1]：</p>
+<ul>
+<li>执行<strong>多遍覆写</strong>，交替使用不同的字节模式</li>
+<li>覆写序列：第一遍使用 <code>0x00</code>（全零），第二遍使用 <code>0xFF</code>，第三遍使用随机字节</li>
+<li>这符合<strong>安全擦除标准</strong>（类似DoD 5220.22-M），旨在使数据恢复即使通过专业取证手段也无法实现</li>
+</ul>
+<h3>3.4 破坏后的不可恢复性分析</h3>
+<p>GigaWiper的三重破坏机制设计使得数据恢复的可能性极低 [1][4]：</p>
+<table>
+<thead>
+<tr>
+<th>破坏方式</th>
+<th>恢复可能性</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>分区表擦除</td>
+<td>低</td>
+<td>分区结构被彻底销毁，需要专业数据恢复服务</td>
+</tr>
+<tr>
+<td>物理磁盘覆写</td>
+<td>极低</td>
+<td>大面积覆写使得扇区级恢复几乎不可能</td>
+</tr>
+<tr>
+<td>伪勒索加密</td>
+<td>零</td>
+<td>密钥从未保存，理论上不可解密</td>
+</tr>
+<tr>
+<td>多遍安全擦除</td>
+<td>零</td>
+<td>符合安全擦除标准，物理恢复不可行</td>
+</tr>
+<tr>
+<td>BSOD/引导破坏</td>
+<td>低</td>
+<td>关键引导文件被删除，需要重装系统</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>四、与历史Wiper的对比分析</h2>
+<h3>4.1 Wiper恶意软件演进时间线</h3>
+<table>
+<thead>
+<tr>
+<th>年份</th>
+<th>恶意软件名称</th>
+<th>归因</th>
+<th>目标/影响</th>
+<th>技术特征</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>2012</strong></td>
+<td><strong>Shamoon (DistTrack)</strong></td>
+<td>Iran / "Cutting Sword of Justice"</td>
+<td>Saudi Aramco，约30,000台工作站被毁 [3][6]</td>
+<td>覆写MBR和文件，替换为阿拉伯语图片，使用合法 <code>RawDisk</code> 驱动</td>
+</tr>
+<tr>
+<td><strong>2016</strong></td>
+<td><strong>Shamoon 2</strong></td>
+<td>Iran</td>
+<td>沙特政府与能源部门</td>
+<td>改进版本，增加了传播能力</td>
+</tr>
+<tr>
+<td><strong>2017.06</strong></td>
+<td><strong>NotPetya</strong></td>
+<td>Russia (Sandworm APT28)</td>
+<td>乌克兰目标，但失控造成全球约100亿美元损失 [3][6]</td>
+<td>伪装为勒索软件，利用EternalBlue (CVE-2017-0144) 和Mimikatz传播，实际为wiper（密钥从未保存）</td>
+</tr>
+<tr>
+<td><strong>2022.01</strong></td>
+<td><strong>WhisperGate</strong></td>
+<td>Russia</td>
+<td>乌克兰</td>
+<td>伪勒索软件，显示勒索通知但无恢复机制，覆盖MBR</td>
+</tr>
+<tr>
+<td><strong>2022.02</strong></td>
+<td><strong>HermeticWiper</strong></td>
+<td>Russia (Sandworm)</td>
+<td>乌克兰</td>
+<td>使用合法 <code>Elasticsearch</code> 驱动绕过签名检测，擦除方式暴力直接</td>
+</tr>
+<tr>
+<td><strong>2022</strong></td>
+<td><strong>CaddyWiper</strong></td>
+<td>Russia (Sandworm)</td>
+<td>乌克兰</td>
+<td>分阶段擦除——先擦除域控制器，再擦除工作站</td>
+</tr>
+<tr>
+<td><strong>2022</strong></td>
+<td><strong>IsaacWiper</strong></td>
+<td>未知</td>
+<td>乌克兰</td>
+<td>Golang编写，多遍覆写，使用已知路径检测</td>
+</tr>
+<tr>
+<td><strong>2023</strong></td>
+<td><strong>Crucio</strong> ( precursor )</td>
+<td>Iran / IRGC关联</td>
+<td>多种目标</td>
+<td>CISA AA23-335A记录，勒索软件，成为GigaWiper Command 3的前身</td>
+</tr>
+<tr>
+<td><strong>2024</strong></td>
+<td><strong>AcidPour</strong></td>
+<td>未知 (推测与俄罗斯有关)</td>
+<td>乌克兰</td>
+<td>AcidLiquid的Go重写版本，针对Linux/路由器设备，擦除ext4文件系统</td>
+</tr>
+<tr>
+<td><strong>2025.06</strong></td>
+<td><strong>FlockWiper</strong> ( precursor )</td>
+<td>与GigaWiper同一开发者</td>
+<td>多种目标</td>
+<td>C语言编写，成为GigaWiper Command 12的前身</td>
+</tr>
+<tr>
+<td><strong>2025.10</strong></td>
+<td><strong>GigaWiper</strong> (活动开始)</td>
+<td>与Crucio/FlockWiper同一开发者，疑似Iran nexus</td>
+<td>以色列等目标 [4]</td>
+<td>Go语言，三合一模块化后门+三重wiper+间谍套件，"Wiper as a Service"概念</td>
+</tr>
+</tbody>
+</table>
+<h3>4.2 技术特征横向对比</h3>
+<table>
+<thead>
+<tr>
+<th>特征维度</th>
+<th>Shamoon (2012)</th>
+<th>NotPetya (2017)</th>
+<th>HermeticWiper (2022)</th>
+<th>AcidPour (2024)</th>
+<th><strong>GigaWiper (2025-2026)</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>破坏层级</strong></td>
+<td>MBR + 文件覆写</td>
+<td>MBR + 文件系统层</td>
+<td>分区层/文件系统层</td>
+<td>ext4文件系统层</td>
+<td><strong>物理磁盘 + 分区表 + 文件系统 + 加密</strong></td>
+</tr>
+<tr>
+<td><strong>伪装能力</strong></td>
+<td>无</td>
+<td>伪勒索软件</td>
+<td>无</td>
+<td>无</td>
+<td><strong>伪勒索软件 + 伪装计划任务/防火墙规则</strong></td>
+</tr>
+<tr>
+<td><strong>传播方式</strong></td>
+<td>需手动部署</td>
+<td>EternalBlue + SMB蠕虫</td>
+<td>需手动部署</td>
+<td>需手动部署</td>
+<td><strong>后门式部署，不自我传播</strong></td>
+</tr>
+<tr>
+<td><strong>间谍能力</strong></td>
+<td>无</td>
+<td>无</td>
+<td>无</td>
+<td>无</td>
+<td><strong>完整间谍套件（截屏/录屏/VNC/系统信息采集）</strong></td>
+</tr>
+<tr>
+<td><strong>持久化</strong></td>
+<td>无</td>
+<td>无</td>
+<td>无</td>
+<td>无</td>
+<td><strong>计划任务（每分钟）+ 注册表</strong></td>
+</tr>
+<tr>
+<td><strong>C2架构</strong></td>
+<td>无</td>
+<td>无</td>
+<td>无</td>
+<td>无</td>
+<td><strong>RabbitMQ + Redis双通道</strong></td>
+</tr>
+<tr>
+<td><strong>模块化程度</strong></td>
+<td>单一功能</td>
+<td>单一功能</td>
+<td>单一功能</td>
+<td>单一功能</td>
+<td><strong>高度模块化，20个命令</strong></td>
+</tr>
+<tr>
+<td><strong>按需破坏</strong></td>
+<td>否（部署即执行）</td>
+<td>否（部署即执行）</td>
+<td>否（部署即执行）</td>
+<td>否（部署即执行）</td>
+<td><strong>是（C2命令触发）</strong></td>
+</tr>
+<tr>
+<td><strong>反取证</strong></td>
+<td>日志清除</td>
+<td>无</td>
+<td>无</td>
+<td>无</td>
+<td><strong>事件日志清除 + 多遍安全擦除</strong></td>
+</tr>
+<tr>
+<td><strong>批量控制</strong></td>
+<td>无</td>
+<td>蠕虫式自动传播</td>
+<td>无</td>
+<td>无</td>
+<td><strong>fanout广播模式，一条命令触发所有主机</strong></td>
+</tr>
+<tr>
+<td><strong>开发语言</strong></td>
+<td>C/C++</td>
+<td>C/C++</td>
+<td>C/C++</td>
+<td>Go</td>
+<td><strong>Go</strong></td>
+</tr>
+</tbody>
+</table>
+<h3>4.3 范式转变：从"武器"到"平台"</h3>
+<p>通过以上对比可以清晰看到，GigaWiper代表了wiper恶意软件的<strong>第四代演进</strong> [1][2]：</p>
+<ol>
+<li><strong>第一代（2012-2016）</strong>：单一功能wiper，如Shamoon——部署即执行，无传播能力，无间谍功能</li>
+<li><strong>第二代（2017）</strong>：伪勒索式wiper，如NotPetya——增加了蠕虫传播能力，但破坏仍然是自动执行的</li>
+<li><strong>第三代（2022-2024）</strong>：国族冲突工具化，如HermeticWiper、CaddyWiper——多种wiper并行使用，工具专业化但仍然是一次性投放</li>
+<li><strong>第四代（2025-）</strong>：<strong>模块化多模式平台</strong>，如GigaWiper——间谍+破坏一体化，按需切换，持久化驻留</li>
+</ol>
+<hr />
+<h2>五、归因分析</h2>
+<h3>5.1 Microsoft的正式归因立场</h3>
+<p>Microsoft在其技术分析报告中<strong>未做出正式的国家级行为者归因</strong> [1][4]。但报告明确指出，GigaWiper的开发者与Crucio和FlockWiper的开发者是<strong>同一实体</strong>，基于以下代码级证据：</p>
+<ul>
+<li><code>BigBangExtortMain</code> 函数名称与Crucio完全一致</li>
+<li><code>WipeCMain</code> 与FlockWiper逻辑几乎完全相同</li>
+<li>PDB路径中的 <code>GRAT</code> 字符串贯穿三个恶意软件家族</li>
+</ul>
+<h3>5.2 Crucio的关联线索</h3>
+<p>Crucio勒索软件被CISA在2023年12月的公告（AA23-335A）中记录，关联到<strong>与伊朗伊斯兰革命卫队（IRGC）有联系的威胁行为者</strong> [1][4]。这为GigaWiper的归因提供了一个间接但重要的线索。</p>
+<h3>5.3 第三方研究机构的信息</h3>
+<ul>
+<li><strong>Google Threat Intelligence Group (GTIG)</strong> 和 <strong>Binary Defense</strong> 将同一恶意软件追踪为 <strong>BLUERABBIT</strong>，Binary Defense于2026年3月首次观察到相关文件 [1][4]</li>
+<li>Binary Defense引用GTIG的信息，将活动关联到一个<strong>疑似伊朗关联的行为者（Iran-nexus group）</strong>，目标包括以色列的组织 [4]</li>
+</ul>
+<h3>5.4 威胁行为者画像</h3>
+<p>综合以上信息，当前最可信的归因评估为：</p>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>信息</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Microsoft追踪名</td>
+<td>GigaWiper</td>
+</tr>
+<tr>
+<td>GTIG/Binary Defense追踪名</td>
+<td>BLUERABBIT</td>
+</tr>
+<tr>
+<td>疑似关联</td>
+<td>伊朗关联行为者（Iran-nexus），可能具有IRGC背景</td>
+</tr>
+<tr>
+<td>关联组织名称</td>
+<td><strong>CyberAv3ngers</strong>（与IRGC有关联的已知伊朗黑客组织）[3]</td>
+</tr>
+<tr>
+<td>已知关联恶意软件</td>
+<td>Crucio（2023）、FlockWiper（2025）、GRAT框架（未完全发现）</td>
+</tr>
+<tr>
+<td>目标行业</td>
+<td>政府部门、能源、电信等</td>
+</tr>
+<tr>
+<td>攻击地理范围</td>
+<td>以色列为主，可能覆盖更广泛的中东地区</td>
+</tr>
+<tr>
+<td>攻击者画像编号</td>
+<td>可能属于APT35（Phosphorus）生态系统的相关行为者</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>六、检测与防御</h2>
+<h3>6.1 入侵指标（IOC）</h3>
+<h4>文件哈希（SHA-256）[1][2]</h4>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>SHA-256</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GigaWiper后门</td>
+<td><code>633d4cbd496b1094495da89a64f5e6c31a0f6d4d1488411db5b0cba1cfe42001</code></td>
+</tr>
+<tr>
+<td>GigaWiper后门</td>
+<td><code>ce9ad5f6c12019f4aae5b189bd8ddf5bb09e75b06a0a587b25a855c65948c913</code></td>
+</tr>
+<tr>
+<td>GigaWiper后门</td>
+<td><code>f622ed85ef31ad4ab973f4e74524866fe1bb44f0965ad2b2ad796cd657a05bfd</code></td>
+</tr>
+<tr>
+<td>GigaWiper后门</td>
+<td><code>9706a192e2c1a1faaf0a521daf31c2af60ff4590e3f47bbb4abc227f42af0683</code></td>
+</tr>
+<tr>
+<td>独立wiper</td>
+<td><code>3c30deb6556a94cfb84ae51798f4aecfae8c7358e55fdb321c5f2376579631cd</code></td>
+</tr>
+<tr>
+<td>Crucio关联样本</td>
+<td><code>440b5385d3838e3f6bc21220caa83b65cd5f3618daea676f271c3671650ce9a3</code></td>
+</tr>
+<tr>
+<td>FlockWiper</td>
+<td><code>12c39f052f030a77c0cd531df86ad3477f46d1287b8b98b625d1dcf89385d721</code></td>
+</tr>
+<tr>
+<td>FlockWiper</td>
+<td><code>db41e0da7ab3305be8d9720769c6950b4dc1c1984ef857d3310eb873a0fc7674</code></td>
+</tr>
+</tbody>
+</table>
+<h4>网络指标 [1][2]</h4>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>类型</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>185.182.193[.]21</code></td>
+<td>IP</td>
+<td>C2服务器（RabbitMQ:5544, Redis:7542）</td>
+</tr>
+<tr>
+<td><code>212.8.248[.]104</code></td>
+<td>IP</td>
+<td>关联C2服务器</td>
+</tr>
+</tbody>
+</table>
+<h4>主机指标 [1][2]</h4>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>类型</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>计划任务名称 <code>OneDrive Update</code>，配置为每分钟+启动时运行</td>
+<td>持久化</td>
+</tr>
+<tr>
+<td>注册表键 <code>HKCU\SOFTWARE\OneDrive\Environment</code></td>
+<td>持久化</td>
+</tr>
+<tr>
+<td>文件扩展名 <code>.candy</code></td>
+<td>伪勒索软件</td>
+</tr>
+<tr>
+<td>桌面壁纸 <code>./image_danger.jpg</code></td>
+<td>伪勒索软件</td>
+</tr>
+<tr>
+<td>输出目录 <code>C:\ProgramData\output</code></td>
+<td>屏幕录制存储</td>
+</tr>
+<tr>
+<td>防火墙规则名称 <code>Microsoft.Windows.CloudExperienceHost</code></td>
+<td>VNC伪装</td>
+</tr>
+<tr>
+<td>控制台字符串 <code>Partitions removed successfully.</code> / <code>Pass 1/2/3 Time took:</code></td>
+<td>wiper执行</td>
+</tr>
+<tr>
+<td>异常字符串 <code>kharbvnmhkjbkjb</code></td>
+<td>日志清除特征</td>
+</tr>
+</tbody>
+</table>
+<h3>6.2 入侵行为指标（IOA）</h3>
+<p>比IOC更关键的是行为检测规则 [1][2][5]：</p>
+<table>
+<thead>
+<tr>
+<th>检测场景</th>
+<th>监控方法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>异常的计划任务创建（每分钟执行）</td>
+<td>监控Task Scheduler事件ID 4698/4699，关注异常频率</td>
+</tr>
+<tr>
+<td>未经授权的物理磁盘写入</td>
+<td>监控 <code>IOCTL_DISK_CREATE_DISK</code> 调用，<code>DeviceIoControl</code> 异常使用</td>
+</tr>
+<tr>
+<td>分区表变更</td>
+<td>监控磁盘分区结构的异常变更事件</td>
+</tr>
+<tr>
+<td><code>wevtutil.exe</code> 批量清除日志</td>
+<td>监控Security.evtx删除或wevtutil的批量清日志调用</td>
+</tr>
+<tr>
+<td>RabbitMQ/Redis异常出站连接</td>
+<td>网络流量分析，监控5544/7542端口的AMQP/Redis协议</td>
+</tr>
+<tr>
+<td>Go语言二进制文件的异常行为</td>
+<td>EDR规则：未签名的Go PE文件执行可疑文件系统操作</td>
+</tr>
+<tr>
+<td>MinIO Client上传行为</td>
+<td>监控 <code>mc.exe</code> 的异常网络连接</td>
+</tr>
+<tr>
+<td>伪装的防火墙规则创建</td>
+<td>监控使用合法Windows组件名称创建的异常防火墙规则</td>
+</tr>
+<tr>
+<td><code>.candy</code> 文件扩展名大量出现</td>
+<td>文件系统监控，关注批量文件重命名事件</td>
+</tr>
+<tr>
+<td>用户活跃时段的持续屏幕录制</td>
+<td>进程监控，关注持续写入 <code>C:\ProgramData\output</code> 的进程</td>
+</tr>
+</tbody>
+</table>
+<h3>6.3 应急响应流程</h3>
+<p>鉴于GigaWiper的特殊性（潜伏+按需毁灭），应急响应需要采取以下优先级 [2][5]：</p>
+<p><strong>第一优先级（0-2小时）：遏制扩散</strong></p>
+<ol>
+<li><strong>立即隔离</strong>：断开所有疑似受感染主机与网络的连接，但<strong>不要关机</strong>（保留内存中的取证证据）</li>
+<li><strong>阻止C2通信</strong>：在边界防火墙/代理层面封锁已知C2 IP地址</li>
+<li><strong>禁用计划任务</strong>：检查并删除名为 <code>OneDrive Update</code> 的计划任务</li>
+<li><strong>保存内存镜像和磁盘镜像</strong>：在隔离状态下进行取证采集</li>
+</ol>
+<p><strong>第二优先级（2-24小时）：深度排查</strong></p>
+<ol>
+<li>搜索所有IOC和IOA（文件哈希、注册表键、防火墙规则）</li>
+<li>检查 <code>C:\ProgramData\output</code> 目录是否存在屏幕录制文件</li>
+<li>审查事件日志是否已被清除（检查 <code>kharbvnmhkjbkjb</code> 字符串）</li>
+<li>网络流量回溯分析，查找RabbitMQ/Redis的异常出站连接</li>
+<li>评估破坏范围——确认是否已触发毁灭命令</li>
+</ol>
+<p><strong>第三优先级（24小时-7天）：恢复与加固</strong></p>
+<ol>
+<li>从<strong>离线备份</strong>恢复受影响系统</li>
+<li>重装系统（如果系统分区已被擦除或加密）</li>
+<li>修改所有可能被窃取的凭证</li>
+<li>部署增强检测规则</li>
+<li>进行全面的安全态势评估</li>
+</ol>
+<h3>6.4 防御策略建议</h3>
+<table>
+<thead>
+<tr>
+<th>防御层面</th>
+<th>具体措施</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>端点防护</strong></td>
+<td>启用篡改保护（Tamper Protection），防止攻击者在触发毁灭前禁用防护</td>
+</tr>
+<tr>
+<td><strong>EDR/XDR</strong></td>
+<td>以阻止模式（Block Mode）运行，启用云端交付保护</td>
+</tr>
+<tr>
+<td><strong>身份认证</strong></td>
+<td>强制MFA，最小权限原则，限制高权限账户的使用</td>
+</tr>
+<tr>
+<td><strong>网络分段</strong></td>
+<td>限制C2出站通信，封锁5544/7542等非标准端口</td>
+</tr>
+<tr>
+<td><strong>备份策略</strong></td>
+<td><strong>离线备份（air-gapped）+ 定期恢复测试</strong>——这是对抗GigaWiper最关键的一环</td>
+</tr>
+<tr>
+<td><strong>日志保护</strong></td>
+<td>将日志转发到远程不可变存储（WORM设备），防止本地日志被清除</td>
+</tr>
+<tr>
+<td><strong>计划任务审计</strong></td>
+<td>定期审计计划任务，关注异常执行频率的任务</td>
+</tr>
+<tr>
+<td><strong>威胁情报</strong></td>
+<td>订阅Microsoft Threat Intelligence等来源，持续更新IOC/IOA</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>七、个人技术观点</h2>
+<h3>7.1 "Wiper as a Service"——破坏能力的商品化趋势</h3>
+<p>GigaWiper最令我关注的是它代表的趋势：<strong>破坏能力的商品化和模块化</strong>。通过将三种不同的破坏方式整合为后门命令，威胁行为者实际上创造了一种"破坏即服务"的概念——部署一次，随时按需调用不同的毁灭方式。</p>
+<p>这种架构的战术价值在于<strong>时机选择的灵活性</strong>。攻击者可以在地缘政治敏感时刻选择最具影响力的破坏方式，而不是在部署时就确定破坏手段。这种"持久的毁灭选项"对于国家级行为者而言具有极高的战略价值。</p>
+<h3>7.2 间谍与毁灭的融合——响应时间的挑战</h3>
+<p>传统wiper的响应时间窗口相对清晰：一旦检测到wiper的投放和执行，立即隔离即可（虽然数据可能已经受损）。但GigaWiper模糊了这条线——一个正在截屏的后门和一个即将擦除磁盘的后门，在检测特征上可能完全相同。这意味着安全团队必须假设<strong>任何持久化后门都可能在下一秒转变为毁灭性武器</strong>，这将显著压缩应急响应的时间窗口。</p>
+<h3>7.3 GRAT框架——冰山一角</h3>
+<p>FlockWiper样本中PDB路径包含 <code>GRAT</code> 字符串，而GigaWiper的函数命名中也大量使用 <code>GRAT</code>——但FlockWiper本身并不包含GRAT功能。这强烈暗示存在一个<strong>尚未被安全社区发现的更大规模恶意软件框架</strong>。如果这个推论正确，GigaWiper可能只是该框架的一个组件，未来可能看到更多基于GRAT框架的恶意软件变体。</p>
+<h3>7.4 对防御者的核心启示</h3>
+<p>GigaWiper的教训非常清晰：</p>
+<ol>
+<li><strong>没有"只有间谍功能"的后门</strong>——任何持久化后门都应被视为潜在的数据毁灭武器</li>
+<li><strong>离线备份是最后的防线</strong>——当攻击者拥有系统级权限时，在线备份同样是目标</li>
+<li><strong>检测速度是关键</strong>——从初始入侵到毁灭执行之间的时间窗口，是安全团队唯一的机会</li>
+<li><strong>不要被伪勒索软件误导</strong>——看到 <code>.candy</code> 扩展名时，应首先假设这是不可逆的毁灭行为，而非可恢复的勒索事件</li>
+</ol>
+<hr />
+<h2>参考来源</h2>
+<p>[1] Microsoft Threat Intelligence, "Microsoft uncovers GigaWiper, a backdoor designed for destruction on demand", July 9, 2026. (https://www.microsoft.com/en-us/security/blog)</p>
+<p>[2] Secure.com, "Microsoft Uncovers GigaWiper, a Backdoor That Waits, Watches, Then Destroys", July 10, 2026. (https://www.secure.com/news/gigawiper-backdoor-microsoft)</p>
+<p>[3] techora.ru, "Microsoft: GigaWiper — новый вирус-убийца от иранских хакеров", July 10, 2026. (https://techora.ru/news/microsoft-gigawiper-novyy-virus-ubiytsa-ot-2026-07-10)</p>
+<p>[4] ayinedjimi-consultants.fr, "GigaWiper: Microsoft dévoile le backdoor destructif modulaire attribué à un groupe Iran-nexus", July 2026. (https://ayinedjimi-consultants.fr/news/gigawiper-bluerabbit-backdoor-destructif-iran-nexus)</p>
+<p>[5] Binary Defense / Google Threat Intelligence Group, "BLUERABBIT" tracking, March 2026.</p>
+<p>[6] CSA Research, "Wiper as Reprisal: Nation-State Destructive Cyberattacks", March 2026. (https://labs.cloudsecurityalliance.org/research/strategic-mdm-emm-wiper-attack-surface-enterprise-device-man/)</p>
+<p>[7] CISA Advisory AA23-335A, "Crucio Ransomware", December 2023. (https://www.cisa.gov/news-events/cybersecurity-advisories)</p>
+<p>[8] ESET Research, "DynoWiper update: Technical analysis and attribution", 2022. (https://www.welivesecurity.com/en/eset-research/dynowiper-update-technical-analysis-attribution/)</p>
+<p>[9] FreeBuf, "Microsoft 揭露 GigaWiper: 一款按需实施破坏的后门", July 2026. (https://m.freebuf.com/articles/system/489644.html)</p>
+<p>[10] fiscybersec blog, "GigaWiper: When One Backdoor Stitches Three Malware Families Into a Destruction-on-Demand Machine", July 14, 2026. (https://blog.fiscybersec.com/gigawiper-when-one-backdoor-stitches-three-malware-families-into-a-destruction-on-demand-machine)</p>
+<hr />
+<blockquote>
+<p><strong>网络安全免责声明</strong></p>
+<p>本文仅出于网络安全研究与教育目的撰写，所有技术分析均基于公开可获取的威胁情报信息和Microsoft等安全厂商的官方报告。本文中提及的恶意软件技术细节、入侵指标（IOC）和行为指标（IOA）仅供防御方用于提升安全检测和应急响应能力。任何个人或组织不得将本文中的信息用于非法的网络安全活动，包括但不限于未经授权的系统入侵、数据窃取、恶意软件开发或部署。读者应遵守所在国家或地区的所有相关法律法规。作者对因不当使用本文信息而导致的任何直接或间接损失不承担任何责任。</p>
+</blockquote>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
