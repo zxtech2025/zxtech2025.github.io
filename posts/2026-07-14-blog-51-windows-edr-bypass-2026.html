@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Windows进程注入绕过四大EDR——2026年最新bypass技术深度复现与分析 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Windows进程注入绕过四大EDR——2026年最新bypass技术深度复现与分析</h1>
+<time>2026-07-14</time>
+<ul>
+<li>技术
+Slug: blog-51-windows-edr-bypass-2026</li>
+</ul>
+<hr />
+<h2>目录</h2>
+<ol>
+<li><a href="#导语edr对抗进入显微手术时代">导语：EDR对抗进入"显微手术"时代</a></li>
+<li><a href="#edr架构原理三层检测体系">EDR架构原理：三层检测体系</a></li>
+<li><a href="#2026年绕过技术体系全景">2026年绕过技术体系全景</a></li>
+<li><a href="#四大edr产品检测盲点分析">四大EDR产品检测盲点分析</a></li>
+<li><a href="#poc原理详解六大核心绕过技术">PoC原理详解：六大核心绕过技术</a></li>
+<li><a href="#绕过技术对比矩阵">绕过技术对比矩阵</a></li>
+<li><a href="#防御建议从被动检测到主动免疫">防御建议：从被动检测到主动免疫</a></li>
+<li><a href="#个人技术观点">个人技术观点</a></li>
+<li><a href="#参考来源">参考来源</a></li>
+<li><a href="#网络安全免责声明">网络安全免责声明</a></li>
+</ol>
+<hr />
+<h2>导语：EDR对抗进入"显微手术"时代</h2>
+<p>2026年的终端安全战场，EDR已经不再是简单的"高级杀毒软件"。以CrowdStrike Falcon、SentinelOne Singularity、Microsoft Defender for Endpoint（MDE）和Palo Alto Cortex XDR为代表的下一代EDR产品，构建了一套从用户态到内核态、从静态特征到行为模型的多层检测体系。它们通过DLL注入hook关键API、注册内核回调监控进程/线程生命周期、订阅ETW（Event Tracing for Windows）获取系统遥测，并依托云端AI行为分析引擎进行异常判定。</p>
+<p>然而，攻防对抗的本质是"成本与收益"的博弈。攻击者发现，完全绕过EDR的检测并非必须——只需要在关键注入环节制造"时间差"或"空间差"，使EDR的检测信号与恶意行为失配，即可达成目标。2024年公开的HookChain研究<sup id="fnref:1"><a class="footnote-ref" href="#fn:1">1</a></sup>展示了通过IAT Hooking结合动态SSN解析和间接Syscall，可在不修改应用源码的情况下完全绕过基于<code>ntdll.dll</code>的监控机制。2025-2026年，SindriKit<sup id="fnref:2"><a class="footnote-ref" href="#fn:2">2</a></sup>、Ekko sleep obfuscation、硬件断点清除hook等技术进一步将对抗推向内核边缘。</p>
+<p>本文将从架构原理出发，逐层拆解六大类绕过技术的实现逻辑，并结合四大EDR的架构特点分析其具体盲点。</p>
+<hr />
+<h2>EDR架构原理：三层检测体系</h2>
+<p>要理解绕过技术，必须先理解EDR的"感官系统"。现代EDR的检测体系可抽象为三层：用户态hook层、内核态回调/遥测层、云端行为分析层。</p>
+<h3>1. 用户态Hook（Userland API Hooking）</h3>
+<p>用户态hook是EDR最前线的检测机制。EDR驱动（Kernel Driver）将自身的Sensor DLL注入到每个用户态进程中，该DLL通过修改<code>ntdll.dll</code>中关键Native API函数的前几个字节（通常是<code>jmp</code>指令），将执行流重定向到EDR的分析代码中。</p>
+<p>典型被hook的函数包括：</p>
+<ul>
+<li><code>NtAllocateVirtualMemory</code> / <code>NtProtectVirtualMemory</code> —— 监控RWX内存分配</li>
+<li><code>NtWriteVirtualMemory</code> —— 监控进程内存写入（注入行为）</li>
+<li><code>NtCreateThreadEx</code> / <code>NtQueueApcThread</code> —— 监控远程线程创建</li>
+<li><code>NtMapViewOfSection</code> —— 监控共享内存映射</li>
+</ul>
+<p>当进程调用这些API时，EDR可检查参数（如目标进程句柄、内存保护属性、写入内容特征等），若判定为可疑行为则生成遥测数据或立即阻断。</p>
+<p>** Hook的实现方式**：</p>
+<table>
+<thead>
+<tr>
+<th>Hook类型</th>
+<th>原理</th>
+<th>典型实现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Inline Hook</td>
+<td>修改函数前5-20字节为jmp</td>
+<td>最普遍</td>
+</tr>
+<tr>
+<td>IAT Hook</td>
+<td>修改导入地址表指针</td>
+<td>易于绕过</td>
+</tr>
+<tr>
+<td>SSDT Hook</td>
+<td>修改系统服务描述符表</td>
+<td>已较少使用（PatchGuard）</td>
+</tr>
+</tbody>
+</table>
+<h3>2. 内核态回调与ETW（Kernel Callbacks / ETW Telemetry）</h3>
+<p>用户态hook存在天然的绕过可能（攻击者可以直接发Syscall），因此现代EDR将关键检测能力下沉到内核态。</p>
+<p><strong>内核回调机制</strong>：</p>
+<p>Windows内核提供了一系列回调注册接口，EDR驱动通过它们订阅系统事件：</p>
+<ul>
+<li><code>PsSetCreateProcessNotifyRoutine(Ex)</code> —— 进程创建通知</li>
+<li><code>PsSetCreateThreadNotifyRoutine(Ex)</code> —— 线程创建通知</li>
+<li><code>PsSetLoadImageNotifyRoutine</code> —— 映像加载通知</li>
+<li><code>ObRegisterCallbacks</code> —— 对象句柄操作通知</li>
+<li>Minifilter驱动 —— 文件系统操作监控</li>
+</ul>
+<p>这些回调由内核在关键事件发生时直接调用，位于Ring 0，用户态程序理论上无法直接篡改。但研究表明，通过BYOVD（Bring Your Own Vulnerable Driver）或已签名的第三方驱动漏洞，攻击者可以获得内核级内存读写能力，进而清零回调例程地址、注销回调或patch回调代码<sup id="fnref:3"><a class="footnote-ref" href="#fn:3">3</a></sup><sup id="fnref:4"><a class="footnote-ref" href="#fn:4">4</a></sup>。</p>
+<p><strong>ETW遥测</strong>：</p>
+<p>ETW是Windows内置的高性能事件追踪框架。EDR广泛订阅以下Provider：</p>
+<ul>
+<li><code>Microsoft-Windows-Kernel-Process</code> —— 进程/线程生命周期事件</li>
+<li><code>Microsoft-Windows-Kernel-Audit-API-Calls</code> —— 关键API审计调用</li>
+<li><code>Microsoft-Windows-Threat-Intelligence</code> —— 威胁情报专用通道</li>
+</ul>
+<p>ETW事件在内核态生成，通过高性能缓冲区传递到用户态消费者。由于ETW Provider本身运行在用户态的<code>ntdll.dll</code>中（如<code>EtwEventWrite</code>），这成为后续ETW Patch技术的攻击面。</p>
+<h3>3. 行为分析引擎（Behavioral Analytics / AI Detection）</h3>
+<p>遥测数据最终会汇集到EDR的本地Agent Service或云端分析引擎。现代EDR（尤其是CrowdStrike和SentinelOne）大量采用以下技术：</p>
+<ul>
+<li><strong>IOA（Indicators of Attack）</strong>：基于攻击链行为的规则引擎，而非静态IoC</li>
+<li><strong>无监督机器学习</strong>：识别偏离基线的异常行为</li>
+<li><strong>跨进程关联分析</strong>：将看似无害的单点操作串联成攻击链</li>
+<li><strong>内存扫描</strong>：定期扫描进程内存中的已知shellcode特征</li>
+</ul>
+<p>行为分析层虽然强大，但其前提是"获得足够多且真实的遥测数据"。如果底层hook或ETW被抑制，上层分析将失去输入源——这正是"遥测欺骗"类技术的核心思路。</p>
+<hr />
+<h2>2026年绕过技术体系全景</h2>
+<p>基于公开研究，当前Windows EDR绕过技术可分为六大类，形成一个从"用户态欺骗"到"内核态压制"的连续谱：</p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────┐
+│                    EDR Bypass Taxonomy 2026                  │
+├─────────────────────────────────────────────────────────────┤
+│  用户态层  │  Direct Syscall → Indirect Syscall + SSN解析    │
+│           │  → IAT Hooking (HookChain) → DLL Unhooking      │
+├─────────────────────────────────────────────────────────────┤
+│  内存操作层 │  Process Hollowing → Process Doppelgänging     │
+│           │  → Process Herpaderping → Module Stomping       │
+├─────────────────────────────────────────────────────────────┤
+│  遥测抑制层 │  ETW Patching → AMSI Bypass → Hardware BP      │
+│           │    Hook Removal                                 │
+├─────────────────────────────────────────────────────────────┤
+│  休眠对抗层 │  Sleep Obfuscation (Ekko/Foliage)              │
+├─────────────────────────────────────────────────────────────┤
+│  内核压制层 │  Kernel Callback Removal (BYOVD)               │
+└─────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<hr />
+<h2>四大EDR产品检测盲点分析</h2>
+<h3>CrowdStrike Falcon</h3>
+<p><strong>架构特点</strong>：</p>
+<ul>
+<li>轻量级agent，大量依赖云端AI分析（Threat Graph）</li>
+<li>用户态hook + 内核回调 + ETW三重遥测</li>
+<li>以IOA（攻击指标）为核心检测逻辑，强调跨进程行为链关联</li>
+</ul>
+<p><strong>已知盲点与绕过路径</strong>：</p>
+<ol>
+<li>
+<p><strong>遥测断链</strong>：CrowdStrike的云端AI虽然强大，但如果本地agent的ETW或hook被抑制，云端无法获得足够数据生成IOA。2025年的研究表明，通过<code>EtwEventWrite</code> patch可在不触发内核态防护的情况下使关键遥测沉默<sup id="fnref2:5"><a class="footnote-ref" href="#fn:5">5</a></sup>。</p>
+</li>
+<li>
+<p><strong>用户态hook绕过</strong>：CrowdStrike的hook集中在<code>ntdll.dll</code>。通过Indirect Syscall或HookChain技术<sup id="fnref3:1"><a class="footnote-ref" href="#fn:1">1</a></sup>，可完全绕过其用户态监控，而Falcon的内核回调在纯内存操作（不创建新进程/线程）场景下检测粒度不足。</p>
+</li>
+<li>
+<p><strong>Sleep检测盲区</strong>：Falcon对beacon休眠期间的内存扫描依赖特定触发条件。使用Ekko等sleep obfuscation技术将可执行内存加密/换页，可规避内存特征扫描。</p>
+</li>
+</ol>
+<h3>SentinelOne Singularity</h3>
+<p><strong>架构特点</strong>：</p>
+<ul>
+<li>强调"自主响应"（Autonomous Response），agent本地决策能力强</li>
+<li>对内核访问做了限制，"kernel access is limited to provide visibility and anti-tampering measures only"<sup id="fnref:6"><a class="footnote-ref" href="#fn:6">6</a></sup></li>
+<li>用户态行为监控 + 内存分析引擎（Storyline）</li>
+</ul>
+<p><strong>已知盲点与绕过路径</strong>：</p>
+<ol>
+<li>
+<p><strong>Storyline依赖用户态遥测</strong>：SentinelOne的Storyline技术通过关联进程行为构建攻击叙事。如果攻击者使用硬件断点清除hook<sup id="fnref3:7"><a class="footnote-ref" href="#fn:7">7</a></sup>而非patch内存，可在不触发内存完整性告警的情况下恢复原始<code>ntdll</code>函数流，使Storyline失去关键事件节点。</p>
+</li>
+<li>
+<p><strong>模块加载信任盲区</strong>：Module Stomping技术利用SentinelOne对已签名、合法DLL的初始加载信任——在加载完成后覆盖其<code>.text</code>段，此时EDR仍认为该模块是"干净的"。</p>
+</li>
+<li>
+<p><strong>Ranger轻量性</strong>：SentinelOne Agent号称轻量，但也意味着其内核回调覆盖不如CrowdStrike全面。针对纯用户态内存注入（不触发进程/线程创建回调），存在一定盲区。</p>
+</li>
+</ol>
+<h3>Microsoft Defender for Endpoint（MDE）</h3>
+<p><strong>架构特点</strong>：</p>
+<ul>
+<li>深度集成Windows系统，可访问独有的内核接口和 Defender 驱动</li>
+<li>ASR（Attack Surface Reduction）规则提供强力预防性控制</li>
+<li>内存完整性（HVCI）和Credential Guard作为系统级防护</li>
+</ul>
+<p><strong>已知盲点与绕过路径</strong>：</p>
+<ol>
+<li>
+<p><strong>ASR规则绕过</strong>：MDE的ASR规则依赖特定触发条件。通过Process Herpaderping<sup id="fnref:8"><a class="footnote-ref" href="#fn:8">8</a></sup>修改磁盘上的文件内容后再映射执行，可在不触发"Block executable files from running unless they meet a prevalence, age, or trusted list criterion"规则的情况下启动恶意代码。</p>
+</li>
+<li>
+<p><strong>HVCI下的内存操作</strong>：HVCI（Hypervisor-protected Code Integrity）确实阻止了非签名驱动的加载和内核patch，但在用户态层面，Direct Syscall + Indirect Syscall组合仍然有效，因为HVCI不拦截用户态到内核态的合法syscall路径。</p>
+</li>
+<li>
+<p><strong>ETW原生依赖</strong>：MDE对ETW的依赖程度高于其他EDR。通过patch <code>EtwEventWrite</code>为<code>ret</code>或<code>xor rax, rax; ret</code><sup id="fnref:9"><a class="footnote-ref" href="#fn:9">9</a></sup>，可导致MDE的部分检测通道直接沉默。</p>
+</li>
+</ol>
+<h3>Palo Alto Cortex XDR</h3>
+<p><strong>架构特点</strong>：</p>
+<ul>
+<li>XDR强调跨端点、网络、云的统一分析</li>
+<li>检测逻辑高度依赖行为分析代理（Behavioral Analytics Agent）</li>
+<li>相比其他三家，在内核态驱动层面的公开研究较少</li>
+</ul>
+<p><strong>已知盲点与绕过路径</strong>：</p>
+<ol>
+<li>
+<p><strong>线程级遥测延迟</strong>：公开材料指出，CrowdStrike Falcon Insight XDR存在"无法按事件发送线程级进程数据"的局限，Cortex XDR同样面临线程级遥测粒度与性能的平衡问题<sup id="fnref:10"><a class="footnote-ref" href="#fn:10">10</a></sup>。攻击者可通过短生命周期线程（瞬时注入后立即自销毁）减少被捕获的概率。</p>
+</li>
+<li>
+<p><strong>跨平台统一agent的兼容性成本</strong>：Cortex XDR作为跨平台产品，其Windows agent需要在兼容性与深度监控之间取舍。对Windows特有机制（如NTFS Transaction、Section Object）的监控粒度可能不如原生Windows EDR。</p>
+</li>
+<li>
+<p><strong>DLL Hook集中度高</strong>：与其他EDR类似，Cortex XDR的用户态hook集中在<code>ntdll.dll</code>和<code>kernel32.dll</code>。HookChain<sup id="fnref4:1"><a class="footnote-ref" href="#fn:1">1</a></sup>技术通过重定向<code>kernel32.dll</code>→<code>kernelbase.dll</code>的执行流，使其hook失效。</p>
+</li>
+</ol>
+<hr />
+<h2>PoC原理详解：六大核心绕过技术</h2>
+<h3>技术一：Syscall直接调用（Direct Syscall）</h3>
+<p><strong>核心原理</strong>：绕过用户态hook的最直接方法——不经过被hook的<code>ntdll.dll</code>导出函数，而是自己构造syscall指令。</p>
+<p><strong>实现思路</strong>：</p>
+<ol>
+<li>从<code>ntdll.dll</code>的<code>.text</code>段中提取目标函数的syscall stub（包含<code>mov r10, rcx</code>、<code>mov eax, SSN</code>、<code>syscall</code>、<code>ret</code>的指令序列）</li>
+<li>将提取的stub复制到自身内存中</li>
+<li>直接调用该stub，参数通过RCX、RDX、R8、R9等寄存器传递（遵循Windows x64调用约定）</li>
+</ol>
+<p><strong>关键API</strong>：<code>NtAllocateVirtualMemory</code>、<code>NtWriteVirtualMemory</code>、<code>NtCreateThreadEx</code></p>
+<p><strong>检测难点</strong>：由于直接执行了与合法<code>ntdll</code>完全相同的syscall指令序列，单纯基于调用来源的检测难以区分。</p>
+<p><strong>EDR应对</strong>：部分EDR开始监控"非<code>ntdll</code>内存区域内的<code>syscall</code>指令"，或检测内存中是否存在从<code>ntdll</code>复制而来的stub。这催生了Indirect Syscall。</p>
+<h3>技术二：间接Syscall + Syscall桩（Indirect Syscall / Halo's Gate）</h3>
+<p><strong>核心原理</strong>：不自己生成<code>syscall</code>指令，而是跳转到<code>ntdll.dll</code>中真实函数体内、EDR hook之后的地址执行。这样既绕过了hook，又不会因"非法位置的syscall指令"被检测。</p>
+<p><strong>实现思路</strong>：</p>
+<ol>
+<li>读取<code>ntdll.dll</code>中目标函数的原始字节</li>
+<li>若函数被hook（前几个字节是<code>jmp</code>），向上/向下遍历相邻函数的stub，通过已知相邻函数的SSN推算目标函数SSN（Halo's Gate技术）</li>
+<li>计算<code>ntdll</code>中该函数stub内<code>syscall</code>指令的确切地址（hook之后的位置）</li>
+<li>使用<code>jmp</code>或<code>call</code>跳转到该地址，完成"间接syscall"</li>
+</ol>
+<p><strong>Sleep Obfuscation关联</strong>：现代C2（如Havoc<sup id="fnref:11"><a class="footnote-ref" href="#fn:11">11</a></sup>）将Indirect Syscall与sleep obfuscation结合。当beacon进入休眠时，通过VEH（Vectored Exception Handler）或APC（Asynchronous Procedure Call）触发内存加密/解密，使EDR的内存扫描无法发现明文shellcode。</p>
+<p><strong>关键API</strong>：<code>NtDelayExecution</code> + 自定义Timer + VEH处理异常</p>
+<h3>技术三：Process Doppelgänging / Process Herpaderping</h3>
+<p>这两种技术都利用Windows文件系统与进程创建机制的时间差，实现"无文件"或"文件内容欺骗"的进程注入。</p>
+<p><strong>Process Doppelgänging</strong>（Windows 7+）：</p>
+<ol>
+<li>使用<code>NtCreateTransaction</code>创建一个NTFS Transaction</li>
+<li>在该Transaction中创建一个新的文件映射（Section），写入恶意PE</li>
+<li>回滚Transaction，使磁盘上不留恶意文件痕迹</li>
+<li>使用<code>NtCreateProcessEx</code>从已创建的Section启动进程</li>
+<li>进程启动时，EDR看到的文件内容已经因回滚而"消失"</li>
+</ol>
+<p><strong>Process Herpaderping</strong>（Windows 10+改进）：</p>
+<ol>
+<li>在磁盘上创建一个合法文件并获取句柄</li>
+<li>使用该句柄创建Section（此时文件内容合法）</li>
+<li>在进程创建前，通过同一句柄将文件内容覆盖为恶意代码</li>
+<li>EDR在进程创建时读取磁盘文件进行扫描，看到的是恶意内容</li>
+<li>但内核在创建进程时使用的是之前创建的Section（合法内容），导致EDR的扫描结果与实际执行内容不一致</li>
+</ol>
+<p><strong>关键API</strong>：<code>NtCreateTransaction</code>、<code>NtCreateSection</code>、<code>NtCreateProcessEx</code>、<code>NtWriteFile</code></p>
+<h3>技术四：Module Stomping / DLL Unhooking</h3>
+<p><strong>Module Stomping（模块踩踏/幻影）</strong>：</p>
+<ol>
+<li>向目标进程加载一个合法的、已签名的DLL（如<code>kernel32.dll</code>或<code>comctl32.dll</code>）</li>
+<li>EDR会记录该DLL的加载事件，并可能进行完整性校验</li>
+<li>等待加载完成后，使用<code>NtProtectVirtualMemory</code>将该DLL的<code>.text</code>段改为RWX</li>
+<li>将shellcode写入<code>.text</code>段，覆盖原始函数代码</li>
+<li>创建远程线程，执行被覆盖的DLL内存区域</li>
+<li>EDR看到的模块列表中，该区域仍然显示为"合法DLL"</li>
+</ol>
+<p><strong>DLL Unhooking（DLL脱钩）</strong>：</p>
+<p>与Module Stomping的"覆盖合法模块"不同，DLL Unhooking的目的是恢复被EDR hook的<code>ntdll</code>函数原始字节。</p>
+<ol>
+<li>从磁盘读取原始的<code>ntdll.dll</code>文件（或从已知干净的内存区域复制）</li>
+<li>对比内存中<code>ntdll</code>函数与被hook的字节差异</li>
+<li>使用<code>NtProtectVirtualMemory</code>将<code>ntdll</code>对应页面改为可写</li>
+<li>将原始字节写回，恢复函数前序指令</li>
+<li>恢复内存保护属性</li>
+</ol>
+<p><strong>硬件断点清除hook（Hardware Breakpoint Hook Removal）</strong>：</p>
+<p>这是DLL Unhooking的进化版。为了不修改<code>ntdll</code>内存（避免触发EDR的内存完整性检测），攻击者使用CPU调试寄存器（DR0-DR3）在<code>AmsiScanBuffer</code>或hook函数上设置硬件断点，配合VEH在断点触发时动态修改执行流，实现"无内存patch"的hook绕过<sup id="fnref:7"><a class="footnote-ref" href="#fn:7">7</a></sup>。</p>
+<h3>技术五：ETW Patching / AMSI Bypass</h3>
+<p><strong>ETW Patching</strong>：</p>
+<p>ETW Provider的写入函数<code>EtwEventWrite</code>位于<code>ntdll.dll</code>中。由于它最终是用户态函数，因此可以被patch：</p>
+<ol>
+<li>定位<code>ntdll!EtwEventWrite</code></li>
+<li>修改其前几个字节为<code>ret</code>（0xC3）或<code>xor rax, rax; ret</code>（0x48 0x33 0xC0 0xC3）</li>
+<li>此后该进程内所有ETW事件写入立即返回，不产生任何遥测</li>
+</ol>
+<p><strong>影响</strong>：严重。EDR高度依赖ETW获取系统级遥测，patch后相当于"致盲"EDR的部分感知能力。</p>
+<p><strong>AMSI Bypass</strong>：</p>
+<p>AMSI（Anti-Malware Scan Interface）是Windows的恶意软件扫描接口，被PowerShell、.NET、Office等调用。常见绕过方式：</p>
+<ol>
+<li><strong>Patch <code>AmsiScanBuffer</code></strong>：将<code>amsi.dll</code>中的<code>AmsiScanBuffer</code>函数patch为始终返回<code>AMSI_RESULT_CLEAN</code></li>
+<li><strong>Patch <code>AmsiInitialize</code></strong>：使AMSI初始化失败</li>
+<li><strong>Hardware Breakpoint法</strong>：在<code>AmsiScanBuffer</code>上设置硬件断点，通过VEH在调用时修改返回值<sup id="fnref2:7"><a class="footnote-ref" href="#fn:7">7</a></sup></li>
+<li><strong>Patchless AMSI Bypass</strong>：通过修改<code>AmsiContext</code>结构体中的扫描函数指针，而非patch代码本身，规避基于代码完整性的检测<sup id="fnref:5"><a class="footnote-ref" href="#fn:5">5</a></sup></li>
+</ol>
+<p><strong>关键API</strong>：<code>EtwEventWrite</code>、<code>AmsiScanBuffer</code>、<code>AmsiInitialize</code></p>
+<h3>技术六：Sleep Obfuscation（内存加密休眠）</h3>
+<p>C2 beacon在休眠期间内存中的shellcode是静止的，EDR可能在此期间进行内存扫描。Sleep Obfuscation通过在休眠前加密/混淆内存中的敏感区域，醒来后再解密，实现"扫描时不可见"。</p>
+<p><strong>Ekko技术</strong>：</p>
+<ol>
+<li>使用<code>NtCreateTimer</code>/<code>SetThreadpoolTimer</code>创建定时器</li>
+<li>在休眠前，将 beacon 内存区域加密，并将解密代码注册为APC或VEH处理器</li>
+<li>当定时器到期时，通过APC/VEH触发解密，恢复执行上下文</li>
+<li>部分实现还会在此期间将内存属性改为不可执行（<code>PAGE_NOACCESS</code>），进一步规避内存扫描</li>
+</ol>
+<p><strong>关键API</strong>：<code>NtCreateTimer</code>、<code>NtQueueApcThread</code>、<code>RtlEncryptMemory</code>、VEH注册</p>
+<hr />
+<h2>绕过技术对比矩阵</h2>
+<table>
+<thead>
+<tr>
+<th>技术名称</th>
+<th>核心原理</th>
+<th>运行层级</th>
+<th>检测难度</th>
+<th>主要影响EDR</th>
+<th>稳定性</th>
+<th>代表性工具/项目</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Direct Syscall</td>
+<td>自行构造syscall指令，跳过ntdll hook</td>
+<td>用户态</td>
+<td>中等</td>
+<td>所有依赖ntdll hook的EDR</td>
+<td>高</td>
+<td>SysWhispers3, Halo's Gate</td>
+</tr>
+<tr>
+<td>Indirect Syscall</td>
+<td>跳转到ntdll中hook之后的地址执行</td>
+<td>用户态</td>
+<td>高</td>
+<td>所有依赖ntdll hook的EDR</td>
+<td>高</td>
+<td>Hell's Gate, HookChain<sup id="fnref5:1"><a class="footnote-ref" href="#fn:1">1</a></sup></td>
+</tr>
+<tr>
+<td>Process Doppelgänging</td>
+<td>利用NTFS Transaction回滚实现无文件执行</td>
+<td>内核态接口</td>
+<td>高</td>
+<td>MDE, Cortex XDR</td>
+<td>中</td>
+<td>Transacted Hollowing</td>
+</tr>
+<tr>
+<td>Process Herpaderping</td>
+<td>进程创建前后修改文件内容造成扫描不一致</td>
+<td>内核态接口</td>
+<td>高</td>
+<td>CrowdStrike, MDE</td>
+<td>中</td>
+<td>Herpaderping PoC</td>
+</tr>
+<tr>
+<td>Module Stomping</td>
+<td>加载合法DLL后覆盖其.text段</td>
+<td>用户态</td>
+<td>高</td>
+<td>SentinelOne, Cortex XDR</td>
+<td>高</td>
+<td>各类C2植入器</td>
+</tr>
+<tr>
+<td>DLL Unhooking</td>
+<td>恢复被EDR修改的ntdll原始字节</td>
+<td>用户态</td>
+<td>中等</td>
+<td>所有用户态hook型EDR</td>
+<td>高</td>
+<td>EDRSandBlast<sup id="fnref2:4"><a class="footnote-ref" href="#fn:4">4</a></sup></td>
+</tr>
+<tr>
+<td>Hardware BP Hook Removal</td>
+<td>使用DR寄存器设置硬件断点，动态修改执行流</td>
+<td>用户态</td>
+<td>极高</td>
+<td>CrowdStrike, SentinelOne</td>
+<td>中</td>
+<td>Chimera<sup id="fnref:12"><a class="footnote-ref" href="#fn:12">12</a></sup></td>
+</tr>
+<tr>
+<td>ETW Patching</td>
+<td>Patch <code>EtwEventWrite</code>使其直接返回</td>
+<td>用户态</td>
+<td>中等</td>
+<td>MDE（依赖最重）、Falcon</td>
+<td>高</td>
+<td>SharpSploit</td>
+</tr>
+<tr>
+<td>AMSI Bypass</td>
+<td>Patch <code>AmsiScanBuffer</code>或劫持其上下文</td>
+<td>用户态</td>
+<td>低-中等</td>
+<td>MDE, 所有AMSI集成产品</td>
+<td>高</td>
+<td>AMSI.fail</td>
+</tr>
+<tr>
+<td>Sleep Obfuscation</td>
+<td>休眠期间加密/隐藏内存中的shellcode</td>
+<td>用户态</td>
+<td>高</td>
+<td>Falcon, SentinelOne</td>
+<td>中</td>
+<td>Ekko, Foliage</td>
+</tr>
+<tr>
+<td>Kernel Callback Removal</td>
+<td>通过内核驱动移除EDR注册的内核回调</td>
+<td>内核态</td>
+<td>极高</td>
+<td>所有EDR</td>
+<td>低（易BSOD）</td>
+<td>EDRSandBlast, RealBlindingEDR<sup id="fnref2:3"><a class="footnote-ref" href="#fn:3">3</a></sup></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>防御建议：从被动检测到主动免疫</h2>
+<h3>1. EDR自身加固方向</h3>
+<p><strong>用户态Hook加固</strong>：</p>
+<ul>
+<li><strong>Canary Hook</strong>：在hook函数前后插入检测用"金丝雀"指令，若发现指令被恢复则触发告警</li>
+<li><strong>多位置Hook</strong>：不仅hook <code>ntdll</code>函数入口，还在<code>kernel32</code>、<code>kernelbase</code>等上层DLL中设置冗余hook</li>
+<li><strong>HookChain防护</strong>：监控IAT（Import Address Table）的异常修改，检测执行流是否被重定向到非预期模块<sup id="fnref2:1"><a class="footnote-ref" href="#fn:1">1</a></sup></li>
+</ul>
+<p><strong>内存完整性保护</strong>：</p>
+<ul>
+<li>对关键系统DLL（<code>ntdll</code>、<code>kernel32</code>、<code>amsi</code>）的<code>.text</code>段启用写保护监控</li>
+<li>检测<code>NtProtectVirtualMemory</code>将内存属性改为RWX的行为，尤其是针对已加载模块的操作</li>
+<li>定期校验内存中关键DLL的哈希，与磁盘原始版本对比</li>
+</ul>
+<h3>2. 行为分析补充</h3>
+<p><strong>跨层关联</strong>：不要仅依赖单一层面的遥测。例如：</p>
+<ul>
+<li>当检测到Direct Syscall时，结合ETW的<code>KERNEL_AUDIT_API_SETCONTEXTTHREAD</code>事件进行交叉验证</li>
+<li>当发现<code>EtwEventWrite</code>被patch时，即使当前没有其他告警，也应将该进程标记为高风险</li>
+</ul>
+<p><strong>异常行为建模</strong>：</p>
+<ul>
+<li>监控进程中是否存在非<code>ntdll</code>区域的<code>syscall</code>指令执行</li>
+<li>监控调试寄存器（DR0-DR3）的异常使用——正常业务程序极少使用硬件断点</li>
+<li>监控VEH（Vectored Exception Handler）的频繁注册/注销，这可能是Sleep Obfuscation或硬件断点攻击的信号</li>
+</ul>
+<p><strong>进程创建增强检测</strong>：</p>
+<ul>
+<li>对Process Doppelgänging/Herpaderping，监控<code>NtCreateTransaction</code>与<code>NtCreateSection</code>的组合调用</li>
+<li>在进程创建完成点（而非创建前）重新扫描映像文件，避免时间差攻击</li>
+</ul>
+<h3>3. 内核态与系统级防护</h3>
+<p><strong>BYOVD防护</strong>：</p>
+<ul>
+<li>严格管控驱动签名策略，仅允许已知、可信的驱动加载</li>
+<li>启用Microsoft的 vulnerable driver blocklist（微软维护的已知漏洞驱动黑名单）</li>
+<li>使用HVCI（Hypervisor-protected Code Integrity）阻止未签名驱动加载</li>
+</ul>
+<p><strong>内核回调完整性</strong>：</p>
+<ul>
+<li>定期枚举<code>PspCreateProcessNotifyRoutine</code>、<code>PspCreateThreadNotifyRoutine</code>等回调数组</li>
+<li>监控<code>ObRegisterCallbacks</code>的注册与注销操作</li>
+<li>对内核回调例程的代码段进行完整性校验</li>
+</ul>
+<p><strong>ETW增强</strong>：</p>
+<ul>
+<li>不依赖单一ETW Provider，多源交叉验证</li>
+<li>在ETW消费者层增加心跳检测——若预期应收到的事件长时间缺失，触发"遥测沉默"告警</li>
+</ul>
+<hr />
+<h2>个人技术观点</h2>
+<p>2026年的EDR绕过技术已经形成了完整的工程化体系。从最早的简单DLL Unhooking，发展到如今的HookChain、硬件断点、内核回调移除，攻击者的技术栈正在向"更底层、更隐蔽、更难以区分正常行为"的方向演进。</p>
+<p>几个值得关注的趋势：</p>
+<ol>
+<li>
+<p><strong>用户态hook的末日</strong>：单纯依赖<code>ntdll</code> inline hook的EDR架构已经难以应对Indirect Syscall和HookChain。未来的EDR必须向内核态和硬件辅助虚拟化（Intel VT-x/AMD-V）下沉，或采用AI驱动的行为基线模型。</p>
+</li>
+<li>
+<p><strong>遥测完整性比遥测丰富度更重要</strong>：拥有1000个ETW Provider但无法保证其数据不被篡改，不如拥有100个但具备完整性校验的Provider。EDR厂商需要将"防篡改"作为与"检测"同等重要的设计目标。</p>
+</li>
+<li>
+<p><strong>Sleep Obfuscation将成为标配</strong>：随着EDR内存扫描的普及，C2的休眠期已不再安全。Ekko、Foliage等技术会被集成到所有主流C2框架中，EDR必须发展"休眠期持续监控"能力——例如通过定时器触发的轻量内存指纹扫描。</p>
+</li>
+<li>
+<p><strong>BYOVD仍是最大威胁</strong>：内核回调移除技术的核心前提是获得内核写能力。在Windows生态中，有签名的漏洞驱动是获得这一能力的"捷径"。微软的驱动黑名单策略虽好，但存在更新滞后性。企业应结合自身环境建立驱动白名单，而非仅依赖黑名单。</p>
+</li>
+<li>
+<p><strong>攻防不对称性在缩小，但并未逆转</strong>：EDR的检测逻辑正在从"签名+规则"转向"行为+AI"，这在理论上可以检测到未知绕过技术。但攻击者同样在使用AI辅助生成绕过代码（如自动化SSN解析、自动化call stack spoofing）。未来的胜负手可能在于"谁能在更短的时间内完成从检测到绕过、或从绕过到检测的迭代"。</p>
+</li>
+</ol>
+<hr />
+<h2>参考来源</h2>
+<hr />
+<h2>网络安全免责声明</h2>
+<p>本文所述技术仅供网络安全研究、授权渗透测试及防御加固参考之用。文中涉及的所有技术细节、API调用原理及绕过思路均基于已公开发表的学术研究、安全博客和行业报告整理而成，不涉及任何完整的攻击利用代码或可用于实际入侵的工具分发。</p>
+<p><strong>严禁将本文内容用于以下行为</strong>：</p>
+<ul>
+<li>未经授权访问计算机信息系统</li>
+<li>破坏计算机信息系统功能或数据</li>
+<li>制作、传播恶意程序</li>
+<li>对他人网络或系统进行任何形式的渗透测试（未获得书面授权）</li>
+</ul>
+<p>读者应遵守《中华人民共和国网络安全法》及相关法律法规，仅在合法授权范围内开展安全研究和测试活动。因违反法律法规或滥用本文信息所造成的任何后果，由行为人自行承担全部法律责任，与本文作者及发布平台无关。</p>
+<p>安全研究的价值在于提升防御能力。建议企业安全团队基于本文思路，定期对自身EDR部署进行红队评估，发现检测盲区并及时加固，而非将技术用于非法目的。</p>
+<hr />
+<p><em>本文最后更新：2026年7月14日</em></p>
+<div class="footnote">
+<hr />
+<ol>
+<li id="fn:1">
+<p>Helvio Carvalho Junior. "HookChain: A new perspective for Bypassing EDR Solutions." arXiv:2404.16856v1, 2024. https://arxiv.org/pdf/2404.16856v1&#160;<a class="footnote-backref" href="#fnref:1" title="Jump back to footnote 1 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:1" title="Jump back to footnote 1 in the text">&#8617;</a><a class="footnote-backref" href="#fnref3:1" title="Jump back to footnote 1 in the text">&#8617;</a><a class="footnote-backref" href="#fnref4:1" title="Jump back to footnote 1 in the text">&#8617;</a><a class="footnote-backref" href="#fnref5:1" title="Jump back to footnote 1 in the text">&#8617;</a></p>
+</li>
+<li id="fn:2">
+<p>femtosec.io. "SindriKit: Decoupling Syscalls to Evade EDR Telemetry." 2026. https://www.femtosec.io/threat-intelligence/sindrikit-edr-evasion-stack-spoofing&#160;<a class="footnote-backref" href="#fnref:2" title="Jump back to footnote 2 in the text">&#8617;</a></p>
+</li>
+<li id="fn:3">
+<p>thedailytechfeed.com. "RealBlindingEDR: A Tool That Disables Antivirus and EDR Systems via Kernel Callbacks." 2025. https://thedailytechfeed.com/realblindingedr-a-tool-that-disables-antivirus-and-edr-systems-via-kernel-callbacks/&#160;<a class="footnote-backref" href="#fnref:3" title="Jump back to footnote 3 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:3" title="Jump back to footnote 3 in the text">&#8617;</a></p>
+</li>
+<li id="fn:4">
+<p>notes.qazeer.io. "EDRSandBlast: EDR bypass with arbitrary kernel memory read/write." https://notes.qazeer.io/red-team-specifics/edr_bypass_with_edrsandblast&#160;<a class="footnote-backref" href="#fnref:4" title="Jump back to footnote 4 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:4" title="Jump back to footnote 4 in the text">&#8617;</a></p>
+</li>
+<li id="fn:5">
+<p>CrowdStrike Blog. "CrowdStrike Researchers Investigate the Threat of Patchless AMSI Bypass Attacks." https://www.crowdstrike.com/en-us/blog/crowdstrike-investigates-threat-of-patchless-amsi-bypass-attacks/&#160;<a class="footnote-backref" href="#fnref:5" title="Jump back to footnote 5 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:5" title="Jump back to footnote 5 in the text">&#8617;</a></p>
+</li>
+<li id="fn:6">
+<p>SentinelOne. "CrowdStrike vs SentinelOne." https://www.sentinelone.com/vs/crowdstrike/&#160;<a class="footnote-backref" href="#fnref:6" title="Jump back to footnote 6 in the text">&#8617;</a></p>
+</li>
+<li id="fn:7">
+<p>0xdbgman.github.io. "Security Controls: Modern EDR &amp; Windows Protection Bypass." https://0xdbgman.github.io/posts/sec-controls-the-art-of-breaking-through/&#160;<a class="footnote-backref" href="#fnref:7" title="Jump back to footnote 7 in the text">&#8617;</a><a class="footnote-backref" href="#fnref2:7" title="Jump back to footnote 7 in the text">&#8617;</a><a class="footnote-backref" href="#fnref3:7" title="Jump back to footnote 7 in the text">&#8617;</a></p>
+</li>
+<li id="fn:8">
+<p>securitylab.lat. "Evasión del EDR y técnicas anti-forenses." https://securitylab.lat/blog/personal/XiaomiFanES/359118.php&#160;<a class="footnote-backref" href="#fnref:8" title="Jump back to footnote 8 in the text">&#8617;</a></p>
+</li>
+<li id="fn:9">
+<p>hackersmanifest.com. "EDR Bypass Techniques." 2026. https://hackersmanifest.com/internal-pentest/09f-edr-bypass/&#160;<a class="footnote-backref" href="#fnref:9" title="Jump back to footnote 9 in the text">&#8617;</a></p>
+</li>
+<li id="fn:10">
+<p>Palo Alto Networks. "Cortex XDRとCrowdStrikeの比較." https://www.paloaltonetworks.jp/cortex/xdrvscrowdstrike&#160;<a class="footnote-backref" href="#fnref:10" title="Jump back to footnote 10 in the text">&#8617;</a></p>
+</li>
+<li id="fn:11">
+<p>redsecuretech.co.uk. "Havoc C2: Sleep Obfuscation &amp; Return Address Spoofing Guide." 2026. https://www.redsecuretech.co.uk/blog/post/havoc-c2-sleep-obfuscation-return-address-spoofing-guide/1164&#160;<a class="footnote-backref" href="#fnref:11" title="Jump back to footnote 11 in the text">&#8617;</a></p>
+</li>
+<li id="fn:12">
+<p>0xsr.com. "Building Chimera: An EDR Evasion Framework from Scratch." February 2026. https://0xsr.com/blog/edr-evasion&#160;<a class="footnote-backref" href="#fnref:12" title="Jump back to footnote 12 in the text">&#8617;</a></p>
+</li>
+<li id="fn:13">
+<p>ringsafe.in. "EDR Bypass Techniques in 2026: How Modern Threats Evade Endpoint Defenses." https://ringsafe.in/edr-bypass-techniques-2026-endpoint-evasion/&#160;<a class="footnote-backref" href="#fnref:13" title="Jump back to footnote 13 in the text">&#8617;</a></p>
+</li>
+<li id="fn:14">
+<p>William Knowles. "Living Dangerously with Module Stomping: Leveraging Code Coverage Analysis for Injecting into Legitimately Loaded DLLs." https://williamknowles.io/living-dangerously-with-module-stomping-leveraging-code-coverage-analysis-for-injecting-into-legitimately-loaded-dlls/&#160;<a class="footnote-backref" href="#fnref:14" title="Jump back to footnote 14 in the text">&#8617;</a></p>
+</li>
+<li id="fn:15">
+<p>ayinedjimi-consultants.fr. "Bypass EDR : Techniques d'Évasion et Contre-mesures 2026." https://ayinedjimi-consultants.fr/articles/bypass-edr-techniques-evasion-contremesures&#160;<a class="footnote-backref" href="#fnref:15" title="Jump back to footnote 15 in the text">&#8617;</a></p>
+</li>
+</ol>
+</div>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

