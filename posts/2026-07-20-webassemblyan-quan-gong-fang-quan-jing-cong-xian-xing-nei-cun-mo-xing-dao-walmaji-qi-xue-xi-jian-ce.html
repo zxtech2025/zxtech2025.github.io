@@ -1,0 +1,969 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebAssembly安全攻防全景：从线性内存模型到WALMA机器学习检测 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>WebAssembly安全攻防全景：从线性内存模型到WALMA机器学习检测</h1>
+<time>2026-07-20</time>
+<ul>
+<li>技术
+Slug: webassembly安全攻防全景-从线性内存模型到walma机器学习检测</li>
+</ul>
+<hr />
+<h2>1. WebAssembly内存模型的安全含义</h2>
+<h3>1.1 线性内存模型（Linear Memory Model）</h3>
+<p>WebAssembly采用单片线性内存模型（monolithic linear memory model），整个内存空间是一块连续的字节数组，地址从0开始递增。模块通过<code>memory.grow</code>指令以64KB为单位扩展内存，通过<code>load</code>/<code>store</code>指令在边界内自由读写。这套设计让C/C++代码可以编译为Wasm并在浏览器中以接近原生速度执行，因为Wasm的线性内存可以直接承载dlmalloc/emmalloc等堆管理器和手动管理的栈区。</p>
+<div class="highlight"><pre><span></span><code><span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">memory</span> <span class="p">(</span><span class="k">export</span> <span class="s2">&quot;mem&quot;</span><span class="p">)</span> <span class="mi">1</span><span class="p">)</span>  <span class="c1">;; 1页 = 64KB 初始内存</span>
+  <span class="c1">;; 线性内存布局示意：</span>
+  <span class="c1">;; [0x00000 - 0x0FFFF] Data段（全局变量、字符串常量）</span>
+  <span class="c1">;; [0x10000 - 0x1FFFF] Heap（malloc分配区域，向上增长）</span>
+  <span class="c1">;; [0x3FFFF - 0x3FFxx] Stack（从顶部向下增长）</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p>关键安全特征：Wasm模块内的所有指针都是线性内存内的偏移量（offset），绝对无法指向宿主机内存。V8引擎在每条内存访问指令前插入边界检查，确保<code>offset + access_size &lt;= memory.size * 64KB</code>。但这仅保证不越界访问线性内存本身——<strong>在边界以内，所有内存区域之间没有任何隔离</strong>。</p>
+<p>这意味着Wasm堆、Wasm栈和数据段共享同一线性地址空间。一个堆缓冲区溢出可以覆盖栈上的返回地址，一个栈缓冲区溢出可以向下污染堆元数据或数据段中的全局变量。这与原生进程地址空间中由MMU页表和分段机制提供的隔离有根本区别：</p>
+<ul>
+<li><strong>原生进程</strong>：代码段、数据段、堆、栈由OS虚拟内存系统映射到不同虚拟页，各区域间存在不可访问的guard page</li>
+<li><strong>Wasm线性内存</strong>：所有区域在同一连续字节数组中，相邻区域之间无任何保护间隙</li>
+</ul>
+<p>正如USENIX Security 2020论文《Everything Old is New Again: Binary Security of WebAssembly》所指出的："WebAssembly's linear memory is a single, contiguous memory space without any holes, so every pointer in [0, max_mem] is valid. As long as the attacker stays within this bound, any read or write will succeed. This is a fundamental limitation of linear memory with severe consequences."</p>
+<h3>1.2 无ASLR的攻击面</h3>
+<p>Wasm线性内存内没有地址空间随机化（ASLR）。每次实例化同一Wasm模块时，数据段、堆起始位置、栈顶位置完全确定。这从根本上改变了内存破坏exploit的可靠性：</p>
+<p><strong>攻击面确定性分析：</strong></p>
+<ol>
+<li><strong>数据段布局</strong>：编译时确定，链接后固定。全局变量、函数指针表、字符串常量在内存中的位置在所有运行实例间完全一致</li>
+<li><strong>堆布局</strong>：emscripten默认使用dlmalloc，首次<code>malloc</code>返回的地址在固定偏移处（通常紧跟数据段之后），且堆分配顺序和大小由程序逻辑决定，在相同输入下完全可重现</li>
+<li><strong>栈布局</strong>：Wasm没有硬件栈，栈由编译器在线性内存中自行管理。全局栈指针的初始值在模块加载时固定</li>
+</ol>
+<div class="highlight"><pre><span></span><code>原生进程地址空间（有ASLR）：
+┌─────────────────────────┐  ← 随机基址
+│  Stack (向下增长)        │
+│  ████████████████████   │  ← guard page（不可访问）
+│  ▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼▼   │
+│                          │
+│  ████████████████████   │  ← guard page
+│  Heap (向上增长)         │
+│  ████████████████████   │  ← guard page
+│  BSS / Data             │
+│  Text (RO)              │
+└─────────────────────────┘
+
+Wasm线性内存（无ASLR）：
+┌─────────────────────────┐  ← 固定基址 0x00000
+│  Data Segment           │  ← 编译时确定
+│  ──────────────────────  │  ← 无隔离
+│  Heap (向上增长)         │  ← 首次malloc地址固定
+│  ──────────────────────  │  ← 无隔离
+│  (空闲区域)              │
+│  ──────────────────────  │  ← 无隔离
+│  Stack (向下增长)        │  ← 栈顶固定
+└─────────────────────────┘  ← memory.size * 64KB
+</code></pre></div>
+
+<p><strong>与原生exploit的对比：</strong></p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>原生进程</th>
+<th>Wasm模块</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ASLR</td>
+<td>有（PIE + ASLR）</td>
+<td>无，布局完全确定</td>
+</tr>
+<tr>
+<td>区域隔离</td>
+<td>MMU guard page</td>
+<td>无，连续字节</td>
+</tr>
+<tr>
+<td>堆布局确定性</td>
+<td>受ASLR影响，需heap spray</td>
+<td>完全确定，无需spray</td>
+</tr>
+<tr>
+<td>栈canary</td>
+<td>编译器插入</td>
+<td>无（Wasm无硬件栈概念）</td>
+</tr>
+<tr>
+<td>DEP/NX</td>
+<td>硬件强制</td>
+<td>Wasm无法执行内存中的数据</td>
+</tr>
+<tr>
+<td>代码注入</td>
+<td>可能（ROP/JOP）</td>
+<td>不可能（内存不可执行）</td>
+</tr>
+<tr>
+<td>数据指向代码</td>
+<td>可能</td>
+<td>不可能（代码在独立空间）</td>
+</tr>
+</tbody>
+</table>
+<p>注意最后三行：Wasm的代码段不在线性内存中，而是由引擎单独管理，线性内存中的数据无法被当作代码执行。这消除了传统的shellcode注入和ROP攻击，但数据破坏攻击——修改控制流数据、覆盖函数指针、污染对象元数据——依然完全有效。</p>
+<h3>1.3 安全边界</h3>
+<p>Wasm的安全依赖三层防线：</p>
+<p><strong>第一层：边界检查。</strong> V8在每条<code>memory.load</code>/<code>memory.store</code>指令执行前验证<code>addr + len &lt;= memory.size * PAGE_SIZE</code>，越界访问触发trap。这个检查是确定性的、不可绕过的——除非引擎本身存在漏洞。</p>
+<p><strong>第二层：类型验证。</strong> Wasm模块在实例化前经过严格的类型检查（validation phase）。所有函数签名、局部变量类型、指令操作数类型在加载时即被验证。这消除了类型混淆类的低级错误。</p>
+<p><strong>第三层：浏览器沙箱。</strong> 即使Wasm模块被攻破，攻击者仍被限制在浏览器渲染进程的沙箱内。Chrome使用多层沙箱：站点隔离（Site Isolation）+ 渲染进程沙箱 + V8堆沙箱。</p>
+<p>但沙箱并非不可穿透。CVE-2026-6307（Longinus）证明，单个V8 JIT编译器漏洞即可同时穿透Chrome渲染进程沙箱和V8堆沙箱，实现完整的RCE链。更根本的问题是：<strong>Wasm线性内存内的数据破坏可以直接影响宿主JavaScript环境</strong>。当Wasm通过<code>externref</code>持有对JS对象的引用时，破坏线性内存中的引用数据可能导致类型混淆，进而攻击JS引擎本身。</p>
+<h2>2. Wasm内存破坏攻击技术</h2>
+<h3>2.1 堆溢出</h3>
+<p>C/C++编译为Wasm后，其内存管理行为（使用dlmalloc/emmalloc）在线性内存中完整保留。经典堆溢出在Wasm中的表现与原生环境几乎一致，且由于无ASLR，利用的确定性和可靠性更高。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// vulnerable.c - 编译为Wasm后存在堆溢出</span>
+<span class="c1">// 编译: emcc vulnerable.c -O2 -s EXPORTED_FUNCTIONS=&quot;[&#39;_vulnerable_copy&#39;,&#39;_allocate_buffer&#39;]&quot; -s WASM=1</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;emscripten/emscripten.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;string.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdlib.h&gt;</span>
+
+<span class="n">EMSCRIPTEN_KEEPALIVE</span>
+<span class="kt">void</span><span class="w"> </span><span class="n">vulnerable_copy</span><span class="p">(</span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">dst</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">src</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">size</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 没有边界检查的拷贝</span>
+<span class="w">    </span><span class="n">memcpy</span><span class="p">(</span><span class="n">dst</span><span class="p">,</span><span class="w"> </span><span class="n">src</span><span class="p">,</span><span class="w"> </span><span class="n">size</span><span class="p">);</span><span class="w">  </span><span class="c1">// 如果size &gt; dst分配的大小，溢出</span>
+<span class="p">}</span>
+
+<span class="n">EMSCRIPTEN_KEEPALIVE</span>
+<span class="kt">char</span><span class="o">*</span><span class="w"> </span><span class="n">allocate_buffer</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">size</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="p">(</span><span class="kt">char</span><span class="o">*</span><span class="p">)</span><span class="n">malloc</span><span class="p">(</span><span class="n">size</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>对应的攻击PoC（教学用途）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// attack_heap_overflow.js - 教学PoC，演示Wasm堆溢出原理</span>
+<span class="k">async</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="nx">demonstrateHeapOverflow</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">wasm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">await</span><span class="w"> </span><span class="nx">WebAssembly</span><span class="p">.</span><span class="nx">instantiateStreaming</span><span class="p">(</span>
+<span class="w">        </span><span class="nx">fetch</span><span class="p">(</span><span class="s1">&#39;vulnerable.wasm&#39;</span><span class="p">),</span>
+<span class="w">        </span><span class="p">{</span><span class="w"> </span><span class="nx">env</span><span class="o">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">emscripten_notify_memory_growth</span><span class="o">:</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="p">{}</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="p">);</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">allocate_buffer</span><span class="p">,</span><span class="w"> </span><span class="nx">vulnerable_copy</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">wasm</span><span class="p">.</span><span class="nx">instance</span><span class="p">.</span><span class="nx">exports</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 分配两个相邻堆块</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">bufA</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">allocate_buffer</span><span class="p">(</span><span class="mf">32</span><span class="p">);</span><span class="w">   </span><span class="c1">// victim</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">bufB</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">allocate_buffer</span><span class="p">(</span><span class="mf">64</span><span class="p">);</span><span class="w">   </span><span class="c1">// 用于构造攻击数据</span>
+
+<span class="w">    </span><span class="c1">// bufA和bufB在线性内存中相邻</span>
+<span class="w">    </span><span class="c1">// 溢出bufB的数据将覆盖bufA及后续堆元数据</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">payload</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nb">Uint8Array</span><span class="p">(</span><span class="mf">128</span><span class="p">);</span><span class="w">  </span><span class="c1">// 远超bufB的64字节</span>
+<span class="w">    </span><span class="c1">// 填充payload以观察溢出效果</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kd">let</span><span class="w"> </span><span class="nx">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0</span><span class="p">;</span><span class="w"> </span><span class="nx">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">128</span><span class="p">;</span><span class="w"> </span><span class="nx">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="nx">payload</span><span class="p">[</span><span class="nx">i</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x41</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 触发溢出：将128字节写入64字节的缓冲区</span>
+<span class="w">    </span><span class="c1">// 在实际攻击中，溢出数据会覆盖相邻堆块的元数据（dlmalloc的chunk header）</span>
+<span class="w">    </span><span class="c1">// 从而实现堆风水布局和任意地址写</span>
+<span class="w">    </span><span class="nx">vulnerable_copy</span><span class="p">(</span><span class="nx">bufB</span><span class="p">,</span><span class="w"> </span><span class="nx">payload</span><span class="p">,</span><span class="w"> </span><span class="mf">128</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 检查bufA是否被覆盖</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">memory</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nb">Uint8Array</span><span class="p">(</span><span class="nx">wasm</span><span class="p">.</span><span class="nx">instance</span><span class="p">.</span><span class="nx">exports</span><span class="p">.</span><span class="nx">mem</span><span class="p">.</span><span class="nx">buffer</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">bufAData</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">memory</span><span class="p">.</span><span class="nx">slice</span><span class="p">(</span><span class="nx">bufA</span><span class="p">,</span><span class="w"> </span><span class="nx">bufA</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mf">32</span><span class="p">);</span>
+<span class="w">    </span><span class="nx">console</span><span class="p">.</span><span class="nx">log</span><span class="p">(</span><span class="s1">&#39;bufA after overflow:&#39;</span><span class="p">,</span><span class="w"> </span><span class="nx">bufAData</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// bufA的内容已被溢出数据覆盖</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>Wasm堆溢出的关键差异：</strong></p>
+<p>在原生环境中，dlmalloc的chunk header包含<code>prev_size</code>和<code>size</code>字段，覆盖这些字段可以劫持<code>free()</code>的unlink操作实现任意写。在Wasm中，这套机制完全保留——因为emscripten直接将dlmalloc编译进Wasm模块。但由于无ASLR且布局确定，攻击者不需要heap spray来猜测地址，可以直接计算目标偏移。</p>
+<p>此外，Wasm线性内存中没有guard page。在原生环境中，越界读写可能触发SIGSEGV；在Wasm中，只要不越过<code>memory.size</code>边界，所有读写都会成功。这意味着溢出可以精确地跨过多个堆块，直到触及线性内存边界。</p>
+<h3>2.2 栈缓冲区溢出</h3>
+<p>Wasm没有硬件栈，但C/C++编译为Wasm时，编译器会在线性内存中维护一个软件栈。全局栈指针（通常存储在Wasm全局变量<code>__stack_pointer</code>中）指向当前栈顶。函数序言（prologue）递减栈指针分配栈帧，函数结语（epilogue）恢复栈指针。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// stack_vuln.c - Wasm栈缓冲区溢出</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;emscripten/emscripten.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;string.h&gt;</span>
+
+<span class="n">EMSCRIPTEN_KEEPALIVE</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">process_input</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">input</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">len</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">local_buf</span><span class="p">[</span><span class="mi">64</span><span class="p">];</span><span class="w">  </span><span class="c1">// 栈上分配64字节</span>
+
+<span class="w">    </span><span class="c1">// 无边界检查：如果len &gt; 64，溢出到栈帧上方</span>
+<span class="w">    </span><span class="c1">// 在Wasm线性内存中，&quot;上方&quot;可能覆盖：</span>
+<span class="w">    </span><span class="c1">// - 调用者的栈帧（保存的栈指针、返回地址）</span>
+<span class="w">    </span><span class="c1">// - 相邻的堆分配区域</span>
+<span class="w">    </span><span class="n">memcpy</span><span class="p">(</span><span class="n">local_buf</span><span class="p">,</span><span class="w"> </span><span class="n">input</span><span class="p">,</span><span class="w"> </span><span class="n">len</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 使用被污染的数据</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">local_buf</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>编译后的Wasm栈帧结构（简化）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">;; 编译器生成的栈帧布局示意</span>
+<span class="p">(</span><span class="k">func</span> <span class="nv">$process_input</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$input</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$len</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+  <span class="p">(</span><span class="k">local</span> <span class="nv">$local_buf</span> <span class="kt">i32</span><span class="p">)</span>
+  <span class="p">(</span><span class="k">local</span> <span class="nv">$saved_sp</span> <span class="kt">i32</span><span class="p">)</span>
+
+  <span class="c1">;; prologue: 保存栈指针，分配栈帧</span>
+  <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$saved_sp</span> <span class="p">(</span><span class="nb">global.get</span> <span class="nv">$__stack_pointer</span><span class="p">))</span>
+  <span class="p">(</span><span class="nb">global.set</span> <span class="nv">$__stack_pointer</span>
+    <span class="p">(</span><span class="nb">i32.sub</span> <span class="p">(</span><span class="nb">global.get</span> <span class="nv">$__stack_pointer</span><span class="p">)</span> <span class="p">(</span><span class="nb">i32.const</span> <span class="mi">80</span><span class="p">)))</span>  <span class="c1">;; 64 + 对齐</span>
+  <span class="p">(</span><span class="nb">local.set</span> <span class="nv">$local_buf</span> <span class="p">(</span><span class="nb">global.get</span> <span class="nv">$__stack_pointer</span><span class="p">))</span>
+
+  <span class="c1">;; memcpy - 无边界检查，直接使用$len</span>
+  <span class="c1">;; 如果$len &gt; 64，写入将越过local_buf边界</span>
+  <span class="c1">;; 覆盖$saved_sp和调用者的栈帧数据</span>
+  <span class="p">(</span><span class="nb">call</span> <span class="nv">$memcpy</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$local_buf</span><span class="p">)</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$input</span><span class="p">)</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$len</span><span class="p">))</span>
+
+  <span class="c1">;; epilogue: 恢复栈指针</span>
+  <span class="c1">;; 如果$saved_sp被覆盖，恢复的栈指针将指向错误位置</span>
+  <span class="p">(</span><span class="nb">global.set</span> <span class="nv">$__stack_pointer</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$saved_sp</span><span class="p">))</span>
+  <span class="p">(</span><span class="nb">i32.load8_u</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$local_buf</span><span class="p">))</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p>攻击PoC（教学用途）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// attack_stack_overflow.js - 教学PoC</span>
+<span class="k">async</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="nx">demonstrateStackOverflow</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">wasm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">await</span><span class="w"> </span><span class="nx">WebAssembly</span><span class="p">.</span><span class="nx">instantiateStreaming</span><span class="p">(</span>
+<span class="w">        </span><span class="nx">fetch</span><span class="p">(</span><span class="s1">&#39;stack_vuln.wasm&#39;</span><span class="p">),</span>
+<span class="w">        </span><span class="p">{</span><span class="w"> </span><span class="nx">env</span><span class="o">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">emscripten_notify_memory_growth</span><span class="o">:</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="p">{}</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="p">);</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">process_input</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">wasm</span><span class="p">.</span><span class="nx">instance</span><span class="p">.</span><span class="nx">exports</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">memory</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nb">Uint8Array</span><span class="p">(</span><span class="nx">wasm</span><span class="p">.</span><span class="nx">instance</span><span class="p">.</span><span class="nx">exports</span><span class="p">.</span><span class="nx">mem</span><span class="p">.</span><span class="nx">buffer</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 构造超长输入触发栈溢出</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">overflow</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nb">Uint8Array</span><span class="p">(</span><span class="mf">256</span><span class="p">);</span><span class="w">  </span><span class="c1">// 远超64字节栈缓冲区</span>
+<span class="w">    </span><span class="c1">// 在偏移64处写入目标数据</span>
+<span class="w">    </span><span class="c1">// 这将覆盖保存的栈指针和调用者栈帧</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kd">let</span><span class="w"> </span><span class="nx">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">64</span><span class="p">;</span><span class="w"> </span><span class="nx">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">256</span><span class="p">;</span><span class="w"> </span><span class="nx">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">overflow</span><span class="p">[</span><span class="nx">i</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x42</span><span class="p">;</span><span class="w">  </span><span class="c1">// 观察溢出模式</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nx">process_input</span><span class="p">(</span><span class="nx">overflow</span><span class="p">,</span><span class="w"> </span><span class="mf">256</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// 此时Wasm模块的内部状态已被破坏</span>
+<span class="w">    </span><span class="c1">// 后续的函数调用将使用被篡改的栈指针</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>关键区别：</strong> 在原生x86中，栈溢出覆盖的是硬件栈上的返回地址，攻击者可以劫持控制流。在Wasm中，"返回地址"是Wasm调用栈（call stack，不是线性内存中的数据栈）中的返回地址，存储在V8引擎管理的独立数据结构中，不在线性内存中。因此，Wasm栈溢出<strong>无法直接劫持控制流到任意地址</strong>。但它可以：</p>
+<ol>
+<li>覆盖全局栈指针<code>__stack_pointer</code>，导致后续所有函数调用使用错误的栈区域</li>
+<li>覆盖存储在线性内存中的函数指针（如C++虚表）</li>
+<li>跨越栈-堆边界，污染堆元数据</li>
+</ol>
+<h3>2.3 类型混淆</h3>
+<p>JavaScript与Wasm之间存在类型边界。Wasm有四种值类型（<code>i32</code>、<code>i64</code>、<code>f32</code>、<code>f64</code>）和引用类型，JavaScript有Number、BigInt、Object等。类型转换发生在JS-Wasm边界上，而V8引擎的类型转换逻辑本身可能存在漏洞。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// type_confusion.js - 教学PoC：JS-Wasm类型边界</span>
+<span class="k">async</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="nx">demonstrateTypeConfusion</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">wasmBytes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nb">Uint8Array</span><span class="p">([</span>
+<span class="w">        </span><span class="mh">0x00</span><span class="p">,</span><span class="w"> </span><span class="mh">0x61</span><span class="p">,</span><span class="w"> </span><span class="mh">0x73</span><span class="p">,</span><span class="w"> </span><span class="mh">0x6d</span><span class="p">,</span><span class="w">  </span><span class="c1">// wasm magic</span>
+<span class="w">        </span><span class="mh">0x01</span><span class="p">,</span><span class="w"> </span><span class="mh">0x00</span><span class="p">,</span><span class="w"> </span><span class="mh">0x00</span><span class="p">,</span><span class="w"> </span><span class="mh">0x00</span><span class="p">,</span><span class="w">  </span><span class="c1">// version 1</span>
+<span class="w">        </span><span class="c1">// ... 完整的Wasm二进制 ...</span>
+<span class="w">    </span><span class="p">]);</span>
+
+<span class="w">    </span><span class="c1">// JS和Wasm的类型转换矩阵</span>
+<span class="w">    </span><span class="c1">// JS Number     -&gt; Wasm i32/f32/f64 (可能丢失精度)</span>
+<span class="w">    </span><span class="c1">// JS BigInt    -&gt; Wasm i64</span>
+<span class="w">    </span><span class="c1">// JS Object    -&gt; Wasm externref</span>
+<span class="w">    </span><span class="c1">// Wasm i32     -&gt; JS Number</span>
+<span class="w">    </span><span class="c1">// Wasm i64     -&gt; JS BigInt</span>
+<span class="w">    </span><span class="c1">// Wasm externref -&gt; JS Object (tagged pointer)</span>
+
+<span class="w">    </span><span class="c1">// 类型混淆场景：如果一个Wasm函数的签名被错误地理解为</span>
+<span class="w">    </span><span class="c1">// (result i64) 而非 (result externref)，</span>
+<span class="w">    </span><span class="c1">// 则返回的tagged pointer会被包装为BigInt而非对象引用</span>
+<span class="w">    </span><span class="c1">// 这是CVE-2026-6307的核心利用原理</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>i32/i64/f32/f64的位模式重解释：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">;; 类型混淆的底层机制：同一寄存器位模式的不同解释</span>
+<span class="c1">;; 返回值存储在 kReturnRegister0 (64位)</span>
+
+<span class="c1">;; 如果函数签名为 (result i64):</span>
+<span class="c1">;;   deoptimizer 读取寄存器 -&gt; static_cast&lt;int64_t&gt; -&gt; 装箱为 BigInt</span>
+<span class="c1">;;   寄存器中的 0x0000123456789ABC 被解释为整数</span>
+
+<span class="c1">;; 如果函数签名为 (result externref):</span>
+<span class="c1">;;   deoptimizer 读取寄存器 -&gt; Tagged&lt;Object&gt; -&gt; 作为JS对象引用</span>
+<span class="c1">;;   寄存器中的 0x0000123456789ABC 被解释为堆指针</span>
+
+<span class="c1">;; 两者读取同一个寄存器，仅因FrameState中记录的返回类型不同</span>
+<span class="c1">;; 就会将同一串比特位解释为完全不同的JS值</span>
+</code></pre></div>
+
+<p>这正是CVE-2026-6307的核心漏洞机制——TurboFan编译器的全局值编号（GVN）错误地合并了两个具有不同Wasm返回类型的<code>FrameState</code>节点，导致deoptimizer用错误的类型解释返回寄存器中的值。</p>
+<h3>2.4 从Wasm漏洞到浏览器XSS</h3>
+<p>Wasm模块通过<code>externref</code>可以持有对JavaScript对象的引用。这些引用作为tagged pointer存储在线性内存中。如果攻击者能够通过堆溢出覆盖这些引用，就可能实现从Wasm内存破坏到JavaScript引擎攻击的跳板。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// wasm_to_xss.js - 攻击链概念演示（教学用途）</span>
+<span class="k">async</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="nx">demonstrateWasmToXssChain</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 攻击链概述（概念层面）</span>
+<span class="w">    </span><span class="c1">//</span>
+<span class="w">    </span><span class="c1">// 1. Wasm模块通过externref持有JS对象引用</span>
+<span class="w">    </span><span class="c1">//    let jsObj = { exec: () =&gt; eval(userInput) };</span>
+<span class="w">    </span><span class="c1">//    wasm_instance.exports.store_reference(jsObj);</span>
+<span class="w">    </span><span class="c1">//</span>
+<span class="w">    </span><span class="c1">// 2. 攻击者通过堆溢出覆盖线性内存中的externref</span>
+<span class="w">    </span><span class="c1">//    将其替换为目标JS对象的地址（伪造对象引用）</span>
+<span class="w">    </span><span class="c1">//</span>
+<span class="w">    </span><span class="c1">// 3. Wasm模块将&quot;被篡改的引用&quot;返回给JS</span>
+<span class="w">    </span><span class="c1">//    let leaked = wasm_instance.exports.get_reference();</span>
+<span class="w">    </span><span class="c1">//    // leaked现在是一个类型混淆的对象引用</span>
+<span class="w">    </span><span class="c1">//</span>
+<span class="w">    </span><span class="c1">// 4. 利用类型混淆实现addrof/fakeobj原语</span>
+<span class="w">    </span><span class="c1">//    （这是CVE-2026-6307的攻击路径）</span>
+<span class="w">    </span><span class="c1">//</span>
+<span class="w">    </span><span class="c1">// 5. 通过addrof/fakeobj进一步攻击V8引擎内部结构</span>
+<span class="w">    </span><span class="c1">//    最终逃逸沙箱实现RCE</span>
+
+<span class="w">    </span><span class="c1">// 注意：完整的攻击链需要精确的偏移计算和V8内部知识</span>
+<span class="w">    </span><span class="c1">// 此处仅展示概念，不提供可直接利用的代码</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>现实约束：</strong> 直接通过Wasm堆溢出实现XSS在实践中相当困难，因为：</p>
+<ol>
+<li><code>externref</code>的tagged pointer格式依赖V8内部实现（压缩指针、Smi编码等）</li>
+<li>线性内存中的指针只是偏移量，无法直接指向V8堆</li>
+<li>V8的类型验证会在JS-Wasm边界检查引用的有效性</li>
+</ol>
+<p>但正如CVE-2026-6307所展示的，当V8引擎本身的JIT编译器存在类型混淆漏洞时，Wasm返回值可以被错误地解释为任意JS对象引用，从而绕过所有这些检查。这构成了一个更高级的攻击路径：<strong>不需要在Wasm内部精确伪造指针，而是利用引擎漏洞让deoptimizer自动完成类型混淆</strong>。</p>
+<h2>3. WALMA：机器学习驱动的内存完整性验证</h2>
+<h3>3.1 WALMA的核心思路</h3>
+<p>WALMA（WebAssembly Linear Memory Attestation）[arXiv:2603.24167]由Oussama Draissi等人提出，是一种基于机器学习的Wasm线性内存完整性验证框架。其核心洞察是：内存损坏事件和外部篡改在线性内存中留下可区分的结构性痕迹（structural artifacts），这些痕迹可以通过图像分类方法检测。</p>
+<p>WALMA将线性内存快照视为灰度图像：每个字节值（0-255）对应一个像素灰度值，内存按行对齐排列。编译后的代码在线性内存中强加的行对齐结构（row-aligned structure）形成了可学习的空间模式，而损坏会破坏这些模式。CNN能够捕获这些模式，而单纯的字节统计和纹理统计方法则会遗漏。</p>
+<p><strong>双向威胁模型：</strong></p>
+<p>WALMA的特别之处在于覆盖了双向威胁：</p>
+<ol>
+<li><strong>被攻破的Wasm模块攻击宿主</strong>：模块内部的内存损坏可能通过externref/共享内存影响宿主环境</li>
+<li><strong>恶意宿主篡改受信模块</strong>：在TEE（可信执行环境）部署场景中，不可信的宿主可能直接修改Wasm模块的线性内存状态</li>
+</ol>
+<h3>3.2 技术架构</h3>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────┐
+│  Wasm Runtime                                               │
+│  ┌────────────────────────────────────────────────────────┐  │
+│  │           Linear Memory (单片线性内存)                  │  │
+│  │                                                        │  │
+│  │  Offset 0x00000: Data Segment (全局变量、常量)         │  │
+│  │  Offset 0x10000: Heap Region (malloc/emmalloc)          │  │
+│  │  Offset 0x3FFFF: Stack Region (软件栈，向下增长)       │  │
+│  │                                                        │  │
+│  │  字节值 [0x00-0xFF] 作为灰度像素                        │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │ 定期快照（Snapshot）              │
+│  ┌──────────────────────▼─────────────────────────────────┐  │
+│  │        Snapshot Classification (快照分类)               │  │
+│  │                                                        │  │
+│  │  输入: 灰度图像 (H x W)                                │  │
+│  │  模型: CNN (卷积神经网络)                                │  │
+│  │  输出: Normal / Corrupted                               │  │
+│  │                                                        │  │
+│  │  特征学习:                                              │  │
+│  │  - 行对齐结构模式（编译器强加的内存布局规律）           │  │
+│  │  - 堆元数据的空间分布（chunk header、free list）        │  │
+│  │  - 数据段的初始化模式                                   │  │
+│  │  - 损坏引入的异常空间模式                               │  │
+│  └──────────────────────┬─────────────────────────────────┘  │
+│                         │                                   │
+│  ┌──────────────────────▼─────────────────────────────────┐  │
+│  │     Alert / Block / Recovery                            │  │
+│  │                                                        │  │
+│  │  - 检测到损坏 → 告警/阻止/回滚                          │  │
+│  │  - TEE部署: 在可信环境中验证，不受恶意宿主影响          │  │
+│  └────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>3.3 模型训练与分类</h3>
+<p><strong>正常快照的特征：</strong></p>
+<ul>
+<li>数据段：编译时确定的初始值模式，包含对齐的常量池、字符串字面量、已初始化的全局变量</li>
+<li>堆区域：由内存分配器管理的结构化模式。dlmalloc的chunk header（<code>prev_size</code> + <code>size</code> + flags）形成规律的空间周期。已分配区域包含应用程序数据，空闲区域包含free list指针</li>
+<li>栈区域：函数调用产生的局部变量和保存的帧指针，形成与调用深度相关的模式</li>
+<li>空闲区域：通常填充为零或未初始化值</li>
+</ul>
+<p>这些区域在图像表示中形成<strong>可学习的空间结构</strong>——CNN的卷积核可以捕获局部模式（如chunk header的固定格式），而池化层和全连接层可以学习全局布局特征。</p>
+<p><strong>损坏快照的特征：</strong></p>
+<ul>
+<li>堆溢出：超出分配边界的写入破坏相邻chunk的header，产生异常的字节模式</li>
+<li>栈溢出：覆盖保存的栈指针导致栈区域的数据混乱</li>
+<li>外部篡改：恶意宿主直接修改内存特定区域，引入不符合编译器布局规律的异常值</li>
+<li>类型混淆：错误解释的数据导致不一致的内存访问模式</li>
+</ul>
+<p><strong>分类精度与开销：</strong></p>
+<p>根据论文实验数据，在WABench套件的53个二进制上：</p>
+<ul>
+<li>检测开销：1.07x - 1.69x（即运行时间增加7%到69%）</li>
+<li>隐藏损坏的难度：需要在真实目标上覆盖数百KB到MB级别的内存才能逃避检测</li>
+<li>Shannon熵分析表明，良性行为的内存熵为异常检测提供了有效的先验边界</li>
+</ul>
+<p><strong>WALMA的关键创新——将内存视为图像：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># WALMA的核心概念（伪代码，非论文原始实现）</span>
+<span class="c1"># 将Wasm线性内存快照转换为灰度图像供CNN分类</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">memory_to_image</span><span class="p">(</span><span class="n">memory_snapshot</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">width</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">256</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">np</span><span class="o">.</span><span class="n">ndarray</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    将线性内存快照转换为灰度图像</span>
+<span class="sd">    每个字节 [0x00, 0xFF] 对应一个像素的灰度值</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">height</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">memory_snapshot</span><span class="p">)</span> <span class="o">//</span> <span class="n">width</span>
+    <span class="n">image</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">frombuffer</span><span class="p">(</span><span class="n">memory_snapshot</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">uint8</span><span class="p">)</span>
+    <span class="n">image</span> <span class="o">=</span> <span class="n">image</span><span class="p">[:</span><span class="n">height</span> <span class="o">*</span> <span class="n">width</span><span class="p">]</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">height</span><span class="p">,</span> <span class="n">width</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">image</span>
+
+<span class="c1"># CNN分类器架构概念</span>
+<span class="c1"># Input: (H, W, 1) 灰度图像</span>
+<span class="c1"># Conv2D(32, 3x3) -&gt; ReLU -&gt; MaxPool2D</span>
+<span class="c1"># Conv2D(64, 3x3) -&gt; ReLU -&gt; MaxPool2D</span>
+<span class="c1"># Conv2D(128, 3x3) -&gt; ReLU -&gt; GlobalAvgPool</span>
+<span class="c1"># Dense(128) -&gt; ReLU -&gt; Dense(2) [Normal, Corrupted]</span>
+<span class="c1"># Output: binary classification</span>
+</code></pre></div>
+
+<p><strong>为什么CNN能检测内存损坏？</strong> 编译后的代码在线性内存中强加了高度结构化的布局：对齐的堆块、固定格式的元数据、初始化模式的规律性。这些结构在灰度图像中表现为可学习的空间模式。损坏——无论是来自溢出还是外部篡改——都会破坏这些模式，产生CNN可以捕获的异常空间特征。论文强调，简单的字节值统计和纹理统计无法达到相同的检测效果，因为它们丢失了空间位置信息。</p>
+<h3>3.4 与传统防御的对比</h3>
+<table>
+<thead>
+<tr>
+<th>防御方案</th>
+<th>侵入性</th>
+<th>运行时开销</th>
+<th>检测能力</th>
+<th>适用威胁模型</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>V8边界检查</td>
+<td>低</td>
+<td>低（硬件级）</td>
+<td>预防越界</td>
+<td>越界读写</td>
+</tr>
+<tr>
+<td>浏览器沙箱</td>
+<td>低</td>
+<td>低</td>
+<td>隔离</td>
+<td>限制攻击范围</td>
+</tr>
+<tr>
+<td>二进制插桩（ASAN/MSAN）</td>
+<td>高</td>
+<td>高（2-3x）</td>
+<td>精确定位</td>
+<td>编译时已知漏洞模式</td>
+</tr>
+<tr>
+<td>自定义运行时</td>
+<td>高</td>
+<td>中-高</td>
+<td>依赖实现</td>
+<td>特定场景</td>
+</tr>
+<tr>
+<td>内存安全语言（Rust）</td>
+<td>高（重写）</td>
+<td>低</td>
+<td>预防内存安全漏洞</td>
+<td>新项目</td>
+</tr>
+<tr>
+<td><strong>WALMA</strong></td>
+<td><strong>低</strong></td>
+<td><strong>中（1.07x-1.69x）</strong></td>
+<td><strong>检测损坏+外部篡改</strong></td>
+<td><strong>运行时完整性验证</strong></td>
+</tr>
+</tbody>
+</table>
+<p>WALMA的核心优势在于其<strong>非侵入性</strong>和<strong>运行时无关性</strong>（runtime-agnostic）：不需要修改Wasm二进制本身，不需要自定义运行时，可以在宿主边界或TEE内部部署。它将执行与验证解耦（decouples execution from verification），使其可以覆盖传统防御无法处理的威胁模型——特别是恶意宿主对受信模块的篡改。</p>
+<p><strong>WALMA的局限性：</strong></p>
+<ul>
+<li>检测延迟：快照是周期性采集的，两次快照之间的瞬时损坏可能被遗漏</li>
+<li>误报风险：正常程序的特定执行路径可能产生异常但合法的内存模式</li>
+<li>隐藏成本：论文指出，攻击者需要覆盖大范围内存才能逃避检测，但这并不意味着不可能</li>
+<li>模型泛化：在不同编译器和优化级别下训练的模型可能需要重新校准</li>
+</ul>
+<h2>4. CVE-2026-6307 Longinus：V8沙箱逃逸深度分析</h2>
+<h3>4.1 漏洞概述</h3>
+<p>CVE-2026-6307（代号Longinus）由Nebula Security的Vega发现，是V8 JIT编译器（TurboFan/Turboshaft）中的一个类型混淆漏洞。该漏洞的独特之处在于：<strong>一个bug同时穿透两个安全边界</strong>——Chrome渲染进程沙箱和V8堆沙箱——实现完整的远程代码执行。</p>
+<ul>
+<li><strong>影响版本</strong>：Chrome 106至Chrome 146.0.7680.165</li>
+<li><strong>修复版本</strong>：Chrome 147.0.7727.101</li>
+<li><strong>漏洞存在时间</strong>：约4年（从Chrome 106引入至2026年6月修复）</li>
+<li><strong>CVSS评分</strong>：Critical</li>
+<li><strong>发现者</strong>：Vega (Nebula Security)</li>
+</ul>
+<p>该漏洞允许攻击者：
+1. 以100%成功率获得任意内存读写原语，无需任何堆喷射（heap spray）技巧
+2. 单独实现V8堆沙箱逃逸，无需配合其他漏洞
+3. 最终在渲染进程沙箱内实现RCE</p>
+<h3>4.2 技术原理</h3>
+<p>漏洞根源在于TurboFan编译器的全局值编号（Global Value Numbering, GVN）对<code>FrameState</code>节点的错误合并。</p>
+<p><strong>漏洞触发路径：</strong></p>
+<ol>
+<li>
+<p><strong>JS-to-Wasm调用内联</strong>：TurboFan将JavaScript到WebAssembly的调用包装器内联到优化图（Sea of Nodes）中。包装器的签名由Wasm函数的<code>CanonicalSig</code>决定</p>
+</li>
+<li>
+<p><strong>双重内联路径</strong>：当同一JS函数通过不同的对象形状（shape）调用Wasm函数时，优化图中可以存在两条内联路径。例如，通过属性getter间接调用两个不同签名的Wasm函数</p>
+</li>
+<li>
+<p><strong>FrameState合并错误</strong>：两条路径各自创建<code>kJSToWasmBuiltinContinuation</code>类型的<code>FrameState</code>节点。GVN的等值比较未正确区分具有不同<code>JSToWasmFrameStateFunctionInfo::signature()</code>的FrameState，将它们错误地合并</p>
+</li>
+<li>
+<p><strong>类型混淆触发</strong>：当lazy deoptimization发生时，deoptimizer从被合并的FrameState中读取Wasm返回类型。由于合并，可能使用了错误的返回类型（如<code>i64</code>而非<code>externref</code>）来物化返回值</p>
+</li>
+</ol>
+<p><strong>核心漏洞代码路径：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// V8 deoptimizer中物化Wasm返回值的逻辑</span>
+<span class="c1">// 文件: src/deoptimizer/deoptimizer.cc</span>
+<span class="n">TranslatedValue</span><span class="w"> </span><span class="nf">Deoptimizer::TranslatedValueForWasmReturnKind</span><span class="p">(</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">optional</span><span class="o">&lt;</span><span class="n">wasm</span><span class="o">::</span><span class="n">ValueKind</span><span class="o">&gt;</span><span class="w"> </span><span class="n">wasm_call_return_kind</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">wasm_call_return_kind</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">switch</span><span class="w"> </span><span class="p">(</span><span class="n">wasm_call_return_kind</span><span class="p">.</span><span class="n">value</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="k">case</span><span class="w"> </span><span class="no">wasm</span><span class="o">::</span><span class="no">kI64</span><span class="p">:</span>
+<span class="w">        </span><span class="c1">// 将返回寄存器的64位值解释为 int64_t，装箱为 BigInt</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">TranslatedValue</span><span class="o">::</span><span class="n">NewInt64ToBigInt</span><span class="p">(</span>
+<span class="w">            </span><span class="o">&amp;</span><span class="n">translated_state_</span><span class="p">,</span>
+<span class="w">            </span><span class="k">static_cast</span><span class="o">&lt;</span><span class="kt">int64_t</span><span class="o">&gt;</span><span class="p">(</span><span class="n">input_</span><span class="o">-&gt;</span><span class="n">GetRegister</span><span class="p">(</span><span class="n">kReturnRegister0</span><span class="p">.</span><span class="n">code</span><span class="p">())));</span>
+<span class="w">      </span><span class="k">case</span><span class="w"> </span><span class="no">wasm</span><span class="o">::</span><span class="no">kRefNull</span><span class="p">:</span>
+<span class="w">      </span><span class="k">case</span><span class="w"> </span><span class="no">wasm</span><span class="o">::</span><span class="no">kRef</span><span class="p">:</span>
+<span class="w">        </span><span class="c1">// 将返回寄存器的64位值解释为 Tagged&lt;Object&gt;，作为JS对象引用</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">TranslatedValue</span><span class="o">::</span><span class="n">NewTagged</span><span class="p">(</span>
+<span class="w">            </span><span class="o">&amp;</span><span class="n">translated_state_</span><span class="p">,</span>
+<span class="w">            </span><span class="n">Tagged</span><span class="o">&lt;</span><span class="n">Object</span><span class="o">&gt;</span><span class="p">(</span><span class="n">input_</span><span class="o">-&gt;</span><span class="n">GetRegister</span><span class="p">(</span><span class="n">kReturnRegister0</span><span class="p">.</span><span class="n">code</span><span class="p">())));</span>
+<span class="w">      </span><span class="c1">// ...</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>关键点</strong>：<code>kI64</code>和<code>kRef</code>/<code>kRefNull</code>都从同一个返回寄存器<code>kReturnRegister0</code>读取值。区别仅在于如何解释这64位：</p>
+<ul>
+<li><code>kI64</code>：<code>int64_t</code> -&gt; <code>BigInt</code>（数值解释）</li>
+<li><code>kRef</code>：<code>Tagged&lt;Object&gt;</code> -&gt; JS对象引用（指针解释）</li>
+</ul>
+<p>当FrameState被错误合并后，一个返回<code>externref</code>的Wasm函数的返回值可能被当作<code>i64</code>处理（泄露完整的64位tagged pointer作为BigInt），或者反过来，一个返回<code>i64</code>的函数的返回值可能被当作对象引用处理（实现<code>fakeobj</code>原语）。</p>
+<h3>4.3 攻击链分析</h3>
+<div class="highlight"><pre><span></span><code><span class="nx">完整攻击链</span><span class="err">：</span>
+
+<span class="mi">1</span><span class="p">.</span><span class="w"> </span><span class="nx">准备阶段</span>
+<span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="nx">创建两个Wasm模块</span><span class="err">，</span><span class="nx">分别导出</span><span class="w"> </span><span class="p">(</span><span class="nx">result</span><span class="w"> </span><span class="kt">i64</span><span class="p">)</span><span class="w"> </span><span class="nx">和</span><span class="w"> </span><span class="p">(</span><span class="nx">result</span><span class="w"> </span><span class="nx">externref</span><span class="p">)</span><span class="w"> </span><span class="nx">的函数</span>
+<span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="nx">通过属性getter间接调用</span><span class="err">，</span><span class="nx">让TurboFan内联两条路径</span>
+<span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="nx">触发TurboFan优化编译</span><span class="err">，</span><span class="nx">生成包含错误合并FrameState的机器码</span>
+
+<span class="mi">2</span><span class="p">.</span><span class="w"> </span><span class="nx">触发类型混淆</span>
+<span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="nx">强制lazy</span><span class="w"> </span><span class="nx">deoptimization</span><span class="err">（</span><span class="nx">使优化代码被标记为需要deopt</span><span class="err">）</span>
+<span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="nx">Deoptimizer使用错误的FrameState</span>
+<span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="nx">返回</span><span class="w"> </span><span class="nx">externref</span><span class="w"> </span><span class="nx">的函数被当作</span><span class="w"> </span><span class="kt">i64</span><span class="w"> </span><span class="nx">处理</span>
+<span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="nx">addrof</span><span class="w"> </span><span class="nx">原语</span><span class="err">：</span><span class="nx">获取任意JS对象的内部指针</span><span class="err">（</span><span class="nx">作为BigInt泄露</span><span class="err">）</span>
+<span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="nx">返回</span><span class="w"> </span><span class="kt">i64</span><span class="w"> </span><span class="nx">的函数被当作</span><span class="w"> </span><span class="nx">externref</span><span class="w"> </span><span class="nx">处理</span>
+<span class="w">       </span><span class="err">└──</span><span class="w"> </span><span class="nx">fakeobj</span><span class="w"> </span><span class="nx">原语</span><span class="err">：</span><span class="nx">将任意64位值包装为JS对象引用</span>
+
+<span class="mi">3</span><span class="p">.</span><span class="w"> </span><span class="nx">V8堆沙箱内操作</span>
+<span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="nx">addrof</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">fakeobj</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nx">任意地址读写原语</span><span class="err">（</span><span class="nx">在沙箱内</span><span class="err">）</span>
+<span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="nx">读取V8内部对象</span><span class="err">（</span><span class="nx">Map</span><span class="err">、</span><span class="nx">JSArrayBuffer等</span><span class="err">）</span><span class="nx">的元数据</span>
+<span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="nx">构造任意地址读写的高层抽象</span><span class="err">（</span><span class="nx">TypedArray</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">fake</span><span class="w"> </span><span class="nx">backing</span><span class="w"> </span><span class="nx">store</span><span class="err">）</span>
+<span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="nx">定位V8堆沙箱外的目标</span><span class="err">（</span><span class="nx">JIT代码页</span><span class="err">、</span><span class="nx">外部指针表</span><span class="err">）</span>
+
+<span class="mi">4</span><span class="p">.</span><span class="w"> </span><span class="nx">沙箱逃逸</span>
+<span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="nx">利用V8外部指针</span><span class="err">（</span><span class="kd">external</span><span class="w"> </span><span class="nx">pointer</span><span class="err">）</span><span class="nx">机制</span>
+<span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="nx">通过沙箱内的任意写修改JIT代码页的元数据</span>
+<span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="nx">将shellcode写入JIT代码区域</span><span class="err">（</span><span class="nx">JIT页面是RWX的</span><span class="err">）</span>
+<span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="nx">跳转到JIT代码执行</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nx">渲染进程内RCE</span>
+
+<span class="mi">5</span><span class="p">.</span><span class="w"> </span><span class="nx">后渗透</span><span class="err">（</span><span class="nx">取决于漏洞利用目标</span><span class="err">）</span>
+<span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="nx">配合Chromium其他漏洞或利用OS层面的漏洞进一步提权</span>
+</code></pre></div>
+
+<p><strong>addrof原语实现（概念演示）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// addrof_concept.js - 概念演示，非完整exploit</span>
+<span class="c1">// 仅展示addrof原语的原理，省略触发deopt的完整setup</span>
+
+<span class="c1">// 假设已通过Longinus漏洞实现了类型混淆</span>
+<span class="c1">// 当返回externref的Wasm函数被错误地当作i64处理时：</span>
+
+<span class="c1">// Wasm函数返回一个JS对象引用 (externref)</span>
+<span class="c1">// Deoptimizer将其解释为 int64_t 并装箱为 BigInt</span>
+<span class="c1">// 这个BigInt的数值就是对象的tagged pointer</span>
+
+<span class="kd">function</span><span class="w"> </span><span class="nx">conceptAddrof</span><span class="p">(</span><span class="nx">targetObj</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 调用被错误合并的Wasm函数路径</span>
+<span class="w">    </span><span class="c1">// Wasm函数内部: return targetObj;  (externref)</span>
+<span class="w">    </span><span class="c1">// Deoptimizer看到: return kind = i64</span>
+<span class="w">    </span><span class="c1">// 结果: BigInt(targetObj的tagged pointer)</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="nx">leaked</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">callConfusedWasmFunction</span><span class="p">(</span><span class="nx">targetObj</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// leaked 是一个 BigInt，其位模式等于 targetObj 的 V8 堆指针</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">leaked</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kd">function</span><span class="w"> </span><span class="nx">conceptFakeobj</span><span class="p">(</span><span class="nx">addr</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 调用返回i64的Wasm函数，但deoptimizer认为是externref</span>
+<span class="w">    </span><span class="c1">// Wasm函数内部: return addr;  (i64)</span>
+<span class="w">    </span><span class="c1">// Deoptimizer看到: return kind = externref</span>
+<span class="w">    </span><span class="c1">// 结果: 将addr作为Tagged&lt;Object&gt;返回</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="nx">fake</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">callConfusedWasmFunction</span><span class="p">(</span><span class="nb">BigInt</span><span class="p">(</span><span class="nx">addr</span><span class="p">));</span>
+<span class="w">    </span><span class="c1">// fake 被JS引擎当作一个有效的对象引用</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">fake</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>从沙箱内到沙箱外：</strong></p>
+<p>V8堆沙箱将所有堆指针限制在一个特定的虚拟地址范围内。Longinus的独特价值在于，它不仅能获得沙箱内的任意读写，还能单独实现沙箱逃逸。核心路径是通过修改JIT代码页的元数据。V8的JIT代码存储在RWX（可读可写可执行）的内存页中，但这些页面的地址存储在外部指针表中。通过沙箱内的任意写，攻击者可以篡改这些外部指针，将控制流重定向到攻击者控制的JIT代码区域。</p>
+<p>值得注意的是，stratan的分析展示了另一种沙箱逃逸路径：通过实验性的WasmFX（栈切换提案）中的continuation类型混淆。WasmFX的<code>resume</code>指令从<code>StackMemory</code>结构中读取参数缓冲区地址，而该结构通过<code>WasmStackObject</code>的外部指针在V8堆中引用。如果攻击者能够篡改continuation的签名信息，就可以让<code>resume</code>使用错误的参数布局，从而实现沙箱外读写。</p>
+<h3>4.4 修复方案</h3>
+<p>Google在Chrome 147.0.7727.101中修复了该漏洞。修复的核心是确保TurboFan/Turboshaft的GVN在比较<code>FrameState</code>节点时，正确包含<code>JSToWasmFrameStateFunctionInfo</code>中的Wasm签名信息。具体而言，FrameState的等值比较必须将<code>CanonicalSig</code>的差异纳入考量，防止具有不同Wasm返回类型的去优化状态被错误合并。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 修复要点（概念）</span>
+<span class="c1">// FrameState等值比较必须包含Wasm签名</span>
+<span class="kt">bool</span><span class="w"> </span><span class="nf">JSToWasmFrameStateFunctionInfo::Equals</span><span class="p">(</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">FrameStateFunctionInfo</span><span class="o">&amp;</span><span class="w"> </span><span class="n">other</span><span class="p">)</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="c1">// 修复前：可能只比较了bailout_id等通用字段</span>
+<span class="w">  </span><span class="c1">// 修复后：必须比较signature()</span>
+<span class="w">  </span><span class="k">auto</span><span class="o">&amp;</span><span class="w"> </span><span class="n">o</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">static_cast</span><span class="o">&lt;</span><span class="k">const</span><span class="w"> </span><span class="n">JSToWasmFrameStateFunctionInfo</span><span class="o">&amp;&gt;</span><span class="p">(</span><span class="n">other</span><span class="p">);</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="n">signature</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">o</span><span class="p">.</span><span class="n">signature</span><span class="p">()</span><span class="w">  </span><span class="c1">// 关键：比较Wasm签名</span>
+<span class="w">      </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">FrameStateFunctionInfo</span><span class="o">::</span><span class="n">Equals</span><span class="p">(</span><span class="n">other</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h2>5. 防御体系：从编译到运行时</h2>
+<h3>5.1 编译期防御</h3>
+<p><strong>Rust + Wasm：所有权系统保证内存安全</strong></p>
+<p>Rust编译为Wasm时，其所有权系统和借用检查器在编译期消除了大部分内存安全漏洞：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// safe_wasm.rs - Rust编译为Wasm的安全实践</span>
+<span class="k">use</span><span class="w"> </span><span class="n">wasm_bindgen</span><span class="p">::</span><span class="n">prelude</span><span class="p">::</span><span class="o">*</span><span class="p">;</span>
+
+<span class="cp">#[wasm_bindgen]</span>
+<span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">SafeBuffer</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">data</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">u8</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="cp">#[wasm_bindgen]</span>
+<span class="k">impl</span><span class="w"> </span><span class="n">SafeBuffer</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[wasm_bindgen(constructor)]</span>
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">new</span><span class="p">(</span><span class="n">size</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nc">Self</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// Rust的Vec在堆上分配，边界检查由编译器保证</span>
+<span class="w">        </span><span class="n">SafeBuffer</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">data</span><span class="p">:</span><span class="w"> </span><span class="nc">vec</span><span class="o">!</span><span class="p">[</span><span class="mi">0</span><span class="k">u8</span><span class="p">;</span><span class="w"> </span><span class="n">size</span><span class="p">],</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">copy_from</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">src</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">])</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="nb">String</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// Rust的切片边界检查：如果src.len() &gt; self.data.len()</span>
+<span class="w">        </span><span class="c1">// 运行时panic，不会发生内存损坏</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="n">src</span><span class="p">.</span><span class="n">len</span><span class="p">()</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">data</span><span class="p">.</span><span class="n">len</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="nb">Err</span><span class="p">(</span><span class="s">&quot;Source buffer too large&quot;</span><span class="p">.</span><span class="n">to_string</span><span class="p">());</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="bp">self</span><span class="p">.</span><span class="n">data</span><span class="p">[</span><span class="o">..</span><span class="n">src</span><span class="p">.</span><span class="n">len</span><span class="p">()].</span><span class="n">copy_from_slice</span><span class="p">(</span><span class="n">src</span><span class="p">);</span>
+<span class="w">        </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">pub</span><span class="w"> </span><span class="k">fn</span><span class="w"> </span><span class="nf">get</span><span class="p">(</span><span class="o">&amp;</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">index</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="kt">u8</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 边界检查由Rust编译器自动插入</span>
+<span class="w">        </span><span class="bp">self</span><span class="p">.</span><span class="n">data</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="n">index</span><span class="p">).</span><span class="n">copied</span><span class="p">()</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>Rust编译为Wasm后，所有的边界检查都被编译为Wasm的<code>if</code>指令和<code>trap</code>指令。虽然这引入了少量运行时开销，但从根本上消除了缓冲区溢出的可能性。</p>
+<p><strong>编译器安全选项：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># emscripten编译安全选项对比</span>
+
+<span class="c1"># -O0: 无优化，保留所有边界检查，但代码体积大、速度慢</span>
+emcc<span class="w"> </span>vulnerable.c<span class="w"> </span>-O0<span class="w"> </span>-s<span class="w"> </span><span class="nv">WASM</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>-s<span class="w"> </span><span class="nv">SAFE_HEAP</span><span class="o">=</span><span class="m">1</span>
+<span class="c1"># SAFE_HEAP=1: 额外插入运行时堆检查（性能影响显著）</span>
+
+<span class="c1"># -O2: 激进优化，可能移除部分冗余边界检查</span>
+<span class="c1"># 但Wasm的memory访问边界检查由引擎保证，不会被移除</span>
+emcc<span class="w"> </span>vulnerable.c<span class="w"> </span>-O2<span class="w"> </span>-s<span class="w"> </span><span class="nv">WASM</span><span class="o">=</span><span class="m">1</span>
+
+<span class="c1"># -O2 + 边界检查硬化</span>
+emcc<span class="w"> </span>vulnerable.c<span class="w"> </span>-O2<span class="w"> </span>-s<span class="w"> </span><span class="nv">WASM</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>-s<span class="w"> </span><span class="nv">BOUNDS_CHECK</span><span class="o">=</span><span class="m">1</span>
+
+<span class="c1"># 使用address sanitizer（编译到Wasm时开销极高）</span>
+emcc<span class="w"> </span>vulnerable.c<span class="w"> </span>-O0<span class="w"> </span>-s<span class="w"> </span><span class="nv">WASM</span><span class="o">=</span><span class="m">1</span><span class="w"> </span>-fsanitize<span class="o">=</span>address
+</code></pre></div>
+
+<p><strong>Wasm GC提案：</strong></p>
+<p>Wasm GC（Garbage Collection）提案引入了结构体类型和数组类型，由引擎管理其内存布局和生命周期。这从根本上消除了手动内存管理带来的UAF和double-free漏洞：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">;; Wasm GC提案：引擎管理的结构体</span>
+<span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">type</span> <span class="nv">$point</span> <span class="p">(</span><span class="err">struct</span>
+    <span class="p">(</span><span class="err">field</span> <span class="nv">$x</span> <span class="kt">f64</span><span class="p">)</span>
+    <span class="p">(</span><span class="err">field</span> <span class="nv">$y</span> <span class="kt">f64</span><span class="p">)</span>
+  <span class="p">))</span>
+
+  <span class="p">(</span><span class="k">type</span> <span class="nv">$rect</span> <span class="p">(</span><span class="err">struct</span>
+    <span class="p">(</span><span class="err">field</span> <span class="nv">$origin</span> <span class="p">(</span><span class="err">ref</span> <span class="nv">$point</span><span class="p">))</span>
+    <span class="p">(</span><span class="err">field</span> <span class="nv">$width</span> <span class="kt">f64</span><span class="p">)</span>
+    <span class="p">(</span><span class="err">field</span> <span class="nv">$height</span> <span class="kt">f64</span><span class="p">)</span>
+  <span class="p">))</span>
+
+  <span class="c1">;; struct.new 在GC管理的堆上分配</span>
+  <span class="c1">;; 不需要手动free，GC自动回收</span>
+  <span class="c1">;; 字段访问由引擎保证类型安全和边界安全</span>
+  <span class="p">(</span><span class="k">func</span> <span class="p">(</span><span class="k">export</span> <span class="s2">&quot;make_rect&quot;</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="p">(</span><span class="err">ref</span> <span class="nv">$rect</span><span class="p">))</span>
+    <span class="p">(</span><span class="err">struct.new</span> <span class="nv">$rect</span>
+      <span class="p">(</span><span class="err">struct.new</span> <span class="nv">$point</span> <span class="p">(</span><span class="nb">f64.const</span> <span class="mf">0.0</span><span class="p">)</span> <span class="p">(</span><span class="nb">f64.const</span> <span class="mf">0.0</span><span class="p">))</span>
+      <span class="p">(</span><span class="nb">f64.const</span> <span class="mf">100</span><span class="err">.</span><span class="mi">0</span><span class="p">)</span>
+      <span class="p">(</span><span class="nb">f64.const</span> <span class="mf">200</span><span class="err">.</span><span class="mi">0</span><span class="p">)</span>
+    <span class="p">)</span>
+  <span class="p">)</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<h3>5.2 运行时防御</h3>
+<p><strong>V8边界检查的实现机制：</strong></p>
+<p>V8在执行Wasm内存访问时，对每条load/store指令进行边界验证。在Liftoff（基线编译器）中，这体现为显式的比较和条件trap指令。在TurboFan（优化编译器）中，编译器尝试通过范围分析（range analysis）消除冗余检查，但保证安全性——未证明安全的访问始终保留检查。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">;; V8生成的边界检查（概念层面）</span>
+<span class="c1">;; 原始: i32.load offset=0 (i32.add (local.get $ptr) (i32.const 4))</span>
+
+<span class="c1">;; Liftoff基线编译器生成（伪汇编）：</span>
+<span class="c1">;;   cmp ptr+4, memory_size * 64KB</span>
+<span class="c1">;;   if &gt;=: trap (out of bounds)</span>
+<span class="c1">;;   load [memory + ptr + 4]</span>
+
+<span class="c1">;; TurboFan优化编译器可能消除检查（如果ptr的范围已知安全）：</span>
+<span class="c1">;;   range analysis: ptr in [0, 100), access_size=4, memory_size=1 page</span>
+<span class="c1">;;   → 100+4 &lt; 65536, check eliminated</span>
+<span class="c1">;;   load [memory + ptr + 4]</span>
+</code></pre></div>
+
+<p><strong>浏览器沙箱的安全边界：</strong></p>
+<p>Chrome的多层沙箱架构：</p>
+<ol>
+<li><strong>Site Isolation</strong>：不同站点在不同的渲染进程中运行</li>
+<li><strong>Renderer Sandbox</strong>：渲染进程运行在受限的环境中（seccomp-bpf过滤、namespace隔离、挂载命名空间）</li>
+<li><strong>V8 Heap Sandbox</strong>：即使攻击者在渲染进程内获得任意读写，V8堆沙箱将可访问的内存限制在V8堆的特定区域</li>
+</ol>
+<p>Longinus证明了第3层可以被穿透。第2层的逃逸通常需要额外的漏洞（如mojo IPC漏洞或系统调用漏洞）。</p>
+<p><strong>内存访问监控：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 运行时内存监控示例（教学演示）</span>
+<span class="kd">class</span><span class="w"> </span><span class="nx">WasmMemoryMonitor</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kr">constructor</span><span class="p">(</span><span class="nx">memory</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">this</span><span class="p">.</span><span class="nx">memory</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">memory</span><span class="p">;</span>
+<span class="w">        </span><span class="k">this</span><span class="p">.</span><span class="nx">originalGrow</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">memory</span><span class="p">.</span><span class="nx">grow</span><span class="p">.</span><span class="nx">bind</span><span class="p">(</span><span class="nx">memory</span><span class="p">);</span>
+<span class="w">        </span><span class="k">this</span><span class="p">.</span><span class="nx">growHistory</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[];</span>
+<span class="w">        </span><span class="k">this</span><span class="p">.</span><span class="nx">accessLog</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[];</span>
+
+<span class="w">        </span><span class="c1">// 包装memory.grow以检测异常模式</span>
+<span class="w">        </span><span class="nx">memory</span><span class="p">.</span><span class="nx">grow</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="nx">delta</span><span class="p">)</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="kd">const</span><span class="w"> </span><span class="nx">timestamp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">performance</span><span class="p">.</span><span class="nx">now</span><span class="p">();</span>
+<span class="w">            </span><span class="k">this</span><span class="p">.</span><span class="nx">growHistory</span><span class="p">.</span><span class="nx">push</span><span class="p">({</span><span class="w"> </span><span class="nx">delta</span><span class="p">,</span><span class="w"> </span><span class="nx">timestamp</span><span class="w"> </span><span class="p">});</span>
+
+<span class="w">            </span><span class="c1">// 检测异常频繁的内存增长</span>
+<span class="w">            </span><span class="kd">const</span><span class="w"> </span><span class="nx">recent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">this</span><span class="p">.</span><span class="nx">growHistory</span><span class="p">.</span><span class="nx">filter</span><span class="p">(</span>
+<span class="w">                </span><span class="nx">e</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="nx">timestamp</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nx">e</span><span class="p">.</span><span class="nx">timestamp</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">1000</span>
+<span class="w">            </span><span class="p">);</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">recent</span><span class="p">.</span><span class="nx">length</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mf">10</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="nx">console</span><span class="p">.</span><span class="nx">warn</span><span class="p">(</span><span class="s1">&#39;[SECURITY] Suspicious memory growth pattern detected&#39;</span><span class="p">);</span>
+<span class="w">                </span><span class="nx">console</span><span class="p">.</span><span class="nx">warn</span><span class="p">(</span><span class="sb">`  </span><span class="si">${</span><span class="nx">recent</span><span class="p">.</span><span class="nx">length</span><span class="si">}</span><span class="sb"> grow calls in last 1s`</span><span class="p">);</span>
+<span class="w">                </span><span class="nx">console</span><span class="p">.</span><span class="nx">warn</span><span class="p">(</span><span class="sb">`  Total delta: </span><span class="si">${</span><span class="nx">recent</span><span class="p">.</span><span class="nx">reduce</span><span class="p">((</span><span class="nx">s</span><span class="p">,</span><span class="w"> </span><span class="nx">e</span><span class="p">)</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="nx">s</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">e</span><span class="p">.</span><span class="nx">delta</span><span class="p">,</span><span class="w"> </span><span class="mf">0</span><span class="p">)</span><span class="si">}</span><span class="sb"> pages`</span><span class="p">);</span>
+<span class="w">            </span><span class="p">}</span>
+
+<span class="w">            </span><span class="c1">// 检测单次异常大的增长</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">delta</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mf">100</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="nx">console</span><span class="p">.</span><span class="nx">warn</span><span class="p">(</span><span class="sb">`[SECURITY] Large memory growth: </span><span class="si">${</span><span class="nx">delta</span><span class="si">}</span><span class="sb"> pages (</span><span class="si">${</span><span class="nx">delta</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">64</span><span class="si">}</span><span class="sb">KB)`</span><span class="p">);</span>
+<span class="w">            </span><span class="p">}</span>
+
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="k">this</span><span class="p">.</span><span class="nx">originalGrow</span><span class="p">(</span><span class="nx">delta</span><span class="p">);</span>
+<span class="w">        </span><span class="p">};</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 定期内存完整性快照（WALMA思路的简化版）</span>
+<span class="w">    </span><span class="nx">takeSnapshot</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">const</span><span class="w"> </span><span class="nx">buffer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nb">Uint8Array</span><span class="p">(</span><span class="k">this</span><span class="p">.</span><span class="nx">memory</span><span class="p">.</span><span class="nx">buffer</span><span class="p">);</span>
+<span class="w">        </span><span class="kd">const</span><span class="w"> </span><span class="nx">snapshot</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">timestamp</span><span class="o">:</span><span class="w"> </span><span class="nx">performance</span><span class="p">.</span><span class="nx">now</span><span class="p">(),</span>
+<span class="w">            </span><span class="nx">size</span><span class="o">:</span><span class="w"> </span><span class="nx">buffer</span><span class="p">.</span><span class="nx">length</span><span class="p">,</span>
+<span class="w">            </span><span class="c1">// 采样关键区域的统计特征</span>
+<span class="w">            </span><span class="nx">entropy</span><span class="o">:</span><span class="w"> </span><span class="k">this</span><span class="p">.</span><span class="nx">_calculateEntropy</span><span class="p">(</span><span class="nx">buffer</span><span class="p">),</span>
+<span class="w">            </span><span class="nx">zeroRatio</span><span class="o">:</span><span class="w"> </span><span class="k">this</span><span class="p">.</span><span class="nx">_calculateZeroRatio</span><span class="p">(</span><span class="nx">buffer</span><span class="p">),</span>
+<span class="w">            </span><span class="nx">checksum</span><span class="o">:</span><span class="w"> </span><span class="k">this</span><span class="p">.</span><span class="nx">_checksum</span><span class="p">(</span><span class="nx">buffer</span><span class="p">),</span>
+<span class="w">        </span><span class="p">};</span>
+<span class="w">        </span><span class="k">this</span><span class="p">.</span><span class="nx">accessLog</span><span class="p">.</span><span class="nx">push</span><span class="p">(</span><span class="nx">snapshot</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">snapshot</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nx">_calculateEntropy</span><span class="p">(</span><span class="nx">data</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">const</span><span class="w"> </span><span class="nx">freq</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nb">Array</span><span class="p">(</span><span class="mf">256</span><span class="p">).</span><span class="nx">fill</span><span class="p">(</span><span class="mf">0</span><span class="p">);</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kd">let</span><span class="w"> </span><span class="nx">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0</span><span class="p">;</span><span class="w"> </span><span class="nx">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="nx">data</span><span class="p">.</span><span class="nx">length</span><span class="p">;</span><span class="w"> </span><span class="nx">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="nx">freq</span><span class="p">[</span><span class="nx">data</span><span class="p">[</span><span class="nx">i</span><span class="p">]]</span><span class="o">++</span><span class="p">;</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="nx">entropy</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0</span><span class="p">;</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kd">let</span><span class="w"> </span><span class="nx">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0</span><span class="p">;</span><span class="w"> </span><span class="nx">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">256</span><span class="p">;</span><span class="w"> </span><span class="nx">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">freq</span><span class="p">[</span><span class="nx">i</span><span class="p">]</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mf">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="kd">const</span><span class="w"> </span><span class="nx">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">freq</span><span class="p">[</span><span class="nx">i</span><span class="p">]</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="nx">data</span><span class="p">.</span><span class="nx">length</span><span class="p">;</span>
+<span class="w">                </span><span class="nx">entropy</span><span class="w"> </span><span class="o">-=</span><span class="w"> </span><span class="nx">p</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nb">Math</span><span class="p">.</span><span class="nx">log2</span><span class="p">(</span><span class="nx">p</span><span class="p">);</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">entropy</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nx">_calculateZeroRatio</span><span class="p">(</span><span class="nx">data</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="nx">zeros</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0</span><span class="p">;</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kd">let</span><span class="w"> </span><span class="nx">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0</span><span class="p">;</span><span class="w"> </span><span class="nx">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="nx">data</span><span class="p">.</span><span class="nx">length</span><span class="p">;</span><span class="w"> </span><span class="nx">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">data</span><span class="p">[</span><span class="nx">i</span><span class="p">]</span><span class="w"> </span><span class="o">===</span><span class="w"> </span><span class="mf">0</span><span class="p">)</span><span class="w"> </span><span class="nx">zeros</span><span class="o">++</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">zeros</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="nx">data</span><span class="p">.</span><span class="nx">length</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nx">_checksum</span><span class="p">(</span><span class="nx">data</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="nx">sum</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0</span><span class="p">;</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kd">let</span><span class="w"> </span><span class="nx">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0</span><span class="p">;</span><span class="w"> </span><span class="nx">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="nb">Math</span><span class="p">.</span><span class="nx">min</span><span class="p">(</span><span class="nx">data</span><span class="p">.</span><span class="nx">length</span><span class="p">,</span><span class="w"> </span><span class="mf">4096</span><span class="p">);</span><span class="w"> </span><span class="nx">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">sum</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="nx">sum</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">data</span><span class="p">[</span><span class="nx">i</span><span class="p">])</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0xFFFFFFFF</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">sum</span><span class="p">.</span><span class="nx">toString</span><span class="p">(</span><span class="mf">16</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c1">// 使用示例</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">memory</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nx">WebAssembly</span><span class="p">.</span><span class="nx">Memory</span><span class="p">({</span><span class="w"> </span><span class="nx">initial</span><span class="o">:</span><span class="w"> </span><span class="mf">256</span><span class="p">,</span><span class="w"> </span><span class="nx">maximum</span><span class="o">:</span><span class="w"> </span><span class="mf">1024</span><span class="w"> </span><span class="p">});</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">monitor</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nx">WasmMemoryMonitor</span><span class="p">(</span><span class="nx">memory</span><span class="p">);</span>
+
+<span class="c1">// 定期快照，检测内存状态变化</span>
+<span class="nx">setInterval</span><span class="p">(()</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">snap</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">monitor</span><span class="p">.</span><span class="nx">takeSnapshot</span><span class="p">();</span>
+<span class="w">    </span><span class="c1">// 将快照数据发送到分析服务</span>
+<span class="w">    </span><span class="c1">// WALMA使用CNN对这些快照进行分类</span>
+<span class="p">},</span><span class="w"> </span><span class="mf">5000</span><span class="p">);</span>
+</code></pre></div>
+
+<h3>5.3 最小权限原则</h3>
+<p><strong>最小化Wasm导出函数：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">;; 不安全：导出所有内部函数</span>
+<span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$internal_sort</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span> <span class="kt">i32</span><span class="p">)</span> <span class="err">...</span><span class="p">)</span>  <span class="c1">;; 内部排序</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$internal_hash</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span> <span class="err">...</span><span class="p">)</span>  <span class="c1">;; 内部哈希</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$do_work</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span> <span class="kt">i32</span><span class="p">)</span> <span class="err">...</span><span class="p">)</span>
+  <span class="p">(</span><span class="k">export</span> <span class="s2">&quot;sort&quot;</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$internal_sort</span><span class="p">))</span>   <span class="c1">;; 暴露内部实现</span>
+  <span class="p">(</span><span class="k">export</span> <span class="s2">&quot;hash&quot;</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$internal_hash</span><span class="p">))</span>   <span class="c1">;; 暴露内部实现</span>
+  <span class="p">(</span><span class="k">export</span> <span class="s2">&quot;do_work&quot;</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$do_work</span><span class="p">))</span>
+<span class="p">)</span>
+
+<span class="c1">;; 安全：仅导出必要的入口函数</span>
+<span class="p">(</span><span class="k">module</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$internal_sort</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span> <span class="kt">i32</span><span class="p">)</span> <span class="err">...</span><span class="p">)</span>  <span class="c1">;; 内部，不导出</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$internal_hash</span> <span class="p">(</span><span class="k">param</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span> <span class="err">...</span><span class="p">)</span>  <span class="c1">;; 内部，不导出</span>
+  <span class="p">(</span><span class="k">func</span> <span class="nv">$process</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$input</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">param</span> <span class="nv">$len</span> <span class="kt">i32</span><span class="p">)</span> <span class="p">(</span><span class="k">result</span> <span class="kt">i32</span><span class="p">)</span>
+    <span class="c1">;; 在内部调用sort和hash，但不暴露给JS</span>
+    <span class="p">(</span><span class="nb">call</span> <span class="nv">$internal_sort</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$input</span><span class="p">)</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$len</span><span class="p">))</span>
+    <span class="p">(</span><span class="nb">call</span> <span class="nv">$internal_hash</span> <span class="p">(</span><span class="nb">local.get</span> <span class="nv">$input</span><span class="p">))</span>
+  <span class="p">)</span>
+  <span class="p">(</span><span class="k">export</span> <span class="s2">&quot;process&quot;</span> <span class="p">(</span><span class="k">func</span> <span class="nv">$process</span><span class="p">))</span>  <span class="c1">;; 唯一入口</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p><strong>输入参数校验：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// safe_api.c - Wasm导出函数的输入校验</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;emscripten/emscripten.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;string.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdlib.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdint.h&gt;</span>
+
+<span class="cp">#define MAX_INPUT_SIZE 4096</span>
+<span class="cp">#define MIN_INPUT_SIZE 1</span>
+
+<span class="n">EMSCRIPTEN_KEEPALIVE</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">safe_process</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">uint8_t</span><span class="w"> </span><span class="o">*</span><span class="n">input</span><span class="p">,</span><span class="w"> </span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">len</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 1. 长度校验</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">len</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">MIN_INPUT_SIZE</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">len</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">MAX_INPUT_SIZE</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span><span class="w">  </span><span class="c1">// 拒绝异常输入</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 2. 内容校验（根据业务逻辑）</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">len</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">input</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mh">0x00</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w">  </span><span class="c1">// 示例：不允许空字节</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="mi">-2</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 3. 使用安全的内存操作</span>
+<span class="w">    </span><span class="kt">uint8_t</span><span class="w"> </span><span class="o">*</span><span class="n">buf</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">uint8_t</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">malloc</span><span class="p">(</span><span class="n">len</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">buf</span><span class="p">)</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">-3</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// memcpy的长度已经过校验，不会溢出</span>
+<span class="w">    </span><span class="n">memcpy</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="n">input</span><span class="p">,</span><span class="w"> </span><span class="n">len</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// ... 处理逻辑 ...</span>
+
+<span class="w">    </span><span class="n">free</span><span class="p">(</span><span class="n">buf</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>不信任Wasm模块内的任何数据：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// host_defense.js - 宿主侧的防御性编程</span>
+<span class="k">async</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="nx">loadWasmSafely</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">instance</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">await</span><span class="w"> </span><span class="nx">WebAssembly</span><span class="p">.</span><span class="nx">instantiateStreaming</span><span class="p">(</span>
+<span class="w">        </span><span class="nx">fetch</span><span class="p">(</span><span class="s1">&#39;untrusted-module.wasm&#39;</span><span class="p">),</span>
+<span class="w">        </span><span class="p">{</span><span class="w"> </span><span class="cm">/* imports */</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 1. 不信任Wasm返回的任何指针/偏移</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">resultOffset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">instance</span><span class="p">.</span><span class="nx">exports</span><span class="p">.</span><span class="nx">process</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">memory</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nb">Uint8Array</span><span class="p">(</span><span class="nx">instance</span><span class="p">.</span><span class="nx">exports</span><span class="p">.</span><span class="nx">mem</span><span class="p">.</span><span class="nx">buffer</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 2. 验证返回的偏移在合法范围内</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="ow">typeof</span><span class="w"> </span><span class="nx">resultOffset</span><span class="w"> </span><span class="o">!==</span><span class="w"> </span><span class="s1">&#39;number&#39;</span><span class="w"> </span><span class="o">||</span>
+<span class="w">        </span><span class="nx">resultOffset</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">0</span><span class="w"> </span><span class="o">||</span>
+<span class="w">        </span><span class="nx">resultOffset</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="nx">memory</span><span class="p">.</span><span class="nx">length</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">throw</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="ne">Error</span><span class="p">(</span><span class="s1">&#39;Wasm returned invalid offset&#39;</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 3. 读取返回数据时做长度限制</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">MAX_READ</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">1024</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">safeData</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">memory</span><span class="p">.</span><span class="nx">slice</span><span class="p">(</span><span class="nx">resultOffset</span><span class="p">,</span>
+<span class="w">        </span><span class="nb">Math</span><span class="p">.</span><span class="nx">min</span><span class="p">(</span><span class="nx">resultOffset</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">MAX_READ</span><span class="p">,</span><span class="w"> </span><span class="nx">memory</span><span class="p">.</span><span class="nx">length</span><span class="p">));</span>
+
+<span class="w">    </span><span class="c1">// 4. 不将Wasm返回的数据直接传递给eval/innerHTML等危险API</span>
+<span class="w">    </span><span class="c1">// 使用TextDecoder安全解码</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">decoder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nx">TextDecoder</span><span class="p">(</span><span class="s1">&#39;utf-8&#39;</span><span class="p">,</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">fatal</span><span class="o">:</span><span class="w"> </span><span class="kc">true</span><span class="w"> </span><span class="p">});</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">text</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">decoder</span><span class="p">.</span><span class="nx">decode</span><span class="p">(</span><span class="nx">safeData</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// 使用textContent而非innerHTML</span>
+<span class="w">    </span><span class="nb">document</span><span class="p">.</span><span class="nx">getElementById</span><span class="p">(</span><span class="s1">&#39;output&#39;</span><span class="p">).</span><span class="nx">textContent</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">text</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h2>6. Wasm安全的未来方向</h2>
+<p><strong>WASM GC提案对内存安全的改善：</strong></p>
+<p>GC提案将内存管理责任从应用程序代码转移到引擎，从根本上消除了手动内存管理相关的漏洞（UAF、double-free、堆溢出）。结构体和数组的字段访问由引擎保证类型安全和边界安全。当GC提案在主流浏览器中全面落地后，C/C++编译到Wasm的内存安全劣势将被显著削弱，因为开发者可以选择使用Rust或直接使用Wasm GC来编写安全关键的模块。</p>
+<p><strong>WASM Exception Handling：</strong></p>
+<p>异常处理提案为Wasm引入了结构化的异常机制，替代了当前的基于<code>setjmp</code>/<code>longjmp</code>的C++异常模拟。这不仅改善了异常处理的性能，还减少了异常处理路径中的内存安全隐患——当前的模拟实现需要在线性内存中保存和恢复执行状态，而原生异常处理由引擎管理这些状态。</p>
+<p><strong>硬件级隔离（CHERI+Wasm）：</strong></p>
+<p>CHERI（Capability Hardware Enhanced RISC Instructions）提供硬件级的内存安全能力。将CHERI的能力模型（capability）应用于Wasm的内存访问，可以在硬件层面强制每个内存访问的权限和边界。这意味着即使Wasm模块存在逻辑漏洞，硬件也会阻止越界访问。目前这是研究阶段的方向，但代表了内存安全的终极形态——从软件检查到硬件强制的范式转变。</p>
+<p><strong>WALMA类ML检测方法的演进：</strong></p>
+<p>WALMA证明了将内存快照视为图像并用CNN分类是可行的。未来的演进方向包括：</p>
+<ol>
+<li><strong>实时检测</strong>：降低快照采集和分类的延迟，从周期性检测转向接近实时的连续监控</li>
+<li><strong>自适应模型</strong>：根据目标程序的正常行为动态调整检测阈值，降低误报率</li>
+<li><strong>多模态融合</strong>：结合内存访问模式（trace-based）和内存状态（snapshot-based）进行联合检测</li>
+<li><strong>轻量化部署</strong>：模型压缩和边缘推理，使ML检测可以在浏览器中直接运行</li>
+<li><strong>形式化保证</strong>：为ML分类器提供可证明的检测下界——论文的Shannon熵分析是这一方向的起点</li>
+</ol>
+<p>Wasm的安全生态正在从"依赖引擎边界检查"向"纵深防御"演进。编译期（Rust所有权、GC提案）、运行时（WALMA、沙箱硬化）、硬件级（CHERI）三层防御的协同，将使Wasm从"比JavaScript安全"进化到"接近内存安全的理论极限"。</p>
+<hr />
+<p><strong>参考资料：</strong></p>
+<ul>
+<li><a href="https://arxiv.org/abs/2603.24167">WALMA: Learning to See Memory Corruption in WebAssembly</a> (arXiv:2603.24167), Draissi et al., 2026</li>
+<li><a href="https://nebusec.ai/research/v8-cve-2026-6307-writeup/">Longinus: CVE-2026-6307 Writeup</a>, Nebula Security (Vega), 2026</li>
+<li><a href="https://tashita.net/turbofan-js-to-wasm-deopt-type-confusion-part-3/">CVE-2026-6307 Part 3: Escaping the V8 Sandbox Through WasmFX</a>, stratan, 2026</li>
+<li><a href="https://www.usenix.org/system/files/sec20-lehmann.pdf">Everything Old is New Again: Binary Security of WebAssembly</a>, Lehmann et al., USENIX Security 2020</li>
+<li><a href="https://v8.dev/blog/sandbox">V8 Heap Sandbox</a>, V8 Project</li>
+<li><a href="https://github.com/WebAssembly/stack-switching/blob/main/proposals/stack-switching/Explainer.md">WasmFX / Stack Switching Proposal</a></li>
+<li><a href="https://webassembly.org/docs/security/">WebAssembly Security</a>, WebAssembly Working Group</li>
+</ul>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
