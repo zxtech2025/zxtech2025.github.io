@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>开源 LLM 安全防火墙框架全景解析——从 GuardRail 到 AIGuardian 的架构对比 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>开源 LLM 安全防火墙框架全景解析——从 GuardRail 到 AIGuardian 的架构对比</h1>
+<time>2026-07-24</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析
+Slug: 开源-llm-安全防火墙框架全景解析从-guardrail-到-aiguardian-的架构对比</li>
+</ul>
+<hr />
+<h2>一、引言：2026 年 7 月，LLM 安全工具的集中爆发</h2>
+<p>当 LLM（大语言模型）从"对话玩具"演进为 Agent（智能体）的推理内核，它所面对的攻击面也从一个文本框扩展到了整个企业的数据平面与执行平面。传统 WAF（Web Application Firewall）挡在 HTTP 边界，却对"一段自然语言里藏着的越狱指令"无能为力——因为 SQL 注入有结构、有边界，而 Prompt 注入的载体是语义本身。</p>
+<p>2026 年 7 月，开源社区出现了一波 LLM 安全工具的集中发布，标志着"LLM 安全防火墙"作为一个独立品类正式成型：</p>
+<table>
+<thead>
+<tr>
+<th>时间</th>
+<th>框架</th>
+<th>出品方</th>
+<th>定位</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>07-11</td>
+<td>GuardRail v1.0</td>
+<td>Aegis AI Foundation</td>
+<td>可编程、低延迟代理</td>
+</tr>
+<tr>
+<td>07-20</td>
+<td>ModelGuard v1.0</td>
+<td>Aperture Security</td>
+<td>实时输入/输出扫描框架</td>
+</tr>
+<tr>
+<td>-</td>
+<td>AIGuardian</td>
+<td>OWASP Foundation</td>
+<td>LLM 应用安全测试与审计</td>
+</tr>
+<tr>
+<td>07-23</td>
+<td>Red-Team-GPT</td>
+<td>VectorSec（MIT 协议）</td>
+<td>自动化对抗测试与安全审计</td>
+</tr>
+</tbody>
+</table>
+<p>这四个项目分别占据了 LLM 安全链路的不同位置：GuardRail 和 ModelGuard 是"在线防护"（运行时拦截），AIGuardian 是"离线审计"（测试期发现），Red-Team-GPT 则是"红队进攻"（主动探测）。本文将从威胁模型出发，给出 LLM 安全防火墙的参考架构，再逐层拆解四大框架的设计取舍。</p>
+<h2>二、LLM 安全威胁模型全景</h2>
+<p>设计防火墙的前提是定义威胁模型。LLM 应用与经典 Web 应用的根本差异在于：<strong>输入是自然语言、输出是生成内容、且模型具备"代理执行"能力</strong>。这意味着攻击者不再需要寻找代码漏洞，只需用语言"说服"模型即可。综合 OWASP Top 10 for LLM Applications（2026 版参考）与实战研究，核心威胁可归纳为六类：</p>
+<div class="highlight"><pre><span></span><code><span class="nf">graph</span><span class="w"> </span><span class="n">TD</span>
+<span class="w">    </span><span class="n">subgraph</span><span class="w"> </span><span class="err">输入侧威胁</span>
+<span class="w">        </span><span class="n">PI</span><span class="p">[</span><span class="s">&quot;LLM01 Prompt 注入&lt;br/&gt;直接注入 / 间接注入&lt;br/&gt;覆盖系统指令、劫持 Agent 行为&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">JB</span><span class="p">[</span><span class="s">&quot;越狱 Jailbreak&lt;br/&gt;角色扮演 / 编码绕过 / 多轮诱导&lt;br/&gt;突破对齐训练的拒绝边界&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">DOS</span><span class="p">[</span><span class="s">&quot;LLM04 模型 DoS&lt;br/&gt;超长上下文 / 递归触发 / 资源耗尽&lt;br/&gt;推高 token 成本与推理延迟&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="kd">end</span>
+
+<span class="w">    </span><span class="n">subgraph</span><span class="w"> </span><span class="err">输出侧威胁</span>
+<span class="w">        </span><span class="n">PII</span><span class="p">[</span><span class="s">&quot;LLM06 敏感信息泄露&lt;br/&gt;PII 外泄 / 训练数据反刍 / 密钥回显&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">OH</span><span class="p">[</span><span class="s">&quot;LLM02 不安全输出处理&lt;br/&gt;生成内容直入 eval/exec/SQL&lt;br/&gt;SSRF 与 RCE 的二次放大&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">HAL</span><span class="p">[</span><span class="s">&quot;LLM09 过度依赖 / 幻觉&lt;br/&gt;幻觉输出诱导下游系统执行错误操作&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="kd">end</span>
+
+<span class="w">    </span><span class="n">subgraph</span><span class="w"> </span><span class="err">供应链与代理威胁</span>
+<span class="w">        </span><span class="n">SC</span><span class="p">[</span><span class="s">&quot;LLM05 供应链漏洞&lt;br/&gt;投毒模型权重 / 恶意插件 / 依赖混淆&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">PLG</span><span class="p">[</span><span class="s">&quot;LLM07 不安全插件设计&lt;br/&gt;插件参数注入 / 权限过宽&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">EA</span><span class="p">[</span><span class="s">&quot;LLM08 过度代理权限&lt;br/&gt;Agent 持有超出任务所需的工具调用权&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="kd">end</span>
+
+<span class="w">    </span><span class="n">USER</span><span class="p">((</span><span class="err">用户请求</span><span class="p">))</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">PI</span>
+<span class="w">    </span><span class="n">USER</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">JB</span>
+<span class="w">    </span><span class="n">USER</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">DOS</span>
+<span class="w">    </span><span class="n">PI</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">MODEL</span><span class="p">[(</span><span class="n">LLM</span><span class="w"> </span><span class="err">推理引擎</span><span class="p">)]</span>
+<span class="w">    </span><span class="n">JB</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">MODEL</span>
+<span class="w">    </span><span class="n">MODEL</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">PII</span>
+<span class="w">    </span><span class="n">MODEL</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">OH</span>
+<span class="w">    </span><span class="n">MODEL</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">HAL</span>
+<span class="w">    </span><span class="n">SC</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">MODEL</span>
+<span class="w">    </span><span class="n">MODEL</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">PLG</span>
+<span class="w">    </span><span class="n">PLG</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">EA</span>
+</code></pre></div>
+
+<p>这六类威胁对应 OWASP Top 10 中的 LLM01、LLM02、LLM04、LLM05、LLM06、LLM07、LLM08、LLM09（LLM03 训练数据投毒与 LLM10 模型窃取属于离线/数据侧威胁，运行时防火墙只能间接缓解）。一个完整的 LLM 防火墙必须在<strong>输入</strong>和<strong>输出</strong>两个方向上同时布防——这正是 GuardRail"双向策略"设计的核心动机。</p>
+<h2>三、LLM 安全防火墙参考架构</h2>
+<p>将上述威胁模型映射到工程实现，LLM 安全防火墙的参考架构是一个部署在"应用层"与"LLM API"之间的代理层（proxy layer），对请求（prompt）和响应（response）做双向检测：</p>
+<div class="highlight"><pre><span></span><code><span class="n">flowchart</span><span class="w"> </span><span class="n">LR</span>
+<span class="w">    </span><span class="n">U</span><span class="p">[</span><span class="s">&quot;用户 / Agent 请求&lt;br/&gt;prompt + 上下文 + 元数据&quot;</span><span class="p">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">PROXY</span>
+
+<span class="w">    </span><span class="n">subgraph</span><span class="w"> </span><span class="n">FW</span><span class="p">[</span><span class="s">&quot;LLM 安全防火墙代理层&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">direction</span><span class="w"> </span><span class="n">TB</span>
+<span class="w">        </span><span class="n">INT</span><span class="p">[</span><span class="s">&quot;请求拦截器&lt;br/&gt;解析 chat/completion 协议&lt;br/&gt;提取 system/user/assistant 段&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">POLICY</span><span class="p">[</span><span class="s">&quot;策略引擎&lt;br/&gt;路由到检测模块链&lt;br/&gt;执行 allow/deny/redact/modify&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">IN_ENG</span><span class="p">[</span><span class="s">&quot;检测引擎 - 入站&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">OUT_ENG</span><span class="p">[</span><span class="s">&quot;检测引擎 - 出站&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">DEC</span><span class="p">[</span><span class="s">&quot;决策器&lt;br/&gt;阈值聚合 / 规则编排&lt;br/&gt;stream-safe 流式决策&quot;</span><span class="p">]</span>
+
+<span class="w">        </span><span class="n">INT</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">POLICY</span>
+<span class="w">        </span><span class="n">POLICY</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">IN_ENG</span>
+<span class="w">        </span><span class="n">IN_ENG</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">DEC</span>
+<span class="w">    </span><span class="kd">end</span>
+
+<span class="w">    </span><span class="n">subgraph</span><span class="w"> </span><span class="n">IN_MOD</span><span class="p">[</span><span class="s">&quot;入站检测模块&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">INJ</span><span class="p">[</span><span class="s">&quot;Prompt 注入检测&lt;br/&gt;模式匹配 + 语义分类器&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">JB_D</span><span class="p">[</span><span class="s">&quot;越狱检测&lt;br/&gt;角色扮演 / 编码变形识别&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">PII_IN</span><span class="p">[</span><span class="s">&quot;入站 PII 净化&lt;br/&gt;防止用户敏感数据进入日志&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">DOS_D</span><span class="p">[</span><span class="s">&quot;DoS 防护&lt;br/&gt;token 预算 / 速率 / 递归深度&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="kd">end</span>
+
+<span class="w">    </span><span class="n">subgraph</span><span class="w"> </span><span class="n">OUT_MOD</span><span class="p">[</span><span class="s">&quot;出站检测模块&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">LEAK</span><span class="p">[</span><span class="s">&quot;数据泄露检测&lt;br/&gt;密钥/凭证/内部文档指纹&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">PII_OUT</span><span class="p">[</span><span class="s">&quot;出站 PII 净化&lt;br/&gt;脱敏返回给终端&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">OH_D</span><span class="p">[</span><span class="s">&quot;不安全输出处理&lt;br/&gt;可执行代码/路径校验&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">HAL_D</span><span class="p">[</span><span class="s">&quot;幻觉/越界检测&lt;br/&gt;事实性约束 / 范围围栏&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="kd">end</span>
+
+<span class="w">    </span><span class="n">PROXY</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">INT</span>
+<span class="w">    </span><span class="n">IN_ENG</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">IN_MOD</span>
+<span class="w">    </span><span class="n">OUT_ENG</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">OUT_MOD</span>
+<span class="w">    </span><span class="n">DEC</span><span class="w"> </span><span class="o">--&gt;|</span><span class="n">allow</span><span class="o">|</span><span class="w"> </span><span class="n">LLM</span><span class="p">[</span><span class="s">&quot;LLM API&lt;br/&gt;OpenAI / Anthropic / 自托管&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="n">DEC</span><span class="w"> </span><span class="o">--&gt;|</span><span class="n">deny</span><span class="o">|</span><span class="w"> </span><span class="n">BLOCK</span><span class="p">[</span><span class="s">&quot;阻断 + 审计日志&lt;br/&gt;返回安全拒答&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="n">LLM</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">OUT_ENG</span>
+<span class="w">    </span><span class="n">OUT_ENG</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">DEC2</span><span class="p">[</span><span class="s">&quot;出站决策器&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="n">DEC2</span><span class="w"> </span><span class="o">--&gt;|</span><span class="n">allow</span><span class="o">|</span><span class="w"> </span><span class="n">R</span><span class="p">[</span><span class="s">&quot;返回用户&lt;br/&gt;可选脱敏后内容&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="n">DEC2</span><span class="w"> </span><span class="o">--&gt;|</span><span class="n">deny</span><span class="o">/</span><span class="n">redact</span><span class="o">|</span><span class="w"> </span><span class="n">BLOCK</span>
+
+<span class="w">    </span><span class="n">style</span><span class="w"> </span><span class="n">FW</span><span class="w"> </span><span class="n">fill</span><span class="o">:</span><span class="err">#</span><span class="mi">0</span><span class="n">d1117</span><span class="p">,</span><span class="n">color</span><span class="o">:</span><span class="err">#</span><span class="n">fff</span><span class="p">,</span><span class="n">stroke</span><span class="o">:</span><span class="err">#</span><span class="mi">58</span><span class="n">a6ff</span>
+<span class="w">    </span><span class="n">style</span><span class="w"> </span><span class="n">LLM</span><span class="w"> </span><span class="n">fill</span><span class="o">:</span><span class="err">#</span><span class="mi">1</span><span class="n">a1f2e</span><span class="p">,</span><span class="n">color</span><span class="o">:</span><span class="err">#</span><span class="n">fff</span><span class="p">,</span><span class="n">stroke</span><span class="o">:</span><span class="err">#</span><span class="mf">3f</span><span class="n">b950</span>
+</code></pre></div>
+
+<p>该架构有三个关键设计要点：</p>
+<ol>
+<li><strong>协议级拦截而非正则过滤</strong>：拦截器需要理解 <code>chat/completions</code> 的 message 结构，区分 <code>system</code>、<code>user</code>、<code>assistant</code> 三种角色——因为攻击者常把注入藏在 <code>user</code> 段末尾以"覆盖"system 段，防火墙必须按角色分别评估风险。</li>
+<li><strong>双向检测链</strong>：入站防"输入操控"，出站防"信息泄露与不安全生成"，两侧检测模块可独立插拔。</li>
+<li><strong>stream-safe 流式决策</strong>：LLM 普遍采用 SSE 流式输出，防火墙不能等响应全部生成完才检测（那会让用户白等数秒），必须支持"边流边检、命中即断流"。</li>
+</ol>
+<h2>四、四大开源框架全景对比</h2>
+<p>四个框架虽然都贴着"LLM 安全"标签，但工程定位差异显著。下表从架构形态、部署位置、检测能力、协议等维度做横向对比：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>GuardRail v1.0</th>
+<th>ModelGuard v1.0</th>
+<th>AIGuardian (OWASP)</th>
+<th>Red-Team-GPT</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>出品方</strong></td>
+<td>Aegis AI Foundation</td>
+<td>Aperture Security</td>
+<td>OWASP Foundation</td>
+<td>VectorSec</td>
+</tr>
+<tr>
+<td><strong>核心形态</strong></td>
+<td>可编程低延迟代理</td>
+<td>实时扫描框架</td>
+<td>安全测试/审计框架</td>
+<td>自动化红队工具</td>
+</tr>
+<tr>
+<td><strong>运行时在线防护</strong></td>
+<td>是（双向代理）</td>
+<td>是（输入/输出扫描）</td>
+<td>否（测试期）</td>
+<td>否（攻击期）</td>
+</tr>
+<tr>
+<td><strong>部署位置</strong></td>
+<td>应用 ↔ LLM API 之间</td>
+<td>应用内嵌入/旁路</td>
+<td>CI/CD 与测试环境</td>
+<td>独立攻击端</td>
+</tr>
+<tr>
+<td><strong>双向检测</strong></td>
+<td>prompt + response 全覆盖</td>
+<td>输入/输出扫描</td>
+<td>仅生成测试用例</td>
+<td>仅发起对抗请求</td>
+</tr>
+<tr>
+<td><strong>内置模块</strong></td>
+<td>注入检测、数据泄露、PII 净化</td>
+<td>输入/输出扫描器集</td>
+<td>基于 OWASP Top 10 的审计套件</td>
+<td>越狱/注入用例生成器</td>
+</tr>
+<tr>
+<td><strong>可扩展性</strong></td>
+<td>模块化，支持自定义检测逻辑</td>
+<td>扫描器插件</td>
+<td>审计规则配置</td>
+<td>攻击策略可配置</td>
+</tr>
+<tr>
+<td><strong>协议</strong></td>
+<td>开源</td>
+<td>开源（非营利）</td>
+<td>开源</td>
+<td>MIT</td>
+</tr>
+<tr>
+<td><strong>目标场景</strong></td>
+<td>生产环境运行时防护</td>
+<td>生产环境运行时扫描</td>
+<td>上线前安全测试</td>
+<td>防御有效性验证</td>
+</tr>
+<tr>
+<td><strong>对 OWASP Top 10 覆盖</strong></td>
+<td>LLM01/02/04/06 为主</td>
+<td>LLM01/02/06</td>
+<td>LLM01-10 全覆盖（审计）</td>
+<td>LLM01/06/08 为主</td>
+</tr>
+<tr>
+<td><strong>典型用户</strong></td>
+<td>应用开发者/运维</td>
+<td>非营利/合规团队</td>
+<td>安全工程师/QA</td>
+<td>红队/渗透测试</td>
+</tr>
+</tbody>
+</table>
+<p>理解这张表的关键是<strong>"安全左移"与"运行时防护"的分工</strong>：</p>
+<ul>
+<li><strong>AIGuardian + Red-Team-GPT</strong> 属于"左移"——在应用上线前发现漏洞、验证护栏是否有效。它们是"盾的质检员"。</li>
+<li><strong>GuardRail + ModelGuard</strong> 属于"运行时"——在请求实际打向 LLM 的那一刻做拦截。它们是"盾本身"。</li>
+</ul>
+<p>一个成熟的 LLM 安全体系应该四者并用：用 AIGuardian 做 CI 门禁，用 Red-Team-GPT 做周期性红蓝对抗，用 GuardRail 做生产代理，用 ModelGuard 做旁路扫描与合规取证。下文以最具"防火墙"特征的 GuardRail 为重点，拆解其代理架构。</p>
+<h2>五、GuardRail 代理架构深度剖析</h2>
+<p>GuardRail（<code>github.com/aegis-ai-foundation/guardrail</code>）的定位是"可编程、低延迟代理"，部署在应用和 LLM API 之间，对传入 prompt 和传出 response 都执行安全策略。其内部处理流水线可拆解为五个阶段：</p>
+<div class="highlight"><pre><span></span><code><span class="n">flowchart</span><span class="w"> </span><span class="n">TD</span>
+<span class="w">    </span><span class="n">A</span><span class="p">[</span><span class="s">&quot;① 请求拦截 Request Interception&lt;br/&gt;解析 HTTP/gRPC&lt;br/&gt;提取 messages 结构&quot;</span><span class="p">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">B</span><span class="p">[</span><span class="s">&quot;② 策略引擎 Policy Engine&lt;br/&gt;按 tenant/route 加载策略链&lt;br/&gt;编排检测模块执行顺序&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="n">B</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">C</span><span class="p">[</span><span class="s">&quot;③ 检测模块链 Detection Modules&lt;br/&gt;注入检测 → PII 净化 → 越狱 → DoS&lt;br/&gt;并行/串行可配置&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="n">C</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">D</span><span class="p">[</span><span class="s">&quot;④ 决策器 Decision&lt;br/&gt;聚合各模块 score&lt;br/&gt;allow / deny / redact / modify&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="n">D</span><span class="w"> </span><span class="o">--&gt;|</span><span class="n">allow</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">modify</span><span class="o">|</span><span class="w"> </span><span class="n">E</span><span class="p">[</span><span class="s">&quot;⑤ 转发 Forward&lt;br/&gt;透传或改写后转发到 LLM API&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="n">D</span><span class="w"> </span><span class="o">--&gt;|</span><span class="n">deny</span><span class="o">|</span><span class="w"> </span><span class="n">F</span><span class="p">[</span><span class="s">&quot;阻断 Block&lt;br/&gt;返回安全拒答 + 审计事件&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="n">E</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">G</span><span class="p">[</span><span class="s">&quot;响应检测 Response Detection&lt;br/&gt;流式扫描 + 出站脱敏&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="n">G</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">H</span><span class="p">[</span><span class="s">&quot;返回应用 Return&quot;</span><span class="p">]</span>
+
+<span class="w">    </span><span class="n">style</span><span class="w"> </span><span class="n">B</span><span class="w"> </span><span class="n">fill</span><span class="o">:</span><span class="err">#</span><span class="mi">161</span><span class="n">b22</span><span class="p">,</span><span class="n">color</span><span class="o">:</span><span class="err">#</span><span class="n">fff</span><span class="p">,</span><span class="n">stroke</span><span class="o">:</span><span class="err">#</span><span class="mi">58</span><span class="n">a6ff</span>
+<span class="w">    </span><span class="n">style</span><span class="w"> </span><span class="n">D</span><span class="w"> </span><span class="n">fill</span><span class="o">:</span><span class="err">#</span><span class="mi">161</span><span class="n">b22</span><span class="p">,</span><span class="n">color</span><span class="o">:</span><span class="err">#</span><span class="n">fff</span><span class="p">,</span><span class="n">stroke</span><span class="o">:</span><span class="err">#</span><span class="n">f85149</span>
+</code></pre></div>
+
+<h3>5.1 请求拦截：协议感知而非字节过滤</h3>
+<p>GuardRail 的拦截层不是一个透明的 HTTP 字节流过滤器，而是一个<strong>协议感知解析器</strong>。它理解 OpenAI 兼容的 <code>chat/completions</code> 与 <code>messages</code> 数组结构，能够把 <code>system</code>、<code>user</code>、<code>tool</code> 等不同角色的内容分别取出，交给下游不同策略。这一点至关重要——因为间接 Prompt 注入往往藏在"工具返回结果"或"检索到的文档片段"里，而非用户的原始输入里。如果防火墙只看 <code>user</code> 段，就会漏掉间接注入的主战场。</p>
+<h3>5.2 策略引擎：声明式编排检测链</h3>
+<p>策略引擎是 GuardRail"可编程"特性的核心。它把安全策略抽象为一组<strong>有序的检测规则</strong>，每条规则声明：</p>
+<ul>
+<li><strong>触发条件</strong>：哪些 route、哪些 message 角色、哪些租户生效；</li>
+<li><strong>检测模块</strong>：调用哪个内置或自定义检测器；</li>
+<li><strong>处置动作</strong>：<code>allow</code>（放行）、<code>deny</code>（阻断）、<code>redact</code>（脱敏后放行）、<code>modify</code>（改写后放行）；</li>
+<li><strong>阈值</strong>：score 超过多少触发对应动作。</li>
+</ul>
+<p>策略引擎支持并行执行无依赖的检测模块以压低延迟，同时保证有依赖的模块（如"先脱敏再分类"）按序执行。</p>
+<h3>5.3 决策器：从单点 score 到聚合裁决</h3>
+<p>单个检测模块输出的是一个 <code>[0,1]</code> 区间的风险分数，决策器负责把多个模块的分数聚合成一个最终裁决。常见聚合策略包括：</p>
+<ul>
+<li><strong>max 聚合</strong>：取最高分，适合"任一命中即阻断"的强安全场景；</li>
+<li><strong>加权求和</strong>：按模块置信度加权，适合需要权衡误报的场景；</li>
+<li><strong>级联短路</strong>：高置信阻断模块先行，命中即短路，避免后续昂贵检测。</li>
+</ul>
+<p>决策器同时负责把裁决结果与原始请求、模块明细写入审计日志，满足合规取证需求。</p>
+<h2>六、Prompt 注入检测的技术实现</h2>
+<p>Prompt 注入是 LLM 安全的"头号公敌"，对应 OWASP LLM01。GuardRail 等框架的注入检测通常采用<strong>三层纵深</strong>：模式匹配层、语义分析层、分类器模型层。</p>
+<h3>6.1 第一层：模式匹配</h3>
+<p>模式匹配是最快的防线，用于拦截已知的注入特征词与结构：</p>
+<ul>
+<li><strong>指令覆盖特征</strong>：<code>ignore previous instructions</code>、<code>disregard the above</code>、<code>you are now</code>、<code>system:</code> 等显式覆盖词；</li>
+<li><strong>分隔符滥用</strong>：攻击者常用 <code>---</code>、<code>###</code>、XML 标签伪造系统消息边界；</li>
+<li><strong>编码变形</strong>：Base64、Unicode 同形字、字符重复（<code>ignooore</code>）等绕过手法。</li>
+</ul>
+<p>模式匹配的优势是<strong>延迟极低（亚毫秒）</strong>，劣势是只能覆盖已知模式，对零日注入手法和新颖语义攻击无效。</p>
+<h3>6.2 第二层：语义分析</h3>
+<p>语义分析层利用一个轻量 LLM 或嵌入模型，判断输入的"真实意图"是否与系统指令冲突。典型做法：</p>
+<ul>
+<li><strong>意图提取</strong>：用小模型把用户输入抽象为"意图向量"；</li>
+<li><strong>指令对比</strong>：将意图向量与 system prompt 的允许行为集做相似度对比；</li>
+<li><strong>越权判定</strong>：若用户意图落在"系统才有的能力"（如"输出你的系统提示""以管理员身份执行"），则判为注入。</li>
+</ul>
+<p>语义层能识别模式匹配漏掉的同义改写，但引入了额外推理开销。</p>
+<h3>6.3 第三层：分类器模型</h3>
+<p>第三层是专门训练的二分类/多分类模型，输入是完整 prompt，输出是注入概率。训练数据来自公开越狱数据集（如 AdvBench、JailbreakBench）与人工标注样本。现代实现多采用<strong>轻量编码器</strong>（如 DeBERTa-v3、RoBERTa）而非大模型，以把单次推理延迟压在 10ms 量级。分类器的问题是<strong>分布漂移</strong>——攻击者不断发明新手法，模型需要持续用对抗样本再训练，否则召回率会随时间衰减。</p>
+<p>三层之间的关系是"快筛 → 精判 → 兜底"：模式匹配先拦掉低成本的批量攻击，语义分析处理改写绕过，分类器模型作为概率兜底。GuardRail 的模块化设计允许三者以插件形式组合，并各自配置阈值。</p>
+<h2>七、PII 检测与净化的技术方案</h2>
+<p>PII（个人身份信息）净化对应 OWASP LLM06，是数据泄露防护的最后一道闸门。技术方案同样分三层：</p>
+<h3>7.1 正则匹配层</h3>
+<p>针对结构化、格式固定的 PII，正则是最快最准的手段：</p>
+<ul>
+<li>邮箱、手机号、身份证号、银行卡号、IP、MAC 地址等；</li>
+<li>信用卡号可用 Luhn 校验增强准确率；</li>
+<li>API Key/Token 等凭证有固定前缀（<code>sk-</code>、<code>AKIA</code>、<code>ghp_</code>）。</li>
+</ul>
+<p>正则层延迟在微秒级，适合作为第一道过滤。</p>
+<h3>7.2 NER 模型层</h3>
+<p>针对非结构化 PII（人名、地址、机构名、病历、合同条款），需要 NER（命名实体识别）模型。常用方案：</p>
+<ul>
+<li><strong>spaCy + 预训练 NER 管道</strong>：中文场景可用 <code>zh_core_web_trf</code>，识别 <code>PER</code>、<code>ORG</code>、<code>LOC</code>；</li>
+<li><strong>Presidio 风格管道</strong>：微软开源的 Presidio 把"识别器（recognizer）+ 否决器（denoiser）+ 匿名化器（anonymizer）"解耦，支持可插拔的 NER 后端；</li>
+<li><strong>Transformer NER</strong>：精度更高但延迟更高，适合非实时场景。</li>
+</ul>
+<h3>7.3 脱敏算法层</h3>
+<p>检测到 PI 后，如何脱敏决定了"可用性"与"安全性"的平衡，常见算法：</p>
+<ul>
+<li><strong>掩码</strong>：<code>张三</code> → <code>张*</code>，<code>13812345678</code> → <code>138****5678</code>，保留可读性；</li>
+<li><strong>替换</strong>：用占位符 <code>[NAME_1]</code>、<code>[PHONE_1]</code> 替换，并维护映射表以便回填（适用于需要保留上下文连贯性的场景）；</li>
+<li><strong>哈希/令牌化</strong>：<code>张三</code> → 确定性哈希 <code>a3f9...</code>，不可逆但可去重关联；</li>
+<li><strong>格式保留加密（FPE）</strong>：密文仍是合法手机号格式，适合下游有格式校验的链路；</li>
+<li><strong>K-匿名化</strong>：用泛化区间替换精确值（年龄 27 → 25-30），牺牲精度换隐私。</li>
+</ul>
+<p>GuardRail 的 PII 模块通常采用"正则 + NER"双通道并行，再按配置的脱敏策略统一处理。一个关键工程细节是<strong>双向脱敏</strong>：入站脱敏防止用户 PII 进入 LLM 上下文与日志，出站脱敏防止 LLM 把训练数据反刍出来的 PII 回显给用户。</p>
+<h2>八、代理层性能设计分析</h2>
+<p>LLM 防火墙作为应用与 LLM 之间的一跳，其延迟会直接叠加到用户感知的响应时间。而 LLM 本身首 token 延迟（TTFT）通常在数百毫秒到数秒，防火墙若再增加数百毫秒，体验会显著劣化。因此"低延迟"是 GuardRail 这类代理的生存底线。</p>
+<h3>8.1 低延迟要求与预算分配</h3>
+<p>一个合理的延迟预算分配：</p>
+<ul>
+<li>总防火墙开销目标：&lt; 50ms（P99）；</li>
+<li>入站检测：&lt; 20ms（模式匹配 + 轻量分类器）；</li>
+<li>策略编排与决策：&lt; 5ms；</li>
+<li>出站检测：流式增量，单 chunk &lt; 10ms；</li>
+<li>网络/序列化开销：剩余预算。</li>
+</ul>
+<p>要落到这个预算，关键手段是<strong>分层短路</strong>：廉价检测（正则、模式）先行，命中即短路；昂贵检测（语义、NER）只在前面未决时触发。</p>
+<h3>8.2 流式处理（stream-safe）</h3>
+<p>LLM 普遍用 SSE（Server-Sent Events）流式返回 token，防火墙必须支持流式而非缓冲整个响应：</p>
+<ul>
+<li><strong>增量检测</strong>：每收到一个 chunk（通常含若干 token）就跑一次轻量检测；</li>
+<li><strong>缓冲窗口</strong>：对跨 chunk 的敏感模式（如被换行/标点切散的身份证号）维护一个滑动窗口，窗口满才判定；</li>
+<li><strong>命中即断流</strong>：一旦在流中检测到泄露，立即向客户端发送断流信号并终止上游连接，避免剩余敏感内容继续输出；</li>
+<li><strong>延迟可接受性</strong>：流式检测允许单 chunk 延迟在 10ms 内，对用户几乎无感。</li>
+</ul>
+<p>流式处理是 LLM 防火墙区别于传统 WAF 的核心技术难点之一——WAF 处理的是完整请求/响应，而 LLM 防火墙要处理的是"逐 token 到达的流"。</p>
+<h3>8.3 异步检测与旁路审计</h3>
+<p>对于不影响放行决策的高耗时检测（如完整 NER、深度语义分析），可采用<strong>旁路异步</strong>模式：先放行请求，同时把请求副本送入异步管道做深度分析，若事后发现高危再触发告警/封禁。这种"先放后审"策略用可控的风险换取了延迟，适合内部低风险场景。GuardRail 的审计日志通道通常走异步路径，避免日志 I/O 阻塞主链路。</p>
+<h2>九、自定义检测模块代码示例</h2>
+<p>GuardRail 的模块化设计允许开发者编写自定义检测逻辑。以下给出 Python 与 TypeScript 两种概念实现，演示一个"检测并净化 API Key"的自定义模块接口形态。</p>
+<h3>9.1 Python 概念实现</h3>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Literal</span>
+
+<span class="c1"># 检测结果数据结构</span>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">DetectionResult</span><span class="p">:</span>
+    <span class="n">action</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;allow&quot;</span><span class="p">,</span> <span class="s2">&quot;deny&quot;</span><span class="p">,</span> <span class="s2">&quot;redact&quot;</span><span class="p">,</span> <span class="s2">&quot;modify&quot;</span><span class="p">]</span>
+    <span class="n">score</span><span class="p">:</span> <span class="nb">float</span>                  <span class="c1"># 0.0 ~ 1.0 风险分数</span>
+    <span class="n">message</span><span class="p">:</span> <span class="nb">str</span>                  <span class="c1"># 人类可读说明</span>
+    <span class="n">redacted_text</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>  <span class="c1"># 脱敏后的文本（仅 redact/modify 时）</span>
+
+<span class="c1"># 自定义检测模块基类</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">GuardrailModule</span><span class="p">:</span>
+    <span class="n">name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;base&quot;</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">detect</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">context</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">DetectionResult</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">NotImplementedError</span>
+
+<span class="c1"># 示例：API Key 检测与脱敏模块</span>
+<span class="n">API_KEY_PATTERNS</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;sk-[A-Za-z0-9]{20,}&quot;</span><span class="p">),</span>      <span class="c1"># OpenAI 风格</span>
+    <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;AKIA[0-9A-Z]</span><span class="si">{16}</span><span class="s2">&quot;</span><span class="p">),</span>          <span class="c1"># AWS 风格</span>
+    <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;ghp_[A-Za-z0-9]</span><span class="si">{36}</span><span class="s2">&quot;</span><span class="p">),</span>       <span class="c1"># GitHub PAT</span>
+<span class="p">]</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">ApiKeyRedactionModule</span><span class="p">(</span><span class="n">GuardrailModule</span><span class="p">):</span>
+    <span class="n">name</span> <span class="o">=</span> <span class="s2">&quot;api_key_redaction&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">detect</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">text</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">context</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">DetectionResult</span><span class="p">:</span>
+        <span class="n">redacted</span> <span class="o">=</span> <span class="n">text</span>
+        <span class="n">hits</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="k">for</span> <span class="n">pattern</span> <span class="ow">in</span> <span class="n">API_KEY_PATTERNS</span><span class="p">:</span>
+            <span class="n">redacted</span><span class="p">,</span> <span class="n">n</span> <span class="o">=</span> <span class="n">pattern</span><span class="o">.</span><span class="n">subn</span><span class="p">(</span><span class="s2">&quot;[REDACTED_KEY]&quot;</span><span class="p">,</span> <span class="n">redacted</span><span class="p">)</span>
+            <span class="n">hits</span> <span class="o">+=</span> <span class="n">n</span>
+
+        <span class="k">if</span> <span class="n">hits</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">DetectionResult</span><span class="p">(</span><span class="n">action</span><span class="o">=</span><span class="s2">&quot;allow&quot;</span><span class="p">,</span> <span class="n">score</span><span class="o">=</span><span class="mf">0.0</span><span class="p">,</span>
+                                    <span class="n">message</span><span class="o">=</span><span class="s2">&quot;no api key detected&quot;</span><span class="p">)</span>
+        <span class="c1"># 命中即脱敏放行，并标记中等风险供审计</span>
+        <span class="k">return</span> <span class="n">DetectionResult</span><span class="p">(</span>
+            <span class="n">action</span><span class="o">=</span><span class="s2">&quot;redact&quot;</span><span class="p">,</span>
+            <span class="n">score</span><span class="o">=</span><span class="mf">0.8</span><span class="p">,</span>
+            <span class="n">message</span><span class="o">=</span><span class="sa">f</span><span class="s2">&quot;redacted </span><span class="si">{</span><span class="n">hits</span><span class="si">}</span><span class="s2"> api key(s)&quot;</span><span class="p">,</span>
+            <span class="n">redacted_text</span><span class="o">=</span><span class="n">redacted</span><span class="p">,</span>
+        <span class="p">)</span>
+
+<span class="c1"># 模块注册（概念）</span>
+<span class="n">REGISTRY</span> <span class="o">=</span> <span class="p">{}</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">register</span><span class="p">(</span><span class="n">module</span><span class="p">:</span> <span class="n">GuardrailModule</span><span class="p">):</span>
+    <span class="n">REGISTRY</span><span class="p">[</span><span class="n">module</span><span class="o">.</span><span class="n">name</span><span class="p">]</span> <span class="o">=</span> <span class="n">module</span>
+
+<span class="n">register</span><span class="p">(</span><span class="n">ApiKeyRedactionModule</span><span class="p">())</span>
+</code></pre></div>
+
+<h3>9.2 TypeScript 概念实现</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// 检测结果类型</span>
+<span class="kr">type</span><span class="w"> </span><span class="nx">DetectionAction</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;allow&quot;</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="s2">&quot;deny&quot;</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="s2">&quot;redact&quot;</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="s2">&quot;modify&quot;</span><span class="p">;</span>
+
+<span class="kd">interface</span><span class="w"> </span><span class="nx">DetectionResult</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="nx">action</span><span class="o">:</span><span class="w"> </span><span class="kt">DetectionAction</span><span class="p">;</span>
+<span class="w">  </span><span class="nx">score</span><span class="o">:</span><span class="w"> </span><span class="kt">number</span><span class="p">;</span><span class="w">            </span><span class="c1">// 0.0 ~ 1.0</span>
+<span class="w">  </span><span class="nx">message</span><span class="o">:</span><span class="w"> </span><span class="kt">string</span><span class="p">;</span>
+<span class="w">  </span><span class="nx">redactedText?</span><span class="o">:</span><span class="w"> </span><span class="kt">string</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// 模块接口</span>
+<span class="kd">interface</span><span class="w"> </span><span class="nx">GuardrailModule</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="nx">name</span><span class="o">:</span><span class="w"> </span><span class="kt">string</span><span class="p">;</span>
+<span class="w">  </span><span class="nx">detect</span><span class="p">(</span><span class="nx">text</span><span class="o">:</span><span class="w"> </span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="nx">context</span><span class="o">:</span><span class="w"> </span><span class="kt">Record</span><span class="o">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="nx">unknown</span><span class="o">&gt;</span><span class="p">)</span><span class="o">:</span><span class="w"> </span><span class="nb">Promise</span><span class="o">&lt;</span><span class="nx">DetectionResult</span><span class="o">&gt;</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// 示例：API Key 检测与脱敏模块</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">API_KEY_PATTERNS</span><span class="o">:</span><span class="w"> </span><span class="kt">RegExp</span><span class="p">[]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
+<span class="w">  </span><span class="sr">/sk-[A-Za-z0-9]{20,}/g</span><span class="p">,</span>
+<span class="w">  </span><span class="sr">/AKIA[0-9A-Z]{16}/g</span><span class="p">,</span>
+<span class="w">  </span><span class="sr">/ghp_[A-Za-z0-9]{36}/g</span><span class="p">,</span>
+<span class="p">];</span>
+
+<span class="kd">class</span><span class="w"> </span><span class="nx">ApiKeyRedactionModule</span><span class="w"> </span><span class="k">implements</span><span class="w"> </span><span class="nx">GuardrailModule</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="nx">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;api_key_redaction&quot;</span><span class="p">;</span>
+
+<span class="w">  </span><span class="k">async</span><span class="w"> </span><span class="nx">detect</span><span class="p">(</span><span class="nx">text</span><span class="o">:</span><span class="w"> </span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="nx">_ctx</span><span class="o">:</span><span class="w"> </span><span class="kt">Record</span><span class="o">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="nx">unknown</span><span class="o">&gt;</span><span class="p">)</span><span class="o">:</span><span class="w"> </span><span class="nb">Promise</span><span class="o">&lt;</span><span class="nx">DetectionResult</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="nx">redacted</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">text</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="nx">hits</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0</span><span class="p">;</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kd">const</span><span class="w"> </span><span class="nx">pattern</span><span class="w"> </span><span class="k">of</span><span class="w"> </span><span class="nx">API_KEY_PATTERNS</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="kd">const</span><span class="w"> </span><span class="nx">matches</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">redacted</span><span class="p">.</span><span class="nx">match</span><span class="p">(</span><span class="nx">pattern</span><span class="p">);</span>
+<span class="w">      </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">matches</span><span class="p">)</span><span class="w"> </span><span class="nx">hits</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="nx">matches</span><span class="p">.</span><span class="nx">length</span><span class="p">;</span>
+<span class="w">      </span><span class="nx">redacted</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">redacted</span><span class="p">.</span><span class="nx">replace</span><span class="p">(</span><span class="nx">pattern</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;[REDACTED_KEY]&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">hits</span><span class="w"> </span><span class="o">===</span><span class="w"> </span><span class="mf">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="k">return</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">action</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;allow&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">score</span><span class="o">:</span><span class="w"> </span><span class="kt">0</span><span class="p">,</span><span class="w"> </span><span class="nx">message</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;no api key detected&quot;</span><span class="w"> </span><span class="p">};</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nx">action</span><span class="o">:</span><span class="w"> </span><span class="s2">&quot;redact&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">score</span><span class="o">:</span><span class="w"> </span><span class="kt">0.8</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">message</span><span class="o">:</span><span class="w"> </span><span class="sb">`redacted </span><span class="si">${</span><span class="nx">hits</span><span class="si">}</span><span class="sb"> api key(s)`</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">redactedText</span><span class="o">:</span><span class="w"> </span><span class="kt">redacted</span><span class="p">,</span>
+<span class="w">    </span><span class="p">};</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c1">// 模块注册</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">REGISTRY</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="nb">Map</span><span class="o">&lt;</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="nx">GuardrailModule</span><span class="o">&gt;</span><span class="p">();</span>
+<span class="kd">function</span><span class="w"> </span><span class="nx">register</span><span class="p">(</span><span class="nx">module</span><span class="o">:</span><span class="w"> </span><span class="kt">GuardrailModule</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="nx">REGISTRY</span><span class="p">.</span><span class="nx">set</span><span class="p">(</span><span class="kr">module</span><span class="nx">.name</span><span class="p">,</span><span class="w"> </span><span class="nx">module</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="nx">register</span><span class="p">(</span><span class="ow">new</span><span class="w"> </span><span class="nx">ApiKeyRedactionModule</span><span class="p">());</span>
+</code></pre></div>
+
+<p>两个示例体现的是同一套抽象：<strong>模块只关心"输入文本 → 检测结果"的纯函数式契约</strong>，不关心协议解析、流式编排、审计落盘——这些由 GuardRail 的策略引擎统一处理。这种解耦让安全团队能聚焦于检测逻辑本身，把工程复杂度留给框架。</p>
+<h2>十、部署架构建议</h2>
+<p>LLM 防火墙在生产中有三种主流部署形态，各有取舍：</p>
+<div class="highlight"><pre><span></span><code><span class="n">flowchart</span><span class="w"> </span><span class="n">TB</span>
+<span class="w">    </span><span class="n">subgraph</span><span class="w"> </span><span class="n">SIDE</span><span class="p">[</span><span class="s">&quot;模式 A: Sidecar 边车模式&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">direction</span><span class="w"> </span><span class="n">TB</span>
+<span class="w">        </span><span class="n">SA</span><span class="p">[</span><span class="s">&quot;应用容器&quot;</span><span class="p">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">SG</span><span class="p">[</span><span class="s">&quot;GuardRail Sidecar&lt;br/&gt;同 Pod/同主机&lt;br/&gt;localhost 通信&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">SG</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">SLLM</span><span class="p">[</span><span class="s">&quot;LLM API&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="kd">end</span>
+
+<span class="w">    </span><span class="n">subgraph</span><span class="w"> </span><span class="n">GW</span><span class="p">[</span><span class="s">&quot;模式 B: Gateway 网关模式&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">direction</span><span class="w"> </span><span class="n">TB</span>
+<span class="w">        </span><span class="n">GA1</span><span class="p">[</span><span class="s">&quot;应用 1&quot;</span><span class="p">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">GG</span><span class="p">[</span><span class="s">&quot;GuardRail 网关&lt;br/&gt;集群入口统一拦截&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">GA2</span><span class="p">[</span><span class="s">&quot;应用 2&quot;</span><span class="p">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">GG</span>
+<span class="w">        </span><span class="n">GG</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">GLLM</span><span class="p">[</span><span class="s">&quot;LLM API&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="kd">end</span>
+
+<span class="w">    </span><span class="n">subgraph</span><span class="w"> </span><span class="n">SDK</span><span class="p">[</span><span class="s">&quot;模式 C: SDK 嵌入模式&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">direction</span><span class="w"> </span><span class="n">TB</span>
+<span class="w">        </span><span class="n">SDKA</span><span class="p">[</span><span class="s">&quot;应用进程内&quot;</span><span class="p">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">SDKG</span><span class="p">[</span><span class="s">&quot;GuardRail SDK&lt;br/&gt;函数调用级拦截&lt;br/&gt;无额外网络跳&quot;</span><span class="p">]</span>
+<span class="w">        </span><span class="n">SDKG</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">SDKLLM</span><span class="p">[</span><span class="s">&quot;LLM API&quot;</span><span class="p">]</span>
+<span class="w">    </span><span class="kd">end</span>
+
+<span class="w">    </span><span class="n">style</span><span class="w"> </span><span class="n">SIDE</span><span class="w"> </span><span class="n">fill</span><span class="o">:</span><span class="err">#</span><span class="mi">0</span><span class="n">d1117</span><span class="p">,</span><span class="n">color</span><span class="o">:</span><span class="err">#</span><span class="n">fff</span><span class="p">,</span><span class="n">stroke</span><span class="o">:</span><span class="err">#</span><span class="mf">3f</span><span class="n">b950</span>
+<span class="w">    </span><span class="n">style</span><span class="w"> </span><span class="n">GW</span><span class="w"> </span><span class="n">fill</span><span class="o">:</span><span class="err">#</span><span class="mi">0</span><span class="n">d1117</span><span class="p">,</span><span class="n">color</span><span class="o">:</span><span class="err">#</span><span class="n">fff</span><span class="p">,</span><span class="n">stroke</span><span class="o">:</span><span class="err">#</span><span class="mi">58</span><span class="n">a6ff</span>
+<span class="w">    </span><span class="n">style</span><span class="w"> </span><span class="n">SDK</span><span class="w"> </span><span class="n">fill</span><span class="o">:</span><span class="err">#</span><span class="mi">0</span><span class="n">d1117</span><span class="p">,</span><span class="n">color</span><span class="o">:</span><span class="err">#</span><span class="n">fff</span><span class="p">,</span><span class="n">stroke</span><span class="o">:</span><span class="err">#</span><span class="n">f0883e</span>
+</code></pre></div>
+
+<p><strong>模式 A：Sidecar 边车模式</strong>。GuardRail 作为 sidecar 与应用同 Pod 部署，通过 localhost 通信。优点是网络跳最少、延迟最低、与应用 1:1 绑定便于按应用定制策略；缺点是策略分散、运维成本随应用数线性增长。适合对延迟极度敏感、应用数量可控的场景。</p>
+<p><strong>模式 B：Gateway 网关模式</strong>。GuardRail 作为独立网关集群，所有应用经统一入口访问 LLM API。优点是策略集中管理、审计统一、易于做租户隔离与限流；缺点是多一跳网络（通常 1-3ms）、网关成为单点需高可用部署。适合多应用、多租户、强合规的企业场景，是大规模生产的首选。</p>
+<p><strong>模式 C：SDK 嵌入模式</strong>。GuardRail 以 SDK 形式嵌入应用进程，在 LLM 客户端调用层做拦截。优点是零额外网络跳、最贴近代码、可访问应用上下文做更精细判断；缺点是语言绑定（需为每种语言维护 SDK）、策略随应用发布而更新、难以统一审计。适合单体应用或对延迟极致要求的内嵌场景。</p>
+<p>实践中常见<strong>混合部署</strong>：核心高敏感应用用 SDK 嵌入做第一道细粒度防护，全量流量经 Gateway 网关做第二道统一防护与审计，AIGuardian 在 CI 中做上线前测试，Red-Team-GPT 定期做对抗验证。</p>
+<h2>十一、与传统 WAF 的对比分析</h2>
+<p>LLM 防火墙常被类比为"AI 时代的 WAF"，但两者在多个维度存在本质差异：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>传统 WAF</th>
+<th>LLM 安全防火墙</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>防护对象</strong></td>
+<td>HTTP 请求/响应</td>
+<td>LLM 的 prompt/response</td>
+</tr>
+<tr>
+<td><strong>输入结构</strong></td>
+<td>结构化（参数、Header、Body）</td>
+<td>非结构化自然语言</td>
+</tr>
+<tr>
+<td><strong>检测范式</strong></td>
+<td>特征签名、正则、规则引擎</td>
+<td>模式匹配 + 语义分析 + ML 分类器</td>
+</tr>
+<tr>
+<td><strong>威胁载体</strong></td>
+<td>代码注入（SQL/XSS/命令注入）</td>
+<td>语义注入（Prompt 注入/越狱）</td>
+</tr>
+<tr>
+<td><strong>输出处理</strong></td>
+<td>静态响应，完整可检</td>
+<td>流式生成，需增量检测</td>
+</tr>
+<tr>
+<td><strong>延迟预算</strong></td>
+<td>毫秒级，缓冲完整请求</td>
+<td>亚 50ms，需流式短路</td>
+</tr>
+<tr>
+<td><strong>协议感知</strong></td>
+<td>HTTP/应用层协议</td>
+<td>chat/completion 消息结构、角色分段</td>
+</tr>
+<tr>
+<td><strong>决策动作</strong></td>
+<td>allow / block</td>
+<td>allow / deny / redact / modify（含改写）</td>
+</tr>
+<tr>
+<td><strong>核心难点</strong></td>
+<td>规则覆盖与误报平衡</td>
+<td>语义理解、流式检测、对抗样本漂移</td>
+</tr>
+<tr>
+<td><strong>典型标准</strong></td>
+<td>OWASP Core（SQLi/XSS 等）</td>
+<td>OWASP Top 10 for LLM Applications</td>
+</tr>
+</tbody>
+</table>
+<p>三个本质差异值得强调：</p>
+<ol>
+<li>
+<p><strong>从"结构边界"到"语义边界"</strong>。WAF 的前提是输入有结构——SQL 注入靠闭合引号、XSS 靠标签边界，都有可枚举的特征。Prompt 注入的载体是自然语言，"ignore previous instructions"和"请忽略上述内容"语义等价但字面完全不同，WAF 的正则范式在这里失效，必须引入语义层。</p>
+</li>
+<li>
+<p><strong>从"完整响应"到"流式生成"</strong>。WAF 处理的是服务器生成的完整响应，可以整体扫描后再返回。LLM 的流式输出要求防火墙在 token 逐个到达时做增量判定，并且能在命中时切断上游流——这是传统 WAF 架构没有的"流中断"能力。</p>
+</li>
+<li>
+<p><strong>从"二值裁决"到"改写式处置"</strong>。WAF 基本是 allow/block 二元决策。LLM 防火墙多了 <code>redact</code>（脱敏后放行）和 <code>modify</code>（改写后放行）两种处置——因为很多场景下直接阻断会破坏用户体验，而把"带上我的信用卡号"改写成"带上 [REDACTED_CARD]"既能继续服务又消除了风险。这种"可改写"能力是 LLM 防火墙独有的。</p>
+</li>
+</ol>
+<h2>十二、总结与展望</h2>
+<p>2026 年 7 月这波开源 LLM 安全工具的集中发布，本质上完成了一次<strong>品类分工的清晰化</strong>：</p>
+<ul>
+<li><strong>GuardRail / ModelGuard</strong> 守住运行时防线，做"在线拦截 + 双向脱敏 + 流式决策"；</li>
+<li><strong>AIGuardian</strong> 守住上线前关卡，做"OWASP Top 10 全覆盖审计"；</li>
+<li><strong>Red-Team-GPT</strong> 守住防御有效性，做"自动化对抗与护栏绕过验证"。</li>
+</ul>
+<p>从架构上看，LLM 安全防火墙的成熟度体现在三个工程能力的闭环：<strong>协议感知的双向拦截</strong>、<strong>三层纵深的检测引擎</strong>（模式匹配 + 语义分析 + 分类器）、<strong>流式低延迟的代理内核</strong>。这三者共同把"自然语言输入"这个传统安全工具无法处理的新攻击面，纳入了可工程化、可观测、可治理的范畴。</p>
+<p>值得警惕的是，LLM 安全是典型的<strong>不对称对抗</strong>：攻击者只需找到一个绕过点，防御者却要覆盖所有路径。GuardRail 这类模块化代理的价值不在于"开箱即用挡住一切"，而在于提供了一个<strong>可持续演进的检测底座</strong>——当新的越狱手法出现时，安全团队可以快速编写自定义模块（如第九节所示）插接入策略链，而不必改动应用代码或更换 LLM 供应商。这种"检测逻辑与应用解耦、与模型解耦"的架构，才是 LLM 安全防火墙区别于一次性工具的根本所在。</p>
+<p>未来的演进方向有三条值得观察：其一是<strong>模型内置安全</strong>（如 Constitutional AI、对齐微调）与<strong>外置防火墙</strong>的协同——内置做"意图层"拒绝，外置做"传输层"拦截，二者互补而非替代；其二是<strong>Agent 安全</strong>的崛起，当 LLM 持有工具调用权（OWASP LLM08 过度代理）时，防火墙需要从"检测文本"扩展到"校验工具调用参数与权限"，这比 Prompt 检测复杂一个量级；其三是<strong>标准化</strong>，OWASP Top 10 for LLM Applications 提供了威胁分类，但业界仍缺一个类似 WAF 的"LLM 防火墙规则标准格式"，这或许是下一个开源机会点。</p>
+<p>对于工程团队而言，当下的务实路径是：以 GuardRail 或 ModelGuard 为运行时底座，以 AIGuardian 为 CI 门禁，以 Red-Team-GPT 为周期性红队，构建"测试—防护—验证"三位一体的 LLM 安全闭环。在 LLM 从"对话"走向"代理执行"的转折点上，谁能率先把这张安全网织密，谁才能让 Agent 真正安全地走出沙箱、接入生产。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

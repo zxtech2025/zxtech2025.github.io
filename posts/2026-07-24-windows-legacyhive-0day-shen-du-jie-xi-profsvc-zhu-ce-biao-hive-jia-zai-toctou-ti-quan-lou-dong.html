@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Windows LegacyHive 0day 深度解析——ProfSvc 注册表 Hive 加载 TOCTOU 提权漏洞 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Windows LegacyHive 0day 深度解析——ProfSvc 注册表 Hive 加载 TOCTOU 提权漏洞</h1>
+<time>2026-07-24</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析
+Slug: windows-legacyhive-0day-深度解析profsvc-注册表-hive-加载-toctou-提权漏洞</li>
+</ul>
+<hr />
+<h2>一、漏洞全景：补丁日后的“回马枪”</h2>
+<p>2026 年 7 月 14 日，微软发布了当月补丁星期二更新，修复了数百个 CVE。然而就在补丁发布后数小时，安全研究员 Chaotic Eclipse（GitHub 账号 MSNightmare）公开了一个名为 <strong>LegacyHive</strong> 的本地权限提升（LPE）概念验证代码。该 PoC 针对的是 Windows 用户配置文件服务（ProfSvc），并且据 SecurityWeek、CrowdStrike、SOC Prime 等机构确认，它在安装了 7 月累积更新后的所有受支持 Windows 桌面版与服务器版上依然有效。</p>
+<p>LegacyHive 的核心危害在于：一个标准（非管理员）用户能够胁迫一个以 SYSTEM 权限运行的服务，把<strong>另一个用户（可以是管理员）的注册表 Hive 文件</strong>加载进自己的注册表空间，并获得完整的读写权限。这打破了 Windows 用户配置文件隔离这一基础安全边界。</p>
+<p>需要强调的是，CrowdStrike 在评估中指出，公开发布的 PoC 代码被刻意限制（deliberately restricted）——它需要第二个标准用户的凭据，且仅针对 <code>UsrClass.dat</code> Hive。研究员声称其原始完整版利用不需要额外用户凭据，即可强制 ProfSvc 加载任意 Hive。这一区别在评估实际风险时至关重要。</p>
+<p>从威胁模型看，LegacyHive 是一个<strong>后渗透（post-compromise）本地提权</strong>漏洞：攻击者必须先在目标机器上获得代码执行能力。这意味着它并非远程入侵入口，但在共享桌面、跳板机、终端服务器（RDS Host）、开发工作站、教室与呼叫中心等多用户环境中，它能把一个低权限立足点迅速放大为管理员甚至 SYSTEM 级别的控制权。</p>
+<h2>二、ProfSvc 架构与 Hive 加载机制</h2>
+<h3>2.1 用户配置文件服务职责</h3>
+<p>Windows User Profile Service（ProfSvc）是一个以 SYSTEM 权限运行的服务，托管在共享进程 <code>svchost.exe</code> 中。它的核心职责是管理用户配置文件的生命周期：在用户登录时加载其注册表 Hive（<code>NTUSER.DAT</code> 与 <code>UsrClass.dat</code>），在用户注销时卸载这些 Hive。它还负责处理“以其他用户身份运行进程”（RunAs / CreateProcessAsUser）场景下目标用户配置文件的按需加载。</p>
+<p>每个 Windows 用户账户携带两个关键 Hive 文件：</p>
+<ul>
+<li><strong><code>NTUSER.DAT</code></strong>：对应用户的 <code>HKEY_CURRENT_USER</code> 根 Hive，存储桌面设置、环境变量、用户级软件配置等。</li>
+<li><strong><code>UsrClass.dat</code></strong>：对应用户的 <code>HKEY_CLASSES_ROOT</code>（Classes Hive），存储文件类型关联、COM 对象注册、Shell 扩展等。该文件位于用户配置文件的 <code>AppData\Local\Microsoft\Windows</code> 目录下。</li>
+</ul>
+<p>这两个文件在正常情况下仅对所属账户（及 SYSTEM）可访问，构成了用户间配置数据隔离的文件层基础。</p>
+<h3>2.2 Hive 加载架构图</h3>
+<p>下面的时序图展示了正常情况下用户登录与跨用户进程创建时，ProfSvc 加载 Hive 的完整流程：</p>
+<div class="highlight"><pre><span></span><code><span class="n">sequenceDiagram</span>
+<span class="w">    </span><span class="n">autonumber</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">U</span><span class="w"> </span><span class="kr">as</span><span class="w"> </span><span class="err">用户进程</span><span class="p">(</span><span class="n">Logon</span><span class="o">/</span><span class="n">RunAs</span><span class="p">)</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">LSASS</span><span class="w"> </span><span class="kr">as</span><span class="w"> </span><span class="n">LSASS</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">Winlogon</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">ProfSvc</span><span class="w"> </span><span class="kr">as</span><span class="w"> </span><span class="n">ProfSvc</span><span class="p">(</span><span class="n">SYSTEM</span><span class="p">)</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">Kernel</span><span class="w"> </span><span class="kr">as</span><span class="w"> </span><span class="err">配置注册表内核</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">FS</span><span class="w"> </span><span class="kr">as</span><span class="w"> </span><span class="err">文件系统</span><span class="p">(</span><span class="n">NTUSER</span><span class="p">.</span><span class="n">DAT</span><span class="o">/</span><span class="n">UsrClass</span><span class="p">.</span><span class="n">dat</span><span class="p">)</span>
+
+<span class="w">    </span><span class="n">U</span><span class="o">-&gt;&gt;</span><span class="n">LSASS</span><span class="o">:</span><span class="w"> </span><span class="err">发起登录</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">CreateProcessAsUser</span><span class="p">(</span><span class="err">目标用户</span><span class="p">)</span>
+<span class="w">    </span><span class="n">LSASS</span><span class="o">-&gt;&gt;</span><span class="n">ProfSvc</span><span class="o">:</span><span class="w"> </span><span class="err">通知加载目标用户配置文件</span>
+<span class="w">    </span><span class="n">ProfSvc</span><span class="o">-&gt;&gt;</span><span class="n">FS</span><span class="o">:</span><span class="w"> </span><span class="err">解析并打开目标用户</span><span class="w"> </span><span class="n">Hive</span><span class="w"> </span><span class="err">文件路径</span>
+<span class="w">    </span><span class="n">FS</span><span class="o">--&gt;&gt;</span><span class="n">ProfSvc</span><span class="o">:</span><span class="w"> </span><span class="err">返回文件句柄</span>
+<span class="w">    </span><span class="n">ProfSvc</span><span class="o">-&gt;&gt;</span><span class="n">ProfSvc</span><span class="o">:</span><span class="w"> </span><span class="err">访问检查</span><span class="w"> </span><span class="n">CheckFullAccessOnFile</span>
+<span class="w">    </span><span class="n">alt</span><span class="w"> </span><span class="err">请求方有完全访问权限</span>
+<span class="w">        </span><span class="n">ProfSvc</span><span class="o">-&gt;&gt;</span><span class="n">Kernel</span><span class="o">:</span><span class="w"> </span><span class="n">NtLoadKey3</span><span class="p">(</span><span class="err">用户模拟令牌</span><span class="p">,</span><span class="w"> </span><span class="n">KEY_READ</span><span class="o">|</span><span class="n">KEY_WRITE</span><span class="p">)</span>
+<span class="w">    </span><span class="n">else</span><span class="w"> </span><span class="err">请求方无完全访问权限</span><span class="p">(</span><span class="err">只读场景</span><span class="p">)</span>
+<span class="w">        </span><span class="n">ProfSvc</span><span class="o">-&gt;&gt;</span><span class="n">Kernel</span><span class="o">:</span><span class="w"> </span><span class="n">NtLoadKeyEx</span><span class="p">(</span><span class="n">SYSTEM身份</span><span class="p">,</span><span class="w"> </span><span class="err">完全访问</span><span class="p">)</span>
+<span class="w">    </span><span class="kd">end</span>
+<span class="w">    </span><span class="n">Kernel</span><span class="o">--&gt;&gt;</span><span class="n">ProfSvc</span><span class="o">:</span><span class="w"> </span><span class="n">Hive</span><span class="w"> </span><span class="err">挂载到</span><span class="w"> </span><span class="n">HKEY_USERS</span><span class="err">\</span><span class="o">&lt;</span><span class="n">SID</span><span class="o">&gt;</span>
+<span class="w">    </span><span class="n">ProfSvc</span><span class="o">--&gt;&gt;</span><span class="n">LSASS</span><span class="o">:</span><span class="w"> </span><span class="err">配置文件就绪</span>
+<span class="w">    </span><span class="n">LSASS</span><span class="o">--&gt;&gt;</span><span class="n">U</span><span class="o">:</span><span class="w"> </span><span class="err">用户环境准备完成</span>
+</code></pre></div>
+
+<p>关键点在于 ProfSvc 加载 Hive 时调用的两个底层函数：</p>
+<ul>
+<li><strong><code>NtLoadKeyEx</code></strong>：较旧的 Hive 加载函数，<strong>不支持用户模拟（impersonation）</strong>，因此 Hive 总是以调用者（即 SYSTEM）身份加载，获得完全访问权限。</li>
+<li><strong><code>NtLoadKey3</code></strong>：较新的函数，<strong>支持用户模拟</strong>，可以指定一个用户令牌，使 Hive 以该用户身份加载，访问权限受限于该令牌。</li>
+</ul>
+<p>ProfSvc 在决定使用哪个函数时，会进行一次 <code>CheckFullAccessOnFile</code> 访问检查，判断请求用户对目标 Hive 文件是否具有完全访问权限。这个看似合理的分支逻辑，正是漏洞的温床。</p>
+<h3>2.3 漏洞代码逻辑剖析</h3>
+<p>根据 0patch 的逆向分析，漏洞代码在所有受支持 Windows 版本上的逻辑可概括如下（<code>r14</code> 寄存器存放用户令牌，0 表示服务内部调用）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 伪代码：profsvc.dll 中的 Hive 加载逻辑</span>
+<span class="n">NTSTATUS</span><span class="w"> </span><span class="n">LoadUserHive</span><span class="p">(</span><span class="n">HANDLE</span><span class="w"> </span><span class="n">UserToken</span><span class="p">,</span><span class="w"> </span><span class="n">PWSTR</span><span class="w"> </span><span class="n">HiveFilePath</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">UserToken</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">NULL</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 服务自身发起，无可模拟令牌 -&gt; 直接以 SYSTEM 加载</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">NtLoadKeyEx</span><span class="p">(</span><span class="n">HiveFilePath</span><span class="p">,</span><span class="w"> </span><span class="p">...);</span><span class="w">  </span><span class="c1">// 完全访问, SYSTEM 身份</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 有用户令牌：检查用户对 Hive 文件是否有完全访问权限</span>
+<span class="w">    </span><span class="n">BOOL</span><span class="w"> </span><span class="n">hasFullAccess</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="n">CheckFullAccessOnFile</span><span class="p">(</span><span class="n">UserToken</span><span class="p">,</span><span class="w"> </span><span class="n">HiveFilePath</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">hasFullAccess</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 有完全访问权限 -&gt; 模拟用户身份加载</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">NtLoadKey3</span><span class="p">(</span><span class="n">UserToken</span><span class="p">,</span><span class="w"> </span><span class="n">HiveFilePath</span><span class="p">,</span><span class="w"> </span><span class="n">KEY_READ</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">KEY_WRITE</span><span class="p">,</span><span class="w"> </span><span class="p">...);</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 【漏洞核心】无完全访问权限 -&gt; 退回 SYSTEM 身份加载</span>
+<span class="w">        </span><span class="c1">// 本意是兼容只读 Mandatory Profile 场景(NTUSER.MAN)</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">NtLoadKeyEx</span><span class="p">(</span><span class="n">HiveFilePath</span><span class="p">,</span><span class="w"> </span><span class="p">...);</span><span class="w">  </span><span class="c1">// 完全访问, SYSTEM 身份</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>0patch 团队对此的点评一针见血：这段代码表面上像一个标准的安全检查（“用户有权限就走左路，没权限就走右路”），但实际语义是“用户有权限就用用户身份加载，没权限就用 SYSTEM 身份加载”——<strong>因此它几乎总能在所有典型条件下成功加载文件</strong>。换言之，直接在所有情况下都以 SYSTEM 加载效果完全相同，这个“安全分支”不仅没有提供保护，反而因为引入了 <code>CheckFullAccessOnFile</code> 与实际 <code>NtLoadKeyEx</code> 调用之间的<strong>时间窗口</strong>，为 TOCTOU 攻击打开了大门。</p>
+<p>据 0patch 推测，这段代码的历史成因可能是：多年前某位微软程序员为修复一个类似 LegacyHive 的符号链接提权，添加了“有用户令牌就模拟”的检查；但该检查破坏了学校机房、公共电脑等使用的 <strong>Mandatory User Profile</strong>（强制用户配置文件，<code>NTUSER.MAN</code> 只读）场景。为了不破坏该场景，程序员补加了“无法完全访问就退回 SYSTEM 加载”的分支——却没意识到这第二个分支完全抵消了第一个分支的安全意义。</p>
+<h2>三、TOCTOU 竞态条件深度分析</h2>
+<h3>3.1 TOCTOU 漏洞模型</h3>
+<p>TOCTOU（Time-of-Check to Time-of-Use，检查时到使用时）是 CWE-362 竞态条件的经典子类。其核心是：程序在<strong>检查</strong>某个条件（如文件路径、权限）与<strong>使用</strong>该检查结果之间，存在一个时间窗口；攻击者若能在此窗口内篡改被检查的对象，就能使程序基于过时的检查结果执行错误的操作。</p>
+<p>在 LegacyHive 中，TOCTOU 发生在：</p>
+<ul>
+<li><strong>Check（检查点）</strong>：<code>CheckFullAccessOnFile(UserToken, HiveFilePath)</code>——ProfSvc 检查请求用户对路径 <code>HiveFilePath</code> 指向的文件是否有完全访问权限。</li>
+<li><strong>Use（使用点）</strong>：<code>NtLoadKeyEx(HiveFilePath, ...)</code>——ProfSvc 实际加载该路径指向的 Hive 文件。</li>
+</ul>
+<p>攻击者要做的就是：让 Check 阶段看到的文件是攻击者<strong>种植的诱饵文件</strong>（其权限导致检查失败，从而走 SYSTEM 加载分支），而在 Use 阶段让 <code>HiveFilePath</code> 解析到<strong>目标用户（管理员）的真实 <code>UsrClass.dat</code></strong>。由于检查失败分支使用不带模拟的 <code>NtLoadKeyEx</code>，Hive 会以 SYSTEM 身份加载，绕过文件 ACL，最终挂载到攻击者的注册表空间。</p>
+<h3>3.2 竞态时序图</h3>
+<p>下面的时序图精确刻画了攻击者如何在 Check 与 Use 之间完成路径“狸猫换太子”：</p>
+<div class="highlight"><pre><span></span><code><span class="n">sequenceDiagram</span>
+<span class="w">    </span><span class="n">autonumber</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">A</span><span class="w"> </span><span class="kr">as</span><span class="w"> </span><span class="err">攻击者进程</span><span class="p">(</span><span class="err">标准用户</span><span class="p">)</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">OM</span><span class="w"> </span><span class="kr">as</span><span class="w"> </span><span class="n">Object</span><span class="w"> </span><span class="n">Manager命名空间</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">ProfSvc</span><span class="w"> </span><span class="kr">as</span><span class="w"> </span><span class="n">ProfSvc</span><span class="p">(</span><span class="n">SYSTEM</span><span class="p">)</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">FS</span><span class="w"> </span><span class="kr">as</span><span class="w"> </span><span class="err">文件系统</span>
+<span class="w">    </span><span class="n">participant</span><span class="w"> </span><span class="n">T</span><span class="w"> </span><span class="kr">as</span><span class="w"> </span><span class="err">目标管理员</span><span class="n">UsrClass</span><span class="p">.</span><span class="n">dat</span>
+
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">A</span><span class="o">:</span><span class="w"> </span><span class="err">种植诱饵</span><span class="n">DAT文件</span><span class="p">(</span><span class="err">权限使</span><span class="n">CheckFullAccess失败</span><span class="p">)</span>
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">OM</span><span class="o">:</span><span class="w"> </span><span class="err">构造符号链接</span><span class="o">:</span><span class="w"> </span><span class="err">路径</span><span class="n">X</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">诱饵</span><span class="n">DAT</span>
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">FS</span><span class="o">:</span><span class="w"> </span><span class="err">对诱饵</span><span class="n">DAT设置Oplock</span><span class="p">(</span><span class="err">机会锁</span><span class="p">)</span>
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">ProfSvc</span><span class="o">:</span><span class="w"> </span><span class="err">触发</span><span class="n">CreateProcessAsUser</span><span class="p">(</span><span class="err">目标用户</span><span class="p">)</span>
+<span class="w">    </span><span class="n">ProfSvc</span><span class="o">-&gt;&gt;</span><span class="n">FS</span><span class="o">:</span><span class="w"> </span><span class="err">解析路径</span><span class="n">X</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">诱饵</span><span class="n">DAT</span>
+<span class="w">    </span><span class="n">ProfSvc</span><span class="o">-&gt;&gt;</span><span class="n">FS</span><span class="o">:</span><span class="w"> </span><span class="n">CheckFullAccessOnFile</span><span class="p">(</span><span class="err">打开诱饵</span><span class="n">DAT</span><span class="p">)</span>
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">FS</span><span class="o">:</span><span class="w"> </span><span class="n">Oplock触发</span><span class="o">!</span><span class="w"> </span><span class="n">ProfSvc阻塞在此</span>
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">A</span><span class="o">:</span><span class="w"> </span><span class="err">检测到</span><span class="n">Oplock命中</span><span class="p">(</span><span class="err">竞态窗口打开</span><span class="p">)</span>
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">OM</span><span class="o">:</span><span class="w"> </span><span class="err">原子替换符号链接</span><span class="o">:</span><span class="w"> </span><span class="err">路径</span><span class="n">X</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">目标</span><span class="n">T的UsrClass</span><span class="p">.</span><span class="n">dat</span>
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">FS</span><span class="o">:</span><span class="w"> </span><span class="err">释放</span><span class="n">Oplock</span>
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">ProfSvc</span><span class="o">:</span><span class="w"> </span><span class="n">Check返回</span><span class="o">:</span><span class="w"> </span><span class="err">无完全访问权限</span>
+<span class="w">    </span><span class="n">ProfSvc</span><span class="o">-&gt;&gt;</span><span class="n">ProfSvc</span><span class="o">:</span><span class="w"> </span><span class="err">决策</span><span class="o">:</span><span class="w"> </span><span class="err">走</span><span class="n">NtLoadKeyEx分支</span><span class="p">(</span><span class="n">SYSTEM身份</span><span class="p">)</span>
+<span class="w">    </span><span class="n">ProfSvc</span><span class="o">-&gt;&gt;</span><span class="n">FS</span><span class="o">:</span><span class="w"> </span><span class="n">NtLoadKeyEx</span><span class="p">(</span><span class="err">路径</span><span class="n">X</span><span class="p">)</span>
+<span class="w">    </span><span class="n">FS</span><span class="o">-&gt;&gt;</span><span class="n">T</span><span class="o">:</span><span class="w"> </span><span class="err">路径</span><span class="n">X现在解析到目标T的UsrClass</span><span class="p">.</span><span class="n">dat</span>
+<span class="w">    </span><span class="n">Note</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="n">FS</span><span class="o">:</span><span class="w"> </span><span class="n">SYSTEM身份打开</span><span class="p">,</span><span class="w"> </span><span class="err">绕过</span><span class="n">ACL</span><span class="o">!</span>
+<span class="w">    </span><span class="n">T</span><span class="o">--&gt;&gt;</span><span class="n">ProfSvc</span><span class="o">:</span><span class="w"> </span><span class="n">Hive文件句柄</span>
+<span class="w">    </span><span class="n">ProfSvc</span><span class="o">-&gt;&gt;</span><span class="n">ProfSvc</span><span class="o">:</span><span class="w"> </span><span class="err">挂载</span><span class="n">Hive到攻击者HKEY_CLASSES_ROOT</span>
+<span class="w">    </span><span class="n">ProfSvc</span><span class="o">--&gt;&gt;</span><span class="n">A</span><span class="o">:</span><span class="w"> </span><span class="n">Hive加载完成</span><span class="p">(</span><span class="err">读写权限</span><span class="p">)</span>
+<span class="w">    </span><span class="n">A</span><span class="o">-&gt;&gt;</span><span class="n">A</span><span class="o">:</span><span class="w"> </span><span class="err">攻击者可读写管理员</span><span class="n">Classes</span><span class="w"> </span><span class="n">Hive</span>
+</code></pre></div>
+
+<h3>3.3 竞态窗口的精确控制：Oplock</h3>
+<p>要让上述时序可靠成立，攻击者必须能<strong>精确感知 Check 阶段的发生时机</strong>，并在 Use 阶段之前完成符号链接替换。这正是 <strong>Oplock（Opportunistic Lock，机会锁）</strong> 发挥作用的地方。</p>
+<p>Oplock 是 Windows 文件系统提供的一种客户端缓存协调机制。当攻击者对诱饵文件设置 Oplock 后，任何其他进程（包括 SYSTEM 权限的 ProfSvc）试图以冲突方式打开该文件时，Oplock 会被“破坏”，攻击者进程会收到通知，而<strong>请求方会被阻塞</strong>，直到攻击者释放 Oplock。这就给了攻击者一个可控的同步点：</p>
+<ol>
+<li>攻击者创建诱饵 DAT 文件并对其设置 Oplock。</li>
+<li>触发 ProfSvc 的 Hive 加载流程，使其路径解析到诱饵文件。</li>
+<li>ProfSvc 在 <code>CheckFullAccessOnFile</code> 中打开诱饵文件，<strong>Oplock 命中，ProfSvc 阻塞</strong>。</li>
+<li>攻击者检测到 Oplock 命中（竞态窗口已打开），立即原子性地替换符号链接，使其指向目标 <code>UsrClass.dat</code>。</li>
+<li>攻击者释放 Oplock，ProfSvc 从 <code>CheckFullAccessOnFile</code> 返回（结果是“无完全访问权限”）。</li>
+<li>ProfSvc 走 <code>NtLoadKeyEx</code> 分支，但此时路径已指向目标文件——SYSTEM 身份加载，绕过 ACL。</li>
+</ol>
+<p>整个过程的核心在于：Oplock 把原本不可控的微秒级竞态窗口，变成了攻击者可主动开关的同步原语，使利用从“碰运气”变为“高可靠”。</p>
+<h2>四、Object Manager 路径操控技术分析</h2>
+<h3>4.1 Windows Object Manager 命名空间</h3>
+<p>要理解 LegacyHive 如何在 Check 与 Use 之间完成路径替换，必须深入 Windows <strong>对象管理器（Object Manager）</strong> 命名空间。对象管理器是 Windows NT 内核的子系统，负责创建、管理和命名所有内核对象（进程、线程、文件、事件、信号量、符号链接、目录对象等）。它维护着一个类似文件系统的<strong>层级命名空间</strong>，根目录为 <code>\</code>。</p>
+<p>关键命名空间节点包括：</p>
+<ul>
+<li><strong><code>\??</code> / <code>\Global??</code></strong>：DOS 设备命名空间，Win32 路径（如 <code>C:\...</code>）在此解析。<code>C:</code> 实际是指向 <code>\Device\HarddiskVolumeX</code> 的符号链接。</li>
+<li><strong><code>\BaseNamedObjects</code></strong>：全局命名对象（事件、互斥体、信号量等）的默认目录。</li>
+<li><strong><code>\BaseNamedObjects\Restricted</code></strong>：受限命名对象目录，标准用户可在此创建对象——这一点对攻击至关重要。</li>
+<li><strong><code>\RPC Control</code></strong>：RPC 控制命名空间，标准用户同样具有 <code>Create Object</code> 权限，常用于符号链接攻击。</li>
+<li><strong><code>\Sessions\X\BaseNamedObjects</code></strong>：会话级命名对象目录。</li>
+</ul>
+<p>对象管理器的符号链接（Object Manager Symbolic Link）与文件系统的符号链接完全不同。它通过 <code>NtCreateSymbolicLinkObject</code> 创建，是一个内核对象，能将一个对象管理器名称重定向到另一个对象管理器路径或设备路径。<strong>普通用户可以在自己有权限的目录（如 <code>\RPC Control</code>、<code>\BaseNamedObjects\Restricted</code>）中创建此类符号链接</strong>。</p>
+<h3>4.2 路径解析与“混淆代理”</h3>
+<p>当高权限进程（如 ProfSvc）打开一个用户可影响的路径时，路径解析会逐段进行。攻击者只要在路径的某一段植入符号链接，就能把剩余路径解析<strong>重定向</strong>到攻击者原本无权访问的目标。这就是经典的 <strong>Confused Deputy（混淆代理）</strong> 模型：高权限服务“代理”了攻击者的请求，却用自身权限访问了被重定向后的目标。</p>
+<p>LegacyHive 及同类利用（如同一研究员的 BlueHammer）的典型路径操控链路为：</p>
+<ol>
+<li><strong>连接点（Junction / Mount Point）桥接</strong>：通过 NTFS 重解析点（<code>IO_REPARSE_TAG_MOUNT_POINT</code>）创建目录连接点，把一个 Win32 文件系统目录重定向到对象管理器目录（如 <code>\BaseNamedObjects\Restricted</code>）。这桥接了文件系统命名空间与对象管理器命名空间。</li>
+<li><strong>对象管理器符号链接注入</strong>：在受限命名空间内用 <code>NtCreateSymbolicLinkObject</code> 创建符号链接，把一个虚拟文件名指向真正的目标设备路径（如目标用户的 <code>UsrClass.dat</code> 全路径，或 <code>\Device\HarddiskVolumeShadowCopyX\...</code> 影子副本路径）。</li>
+<li><strong>路径解析劫持</strong>：当高权限进程沿连接点进入对象管理器空间，再沿符号链接解析时，最终打开的是攻击者指定的目标文件——以高权限进程的身份绕过目标文件的 ACL。</li>
+</ol>
+<h3>4.3 关键 NT API</h3>
+<p>下表总结了路径操控链路中用到的核心原生 API：</p>
+<table>
+<thead>
+<tr>
+<th>API</th>
+<th>作用</th>
+<th>权限要求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NtCreateSymbolicLinkObject</code></td>
+<td>在对象管理器命名空间创建符号链接</td>
+<td>对目标目录有 <code>CREATE_OBJECT</code> 权限</td>
+</tr>
+<tr>
+<td><code>NtOpenDirectoryObject</code></td>
+<td>打开对象管理器目录对象</td>
+<td>对应目录的访问权限</td>
+</tr>
+<tr>
+<td><code>NtCreateDirectoryObjectEx</code></td>
+<td>创建/操作对象管理器目录对象</td>
+<td>父目录权限</td>
+</tr>
+<tr>
+<td><code>DeviceIoControl(FSCTL_SET_REPARSE_POINT)</code></td>
+<td>设置 NTFS 重解析点（连接点）</td>
+<td>对目录有写权限（标准用户即可）</td>
+</tr>
+<tr>
+<td><code>SetOplock</code> / <code>NtCreateFile(OPLOCK)</code></td>
+<td>设置机会锁</td>
+<td>对文件有适当访问权限</td>
+</tr>
+</tbody>
+</table>
+<p>值得注意的是，文件系统符号链接（NTFS Symlink）需要 <code>SeCreateSymbolicLinkPrivilege</code>（默认仅管理员），但<strong>连接点（Junction）与对象管理器符号链接标准用户即可创建</strong>。这正是此类提权链能由低权限用户发起的根本原因——攻击者总能找到标准用户可写、可创建对象的命名空间角落。</p>
+<h2>五、完整攻击链分析</h2>
+<h3>5.1 前置条件</h3>
+<p>公开版 LegacyHive PoC 的利用条件为：</p>
+<ol>
+<li><strong>两个标准用户账户的凭据</strong>：攻击者当前登录账户 A（标准用户），并掌握第二个标准用户账户 B 的口令。账户 B 用于触发“以 B 身份运行进程”，从而让 ProfSvc 为 B 加载配置文件 Hive。</li>
+<li><strong>识别第三个目标账户 C</strong>（可以是管理员）：其 <code>UsrClass.dat</code> 是攻击者想要劫持的目标。</li>
+<li>目标机器上账户 B 与账户 C 的 Hive 文件存在且路径可预测。</li>
+</ol>
+<h3>5.2 攻击链全景</h3>
+<div class="highlight"><pre><span></span><code><span class="n">flowchart</span><span class="w"> </span><span class="n">TD</span>
+<span class="w">    </span><span class="n">A</span><span class="p">[</span><span class="err">攻击者登录账户</span><span class="n">A</span><span class="w"> </span><span class="err">标准用户</span><span class="p">]</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">B</span><span class="p">[</span><span class="err">掌握账户</span><span class="n">B凭据</span><span class="w"> </span><span class="err">标准用户</span><span class="p">]</span>
+<span class="w">    </span><span class="n">B</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">C</span><span class="p">[</span><span class="err">识别目标账户</span><span class="n">C</span><span class="w"> </span><span class="err">管理员</span><span class="p">]</span>
+<span class="w">    </span><span class="n">C</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">D</span><span class="p">[</span><span class="err">种植诱饵</span><span class="n">DAT文件</span><span class="err">\</span><span class="n">n权限使CheckFullAccess失败</span><span class="p">]</span>
+<span class="w">    </span><span class="n">D</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">E</span><span class="p">[</span><span class="err">构造</span><span class="n">Object</span><span class="w"> </span><span class="n">Manager符号链接</span><span class="err">\</span><span class="n">n路径X</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">诱饵</span><span class="n">DAT</span><span class="p">]</span>
+<span class="w">    </span><span class="n">E</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">F</span><span class="p">[</span><span class="err">对诱饵</span><span class="n">DAT设置Oplock</span><span class="p">]</span>
+<span class="w">    </span><span class="n">F</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">G</span><span class="p">[</span><span class="err">以账户</span><span class="n">B身份CreateProcessAsUser</span><span class="err">\</span><span class="n">n触发ProfSvc加载B的Hive</span><span class="p">]</span>
+<span class="w">    </span><span class="n">G</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">H</span><span class="p">{</span><span class="n">ProfSvc执行CheckFullAccessOnFile</span><span class="err">\</span><span class="n">n打开诱饵DAT</span><span class="p">,</span><span class="w"> </span><span class="n">Oplock命中</span><span class="p">}</span>
+<span class="w">    </span><span class="n">H</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">I</span><span class="p">[</span><span class="err">攻击者检测到</span><span class="n">Oplock</span><span class="err">\</span><span class="n">n竞态窗口打开</span><span class="p">]</span>
+<span class="w">    </span><span class="n">I</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">J</span><span class="p">[</span><span class="err">原子替换符号链接\</span><span class="n">n路径X</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">账户</span><span class="n">C的UsrClass</span><span class="p">.</span><span class="n">dat</span><span class="p">]</span>
+<span class="w">    </span><span class="n">J</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">K</span><span class="p">[</span><span class="err">释放</span><span class="n">Oplock</span><span class="p">]</span>
+<span class="w">    </span><span class="n">K</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">L</span><span class="p">[</span><span class="n">Check返回</span><span class="o">:</span><span class="w"> </span><span class="err">无完全访问权限</span><span class="p">]</span>
+<span class="w">    </span><span class="n">L</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">M</span><span class="p">[</span><span class="n">ProfSvc走NtLoadKeyEx分支</span><span class="err">\</span><span class="n">nSYSTEM身份</span><span class="p">]</span>
+<span class="w">    </span><span class="n">M</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">N</span><span class="p">[</span><span class="n">NtLoadKeyEx加载路径X</span><span class="err">\</span><span class="n">n实际加载账户C的UsrClass</span><span class="p">.</span><span class="n">dat</span><span class="p">]</span>
+<span class="w">    </span><span class="n">N</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">O</span><span class="p">[</span><span class="n">Hive挂载到攻击者HKEY_CLASSES_ROOT</span><span class="err">\</span><span class="n">n读写权限</span><span class="p">]</span>
+<span class="w">    </span><span class="n">O</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">P1</span><span class="p">[</span><span class="err">后利用</span><span class="mi">1</span><span class="o">:</span><span class="w"> </span><span class="err">读取管理员</span><span class="n">Classes数据</span><span class="err">\</span><span class="n">n文件关联</span><span class="o">/</span><span class="n">COM注册</span><span class="p">]</span>
+<span class="w">    </span><span class="n">O</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">P2</span><span class="p">[</span><span class="err">后利用</span><span class="mi">2</span><span class="o">:</span><span class="w"> </span><span class="err">篡改文件关联\</span><span class="n">n如</span><span class="p">.</span><span class="n">txt</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">恶意程序</span><span class="p">]</span>
+<span class="w">    </span><span class="n">O</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">P3</span><span class="p">[</span><span class="err">后利用</span><span class="mi">3</span><span class="o">:</span><span class="w"> </span><span class="err">植入恶意</span><span class="n">COM对象</span><span class="o">/</span><span class="n">Shell扩展</span><span class="err">\</span><span class="n">n管理员下次登录时以管理员身份执行</span><span class="p">]</span>
+<span class="w">    </span><span class="n">P2</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">Q</span><span class="p">[</span><span class="err">管理员登录时触发\</span><span class="n">n以管理员权限执行攻击者代码</span><span class="p">]</span>
+<span class="w">    </span><span class="n">P3</span><span class="w"> </span><span class="o">--&gt;</span><span class="w"> </span><span class="n">Q</span>
+</code></pre></div>
+
+<h3>5.3 各阶段详解</h3>
+<p><strong>阶段一：环境准备与诱饵构造</strong>
+攻击者在账户 A 下创建一个临时 DAT 文件（可以是任意合法 Hive 文件或空文件），并通过 ACL 设置使其对账户 B 不可完全访问（例如仅只读或完全拒绝）。该文件仅作为 <code>CheckFullAccessOnFile</code> 的“靶子”，目的是让检查必然失败，从而迫使 ProfSvc 走 SYSTEM 加载分支。</p>
+<p><strong>阶段二：符号链接与 Oplock 布设</strong>
+攻击者构造路径操控链路：在用户可写的命名空间（如 <code>\RPC Control</code>）创建对象管理器符号链接，使其暂时指向诱饵 DAT。同时对诱饵 DAT 设置 Oplock，作为竞态同步点。</p>
+<p><strong>阶段三：触发 ProfSvc Hive 加载</strong>
+攻击者使用账户 B 的凭据调用 <code>CreateProcessAsUser</code>（或等效的 RunAs 机制）创建进程。这会通知 ProfSvc 为账户 B 加载配置文件 Hive。攻击者需要让 ProfSvc 解析的 Hive 路径经过其布设的符号链接。</p>
+<p><strong>阶段四：竞态触发与路径替换</strong>
+ProfSvc 在 <code>CheckFullAccessOnFile</code> 中打开诱饵 DAT，Oplock 命中，ProfSvc 阻塞。攻击者检测到 Oplock 命中后，原子性地将符号链接目标从诱饵 DAT 替换为账户 C（管理员）的 <code>UsrClass.dat</code>，随后释放 Oplock。</p>
+<p><strong>阶段五：Hive 劫持与挂载</strong>
+ProfSvc 的 <code>CheckFullAccessOnFile</code> 返回“无完全访问权限”，进入 <code>NtLoadKeyEx</code> 分支。但此时路径已指向账户 C 的 <code>UsrClass.dat</code>，ProfSvc 以 SYSTEM 身份打开该文件（绕过其 ACL），并将 Hive 挂载到<strong>攻击者账户 A 的 <code>HKEY_CLASSES_ROOT</code></strong> 空间下，且具备读写权限。</p>
+<p><strong>阶段六：后利用</strong>
+攻击者现在可以读写管理员的 Classes Hive：</p>
+<ul>
+<li><strong>数据窃取</strong>：读取管理员存储的文件关联、COM 注册、应用配置等敏感信息。</li>
+<li><strong>文件关联劫持</strong>：将 <code>.txt</code> 等扩展名的关联程序改为攻击者控制的恶意程序。当管理员登录并打开此类文件时，恶意程序以管理员身份执行。</li>
+<li><strong>COM 对象 / Shell 扩展植入</strong>：覆盖管理员登录时自动加载的 COM 对象或 Shell 扩展注册，实现持久化与登录即执行。由于代码在合法管理员会话上下文中运行，对 EDR 而言看起来像正常活动，检测难度高。</li>
+</ul>
+<p>研究员 Will Dormann 的演示印证了这一点：非管理员用户运行 LegacyHive 后，传入第二个标准用户凭据并指定管理员账户名，随后以该标准用户身份启动 <code>regedit.exe</code>，即可直接浏览并修改管理员的 Classes 注册表配置单元——包括把 <code>.txt</code> 关联从文本编辑器改为 <code>calc.exe</code> 作为概念验证。</p>
+<h2>六、PoC 概念代码</h2>
+<p>下面给出展示核心利用逻辑的 C/C++ 伪代码。该代码仅为概念演示，省略了错误处理与具体偏移，重点呈现符号链接构造、Oplock 同步与竞态触发的编排逻辑。</p>
+<h3>6.1 符号链接与 Oplock 基础设施</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// ============ Object Manager 符号链接与 Oplock 工具（概念伪代码）============</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;windows.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;winternl.h&gt;</span>
+
+<span class="c1">// 动态解析未文档化的 NT API</span>
+<span class="k">typedef</span><span class="w"> </span><span class="n">NTSTATUS</span><span class="w"> </span><span class="p">(</span><span class="n">NTAPI</span><span class="o">*</span><span class="w"> </span><span class="n">_NtCreateSymbolicLinkObject</span><span class="p">)(</span>
+<span class="w">    </span><span class="n">PHANDLE</span><span class="w"> </span><span class="n">LinkHandle</span><span class="p">,</span><span class="w"> </span><span class="n">ACCESS_MASK</span><span class="w"> </span><span class="n">DesiredAccess</span><span class="p">,</span>
+<span class="w">    </span><span class="n">POBJECT_ATTRIBUTES</span><span class="w"> </span><span class="n">ObjectAttributes</span><span class="p">,</span><span class="w"> </span><span class="n">PUNICODE_STRING</span><span class="w"> </span><span class="n">LinkTarget</span><span class="p">);</span>
+
+<span class="n">_NtCreateSymbolicLinkObject</span><span class="w"> </span><span class="n">NtCreateSymbolicLinkObject</span><span class="p">;</span>
+
+<span class="c1">// 在对象管理器命名空间创建符号链接</span>
+<span class="n">HANDLE</span><span class="w"> </span><span class="nf">CreateObjectSymlink</span><span class="p">(</span><span class="n">LPCWSTR</span><span class="w"> </span><span class="n">linkDir</span><span class="p">,</span><span class="w"> </span><span class="n">LPCWSTR</span><span class="w"> </span><span class="n">linkName</span><span class="p">,</span><span class="w"> </span><span class="n">LPCWSTR</span><span class="w"> </span><span class="n">target</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">WCHAR</span><span class="w"> </span><span class="n">fullPath</span><span class="p">[</span><span class="n">MAX_PATH</span><span class="p">];</span>
+<span class="w">    </span><span class="n">wsprintfW</span><span class="p">(</span><span class="n">fullPath</span><span class="p">,</span><span class="w"> </span><span class="sa">L</span><span class="s">&quot;</span><span class="se">\\</span><span class="s">%s</span><span class="se">\\</span><span class="s">%s&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">linkDir</span><span class="p">,</span><span class="w"> </span><span class="n">linkName</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">UNICODE_STRING</span><span class="w"> </span><span class="n">objName</span><span class="p">;</span>
+<span class="w">    </span><span class="n">RtlInitUnicodeString</span><span class="p">(</span><span class="o">&amp;</span><span class="n">objName</span><span class="p">,</span><span class="w"> </span><span class="n">fullPath</span><span class="p">);</span>
+<span class="w">    </span><span class="n">OBJECT_ATTRIBUTES</span><span class="w"> </span><span class="n">oa</span><span class="p">;</span>
+<span class="w">    </span><span class="n">InitializeObjectAttributes</span><span class="p">(</span><span class="o">&amp;</span><span class="n">oa</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">objName</span><span class="p">,</span><span class="w"> </span><span class="n">OBJ_CASE_INSENSITIVE</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">UNICODE_STRING</span><span class="w"> </span><span class="n">targetUs</span><span class="p">;</span>
+<span class="w">    </span><span class="n">RtlInitUnicodeString</span><span class="p">(</span><span class="o">&amp;</span><span class="n">targetUs</span><span class="p">,</span><span class="w"> </span><span class="n">target</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">HANDLE</span><span class="w"> </span><span class="n">hLink</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="w">    </span><span class="n">NtCreateSymbolicLinkObject</span><span class="p">(</span><span class="o">&amp;</span><span class="n">hLink</span><span class="p">,</span><span class="w"> </span><span class="n">SYMBOLIC_LINK_ALL_ACCESS</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">oa</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">targetUs</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">hLink</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// 对文件设置机会锁（OVERLAPPED + OPLOCK）</span>
+<span class="n">HANDLE</span><span class="w"> </span><span class="nf">SetOplockOnFile</span><span class="p">(</span><span class="n">LPCWSTR</span><span class="w"> </span><span class="n">filePath</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">HANDLE</span><span class="w"> </span><span class="n">hFile</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">CreateFileW</span><span class="p">(</span><span class="n">filePath</span><span class="p">,</span><span class="w"> </span><span class="n">GENERIC_READ</span><span class="p">,</span><span class="w"> </span><span class="n">FILE_SHARE_READ</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">FILE_SHARE_WRITE</span><span class="p">,</span>
+<span class="w">                               </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">OPEN_EXISTING</span><span class="p">,</span><span class="w"> </span><span class="n">FILE_FLAG_OVERLAPPED</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// 调用 DeviceIoControl with FSCTL_REQUEST_OPLOCK</span>
+<span class="w">    </span><span class="c1">// 简化：返回文件句柄，实际需 RequestOplock 并等待完成</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">hFile</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>6.2 竞态触发主循环</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// ============ LegacyHive 竞态触发主逻辑（概念伪代码）============</span>
+<span class="kt">void</span><span class="w"> </span><span class="nf">ExploitLegacyHive</span><span class="p">(</span><span class="n">LPCWSTR</span><span class="w"> </span><span class="n">baitFile</span><span class="p">,</span><span class="w">      </span><span class="c1">// 攻击者种植的诱饵DAT</span>
+<span class="w">                       </span><span class="n">LPCWSTR</span><span class="w"> </span><span class="n">linkDir</span><span class="p">,</span><span class="w">        </span><span class="c1">// 可写对象目录, 如 \RPC Control</span>
+<span class="w">                       </span><span class="n">LPCWSTR</span><span class="w"> </span><span class="n">linkName</span><span class="p">,</span><span class="w">       </span><span class="c1">// 符号链接名</span>
+<span class="w">                       </span><span class="n">LPCWSTR</span><span class="w"> </span><span class="n">targetHive</span><span class="p">,</span><span class="w">     </span><span class="c1">// 目标管理员UsrClass.dat全路径</span>
+<span class="w">                       </span><span class="n">LPCWSTR</span><span class="w"> </span><span class="n">userBcreds</span><span class="p">,</span><span class="w">     </span><span class="c1">// 第二标准用户凭据</span>
+<span class="w">                       </span><span class="n">LPCWSTR</span><span class="w"> </span><span class="n">targetUserC</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w">  </span><span class="c1">// 目标管理员账户名</span>
+<span class="w">    </span><span class="c1">// 1. 布设符号链接: linkName -&gt; 诱饵DAT（临时指向）</span>
+<span class="w">    </span><span class="n">HANDLE</span><span class="w"> </span><span class="n">hLink</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">CreateObjectSymlink</span><span class="p">(</span><span class="n">linkDir</span><span class="p">,</span><span class="w"> </span><span class="n">linkName</span><span class="p">,</span><span class="w"> </span><span class="n">baitFile</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 2. 对诱饵DAT设置Oplock，作为竞态同步点</span>
+<span class="w">    </span><span class="n">HANDLE</span><span class="w"> </span><span class="n">hOplock</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SetOplockOnFile</span><span class="p">(</span><span class="n">baitFile</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 3. 启动监听线程：Oplock命中后替换符号链接目标</span>
+<span class="w">    </span><span class="n">HANDLE</span><span class="w"> </span><span class="n">hSwapper</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">CreateThread</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="p">[](</span><span class="n">LPVOID</span><span class="w"> </span><span class="n">p</span><span class="p">)</span><span class="o">-&gt;</span><span class="n">DWORD</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">auto</span><span class="o">*</span><span class="w"> </span><span class="n">args</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">SwapArgs</span><span class="o">*</span><span class="p">)</span><span class="n">p</span><span class="p">;</span>
+<span class="w">        </span><span class="n">WaitForOplockBreak</span><span class="p">(</span><span class="n">args</span><span class="o">-&gt;</span><span class="n">hOplock</span><span class="p">);</span><span class="w">   </span><span class="c1">// 阻塞直到ProfSvc打开诱饵DAT</span>
+<span class="w">        </span><span class="c1">// 竞态窗口已打开：删除旧链接，创建指向目标的新链接</span>
+<span class="w">        </span><span class="n">NtClose</span><span class="p">(</span><span class="n">args</span><span class="o">-&gt;</span><span class="n">hLink</span><span class="p">);</span>
+<span class="w">        </span><span class="n">CreateObjectSymlink</span><span class="p">(</span><span class="n">args</span><span class="o">-&gt;</span><span class="n">linkDir</span><span class="p">,</span><span class="w"> </span><span class="n">args</span><span class="o">-&gt;</span><span class="n">linkName</span><span class="p">,</span><span class="w"> </span><span class="n">args</span><span class="o">-&gt;</span><span class="n">targetHive</span><span class="p">);</span>
+<span class="w">        </span><span class="n">ReleaseOplock</span><span class="p">(</span><span class="n">args</span><span class="o">-&gt;</span><span class="n">hOplock</span><span class="p">);</span><span class="w">        </span><span class="c1">// 放行ProfSvc</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="p">},</span><span class="w"> </span><span class="o">&amp;</span><span class="n">swapArgs</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 4. 以账户B身份创建进程，触发ProfSvc加载账户B的配置文件Hive</span>
+<span class="w">    </span><span class="c1">//    ProfSvc将解析经过符号链接的Hive路径</span>
+<span class="w">    </span><span class="n">CreateProcessAsUserWithCreds</span><span class="p">(</span><span class="n">userBcreds</span><span class="p">,</span><span class="w"> </span><span class="cm">/* trigger profile load */</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 5. 等待竞态完成</span>
+<span class="w">    </span><span class="n">WaitForSingleObject</span><span class="p">(</span><span class="n">hSwapper</span><span class="p">,</span><span class="w"> </span><span class="n">INFINITE</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 6. 此时账户C的UsrClass.dat已挂载到攻击者HKEY_CLASSES_ROOT</span>
+<span class="w">    </span><span class="c1">//    攻击者可读写目标Classes Hive</span>
+<span class="w">    </span><span class="n">HKEY</span><span class="w"> </span><span class="n">hTargetClasses</span><span class="p">;</span>
+<span class="w">    </span><span class="n">RegOpenKeyEx</span><span class="p">(</span><span class="n">HKEY_CLASSES_ROOT</span><span class="p">,</span><span class="w"> </span><span class="sa">L</span><span class="s">&quot;.txt&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">KEY_SET_VALUE</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">hTargetClasses</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// 后利用示例：篡改文件关联</span>
+<span class="w">    </span><span class="n">RegSetValueEx</span><span class="p">(</span><span class="n">hTargetClasses</span><span class="p">,</span><span class="w"> </span><span class="k">nullptr</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">REG_SZ</span><span class="p">,</span>
+<span class="w">                  </span><span class="p">(</span><span class="n">BYTE</span><span class="o">*</span><span class="p">)</span><span class="sa">L</span><span class="s">&quot;malicious_handler&quot;</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="sa">L</span><span class="s">&quot;malicious_handler&quot;</span><span class="p">));</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>上述代码刻意简化了实际工程细节（如触发 ProfSvc 加载账户 B Hive 的精确机制、Oplock 的 <code>FSCTL_REQUEST_OPLOCK</code> 完整调用、连接点桥接等），但其准确表达了 LegacyHive 的三要素：<strong>符号链接布设 → Oplock 同步竞态 → 路径原子替换</strong>。</p>
+<h2>七、0patch 微补丁技术原理</h2>
+<p>在微软尚未发布官方补丁的情况下，ACROS Security（0patch 团队）于 2026 年 7 月 20 日发布了免费微补丁。其技术原理值得深入分析，因为它精准地揭示了漏洞的修复思路。</p>
+<h3>7.1 微补丁逻辑</h3>
+<p>0patch 的修复策略是“软化”漏洞代码中的第二个检查分支，使最终逻辑变为：</p>
+<ol>
+<li><strong>存在用户令牌时，必须使用 <code>NtLoadKey3</code> 带模拟加载</strong>；只有无令牌（服务自身调用）的情况才走 <code>NtLoadKeyEx</code>（SYSTEM 身份）。这恢复了原始程序员设想的保护。</li>
+<li>当 <code>CheckFullAccessOnFile</code> <strong>成功</strong>时：用 <code>NtLoadKey3</code> 模拟用户身份加载为完全访问 Hive（行为不变）。</li>
+<li>当 <code>CheckFullAccessOnFile</code> <strong>失败</strong>时：<strong>仍用 <code>NtLoadKey3</code> 模拟用户身份加载，但作为只读 Hive</strong>（而非退回 SYSTEM 身份的 <code>NtLoadKeyEx</code>）。</li>
+</ol>
+<p>关键变化在第 3 点：原来检查失败会以 SYSTEM 完全访问加载，现在改为以用户身份<strong>只读</strong>加载。这一改动同时满足两个目标：</p>
+<ul>
+<li><strong>阻断攻击</strong>：攻击者的诱饵文件使检查失败后，Hive 只以用户身份只读加载。即便符号链接已指向目标 <code>UsrClass.dat</code>，也因模拟用户身份而受限于用户对该文件的 ACL（标准用户无权访问管理员 Hive），且只读无法写入——攻击失去意义。0patch 验证显示，开启补丁后攻击者加载到的是临时用户配置文件 Hive，而非管理员的 Hive。</li>
+<li><strong>兼容合法场景</strong>：Mandatory User Profile（<code>NTUSER.MAN</code> 只读）场景仍可工作——只读加载本就是该场景所需。</li>
+</ul>
+<h3>7.2 微补丁覆盖范围</h3>
+<p>0patch 微补丁覆盖：</p>
+<ul>
+<li><strong>受官方支持的版本</strong>：Windows 11 25H2/24H2/23H2、Windows Server 2025/2022（均已更新至 2026 年 7 月）。</li>
+<li><strong>0patch 安全接管的版本</strong>：Windows 11 22H2/21H2、Windows 10 22H2/21H2/21H1/20H2/2004。</li>
+</ul>
+<p>并明确指出该漏洞<strong>不影响</strong> Windows 10 2004 之前的版本（含 Windows 7），也不影响 Windows Server 2008 R2 / 2012 / 2012 R2 / 2016 / 2019——因为漏洞代码分支在这些旧版本中尚不存在。</p>
+<p>由于是 0day，该微补丁纳入 FREE 计划，直至微软官方补丁发布。</p>
+<h3>7.3 微补丁与官方补丁的工程对比</h3>
+<p>0patch 的修复凸显了一个重要的工程启示：<strong>安全检查的失败分支绝不能静默提升权限</strong>。原代码中“检查失败就以更高权限重试”的模式，从设计上就是反安全的——它把访问控制从“门禁”变成了“安检失败的 VIP 通道”。微补丁通过将失败分支降级为只读，在不破坏功能的前提下消除了权限提升路径，体现了最小权限原则的正确应用。</p>
+<h2>八、检测规则</h2>
+<p>在无补丁环境下，检测是第一道防线。LegacyHive 的检测应聚焦<strong>行为特征</strong>而非签名（PoC 可重命名重构）。</p>
+<h3>8.1 Sysmon 检测规则</h3>
+<p><strong>规则一：ProfSvc 托管进程异常 Hive 加载（Event ID 12/13 注册表对象事件）</strong></p>
+<p>监控 <code>svchost.exe</code>（ProfSvc 宿主）加载非当前登录用户 Hive 的行为：</p>
+<div class="highlight"><pre><span></span><code><span class="cm">&lt;!-- Sysmon 配置：监控 NtLoadKey 加载注册表 Hive --&gt;</span>
+<span class="nt">&lt;RuleGroup</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;Registry Hive Load&quot;</span><span class="w"> </span><span class="na">groupRelation=</span><span class="s">&quot;or&quot;</span><span class="nt">&gt;</span>
+<span class="w">  </span><span class="nt">&lt;RegistryEvent</span><span class="w"> </span><span class="na">onmatch=</span><span class="s">&quot;include&quot;</span><span class="nt">&gt;</span>
+<span class="w">    </span><span class="cm">&lt;!-- Event ID 12: 注册表键/值创建与删除 --&gt;</span>
+<span class="w">    </span><span class="cm">&lt;!-- 捕获 HKEY_USERS 下非交互登录用户的 Hive 挂载 --&gt;</span>
+<span class="w">    </span><span class="nt">&lt;TargetObject</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;contains&quot;</span><span class="nt">&gt;</span>\REGISTRY\USER\S-<span class="nt">&lt;/TargetObject&gt;</span>
+<span class="w">    </span><span class="nt">&lt;EventType</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;is&quot;</span><span class="nt">&gt;</span>CreateKey<span class="nt">&lt;/EventType&gt;</span>
+<span class="w">  </span><span class="nt">&lt;/RegistryEvent&gt;</span>
+<span class="nt">&lt;/RuleGroup&gt;</span>
+</code></pre></div>
+
+<p><strong>规则二：标准用户进程创建对象管理器符号链接与重解析点（Event ID 1 进程创建 + 文件事件）</strong></p>
+<p>监控低权限进程在受限命名空间创建符号链接、连接点的行为，特别是临近 ProfSvc 操作时：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">&lt;RuleGroup</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;Suspicious Symlink/Junction Creation&quot;</span><span class="w"> </span><span class="na">groupRelation=</span><span class="s">&quot;or&quot;</span><span class="nt">&gt;</span>
+<span class="w">  </span><span class="nt">&lt;FileCreate</span><span class="w"> </span><span class="na">onmatch=</span><span class="s">&quot;include&quot;</span><span class="nt">&gt;</span>
+<span class="w">    </span><span class="nt">&lt;TargetFilename</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;contains&quot;</span><span class="nt">&gt;</span>\RPC<span class="w"> </span>Control\<span class="nt">&lt;/TargetFilename&gt;</span>
+<span class="w">    </span><span class="nt">&lt;TargetFilename</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;contains&quot;</span><span class="nt">&gt;</span>\BaseNamedObjects\Restricted\<span class="nt">&lt;/TargetFilename&gt;</span>
+<span class="w">  </span><span class="nt">&lt;/FileCreate&gt;</span>
+<span class="w">  </span><span class="nt">&lt;ProcessCreate</span><span class="w"> </span><span class="na">onmatch=</span><span class="s">&quot;include&quot;</span><span class="nt">&gt;</span>
+<span class="w">    </span><span class="cm">&lt;!-- 捕获携带 CreateProcessAsUser + 符号链接工具调用的可疑进程链 --&gt;</span>
+<span class="w">    </span><span class="nt">&lt;Image</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;end with&quot;</span><span class="nt">&gt;</span>\LegacyHive.exe<span class="nt">&lt;/Image&gt;</span>
+<span class="w">    </span><span class="nt">&lt;CommandLine</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;contains&quot;</span><span class="nt">&gt;</span>/user:<span class="nt">&lt;/CommandLine&gt;</span>
+<span class="w">    </span><span class="nt">&lt;ParentImage</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;end with&quot;</span><span class="nt">&gt;</span>\cmd.exe<span class="nt">&lt;/ParentImage&gt;</span>
+<span class="w">  </span><span class="nt">&lt;/ProcessCreate&gt;</span>
+<span class="nt">&lt;/RuleGroup&gt;</span>
+</code></pre></div>
+
+<p><strong>规则三：跨账户 Hive 文件访问（Event ID 11 文件创建 + Event ID 10 文件访问）</strong></p>
+<p>监控一个用户进程访问另一用户配置文件目录下 <code>UsrClass.dat</code> / <code>NTUSER.DAT</code> 的行为：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">&lt;RuleGroup</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;Cross-User Hive Access&quot;</span><span class="w"> </span><span class="na">groupRelation=</span><span class="s">&quot;or&quot;</span><span class="nt">&gt;</span>
+<span class="w">  </span><span class="nt">&lt;FileCreate</span><span class="w"> </span><span class="na">onmatch=</span><span class="s">&quot;include&quot;</span><span class="nt">&gt;</span>
+<span class="w">    </span><span class="nt">&lt;TargetFilename</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;contains&quot;</span><span class="nt">&gt;</span>UsrClass.dat<span class="nt">&lt;/TargetFilename&gt;</span>
+<span class="w">    </span><span class="nt">&lt;TargetFilename</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;contains&quot;</span><span class="nt">&gt;</span>NTUSER.DAT<span class="nt">&lt;/TargetFilename&gt;</span>
+<span class="w">  </span><span class="nt">&lt;/FileCreate&gt;</span>
+<span class="nt">&lt;/RuleGroup&gt;</span>
+</code></pre></div>
+
+<h3>8.2 进程监控（Process Monitor）特征</h3>
+<p>用 Sysinternals Process Monitor 可观察到 LegacyHive 的典型行为指纹：</p>
+<ol>
+<li>首次以低权限身份打开目标管理员 <code>UsrClass.dat</code> 返回 <strong><code>ACCESS DENIED</code></strong>。</li>
+<li>紧接着以 <code>NT AUTHORITY\SYSTEM</code> 上下文重试打开同一文件并<strong>成功</strong>。</li>
+<li>随后该 Hive 被挂载，攻击者账户可访问其内容。</li>
+</ol>
+<p>这一“先拒后成”的模式（ACCESS DENIED → SYSTEM 重试成功）是 LegacyHive 的强特征，与 Project Zero 早年记录的任意文件创建与 Classes Hive 劫持模式一脉相承。</p>
+<h3>8.3 EDR / SIEM 关联规则</h3>
+<p>在 SIEM 中建议建立以下关联检测：</p>
+<ul>
+<li><strong>规则 A</strong>：同一标准用户进程在短时间内（如 5 秒内）同时出现“对象管理器符号链接创建 + <code>CreateProcessAsUser</code> 调用 + 注册表 Hive 挂载事件”三连，判定为高危。</li>
+<li><strong>规则 B</strong>：<code>svchost.exe</code>（ProfSvc）加载的 Hive 路径不属于当前交互登录用户的配置文件目录，触发告警。</li>
+<li><strong>规则 C</strong>：标准用户进程访问 <code>C:\Users\&lt;其他用户&gt;\AppData\Local\Microsoft\Windows\UsrClass.dat</code>，触发告警。</li>
+<li><strong>规则 D</strong>：监控 <code>Local AppData</code> 注册表值被修改指向非标准配置文件目录的行为（攻击链的路径操控前置步骤）。</li>
+</ul>
+<p>由于竞态型利用往往多次失败后才成功，应关注<strong>失败尝试的聚类</strong>而非单次事件。</p>
+<h2>九、缓解措施</h2>
+<p>在官方补丁发布前，建议采取分层缓解：</p>
+<h3>9.1 首选：部署 0patch 微补丁</h3>
+<p>对受影响系统部署 0patch FREE 计划中的 LegacyHive 微补丁，这是当前唯一可用的针对性修复。微补丁无需重启、可即时生效，且在微软官方补丁发布后可平滑替换。</p>
+<h3>9.2 限制特权账户本地登录</h3>
+<ul>
+<li>禁止管理员账户在共享/低信任系统上交互登录，遵循<strong>管理账号与日常使用账号分离</strong>原则。</li>
+<li>对管理员账户配置“拒绝本地登录”组策略，仅允许通过受管跳板机访问。</li>
+<li>避免在共享工作站上保留已登录的特权会话。</li>
+</ul>
+<h3>9.3 应用控制</h3>
+<p>部署 WDAC（Windows Defender Application Control）或 AppLocker，阻止标准用户执行未签名/未批准的二进制文件、脚本及用户可写路径下的启动项。这直接抬高了攻击者“在本地获得代码执行”的第一道门槛——LegacyHive 本身需要攻击者已能运行代码。</p>
+<h3>9.4 注册表与文件权限加固</h3>
+<ul>
+<li>审计并收紧用户配置文件目录的 ACL，确保标准用户无法枚举其他用户的 <code>NTUSER.DAT</code> / <code>UsrClass.dat</code> 路径。</li>
+<li>监控 <code>HKEY_USERS</code> 下非预期 SID 的 Hive 挂载。</li>
+</ul>
+<h3>9.5 多用户环境专项加固</h3>
+<p>对 RDS Host、共享桌面、教室机房等高暴露环境：</p>
+<ul>
+<li>强制使用 Mandatory Profile 或 FCU（强制用户配置文件）以减少可写 Hive 暴露面。</li>
+<li>启用会话隔离与用户配置文件磁盘（UPD）。</li>
+<li>缩短空闲会话超时，减少竞态触发窗口。</li>
+</ul>
+<h2>十、与历史类似漏洞的对比</h2>
+<p>LegacyHive 并非孤立事件，它延续了一条清晰的 Windows 符号链接提权技术脉络。</p>
+<h3>10.1 CVE-2021-26868：图形组件符号链接提权</h3>
+<p>CVE-2021-26868 是 Windows 图形组件的本地提权漏洞，其利用同样依赖符号链接/连接点重定向高权限服务的文件访问。攻击者通过在用户可写位置布置连接点，使图形子系统以 SYSTEM 身份打开被重定向的目标文件，从而实现权限提升。微软的修复方向是路径规范化与重解析点感知——这与 SOC Prime 对 LegacyHive 建议的修复思路（路径规范化、拒绝 Object Manager 命名空间前缀）一致。</p>
+<h3>10.2 James Forshaw 的符号链接研究体系</h3>
+<p>Google Project Zero 研究员 James Forshaw 在 2015 年发表的 <em>“A Link to the Past: Abusing Symbolic Links on Windows”</em> 奠定了这一领域的方法论。他系统梳理了三类可被滥用的符号链接（NTFS 符号链接、连接点、对象管理器符号链接）以及配套的竞态技术（oplock、BaitAndSwitch）。LegacyHive 的 Oplock + 对象管理器符号链接组合，正是 Forshaw 工具链（如 <code>BaitAndSwitch</code>、<code>CreateDosDeviceSymlink</code>、<code>CreateMountPoint</code>）的标准运用。</p>
+<p>Forshaw 同时推动了微软的“符号链接加固（symlink hardening）”工程——通过 <code>FILE_FLAG_OPEN_REPARSE_POINT</code>、重解析点感知的路径解析等机制减少此类攻击面。然而 LegacyHive 证明，只要系统服务中仍存在“用户可影响路径 + 高权限代理访问 + 检查/使用时间差”的组合，这类攻击就难以根除。</p>
+<h3>10.3 itm4n 的 Classes Hive 劫持与 PPLdump</h3>
+<p>研究员 itm4n（Clement Labro）实现的 PPLdump 工具利用 <code>DefineDosDevice</code> + <code>\??</code> 符号链接链，将伪造的 <code>Section</code> 对象植入 <code>\KnownDlls</code>，绕过 PPL（Protected Process Light）保护转储 LSASS。其技术内核——对象管理器符号链接重定向特权进程的资源解析——与 LegacyHive 的路径操控如出一辙。itm4n 同时记录了 Classes Hive 劫持的利用模式，LegacyHive 可视为该模式在 ProfSvc 场景的再实现。</p>
+<h3>10.4 同一研究员的 BlueHammer</h3>
+<p>值得特别注意的是，LegacyHive 的作者 Nightmare-Eclipse 此前还公开了 <strong>BlueHammer</strong> 漏洞利用，针对 Windows Defender（<code>MsMpEng.exe</code>，SYSTEM 权限）。BlueHammer 同样采用对象管理器符号链接重定向技术：通过连接点把 Defender 更新目录重定向到 <code>\BaseNamedObjects\Restricted</code>，再用 <code>NtCreateSymbolicLinkObject</code> 在该受限空间创建指向 VSS（卷影副本）中 SAM Hive 的符号链接，诱使 Defender 以 SYSTEM 身份打开 SAM Hive。两个漏洞共享同一套路径操控工具链，差别仅在被劫持的高权限服务（ProfSvc vs Defender）与目标资源（用户 Hive vs SAM Hive）。这表明该研究员系统性地掌握了“对象管理器符号链接 + oplock 竞态”这一攻击范式，并能灵活迁移到不同服务。</p>
+<h3>10.5 对比总结表</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>LegacyHive</th>
+<th>CVE-2021-26868</th>
+<th>BlueHammer</th>
+<th>itm4n Classes Hive 劫持</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>受害服务</td>
+<td>ProfSvc(SYSTEM)</td>
+<td>图形组件</td>
+<td>Defender MsMpEng(SYSTEM)</td>
+<td>各类特权服务</td>
+</tr>
+<tr>
+<td>路径操控</td>
+<td>OM符号链接+连接点</td>
+<td>连接点</td>
+<td>OM符号链接+连接点</td>
+<td>DosDevice+符号链接</td>
+</tr>
+<tr>
+<td>竞态同步</td>
+<td>Oplock</td>
+<td>Oplock</td>
+<td>Oplock+Cloud Files API</td>
+<td>Oplock</td>
+</tr>
+<tr>
+<td>目标资源</td>
+<td>用户UsrClass.dat</td>
+<td>文件/注册表</td>
+<td>SAM Hive(VSS)</td>
+<td>Classes Hive</td>
+</tr>
+<tr>
+<td>提权结果</td>
+<td>读写管理员Hive</td>
+<td>SYSTEM文件操作</td>
+<td>读取SAM</td>
+<td>读写目标Hive</td>
+</tr>
+<tr>
+<td>修复方向</td>
+<td>路径规范化+降级加载</td>
+<td>路径规范化</td>
+<td>路径校验</td>
+<td>重解析点感知</td>
+</tr>
+</tbody>
+</table>
+<h2>十一、技术启示与展望</h2>
+<p>LegacyHive 的价值不仅在于其作为未修补 0day 的即时威胁，更在于它揭示了 Windows 配置文件管理代码深层的信任模型缺陷。</p>
+<p><strong>启示一：检查失败不应提升权限。</strong> 漏洞代码“访问检查失败则以更高权限重试”的设计，从根本上违背了最小权限原则。任何安全检查的失败分支都应当<strong>降级</strong>或<strong>拒绝</strong>，而非静默提权。0patch 微补丁正是通过将失败分支降级为只读，以最小改动消除了漏洞。</p>
+<p><strong>启示二：用户可影响路径 + 高权限代理 = 永恒攻击面。</strong> 只要系统服务继续以 SYSTEM 身份处理用户可影响的路径（配置文件路径、更新路径、临时目录），并存在检查与使用的时间差，符号链接提权就持续有效。Forshaw 的研究已过去十年，微软的符号链接加固也持续推进，但 LegacyHive 与 BlueHammer 证明这一攻击范式依然生命力旺盛。架构层面的修复——如让特权服务在用户安全上下文下执行用户相关 I/O、对用户提供的路径进行规范化和边界校验、拒绝 Object Manager 命名空间前缀——才是治本之道。</p>
+<p><strong>启示三：竞态型利用的检测应关注聚类而非单点。</strong> Oplock 同步使竞态利用高度可靠，但攻击者仍可能多次尝试。检测规则应聚焦行为序列的聚类（符号链接创建 + RunAs + Hive 加载的时序组合）与跨账户资源访问异常，而非依赖单一特征。</p>
+<p><strong>启示四：无 CVE 不等于无风险。</strong> LegacyHive 在披露时无 CVE、无官方补丁，导致依赖 CVE 驱动的资产扫描与漏洞管理流程出现盲区。安全团队需要建立基于漏洞名称、受影响组件与行为特征的跟踪能力，而非仅依赖 CVE 编号。</p>
+<p><strong>启示五：研究员的“刻意限制”降低了即时威胁但不应降低重视。</strong> CrowdStrike 确认公开 PoC 被刻意限制（需第二用户凭据、仅限 UsrClass.dat）。这延缓了武器化，但研究员声称完整版可免凭据加载任意 Hive。防御者应按“完整版能力”评估风险并加固，而非仅针对公开 PoC 的限制版本做防御。</p>
+<p>随着微软持续调查并最终发布官方补丁，LegacyHive 的技术细节将成为 Windows 提权研究的重要案例。它再次提醒我们：在操作系统这一复杂系统中，配置文件管理、命名空间解析与特权服务执行三者的交汇处，永远是攻击者与防御者博弈的前沿。</p>
+<hr />
+<p><strong>参考资料：</strong></p>
+<ul>
+<li>0patch 官方博客：《Free micropatches available for "LegacyHive" 0day》（Mitja Kolsek，2026-07-20）</li>
+<li>SOC Prime 技术分析：《LegacyHive: The Windows User Profile Service Bug That Loads Another User's Registry Hive》</li>
+<li>SecurityWeek：《Nightmare Eclipse Drops 'LegacyHive' Windows Zero-Day》</li>
+<li>WindowsForum：《LegacyHive Windows ProfSvc Zero-Day: Detect and Contain LPE》</li>
+<li>FreeBuf：《Windows LegacyHive 0Day 漏洞可让黑客获取管理员权限》</li>
+<li>James Forshaw（Google Project Zero）：《A Link to the Past: Abusing Symbolic Links on Windows》（2015）</li>
+<li>itm4n（Clement Labro）：PPLdump 与 Classes Hive 劫持研究</li>
+<li>Nightmare-Eclipse GitHub：LegacyHive / BlueHammer PoC 仓库</li>
+<li>MITRE CWE-362：Race Condition</li>
+</ul>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
