@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Android 17内存管理架构升级：MemoryLimiter与16KB页面大小的底层技术拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Android 17内存管理架构升级：MemoryLimiter与16KB页面大小的底层技术拆解</h1>
+<time>2026-07-27</time>
+<ul>
+<li>技术
+Slug: android-17内存管理架构升级-memorylimiter与16kb页面大小的底层技术拆解</li>
+</ul>
+<hr />
+<h2>引言</h2>
+<p>Pixel 11 的涨价把 Android 系统的内存优化推到了聚光灯下。当旗舰机型的 RAM 配置从 12GB 攀升到 16GB、甚至 24GB，硬件成本的上升倒逼 Google 必须从系统软件层榨取内存效率。Android 17 正式推出了三大内存管理革新：</p>
+<ol>
+<li><strong>MemoryLimiter</strong>：基于 cgroup v2 的预防性单应用内存上限管控机制</li>
+<li><strong>16KB Page Size</strong>：从传统 4KB 页面升级到 16KB，重构 MMU 地址翻译链路</li>
+<li><strong>前后台差异化冻结策略</strong>：用 SIGSTOP 替代粗放的 SIGKILL，减少冷启动开销</li>
+</ol>
+<p>本文将从 Android 内存管理的基础架构出发，逐层拆解这两项核心技术的底层原理、实现机制与开发者适配路径。</p>
+<hr />
+<h2>一、Android 内存管理基础架构回顾</h2>
+<p>在理解 Android 17 的新机制之前，必须先理清 Android 现有的内存管理栈。这套栈由内核空间与用户空间协同构成，自下而上可以分为四层。</p>
+<h3>1.1 kswapd：内核交换守护进程</h3>
+<p><code>kswapd</code> 是 Linux 内核的常驻后台线程，负责在系统空闲内存紧张时回收内存。它的工作逻辑围绕两个水位线展开：</p>
+<ul>
+<li><strong>low watermark（低水位线）</strong>：当空闲内存低于此阈值时，<code>kswapd</code> 被唤醒开始工作</li>
+<li><strong>high watermark（高水位线）</strong>：当空闲内存恢复到此阈值时，<code>kswapd</code> 回收完成后进入休眠</li>
+</ul>
+<p><code>kswapd</code> 的回收手段包括：写出脏页（dirty pages）到 swap 设备、回收文件映射页（clean page cache）、回收匿名页（anonymous pages，压缩到 zram）。在 Android 设备上，由于通常没有传统 swap 分区，<code>zram</code> 压缩成为主要的匿名页回收手段。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 内核 mm/vmscan.c 中 kswapd 的核心循环（简化版）</span>
+<span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">kswapd</span><span class="p">(</span><span class="kt">void</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">pgdat</span><span class="w"> </span><span class="o">*</span><span class="n">pgdat</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">pgdat</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">p</span><span class="p">;</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="p">;</span><span class="w"> </span><span class="p">;</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 等待被唤醒</span>
+<span class="w">        </span><span class="n">wait_event_freezable</span><span class="p">(</span><span class="n">pgdat</span><span class="o">-&gt;</span><span class="n">kswapd_wait</span><span class="p">,</span>
+<span class="w">            </span><span class="n">kswapd_shall_balance</span><span class="p">(</span><span class="n">pgdat</span><span class="p">));</span>
+
+<span class="w">        </span><span class="c1">// 循环回收直到空闲内存恢复到 high watermark</span>
+<span class="w">        </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">kswapd_shall_balance</span><span class="p">(</span><span class="n">pgdat</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">balance_pgdat</span><span class="p">(</span><span class="n">pgdat</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">sc</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>1.2 LMKD：Low Memory Killer Daemon</h3>
+<p>当 <code>kswapd</code> 的回收速度跟不上内存消耗速度时，系统进入更紧急的状态，此时 LMKD 介入。LMKD 是 Android 用户空间的守护进程（替代了早期内核态的 LMK），它通过 PSI（Pressure Stall Information）感知内存压力，并基于 <code>oom_adj</code> 优先级终止进程。</p>
+<p>LMKD 的核心决策依据是进程的 <code>oom_score_adj</code>（取值范围 -1000 到 1000，数值越高越容易被杀）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// lmkd 的核心杀进程逻辑（伪代码）</span>
+<span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">find_and_kill_process</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">min_score_adj</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">proc_info</span><span class="w"> </span><span class="o">*</span><span class="n">proc</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 按 oom_score_adj 从高到低遍历</span>
+<span class="w">    </span><span class="n">proc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">proc_list_get_first</span><span class="p">(</span><span class="n">min_score_adj</span><span class="p">);</span>
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">proc</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 后台缓存进程优先被杀</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">proc</span><span class="o">-&gt;</span><span class="n">oom_score_adj</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="n">min_score_adj</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">kill</span><span class="p">(</span><span class="n">proc</span><span class="o">-&gt;</span><span class="n">pid</span><span class="p">,</span><span class="w"> </span><span class="n">SIGKILL</span><span class="p">);</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="n">proc</span><span class="o">-&gt;</span><span class="n">pid</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="n">proc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">proc_list_get_next</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>1.3 onTrimMemory() 回调</h3>
+<p>应用层通过 <code>onTrimMemory()</code> 回调感知内存压力，主动释放资源。系统根据内存紧张程度传递不同的 level：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">class</span><span class="w"> </span><span class="nc">MyApp</span><span class="w"> </span><span class="p">:</span><span class="w"> </span><span class="n">Application</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">override</span><span class="w"> </span><span class="kd">fun</span><span class="w"> </span><span class="nf">onTrimMemory</span><span class="p">(</span><span class="n">level</span><span class="p">:</span><span class="w"> </span><span class="kt">Int</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">when</span><span class="w"> </span><span class="p">(</span><span class="n">level</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 系统内存极度紧张，应用处于后台</span>
+<span class="w">            </span><span class="n">TRIM_MEMORY_COMPLETE</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">imageCache</span><span class="p">.</span><span class="na">clear</span><span class="p">()</span>
+<span class="w">                </span><span class="n">releaseVideoBuffers</span><span class="p">()</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">            </span><span class="c1">// 应用进入后台，适合释放中等资源</span>
+<span class="w">            </span><span class="n">TRIM_MEMORY_UI_HIDDEN</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">releaseUiAssets</span><span class="p">()</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">            </span><span class="c1">// 后台运行中，系统内存稍紧</span>
+<span class="w">            </span><span class="n">TRIM_MEMORY_BACKGROUND</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">trimObjectPools</span><span class="p">()</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>1.4 进程优先级体系</h3>
+<p>Android 通过 <code>oom_adj</code>（Out-Of-Memory Adjustment）将进程划分为多个优先级层级，LMKD 据此决定终止顺序。优先级从高到低依次为：</p>
+<table>
+<thead>
+<tr>
+<th>优先级层级</th>
+<th>oom_adj 区间</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>前台进程（Foreground）</td>
+<td>0 ~ 100</td>
+<td>用户正在交互的 Activity 所在进程</td>
+</tr>
+<tr>
+<td>可见进程（Visible）</td>
+<td>100 ~ 200</td>
+<td>可见但非前台，如半透明 Activity 覆盖</td>
+</tr>
+<tr>
+<td>服务进程（Service）</td>
+<td>200 ~ 500</td>
+<td>后台运行的 Service</td>
+</tr>
+<tr>
+<td>后台进程（Cached）</td>
+<td>500 ~ 900</td>
+<td>缓存的 Activity 进程</td>
+</tr>
+<tr>
+<td>空进程（Empty）</td>
+<td>900 ~ 1000</td>
+<td>无活动组件的进程</td>
+</tr>
+</tbody>
+</table>
+<p>这套基础架构构成了传统 Android 内存管理的"响应式"模型：系统被动等待内存压力信号，再回收或杀进程。<strong>MemoryLimiter 的核心革新就是将其变为"预防式"模型。</strong></p>
+<hr />
+<h2>二、MemoryLimiter 机制深度拆解</h2>
+<h3>2.1 设计动机与目标</h3>
+<p>传统 LMKD 的根本缺陷在于：它只在内存<strong>已经紧张</strong>时才触发动作。这意味着：</p>
+<ul>
+<li>杀进程是批量式的，多个后台进程被同时清理</li>
+<li>冷启动开销大：被杀进程重新创建需要重新加载 dex、初始化 Application</li>
+<li>用户体验抖动：前台应用可能在杀进程的瞬间出现卡顿</li>
+</ul>
+<p>MemoryLimiter 的设计目标是：<strong>为每个前台应用设定独立的内存预算，在超额前提前介入，用冻结（freeze）替代杀死（kill）</strong>。</p>
+<h3>2.2 前台内存上限策略</h3>
+<p>MemoryLimiter 根据设备总 RAM 配置动态设定单应用的前台内存上限：</p>
+<table>
+<thead>
+<tr>
+<th>设备 RAM</th>
+<th>单应用前台内存上限</th>
+<th>占比</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>6GB</td>
+<td>512MB</td>
+<td>约 8.3%</td>
+</tr>
+<tr>
+<td>8GB</td>
+<td>768MB</td>
+<td>约 9.4%</td>
+</tr>
+<tr>
+<td>12GB</td>
+<td>1024MB</td>
+<td>约 8.3%</td>
+</tr>
+<tr>
+<td>16GB</td>
+<td>1280MB（预估）</td>
+<td>约 8.0%</td>
+</tr>
+</tbody>
+</table>
+<p>这种差异化配置考虑了不同机型的实际可用内存。6GB 机型系统本身占用约 2GB，留给应用的空间极为有限，因此上限压得更低。12GB 机型则可以给单个应用更宽裕的 1GB 空间。</p>
+<h3>2.3 实时监控与提前冻结</h3>
+<p>MemoryLimiter 的核心行为模式是<strong>实时监控</strong>而非<strong>事后清理</strong>。它的工作流程如下：</p>
+<div class="highlight"><pre><span></span><code>应用内存使用 → 持续监控RSS → 达到阈值80% → 发出压力通知
+                                      ↓
+                              达到阈值95% → 冻结非关键分配
+                                      ↓
+                              达到阈值100% → SIGSTOP冻结应用
+                                      ↓
+                              持续超限 → 降级为SIGKILL
+</code></pre></div>
+
+<p>这套分级响应机制确保了：</p>
+<ol>
+<li>应用在接近上限前就收到压力通知（通过 <code>onTrimMemory</code>），有机会主动释放</li>
+<li>冻结状态下应用状态被完整保留，用户切回时可以快速恢复</li>
+<li>只有在持续超限且无法通过冻结解决时，才升级为杀死</li>
+</ol>
+<h3>2.4 与传统 LMK 的本质区别</h3>
+<p>这是 MemoryLimiter 最核心的范式转变——从"响应式"到"预防式"：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>传统 LMK/LMKD</th>
+<th>MemoryLimiter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>触发时机</td>
+<td>内存耗尽后（响应式）</td>
+<td>内存接近上限前（预防式）</td>
+</tr>
+<tr>
+<td>作用对象</td>
+<td>全局进程队列，按 oom_adj 杀</td>
+<td>单个应用进程，按 RSS 监控</td>
+</tr>
+<tr>
+<td>处置手段</td>
+<td>SIGKILL 终止进程</td>
+<td>SIGSTOP 冻结 → 升级 SIGKILL</td>
+</tr>
+<tr>
+<td>状态保留</td>
+<td>进程被销毁，需冷启动恢复</td>
+<td>冻结状态可快速恢复</td>
+</tr>
+<tr>
+<td>资源开销</td>
+<td>冷启动需重新加载 dex、初始化</td>
+<td>唤醒即用，省去冷启动</td>
+</tr>
+<tr>
+<td>用户感知</td>
+<td>可能看到应用重新加载</td>
+<td>切回时近乎即时恢复</td>
+</tr>
+<tr>
+<td>适用范围</td>
+<td>系统全局内存压力</td>
+<td>单应用内存越界管控</td>
+</tr>
+</tbody>
+</table>
+<h3>2.5 实现原理：cgroup v2 与 per-process RSS</h3>
+<p>MemoryLimiter 的底层实现依赖 Linux 内核的 <strong>cgroup v2 memory controller</strong>。cgroup v2 提供了 <code>memory.max</code> 和 <code>memory.high</code> 两个关键控制接口。</p>
+<p><code>memory.high</code> 是软限制，触发内存回收；<code>memory.max</code> 是硬限制，触发 OOM killer 或自定义行为。MemoryLimiter 的实现架构如下：</p>
+<div class="highlight"><pre><span></span><code><span class="err">┌──────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                  </span><span class="n">Android</span><span class="w"> </span><span class="n">Framework</span><span class="w">                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="n">ActivityManagerService</span><span class="w"> </span><span class="err">──</span><span class="w"> </span><span class="n">MemoryLimiterService</span><span class="w">        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">         </span><span class="err">│</span><span class="w">                       </span><span class="err">│</span><span class="w">                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">通知</span><span class="n">onTrimMemory</span><span class="w">         </span><span class="err">监控</span><span class="n">cgroup内存</span><span class="w">              </span><span class="err">│</span>
+<span class="err">└─────────┼───────────────────────┼───────────────────────┘</span>
+<span class="w">          </span><span class="err">│</span><span class="w">                       </span><span class="err">│</span>
+<span class="w">          </span><span class="err">▼</span><span class="w">                       </span><span class="err">▼</span>
+<span class="err">┌──────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">              </span><span class="n">cgroup</span><span class="w"> </span><span class="n">v2</span><span class="w"> </span><span class="p">(</span><span class="n">per</span><span class="o">-</span><span class="n">app</span><span class="p">)</span><span class="w">                          </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="o">/</span><span class="n">sys</span><span class="o">/</span><span class="n">fs</span><span class="o">/</span><span class="n">cgroup</span><span class="o">/&lt;</span><span class="n">uid_</span><span class="o">&lt;</span><span class="n">pid</span><span class="o">&gt;&gt;/</span><span class="w">                             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">      </span><span class="err">├──</span><span class="w"> </span><span class="n">memory</span><span class="p">.</span><span class="nf">max</span><span class="w">      </span><span class="err">←</span><span class="w"> </span><span class="err">应用内存硬上限</span><span class="w">                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">      </span><span class="err">├──</span><span class="w"> </span><span class="n">memory</span><span class="p">.</span><span class="n">high</span><span class="w">     </span><span class="err">←</span><span class="w"> </span><span class="err">软限制，触发回收</span><span class="w">                </span><span class="err">│</span>
+<span class="err">│</span><span class="w">      </span><span class="err">├──</span><span class="w"> </span><span class="n">memory</span><span class="p">.</span><span class="n">current</span><span class="w">  </span><span class="err">←</span><span class="w"> </span><span class="err">实时</span><span class="n">RSS读取</span><span class="w">                    </span><span class="err">│</span>
+<span class="err">│</span><span class="w">      </span><span class="err">├──</span><span class="w"> </span><span class="n">memory</span><span class="p">.</span><span class="n">events</span><span class="w">   </span><span class="err">←</span><span class="w"> </span><span class="n">OOM</span><span class="o">/</span><span class="err">事件通知</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">      </span><span class="err">└──</span><span class="w"> </span><span class="n">cgroup</span><span class="p">.</span><span class="n">freeze</span><span class="w">   </span><span class="err">←</span><span class="w"> </span><span class="err">写</span><span class="mi">1</span><span class="err">即冻结进程组</span><span class="w">                 </span><span class="err">│</span>
+<span class="err">└──────────────────────────────────────────────────────────┘</span>
+<span class="w">          </span><span class="err">│</span>
+<span class="w">          </span><span class="err">▼</span>
+<span class="err">┌──────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                   </span><span class="n">Linux</span><span class="w"> </span><span class="n">Kernel</span><span class="w">                            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="n">mem_cgroup</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">页面回收</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">task</span><span class="o">-&gt;</span><span class="n">frozen</span><span class="w"> </span><span class="err">标记</span><span class="w">               </span><span class="err">│</span>
+<span class="err">└──────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<p>在 Android 17 中，每个应用进程启动时会被分配到独立的 cgroup，其 <code>memory.max</code> 根据前台/后台状态动态设置：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// MemoryLimiter 内核侧辅助逻辑（简化）</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">memlimiter_set_limit</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">task_struct</span><span class="w"> </span><span class="o">*</span><span class="n">task</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                         </span><span class="kt">size_t</span><span class="w"> </span><span class="n">max_bytes</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">cgroup_subsys_state</span><span class="w"> </span><span class="o">*</span><span class="n">css</span><span class="p">;</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">mem_cgroup</span><span class="w"> </span><span class="o">*</span><span class="n">memcg</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">css</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">task_get_css</span><span class="p">(</span><span class="n">task</span><span class="p">,</span><span class="w"> </span><span class="n">memory_cgrp_id</span><span class="p">);</span>
+<span class="w">    </span><span class="n">memcg</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mem_cgroup_from_css</span><span class="p">(</span><span class="n">css</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 设置 memory.max 硬上限</span>
+<span class="w">    </span><span class="n">page_counter_set_max</span><span class="p">(</span><span class="o">&amp;</span><span class="n">memcg</span><span class="o">-&gt;</span><span class="n">memory</span><span class="p">,</span><span class="w"> </span><span class="n">max_bytes</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// 设置 memory.high 软上限为 max 的 80%</span>
+<span class="w">    </span><span class="n">page_counter_set_high</span><span class="p">(</span><span class="o">&amp;</span><span class="n">memcg</span><span class="o">-&gt;</span><span class="n">memory</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                          </span><span class="n">max_bytes</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">80</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">100</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// 读取进程实时 RSS</span>
+<span class="kt">size_t</span><span class="w"> </span><span class="nf">memlimiter_read_rss</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">task_struct</span><span class="w"> </span><span class="o">*</span><span class="n">task</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">mem_cgroup</span><span class="w"> </span><span class="o">*</span><span class="n">memcg</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">get_mem_cgroup_from_mm</span><span class="p">(</span><span class="n">task</span><span class="o">-&gt;</span><span class="n">mm</span><span class="p">);</span>
+<span class="w">    </span><span class="kt">size_t</span><span class="w"> </span><span class="n">rss</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">memcg</span><span class="o">-&gt;</span><span class="n">memory</span><span class="p">.</span><span class="n">current</span><span class="p">;</span>
+<span class="w">    </span><span class="n">css_put</span><span class="p">(</span><span class="o">&amp;</span><span class="n">memcg</span><span class="o">-&gt;</span><span class="n">css</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">rss</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>2.6 冻结机制：SIGSTOP 替代 SIGKILL</h3>
+<p>传统 LMKD 使用 <code>SIGKILL</code> 终止进程，进程无法捕获该信号，所有状态丢失。MemoryLimiter 采用了更温和的 cgroup freezer 机制：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// Framework 侧 MemoryLimiterService 核心逻辑（伪代码）</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">MemoryLimiterService</span><span class="w"> </span><span class="kd">extends</span><span class="w"> </span><span class="n">SystemService</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kt">float</span><span class="w"> </span><span class="n">FREEZE_THRESHOLD</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">0.95f</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kt">float</span><span class="w"> </span><span class="n">KILL_THRESHOLD</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="mf">1.0f</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kt">void</span><span class="w"> </span><span class="nf">monitorAppMemory</span><span class="p">(</span><span class="n">ProcessRecord</span><span class="w"> </span><span class="n">app</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">limit</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">app</span><span class="p">.</span><span class="na">memoryLimitMax</span><span class="p">;</span><span class="w">       </span><span class="c1">// 如 768MB</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">current</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">readCgroupMemory</span><span class="p">(</span><span class="n">app</span><span class="p">);</span><span class="w">  </span><span class="c1">// 实时RSS</span>
+
+<span class="w">        </span><span class="kt">float</span><span class="w"> </span><span class="n">ratio</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">float</span><span class="p">)</span><span class="w"> </span><span class="n">current</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">limit</span><span class="p">;</span>
+
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">ratio</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="n">KILL_THRESHOLD</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 持续超限，降级为SIGKILL</span>
+<span class="w">            </span><span class="n">killProcess</span><span class="p">(</span><span class="n">app</span><span class="p">.</span><span class="na">pid</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">ratio</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="n">FREEZE_THRESHOLD</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 冻结应用进程组</span>
+<span class="w">            </span><span class="n">freezeCgroup</span><span class="p">(</span><span class="n">app</span><span class="p">);</span>
+<span class="w">            </span><span class="c1">// 通知应用释放内存（如果有未冻结的可见组件）</span>
+<span class="w">            </span><span class="n">app</span><span class="p">.</span><span class="na">onTrimMemory</span><span class="p">(</span><span class="n">TRIM_MEMORY_CRITICAL</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">ratio</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mf">0.80f</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 软限制触发，通知应用主动释放</span>
+<span class="w">            </span><span class="n">app</span><span class="p">.</span><span class="na">onTrimMemory</span><span class="p">(</span><span class="n">TRIM_MEMORY_MODERATE</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kt">void</span><span class="w"> </span><span class="nf">freezeCgroup</span><span class="p">(</span><span class="n">ProcessRecord</span><span class="w"> </span><span class="n">app</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 写入 cgroup.freeze=1，内核冻结整个进程组</span>
+<span class="w">        </span><span class="c1">// 进程被挂起（类似SIGSTOP但更优雅）</span>
+<span class="w">        </span><span class="n">writeCgroupFile</span><span class="p">(</span><span class="n">app</span><span class="p">.</span><span class="na">cgroupPath</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;/cgroup.freeze&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;1&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>cgroup freezer 的优势在于：</p>
+<ol>
+<li><strong>原子性</strong>：整个进程组（包括子线程）被一致冻结，无竞态</li>
+<li><strong>可恢复</strong>：写入 <code>cgroup.freeze=0</code> 即可解冻，状态完整保留</li>
+<li><strong>省电</strong>：冻结的进程不消耗 CPU，不参与调度</li>
+<li><strong>低开销</strong>：相比 <code>SIGSTOP</code> + <code>SIGCONT</code>，cgroup freezer 是内核原生支持的批量操作</li>
+</ol>
+<p>当用户从冻结的应用切回时，只需解冻即可恢复，省去了冷启动的全部开销。只有当系统内存压力持续加剧，冻结的应用也无法缓解时，才会升级为 <code>SIGKILL</code>。</p>
+<hr />
+<h2>三、16KB Page Size 技术原理</h2>
+<h3>3.1 从 4KB 到 16KB 的演进</h3>
+<p>Linux 内核在 x86 和 ARM64 上长期使用 4KB 作为默认页面大小。但随着设备 RAM 容量增大（12GB、16GB 甚至 24GB），4KB 页面暴露出严重的效率问题：<strong>页表项数量爆炸</strong>。</p>
+<p>Android 15 开始，AOSP 正式支持 16KB 页面大小的构建配置。ARM64 架构从 v8.0 起原生支持 4KB、16KB、64KB 三种页面大小，这为 Android 的迁移奠定了硬件基础。Android 17 进一步推动 16KB 成为新设备的推荐配置。</p>
+<h3>3.2 页表结构详解</h3>
+<p>理解 16KB 页面的优势，必须从 MMU（Memory Management Unit）的地址翻译过程入手。x86-64 采用 4 级页表结构：</p>
+<div class="highlight"><pre><span></span><code>虚拟地址（64位）分解：
+┌────────┬────────┬────────┬────────┬────────┬──────────┐
+│  保留  │ PML4   │ PDPT   │  PD    │  PT    │ 偏移量   │
+│ (16位) │ (9位)  │ (9位)  │ (9位)  │ (9位)  │ (12位)   │
+└────────┴────────┴────────┴────────┴────────┴──────────┘
+
+4级页表翻译流程：
+CR3 ──→ [PML4 表] ──→ [PDPT 表] ──→ [PD 表] ──→ [PT 表] ──→ 物理页帧
+         (512项)       (512项)       (512项)     (512项)     (4KB页)
+</code></pre></div>
+
+<p>对于 4KB 页面，每级页表项数为 512（2^9），需要 4 级页表翻译，地址翻译需要 <strong>4 次内存访问</strong>。</p>
+<p>ARM64 的页表翻译与此类似。当页面大小变为 16KB 时，偏移量从 12 位增加到 14 位，每级页表项数变为 2048（2^11），这意味着：</p>
+<ol>
+<li><strong>单级页表覆盖范围扩大 4 倍</strong></li>
+<li><strong>同样大小的虚拟地址空间，所需页表层数减少</strong></li>
+<li><strong>页表项总数大幅减少</strong></li>
+</ol>
+<h3>3.3 页表项数量对比</h3>
+<p>以 12GB 物理内存为例，计算两种页面大小下的页表项数量：</p>
+<p><strong>4KB 页面：</strong></p>
+<div class="highlight"><pre><span></span><code>页表项数 = 总内存 / 页面大小
+        = 12GB / 4KB
+        = 12 × 1024 × 1024 KB / 4 KB
+        = 3,145,728 条（约 314 万）
+每条页表项 8 字节，总页表内存 = 3,145,728 × 8 = 约 24MB
+</code></pre></div>
+
+<p><strong>16KB 页面：</strong></p>
+<div class="highlight"><pre><span></span><code>页表项数 = 12GB / 16KB
+        = 12 × 1024 × 1024 KB / 16 KB
+        = 786,432 条（约 78.5 万）
+每条页表项 8 字节，总页表内存 = 786,432 × 8 = 约 6MB
+</code></pre></div>
+
+<p>页表项数量减少 <strong>75%</strong>，页表内存占用减少 <strong>75%</strong>。</p>
+<h3>3.4 TLB 命中率与性能提升</h3>
+<p>TLB（Translation Lookaside Buffer）是 CPU 内部缓存页表项的高速缓存。每次虚拟地址翻译时，MMU 首先查询 TLB，命中则直接得到物理地址，未命中则需要遍历多级页表（page walk），代价高昂。</p>
+<p>TLB 的容量极其有限（通常几十到几百项）。在 4KB 页面下：</p>
+<div class="highlight"><pre><span></span><code>假设 TLB 容量 = 64 项
+4KB 页面：TLB 可覆盖 64 × 4KB = 256KB 连续地址空间
+16KB 页面：TLB 可覆盖 64 × 16KB = 1MB 连续地址空间
+</code></pre></div>
+
+<p>16KB 页面让 TLB 的覆盖范围扩大 <strong>4 倍</strong>，显著提升 TLB 命中率。</p>
+<p>TLB miss 的代价有多大？以一次 page walk 为例：</p>
+<div class="highlight"><pre><span></span><code>TLB hit：  1 个时钟周期
+TLB miss： 4 次内存访问（4级页表）≈ 100~400 个时钟周期
+</code></pre></div>
+
+<p>在内存密集型应用中，TLB miss 率的微小下降都能带来可观的性能提升。实测数据表明，16KB 页面可让：</p>
+<ul>
+<li><strong>应用启动时间缩短 3% ~ 30%</strong></li>
+<li><strong>CPU 内存访问延迟降低</strong></li>
+<li><strong>大型应用（如游戏、图像处理）受益最明显</strong></li>
+</ul>
+<h3>3.5 内存碎片化影响</h3>
+<p>16KB 页面并非没有代价。主要影响在于内存碎片化：</p>
+<ol>
+<li><strong>内部碎片</strong>：应用申请 5KB 内存，系统分配 16KB 页面，浪费 11KB。在 4KB 下仅浪费 1KB</li>
+<li><strong>分配粒度变粗</strong>：小对象密集的场景，内存利用率下降</li>
+<li><strong>对齐要求提高</strong>：所有内存分配需 16KB 对齐</li>
+</ol>
+<p>不过，对于现代 Android 应用，大量内存被 bitmap、native buffer、dex 文件映射占用，这些大块分配场景下 16KB 页面的内部碎片影响可以忽略。</p>
+<h3>3.6 ARM64 架构支持与 AOSP 构建</h3>
+<p>ARM64 架构从 ARMv8-A 起原生支持三种页面大小。Linux 内核通过 <code>CONFIG_ARM64_16K_PAGES</code> 编译选项启用 16KB 支持：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 内核编译配置（arch/arm64/configs/）</span>
+<span class="nv">CONFIG_ARM64_16K_PAGES</span><span class="o">=</span>y
+<span class="c1"># 而非</span>
+<span class="c1"># CONFIG_ARM64_4K_PAGES=y</span>
+<span class="c1"># CONFIG_ARM64_64K_PAGES=y</span>
+
+<span class="c1"># AOSP 构建参数</span>
+<span class="c1"># build/make/core/combo/linux-arm64.mk</span>
+TARGET_PAGE_SIZE<span class="w"> </span>:<span class="o">=</span><span class="w"> </span><span class="m">16384</span>
+</code></pre></div>
+
+<p>从 Android 15 开始，AOSP 支持构建 16KB 页面大小的系统镜像。设备厂商需要在内核、bootloader、用户空间三处统一配置页面大小，三者必须一致。</p>
+<hr />
+<h2>四、对比分析</h2>
+<h3>4.1 4KB vs 16KB 页面性能对比</h3>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>4KB Page Size</th>
+<th>16KB Page Size</th>
+<th>变化</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>页表项数量（12GB RAM）</td>
+<td>3,145,728 条</td>
+<td>786,432 条</td>
+<td>减少 75%</td>
+</tr>
+<tr>
+<td>页表内存占用（12GB RAM）</td>
+<td>约 24MB</td>
+<td>约 6MB</td>
+<td>减少 75%</td>
+</tr>
+<tr>
+<td>TLB 覆盖范围（64项TLB）</td>
+<td>256KB</td>
+<td>1MB</td>
+<td>扩大 4 倍</td>
+</tr>
+<tr>
+<td>地址翻译层级（ARM64）</td>
+<td>多级</td>
+<td>减少层级</td>
+<td>层级下降</td>
+</tr>
+<tr>
+<td>TLB miss 代价</td>
+<td>4 次 page walk</td>
+<td>减少次数</td>
+<td>降低</td>
+</tr>
+<tr>
+<td>应用启动时间</td>
+<td>基准</td>
+<td>-3% ~ -30%</td>
+<td>显著缩短</td>
+</tr>
+<tr>
+<td>CPU 内存访问延迟</td>
+<td>基准</td>
+<td>降低</td>
+<td>优化</td>
+</tr>
+<tr>
+<td>内部碎片</td>
+<td>较小</td>
+<td>较大</td>
+<td>增加</td>
+</tr>
+<tr>
+<td>小对象分配效率</td>
+<td>高</td>
+<td>略降</td>
+<td>略降</td>
+</tr>
+<tr>
+<td>ARM64 原生支持</td>
+<td>支持</td>
+<td>支持（ARMv8-A+）</td>
+<td>等价</td>
+</tr>
+<tr>
+<td>AOSP 支持</td>
+<td>长期支持</td>
+<td>Android 15+ 起支持</td>
+<td>新增</td>
+</tr>
+<tr>
+<td>对齐要求</td>
+<td>4KB 对齐</td>
+<td>16KB 对齐</td>
+<td>提高</td>
+</tr>
+</tbody>
+</table>
+<h3>4.2 传统 LMK vs MemoryLimiter 对比</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>传统 LMK / LMKD</th>
+<th>MemoryLimiter</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>设计理念</td>
+<td>响应式（事后处理）</td>
+<td>预防式（事前干预）</td>
+</tr>
+<tr>
+<td>触发条件</td>
+<td>系统 PSI 压力信号</td>
+<td>单应用 RSS 接近上限</td>
+</tr>
+<tr>
+<td>监控粒度</td>
+<td>系统全局空闲内存</td>
+<td>per-process RSS</td>
+</tr>
+<tr>
+<td>优先级依据</td>
+<td>oom_adj 全局排序</td>
+<td>单进程内存占用比例</td>
+</tr>
+<tr>
+<td>处置方式</td>
+<td>SIGKILL 终止</td>
+<td>SIGSTOP 冻结 → 升级 SIGKILL</td>
+</tr>
+<tr>
+<td>状态保留</td>
+<td>进程销毁，状态丢失</td>
+<td>冻结保留，可恢复</td>
+</tr>
+<tr>
+<td>恢复方式</td>
+<td>冷启动重新加载</td>
+<td>解冻即用</td>
+</tr>
+<tr>
+<td>用户感知</td>
+<td>应用重新加载、白屏</td>
+<td>近乎无感切回</td>
+</tr>
+<tr>
+<td>资源开销</td>
+<td>冷启动 CPU/IO 开销大</td>
+<td>唤醒开销极小</td>
+</tr>
+<tr>
+<td>前台应用保护</td>
+<td>依赖 oom_adj 间接保护</td>
+<td>硬性内存上限保护</td>
+</tr>
+<tr>
+<td>后台应用管理</td>
+<td>批量杀</td>
+<td>单独冻结</td>
+</tr>
+<tr>
+<td>配置方式</td>
+<td>全局 minfree 阈值</td>
+<td>per-app memory.max</td>
+</tr>
+<tr>
+<td>底层依赖</td>
+<td>PSI + oom_adj</td>
+<td>cgroup v2 memory controller</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>五、Android 内存管理架构图</h2>
+<p>以下是 Android 17 完整的内存管理架构层次，涵盖从硬件到应用的完整栈：</p>
+<div class="highlight"><pre><span></span><code><span class="err">┌─────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                        </span><span class="n">应用层</span><span class="err">（</span><span class="k">User</span><span class="w"> </span><span class="nf">Space</span><span class="err">）</span><span class="w">                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌─────────────┐</span><span class="w">  </span><span class="err">┌─────────────┐</span><span class="w">  </span><span class="err">┌─────────────┐</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">App</span><span class="w"> </span><span class="n">A</span><span class="w">       </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">App</span><span class="w"> </span><span class="n">B</span><span class="w">       </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">App</span><span class="w"> </span><span class="n">C</span><span class="w">       </span><span class="err">│</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="p">(</span><span class="n">前台</span><span class="p">)</span><span class="w">      </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="p">(</span><span class="n">可见</span><span class="p">)</span><span class="w">      </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="p">(</span><span class="n">后台</span><span class="o">-</span><span class="n">冻结</span><span class="p">)</span><span class="w">  </span><span class="err">│</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">             </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">             </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">             </span><span class="err">│</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="n">onTrimMemory</span><span class="w"> </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="n">onTrimMemory</span><span class="w"> </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">cgroup</span><span class="w">     </span><span class="err">│</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">回调</span><span class="w">       </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">回调</span><span class="w">       </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">freeze</span><span class="o">=</span><span class="mi">1</span><span class="w">   </span><span class="err">│</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──────┬──────┘</span><span class="w">  </span><span class="err">└──────┬──────┘</span><span class="w">  </span><span class="err">└──────┬──────┘</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">         </span><span class="err">│</span><span class="w">                </span><span class="err">│</span><span class="w">                </span><span class="err">│</span><span class="w">                     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">───────┴────────────────┴────────────────┴────────────────</span><span class="w">     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                        </span><span class="n">Binder</span><span class="w"> </span><span class="n">IPC</span><span class="w">                                 </span><span class="err">│</span>
+<span class="err">└─────────────────────────┬───────────────────────────────────────┘</span>
+<span class="w">                          </span><span class="err">│</span>
+<span class="err">┌─────────────────────────▼───────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                   </span><span class="n">Android</span><span class="w"> </span><span class="n">Framework</span><span class="w">                             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌──────────────────┐</span><span class="w">  </span><span class="err">┌──────────────────────────┐</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">ActivityManager</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">MemoryLimiterService</span><span class="w">     </span><span class="err">│</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">Service</span><span class="w">          </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="p">(</span><span class="n">Android</span><span class="w"> </span><span class="mi">17</span><span class="w"> </span><span class="n">新增</span><span class="p">)</span><span class="w">        </span><span class="err">│</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                  </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                          </span><span class="err">│</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">进程优先级管理</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">per</span><span class="o">-</span><span class="n">app</span><span class="w"> </span><span class="n">RSS</span><span class="w"> </span><span class="n">监控</span><span class="w">       </span><span class="err">│</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">oom_adj</span><span class="w"> </span><span class="n">计算</span><span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">memory</span><span class="p">.</span><span class="nf">max</span><span class="w"> </span><span class="n">设定</span><span class="w">        </span><span class="err">│</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">onTrimMemory</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">冻结</span><span class="o">/</span><span class="n">解冻决策</span><span class="w">          </span><span class="err">│</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="n">分发</span><span class="w">          </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">前后台差异化策略</span><span class="w">        </span><span class="err">│</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└────────┬─────────┘</span><span class="w">  </span><span class="err">└────────────┬─────────────┘</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">           </span><span class="err">│</span><span class="w">                         </span><span class="err">│</span><span class="w">                            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌────────▼─────────────────────────▼─────────────┐</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">              </span><span class="n">LMKD</span><span class="w"> </span><span class="p">(</span><span class="n">Low</span><span class="w"> </span><span class="n">Memory</span><span class="w"> </span><span class="n">Killer</span><span class="w"> </span><span class="n">Daemon</span><span class="p">)</span><span class="w">    </span><span class="err">│</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                                                  </span><span class="err">│</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">PSI</span><span class="w"> </span><span class="n">内存压力监听</span><span class="w">                              </span><span class="err">│</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">oom_adj</span><span class="w"> </span><span class="n">优先级排序</span><span class="w">                            </span><span class="err">│</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">SIGKILL</span><span class="w"> </span><span class="n">终止后台进程</span><span class="w">                          </span><span class="err">│</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──────────────────────┬──────────────────────────┘</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                         </span><span class="err">│</span><span class="w">                                        </span><span class="err">│</span>
+<span class="err">└─────────────────────────┼───────────────────────────────────────┘</span>
+<span class="w">                          </span><span class="err">│</span><span class="w"> </span><span class="o">/</span><span class="n">dev</span><span class="o">/</span><span class="n">memcg</span><span class="p">,</span><span class="w"> </span><span class="o">/</span><span class="k">proc</span><span class="p">,</span><span class="w"> </span><span class="n">sysfs</span>
+<span class="err">┌─────────────────────────▼───────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                     </span><span class="n">Linux</span><span class="w"> </span><span class="n">Kernel</span><span class="w">                                 </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌──────────────────────────────────────────────┐</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">            </span><span class="n">cgroup</span><span class="w"> </span><span class="n">v2</span><span class="w"> </span><span class="p">(</span><span class="n">memory</span><span class="w"> </span><span class="n">controller</span><span class="p">)</span><span class="w">      </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                                                </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="o">/</span><span class="n">sys</span><span class="o">/</span><span class="n">fs</span><span class="o">/</span><span class="n">cgroup</span><span class="o">/</span><span class="w">                               </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">    </span><span class="err">├──</span><span class="w"> </span><span class="n">uid_10001</span><span class="o">/</span><span class="w">                               </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">memory</span><span class="p">.</span><span class="nf">max</span><span class="w">      </span><span class="p">(</span><span class="mi">768</span><span class="n">MB</span><span class="p">)</span><span class="w">             </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">memory</span><span class="p">.</span><span class="n">high</span><span class="w">     </span><span class="p">(</span><span class="mi">614</span><span class="n">MB</span><span class="o">=</span><span class="mi">80</span><span class="o">%</span><span class="p">)</span><span class="w">         </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">memory</span><span class="p">.</span><span class="k">current</span><span class="w">  </span><span class="p">(</span><span class="n">实时RSS</span><span class="p">)</span><span class="w">           </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">memory</span><span class="p">.</span><span class="n">events</span><span class="w">   </span><span class="p">(</span><span class="n">OOM通知</span><span class="p">)</span><span class="w">           </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">cgroup</span><span class="p">.</span><span class="n">freeze</span><span class="w">   </span><span class="p">(</span><span class="n">冻结控制</span><span class="p">)</span><span class="w">          </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">    </span><span class="err">└──</span><span class="w"> </span><span class="p">...</span><span class="w">                                     </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──────────────────────┬───────────────────────┘</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                         </span><span class="err">│</span><span class="w">                                        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌──────────────────────▼───────────────────────┐</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">              </span><span class="n">kswapd</span><span class="w"> </span><span class="p">(</span><span class="n">内核交换守护进程</span><span class="p">)</span><span class="w">          </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                                                </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">空闲内存</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">low</span><span class="w"> </span><span class="n">watermark</span><span class="w"> </span><span class="n">时唤醒</span><span class="w">             </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">回收</span><span class="w"> </span><span class="n">clean</span><span class="w"> </span><span class="n">pages</span><span class="w">                           </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">压缩匿名页到</span><span class="w"> </span><span class="n">zram</span><span class="w">                          </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">空闲内存</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">high</span><span class="w"> </span><span class="n">watermark</span><span class="w"> </span><span class="n">时休眠</span><span class="w">           </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──────────────────────┬───────────────────────┘</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                         </span><span class="err">│</span><span class="w">                                        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌──────────────────────▼───────────────────────┐</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">            </span><span class="n">MMU</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">Page</span><span class="w"> </span><span class="nc">Table</span><span class="w"> </span><span class="p">(</span><span class="mi">16</span><span class="n">KB</span><span class="w"> </span><span class="n">Page</span><span class="p">)</span><span class="w">       </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                                                </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">虚拟地址</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="o">[</span><span class="n">PML4</span><span class="o">]</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="o">[</span><span class="n">PDPT</span><span class="o">]</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="o">[</span><span class="n">PD</span><span class="o">]</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">物理页帧</span><span class="w">  </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                    </span><span class="p">(</span><span class="mi">16</span><span class="n">KB页</span><span class="p">,</span><span class="w"> </span><span class="n">减少层级</span><span class="p">)</span><span class="w">           </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                                                </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">TLB</span><span class="w"> </span><span class="n">缓存</span><span class="w"> </span><span class="p">(</span><span class="n">命中率提升</span><span class="p">,</span><span class="w"> </span><span class="n">覆盖范围</span><span class="err">×</span><span class="mi">4</span><span class="p">)</span><span class="w">             </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──────────────────────┬───────────────────────┘</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                         </span><span class="err">│</span><span class="w">                                        </span><span class="err">│</span>
+<span class="err">└─────────────────────────┼───────────────────────────────────────┘</span>
+<span class="w">                          </span><span class="err">│</span>
+<span class="err">┌─────────────────────────▼───────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                        </span><span class="n">硬件层</span><span class="w">                                     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">┌─────────────┐</span><span class="w">  </span><span class="err">┌──────────────┐</span><span class="w">  </span><span class="err">┌─────────────────┐</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="n">ARM64</span><span class="w"> </span><span class="n">CPU</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">LPDDR</span><span class="w"> </span><span class="n">RAM</span><span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">zram</span><span class="w"> </span><span class="p">(</span><span class="n">压缩</span><span class="p">)</span><span class="w">    </span><span class="err">│</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">             </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">              </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                  </span><span class="err">│</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">MMU</span><span class="w"> </span><span class="n">单元</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">12</span><span class="o">/</span><span class="mi">16</span><span class="o">/</span><span class="mi">24</span><span class="n">GB</span><span class="w"> </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">匿名页压缩</span><span class="w">    </span><span class="err">│</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">TLB</span><span class="w"> </span><span class="n">缓存</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">16</span><span class="n">KB</span><span class="w"> </span><span class="n">页帧</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">节省物理内存</span><span class="w">  </span><span class="err">│</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">16</span><span class="n">KB支持</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">              </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                  </span><span class="err">│</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">└─────────────┘</span><span class="w">  </span><span class="err">└──────────────┘</span><span class="w">  </span><span class="err">└─────────────────┘</span><span class="w">       </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<hr />
+<h2>六、开发者适配指南</h2>
+<h3>6.1 16KB 页面适配</h3>
+<p>16KB 页面对开发者最直接的影响是<strong>内存对齐要求</strong>。所有通过 <code>mmap</code> 映射的内存区域（包括 <code>.so</code> 文件加载、<code>JNI</code> 库）必须满足 16KB 对齐，否则在 16KB 页面设备上加载失败。</p>
+<h4>6.1.1 检查 Native 库对齐</h4>
+<p>使用 Android NDK 提供的工具检查 <code>.so</code> 文件对齐：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检查 ELF 文件的对齐要求</span>
+<span class="nv">$NDK</span>/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf<span class="w"> </span>-l<span class="w"> </span>libnative.so
+
+<span class="c1"># 输出示例（4KB 对齐，不兼容16KB）：</span>
+<span class="c1"># LOAD   0x000000 0x00000000 0x00000000 0x00100 0x00100 R 0x1000</span>
+<span class="c1">#                                            ↑ 0x1000 = 4KB</span>
+
+<span class="c1"># 输出示例（16KB 对齐，兼容）：</span>
+<span class="c1"># LOAD   0x000000 0x00000000 0x00000000 0x00100 0x00100 R 0x4000</span>
+<span class="c1">#                                            ↑ 0x4000 = 16KB</span>
+</code></pre></div>
+
+<h4>6.1.2 构建配置</h4>
+<p>在 <code>CMakeLists.txt</code> 或 <code>Android.mk</code> 中指定 16KB 对齐：</p>
+<div class="highlight"><pre><span></span><code><span class="c"># CMakeLists.txt</span>
+<span class="nb">cmake_minimum_required</span><span class="p">(</span><span class="s">VERSION</span><span class="w"> </span><span class="s">3.22.1</span><span class="p">)</span>
+
+<span class="nb">project</span><span class="p">(</span><span class="s">native-lib</span><span class="p">)</span>
+
+<span class="c"># 启用 16KB 页面大小对齐</span>
+<span class="nb">add_link_options</span><span class="p">(</span><span class="s2">&quot;-Wl,-z,max-page-size=16384&quot;</span><span class="p">)</span>
+
+<span class="c"># 或者针对特定 target</span>
+<span class="nb">add_library</span><span class="p">(</span><span class="s">native-lib</span><span class="w"> </span><span class="s">SHARED</span>
+<span class="w">    </span><span class="s">src/main/cpp/native-lib.cpp</span>
+<span class="p">)</span>
+<span class="nb">target_link_options</span><span class="p">(</span><span class="s">native-lib</span><span class="w"> </span><span class="s">PRIVATE</span>
+<span class="w">    </span><span class="s2">&quot;-Wl,-z,max-page-size=16384&quot;</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<p>对应的 <code>Android.mk</code> 写法：</p>
+<div class="highlight"><pre><span></span><code><span class="c"># Android.mk</span>
+<span class="nv">LOCAL_PATH</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">$(</span>call<span class="w"> </span>my-dir<span class="k">)</span>
+
+<span class="cp">include $(CLEAR_VARS)</span>
+<span class="nv">LOCAL_MODULE</span><span class="w">    </span><span class="o">:=</span><span class="w"> </span>native-lib
+<span class="nv">LOCAL_SRC_FILES</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span>native-lib.cpp
+<span class="c"># 启用 16KB 对齐</span>
+<span class="nv">LOCAL_LDFLAGS</span><span class="w">   </span><span class="o">:=</span><span class="w"> </span>-Wl,-z,max-page-size<span class="o">=</span><span class="m">16384</span>
+<span class="cp">include $(BUILD_SHARED_LIBRARY)</span>
+</code></pre></div>
+
+<h4>6.1.3 NDK 版本要求</h4>
+<p>确保使用支持 16KB 的 NDK 版本（NDK r27+）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// app/build.gradle</span>
+<span class="n">android</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">ndkVersion</span><span class="w"> </span><span class="s">&quot;27.0.12077973&quot;</span><span class="w">  </span><span class="c1">// 支持 16KB 的版本</span>
+
+<span class="w">    </span><span class="n">defaultConfig</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">externalNativeBuild</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">cmake</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">cppFlags</span><span class="w"> </span><span class="s">&quot;-std=c++17&quot;</span>
+<span class="w">                </span><span class="n">arguments</span><span class="w"> </span><span class="s">&quot;-DANDROID_STL=c++_shared&quot;</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h4>6.1.4 运行时检测页面大小</h4>
+<p>应用可以在运行时检测当前设备的页面大小，动态调整内存分配策略：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">object</span><span class="w"> </span><span class="nc">PageSizeDetector</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">fun</span><span class="w"> </span><span class="nf">getPageSize</span><span class="p">():</span><span class="w"> </span><span class="kt">Int</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 通过 sysconf 获取系统页面大小</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">Os</span><span class="p">.</span><span class="na">sysconf</span><span class="p">(</span><span class="n">OsConstants</span><span class="p">.</span><span class="na">_SC_PAGESIZE</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">fun</span><span class="w"> </span><span class="nf">is16KbPageEnabled</span><span class="p">():</span><span class="w"> </span><span class="kt">Boolean</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">getPageSize</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="m">16384</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c1">// 使用示例</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">PageSizeDetector</span><span class="p">.</span><span class="na">is16KbPageEnabled</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 16KB 模式下，调整内存分配粒度</span>
+<span class="w">    </span><span class="c1">// 例如增大 Bitmap 的 inSampleSize，减少小对象分配</span>
+<span class="w">    </span><span class="n">BitmapFactory</span><span class="p">.</span><span class="na">Options</span><span class="p">().</span><span class="na">apply</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">inSampleSize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="m">2</span><span class="w">  </span><span class="c1">// 降低分辨率，减少页表项</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h4>6.1.5 Java 层 mmap 注意事项</h4>
+<p>如果应用使用 <code>ByteBuffer.allocateDirect</code> 或直接通过 JNI 调用 <code>mmap</code>，需确保传入的 offset 和 length 对齐：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 错误示例：未对齐的 mmap</span>
+<span class="kt">long</span><span class="w"> </span><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mmap</span><span class="p">(</span><span class="n">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">8192</span><span class="p">,</span><span class="w">    </span><span class="c1">// 8KB，非16KB倍数</span>
+<span class="w">                 </span><span class="n">PROT_READ</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">PROT_WRITE</span><span class="p">,</span>
+<span class="w">                 </span><span class="n">MAP_PRIVATE</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MAP_ANONYMOUS</span><span class="p">,</span>
+<span class="w">                 </span><span class="o">-</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+
+<span class="c1">// 正确示例：16KB 对齐分配</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">pageSize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">16384</span><span class="p">;</span>
+<span class="kt">long</span><span class="w"> </span><span class="n">size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">((</span><span class="mi">8192</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">pageSize</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">pageSize</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">pageSize</span><span class="p">;</span><span class="w">  </span><span class="c1">// 向上取整到 16KB</span>
+<span class="kt">long</span><span class="w"> </span><span class="n">addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mmap</span><span class="p">(</span><span class="n">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">size</span><span class="p">,</span>
+<span class="w">                 </span><span class="n">PROT_READ</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">PROT_WRITE</span><span class="p">,</span>
+<span class="w">                 </span><span class="n">MAP_PRIVATE</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MAP_ANONYMOUS</span><span class="p">,</span>
+<span class="w">                 </span><span class="o">-</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+</code></pre></div>
+
+<h3>6.2 MemoryLimiter 适配</h3>
+<p>MemoryLimiter 的存在意味着应用不能再无节制地占用内存。开发者需要：</p>
+<ol>
+<li><strong>监控自身 RSS</strong>：应用应主动感知内存占用</li>
+<li><strong>响应 onTrimMemory</strong>：在收到压力通知时及时释放</li>
+<li><strong>优化大对象管理</strong>：Bitmap、大数组等需要及时回收</li>
+</ol>
+<h4>6.2.1 监控应用 RSS</h4>
+<div class="highlight"><pre><span></span><code><span class="kd">class</span><span class="w"> </span><span class="nc">MemoryMonitor</span><span class="p">(</span><span class="kd">private</span><span class="w"> </span><span class="kd">val</span><span class="w"> </span><span class="nv">context</span><span class="p">:</span><span class="w"> </span><span class="n">Context</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">fun</span><span class="w"> </span><span class="nf">getCurrentRss</span><span class="p">():</span><span class="w"> </span><span class="kt">Long</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 读取 /proc/self/statm 获取 RSS</span>
+<span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">statm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">File</span><span class="p">(</span><span class="s">&quot;/proc/self/statm&quot;</span><span class="p">).</span><span class="na">readText</span><span class="p">().</span><span class="na">split</span><span class="p">(</span><span class="s">&quot; &quot;</span><span class="p">)</span>
+<span class="w">        </span><span class="c1">// RSS（第2个字段，单位为页）</span>
+<span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">rssPages</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">statm</span><span class="o">[</span><span class="m">1</span><span class="o">]</span><span class="p">.</span><span class="na">toLong</span><span class="p">()</span>
+<span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">pageSize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Os</span><span class="p">.</span><span class="na">sysconf</span><span class="p">(</span><span class="n">OsConstants</span><span class="p">.</span><span class="na">_SC_PAGESIZE</span><span class="p">)</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">rssPages</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">pageSize</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">fun</span><span class="w"> </span><span class="nf">getMemoryLimit</span><span class="p">():</span><span class="w"> </span><span class="kt">Long</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">am</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">context</span><span class="p">.</span><span class="na">getSystemService</span><span class="p">(</span><span class="n">Context</span><span class="p">.</span><span class="na">ACTIVITY_SERVICE</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">ActivityManager</span>
+<span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">info</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ActivityManager</span><span class="p">.</span><span class="na">MemoryInfo</span><span class="p">()</span>
+<span class="w">        </span><span class="n">am</span><span class="p">.</span><span class="na">getMemoryInfo</span><span class="p">(</span><span class="n">info</span><span class="p">)</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">info</span><span class="p">.</span><span class="na">totalMem</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">fun</span><span class="w"> </span><span class="nf">logMemoryStatus</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">rss</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">getCurrentRss</span><span class="p">()</span>
+<span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">limit</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">getMemoryLimit</span><span class="p">()</span>
+<span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">ratio</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">rss</span><span class="p">.</span><span class="na">toFloat</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">limit</span><span class="p">.</span><span class="na">toFloat</span><span class="p">()</span>
+<span class="w">        </span><span class="n">Log</span><span class="p">.</span><span class="na">i</span><span class="p">(</span><span class="s">&quot;MemoryMonitor&quot;</span><span class="p">,</span><span class="w"> </span>
+<span class="w">              </span><span class="s">&quot;RSS=</span><span class="si">${</span><span class="n">rss</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="m">1024</span><span class="si">}</span><span class="s">MB, ratio=</span><span class="si">${</span><span class="n">ratio</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">100</span><span class="si">}</span><span class="s">%&quot;</span><span class="p">)</span>
+
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">ratio</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="m">0.8f</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 主动释放内存</span>
+<span class="w">            </span><span class="n">releaseNonCriticalMemory</span><span class="p">()</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h4>6.2.2 完善的 onTrimMemory 响应</h4>
+<div class="highlight"><pre><span></span><code><span class="kd">class</span><span class="w"> </span><span class="nc">MyApplication</span><span class="w"> </span><span class="p">:</span><span class="w"> </span><span class="n">Application</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">val</span><span class="w"> </span><span class="nv">imageCache</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LruCache</span><span class="o">&lt;</span><span class="kt">String</span><span class="p">,</span><span class="w"> </span><span class="n">Bitmap</span><span class="o">&gt;</span><span class="p">(</span><span class="m">64</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="m">1024</span><span class="p">)</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">val</span><span class="w"> </span><span class="nv">objectPool</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mutableListOf</span><span class="o">&lt;</span><span class="kt">Any</span><span class="o">&gt;</span><span class="p">()</span>
+
+<span class="w">    </span><span class="kd">override</span><span class="w"> </span><span class="kd">fun</span><span class="w"> </span><span class="nf">onTrimMemory</span><span class="p">(</span><span class="n">level</span><span class="p">:</span><span class="w"> </span><span class="kt">Int</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">super</span><span class="p">.</span><span class="na">onTrimMemory</span><span class="p">(</span><span class="n">level</span><span class="p">)</span>
+
+<span class="w">        </span><span class="k">when</span><span class="w"> </span><span class="p">(</span><span class="n">level</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">TRIM_MEMORY_COMPLETE</span><span class="p">,</span>
+<span class="w">            </span><span class="n">TRIM_MEMORY_RUNNING_CRITICAL</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="c1">// 内存极度紧张，释放所有可释放资源</span>
+<span class="w">                </span><span class="n">imageCache</span><span class="p">.</span><span class="na">evictAll</span><span class="p">()</span>
+<span class="w">                </span><span class="n">objectPool</span><span class="p">.</span><span class="na">clear</span><span class="p">()</span>
+<span class="w">                </span><span class="c1">// 通知 Glide/Picasso 等图片库清理</span>
+<span class="w">                </span><span class="n">Glide</span><span class="p">.</span><span class="na">get</span><span class="p">(</span><span class="k">this</span><span class="p">).</span><span class="na">clearMemory</span><span class="p">()</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">            </span><span class="n">TRIM_MEMORY_RUNNING_LOW</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="c1">// 释放非关键缓存</span>
+<span class="w">                </span><span class="n">imageCache</span><span class="p">.</span><span class="na">trimToSize</span><span class="p">(</span><span class="n">imageCache</span><span class="p">.</span><span class="na">size</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="m">2</span><span class="p">)</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">            </span><span class="n">TRIM_MEMORY_UI_HIDDEN</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="c1">// 应用进入后台，释放UI资源</span>
+<span class="w">                </span><span class="n">releaseUiAssets</span><span class="p">()</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">            </span><span class="n">TRIM_MEMORY_BACKGROUND</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="c1">// 后台运行，轻度清理</span>
+<span class="w">                </span><span class="n">objectPool</span><span class="p">.</span><span class="na">removeAll</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nb">it</span><span class="w"> </span><span class="k">!is</span><span class="w"> </span><span class="n">CriticalObject</span><span class="w"> </span><span class="p">}</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h4>6.2.3 适配 cgroup freeze 行为</h4>
+<p>被冻结的应用在解冻后需要注意状态一致性。特别是涉及外部资源（网络连接、文件句柄）的场景：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">class</span><span class="w"> </span><span class="nc">NetworkManager</span><span class="p">(</span><span class="kd">private</span><span class="w"> </span><span class="kd">val</span><span class="w"> </span><span class="nv">context</span><span class="p">:</span><span class="w"> </span><span class="n">Context</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">var</span><span class="w"> </span><span class="nv">socket</span><span class="p">:</span><span class="w"> </span><span class="n">Socket? </span><span class="o">=</span><span class="w"> </span><span class="kc">null</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">var</span><span class="w"> </span><span class="nv">lastHeartbeatTime</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="m">0L</span>
+
+<span class="w">    </span><span class="c1">// 应用被冻结后恢复时调用</span>
+<span class="w">    </span><span class="kd">fun</span><span class="w"> </span><span class="nf">onProcessResumed</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">now</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">System</span><span class="p">.</span><span class="na">currentTimeMillis</span><span class="p">()</span>
+<span class="w">        </span><span class="kd">val</span><span class="w"> </span><span class="nv">frozenDuration</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">now</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">lastHeartbeatTime</span>
+
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">frozenDuration</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="m">30</span><span class="n">_000</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 冻结超过30秒，网络连接可能已失效</span>
+<span class="w">            </span><span class="n">socket</span><span class="o">?.</span><span class="na">let</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="k">try</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nb">it</span><span class="p">.</span><span class="na">close</span><span class="p">()</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="k">catch</span><span class="w"> </span><span class="p">(</span><span class="n">e</span><span class="p">:</span><span class="w"> </span><span class="n">Exception</span><span class="p">)</span><span class="w"> </span><span class="p">{}</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">            </span><span class="n">socket</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">null</span>
+<span class="w">            </span><span class="c1">// 重新建立连接</span>
+<span class="w">            </span><span class="n">reconnect</span><span class="p">()</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 短暂冻结，发送心跳保活</span>
+<span class="w">            </span><span class="n">sendHeartbeat</span><span class="p">()</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="n">lastHeartbeatTime</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">now</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<hr />
+<h2>七、总结</h2>
+<p>Android 17 的内存管理升级代表了移动操作系统在内存治理上的两个根本性范式转变：</p>
+<p><strong>MemoryLimiter</strong> 实现了从"响应式杀进程"到"预防式冻结进程"的转变。通过 cgroup v2 的 <code>memory.max</code> 和 <code>cgroup.freeze</code> 机制，系统可以为每个应用设定独立的内存预算，在超额前用 SIGSTOP 冻结替代 SIGKILL 终止，既保护了前台应用的用户体验，又避免了冷启动的巨大开销。配合分级的 <code>onTrimMemory</code> 通知，应用有机会主动释放内存，整个回收过程更加平滑。</p>
+<p><strong>16KB Page Size</strong> 实现了从"细粒度低效"到"粗粒度高效"的转变。页表项数量减少 75%、TLB 覆盖范围扩大 4 倍，直接带来了 3% ~ 30% 的应用启动加速。ARM64 架构的原生支持和 Android 15 起的 AOSP 构建能力，为这一迁移铺平了道路。代价是更高的内存对齐要求和略增的内部碎片，但对现代 Android 应用而言，收益远大于代价。</p>
+<p>对开发者而言，适配工作的核心是：</p>
+<ol>
+<li><strong>Native 库迁移到 16KB 对齐</strong>，避免在 16KB 设备上加载失败</li>
+<li><strong>完善 <code>onTrimMemory</code> 响应</strong>，在压力通知下主动释放资源</li>
+<li><strong>处理冻结/解冻的状态一致性</strong>，特别是网络连接等外部资源</li>
+<li><strong>运行时检测页面大小</strong>，动态调整内存分配策略</li>
+</ol>
+<p>随着 12GB、16GB 甚至 24GB RAM 机型成为主流，硬件堆叠的红利已逐渐触顶。Android 17 通过软件层的深度优化，在不增加硬件成本的前提下提升了内存利用效率，这也印证了一个趋势：<strong>未来的内存优化战场，在系统软件层而非硬件层</strong>。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
