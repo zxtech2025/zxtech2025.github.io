@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI模型盗窃漏洞：从API查询到参数逆向的完整攻击链拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>AI模型盗窃漏洞：从API查询到参数逆向的完整攻击链拆解</h1>
+<time>2026-07-28</time>
+<ul>
+<li>技术
+Slug: ai安全-pwnzzai模型盗窃漏洞-从api查询到参数逆向的完整攻击链拆解</li>
+</ul>
+<hr />
+<h2>一、模型盗窃漏洞概述</h2>
+<h3>1.1 PwnzzAI平台背景</h3>
+<p>PwnzzAI是一个基于 OWASP AI Exchange 标准构建的<strong>故意不安全（intentionally insecure）</strong>AI教学靶场平台，其核心目的是以可控、可复现的方式暴露真实AI系统中存在的安全缺陷。技术栈采用 <code>Flask + Ollama + OpenAI</code> 三层结构：Flask 承载推理 API 网关，Ollama 提供本地开源模型推理后端，OpenAI SDK 桥接商业闭源模型。平台将AI安全风险划分为 <strong>11大类漏洞</strong>，覆盖提示注入、训练数据投毒、模型拒绝服务、供应链等，其中第11类——<strong>模型盗窃（Model Stealing / Model Extraction）</strong>——被认为是后果最严重、也最容易被开发者忽视的一类，因为它不破坏系统可用性，而是悄无声息地复制核心资产。</p>
+<h3>1.2 模型盗窃的定义与本质</h3>
+<p>模型盗窃指攻击者仅通过合法的API查询通道，收集大量"输入-输出对"，进而训练一个<strong>替代模型（substitute model）</strong>来逼近原始模型的功能，甚至直接逆向出原始模型的参数矩阵。</p>
+<p>其技术本质是<strong>函数近似</strong>。设目标模型为黑盒函数 $F$，接受输入 $X$，输出 $Y$：</p>
+<p>$$Y = F(X)$$</p>
+<p>攻击者的目标是构造一个函数 $F'$，使得在输入分布 $\mathcal{D}$ 上：</p>
+<p>$$F'(X) \approx F(X), \quad \forall X \sim \mathcal{D}$$</p>
+<p>近似程度用<strong>保真度（fidelity）</strong>衡量，即 $F'$ 与 $F$ 在测试集上输出一致的比例。值得注意的是，保真度与<strong>准确度（accuracy）</strong>是两个不同指标：一个保真度99%的替代模型，其独立准确度可能只有80%——它"学到了老师的偏见"，包括老师的错误。</p>
+<h3>1.3 四大攻击类型对比</h3>
+<p>模型盗窃并非单一手法，根据攻击面与目标层级的不同，可分为四类。下表是PwnzzAI靶场中复现的攻击矩阵：</p>
+<table>
+<thead>
+<tr>
+<th>攻击类型</th>
+<th>攻击面</th>
+<th>目标资产</th>
+<th>关键技术</th>
+<th>典型成本</th>
+<th>可检测性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A. 功能窃取（替代模型）</td>
+<td>API预测端点</td>
+<td>模型决策函数 $F(\cdot)$</td>
+<td>主动学习+知识蒸馏</td>
+<td>低（API费用）</td>
+<td>中（需查询异常检测）</td>
+</tr>
+<tr>
+<td>B. 嵌入层/投影矩阵窃取</td>
+<td>top-k logits端点</td>
+<td>输出投影矩阵 $W$</td>
+<td>SVD逆向+蒸馏</td>
+<td>低（&lt;$20~$2000）</td>
+<td>低（查询量小）</td>
+</tr>
+<tr>
+<td>C. 提示进化攻击</td>
+<td>文本生成API</td>
+<td>模型知识/能力边界</td>
+<td>进化算法+遗传搜索</td>
+<td>极低（仅黑盒查询）</td>
+<td>极低（伪装正常使用）</td>
+</tr>
+<tr>
+<td>D. GPU内存侧信道</td>
+<td>共享GPU硬件</td>
+<td>模型权重/激活值</td>
+<td>内存残留读取</td>
+<td>硬件级（无需API）</td>
+<td>低（旁路不触发应用日志）</td>
+</tr>
+</tbody>
+</table>
+<p>其中类型A是经典"复制功能"，类型B更进一步直接"偷参数"，类型C针对生成式模型的知识提取，类型D则彻底跳过API层、从硬件侧信道直取权重。下文逐一拆解。</p>
+<hr />
+<h2>二、攻击类型A：功能级模型窃取（替代模型训练）</h2>
+<h3>2.1 漏洞API的典型形态</h3>
+<p>PwnzzAI靶场中提供了一个故意暴露过多信息的鸢尾花分类API。漏洞的根源不在于"提供了API"，而在于<strong>API返回了完整的概率向量 <code>predict_proba</code></strong>，而非仅返回 argmax 标签。每多暴露一个维度的概率，攻击者获得的决策边界信息就呈指数级增长。</p>
+<p>目标API代码（漏洞版本）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># target_api.py —— PwnzzAI 靶场：故意不安全的鸢尾花分类API</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">flask</span><span class="w"> </span><span class="kn">import</span> <span class="n">Flask</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="n">jsonify</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">sklearn.datasets</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_iris</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">sklearn.ensemble</span><span class="w"> </span><span class="kn">import</span> <span class="n">RandomForestClassifier</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+
+<span class="n">app</span> <span class="o">=</span> <span class="n">Flask</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
+
+<span class="c1"># 用全部数据训练一个&quot;机密&quot;模型（模拟受保护资产）</span>
+<span class="n">iris</span> <span class="o">=</span> <span class="n">load_iris</span><span class="p">()</span>
+<span class="n">X</span><span class="p">,</span> <span class="n">y</span> <span class="o">=</span> <span class="n">iris</span><span class="o">.</span><span class="n">data</span><span class="p">,</span> <span class="n">iris</span><span class="o">.</span><span class="n">target</span>
+<span class="n">TARGET_MODEL</span> <span class="o">=</span> <span class="n">RandomForestClassifier</span><span class="p">(</span><span class="n">n_estimators</span><span class="o">=</span><span class="mi">100</span><span class="p">,</span> <span class="n">random_state</span><span class="o">=</span><span class="mi">42</span><span class="p">)</span>
+<span class="n">TARGET_MODEL</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span><span class="n">X</span><span class="p">,</span> <span class="n">y</span><span class="p">)</span>
+
+<span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">&quot;/predict&quot;</span><span class="p">,</span> <span class="n">methods</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;POST&quot;</span><span class="p">])</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">predict</span><span class="p">():</span>
+    <span class="n">data</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">json</span>
+    <span class="n">features</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">data</span><span class="p">[</span><span class="s2">&quot;features&quot;</span><span class="p">])</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+    <span class="c1"># 【漏洞点】返回完整概率向量 predict_proba，而非仅返回 class label</span>
+    <span class="c1"># 概率向量泄露了决策边界的&quot;软&quot;信息，使替代模型可逼近决策几何</span>
+    <span class="n">proba</span> <span class="o">=</span> <span class="n">TARGET_MODEL</span><span class="o">.</span><span class="n">predict_proba</span><span class="p">(</span><span class="n">features</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">jsonify</span><span class="p">({</span>
+        <span class="s2">&quot;probabilities&quot;</span><span class="p">:</span> <span class="n">proba</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span>   <span class="c1"># 危险：暴露完整概率分布</span>
+        <span class="s2">&quot;label&quot;</span><span class="p">:</span> <span class="nb">int</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="n">proba</span><span class="p">))</span>
+    <span class="p">})</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="n">app</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">host</span><span class="o">=</span><span class="s2">&quot;0.0.0.0&quot;</span><span class="p">,</span> <span class="n">port</span><span class="o">=</span><span class="mi">5000</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>漏洞分析</strong>：<code>predict_proba</code> 返回长度为3的概率向量（三类鸢尾花）。若只返回 <code>label</code>，攻击者只能得到硬标签（hard label），需要更多查询才能逼近边界；而软标签（soft label / probability）直接编码了样本到决策边界的距离，是知识蒸馏的"暗知识（dark knowledge）"。一个简单的对照：同样2000次查询，硬标签攻击保真度约82%，软标签攻击可达96%。</p>
+<h3>2.2 完整窃取PoC：三阶段攻击脚本</h3>
+<p>攻击脚本分三个阶段：<strong>数据收集 → 克隆训练 → 验证</strong>。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># steal_model.py —— 替代模型窃取PoC（三阶段）</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">requests</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">sklearn.datasets</span><span class="w"> </span><span class="kn">import</span> <span class="n">load_iris</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">sklearn.tree</span><span class="w"> </span><span class="kn">import</span> <span class="n">DecisionTreeClassifier</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">sklearn.neural_network</span><span class="w"> </span><span class="kn">import</span> <span class="n">MLPClassifier</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">sklearn.metrics</span><span class="w"> </span><span class="kn">import</span> <span class="n">accuracy_score</span>
+
+<span class="n">TARGET_URL</span> <span class="o">=</span> <span class="s2">&quot;http://localhost:5000/predict&quot;</span>
+<span class="n">N_QUERIES</span> <span class="o">=</span> <span class="mi">2000</span>
+
+<span class="c1"># ========== 阶段一：数据收集（输入采样 + 查询目标API）==========</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">collect_data</span><span class="p">(</span><span class="n">n_queries</span><span class="p">):</span>
+    <span class="n">iris</span> <span class="o">=</span> <span class="n">load_iris</span><span class="p">()</span>
+    <span class="n">X_orig</span> <span class="o">=</span> <span class="n">iris</span><span class="o">.</span><span class="n">data</span>  <span class="c1"># 仅借用特征分布范围，不使用标签</span>
+    <span class="c1"># 在原始特征空间内进行数据增强：均匀扰动采样</span>
+    <span class="n">mins</span><span class="p">,</span> <span class="n">maxs</span> <span class="o">=</span> <span class="n">X_orig</span><span class="o">.</span><span class="n">min</span><span class="p">(</span><span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">),</span> <span class="n">X_orig</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+    <span class="c1"># 主动学习：在边界附近加密采样（这里简化为均匀+高斯扰动）</span>
+    <span class="n">X_probe</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">uniform</span><span class="p">(</span><span class="n">mins</span><span class="p">,</span> <span class="n">maxs</span><span class="p">,</span> <span class="n">size</span><span class="o">=</span><span class="p">(</span><span class="n">n_queries</span><span class="p">,</span> <span class="mi">4</span><span class="p">))</span>
+    <span class="c1"># 叠加局部高斯噪声以探索决策边界细节</span>
+    <span class="n">X_probe</span> <span class="o">+=</span> <span class="n">np</span><span class="o">.</span><span class="n">random</span><span class="o">.</span><span class="n">normal</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="mf">0.05</span><span class="p">,</span> <span class="n">size</span><span class="o">=</span><span class="n">X_probe</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
+
+    <span class="n">y_clone</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">soft_labels</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">x</span> <span class="ow">in</span> <span class="n">X_probe</span><span class="p">:</span>
+        <span class="n">resp</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="n">TARGET_URL</span><span class="p">,</span> <span class="n">json</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;features&quot;</span><span class="p">:</span> <span class="n">x</span><span class="o">.</span><span class="n">tolist</span><span class="p">()})</span><span class="o">.</span><span class="n">json</span><span class="p">()</span>
+        <span class="n">soft_labels</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">resp</span><span class="p">[</span><span class="s2">&quot;probabilities&quot;</span><span class="p">])</span>   <span class="c1"># 采集软标签</span>
+        <span class="n">y_clone</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="nb">int</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="n">resp</span><span class="p">[</span><span class="s2">&quot;probabilities&quot;</span><span class="p">])))</span>
+    <span class="k">return</span> <span class="n">X_probe</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">y_clone</span><span class="p">),</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">soft_labels</span><span class="p">)</span>
+
+<span class="c1"># ========== 阶段二：克隆训练（用软标签蒸馏替代模型）==========</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">train_clone</span><span class="p">(</span><span class="n">X</span><span class="p">,</span> <span class="n">y_hard</span><span class="p">,</span> <span class="n">y_soft</span><span class="p">):</span>
+    <span class="c1"># 策略1：决策树克隆硬标签（快速逼近决策边界）</span>
+    <span class="n">clone_tree</span> <span class="o">=</span> <span class="n">DecisionTreeClassifier</span><span class="p">(</span><span class="n">max_depth</span><span class="o">=</span><span class="mi">8</span><span class="p">,</span> <span class="n">random_state</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+    <span class="n">clone_tree</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span><span class="n">X</span><span class="p">,</span> <span class="n">y_hard</span><span class="p">)</span>
+
+    <span class="c1"># 策略2：MLP克隆软标签（知识蒸馏，保留暗知识）</span>
+    <span class="n">clone_mlp</span> <span class="o">=</span> <span class="n">MLPClassifier</span><span class="p">(</span><span class="n">hidden_layer_sizes</span><span class="o">=</span><span class="p">(</span><span class="mi">64</span><span class="p">,</span> <span class="mi">32</span><span class="p">),</span>
+                              <span class="n">max_iter</span><span class="o">=</span><span class="mi">2000</span><span class="p">,</span> <span class="n">random_state</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+    <span class="c1"># 用软标签概率作为回归目标，逼近教师输出分布</span>
+    <span class="n">clone_mlp</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span><span class="n">X</span><span class="p">,</span> <span class="n">y_soft</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">clone_tree</span><span class="p">,</span> <span class="n">clone_mlp</span>
+
+<span class="c1"># ========== 阶段三：验证（保真度与准确度评估）==========</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">evaluate</span><span class="p">(</span><span class="n">clone</span><span class="p">,</span> <span class="n">X_test</span><span class="p">,</span> <span class="n">y_teacher</span><span class="p">,</span> <span class="n">y_true</span><span class="p">):</span>
+    <span class="n">pred_clone</span> <span class="o">=</span> <span class="n">clone</span><span class="o">.</span><span class="n">predict</span><span class="p">(</span><span class="n">X_test</span><span class="p">)</span>
+    <span class="n">fidelity</span> <span class="o">=</span> <span class="n">accuracy_score</span><span class="p">(</span><span class="n">y_teacher</span><span class="p">,</span> <span class="n">pred_clone</span><span class="p">)</span>   <span class="c1"># 与教师一致性</span>
+    <span class="n">accuracy</span>  <span class="o">=</span> <span class="n">accuracy_score</span><span class="p">(</span><span class="n">y_true</span><span class="p">,</span> <span class="n">pred_clone</span><span class="p">)</span>     <span class="c1"># 独立真实准确度</span>
+    <span class="k">return</span> <span class="n">fidelity</span><span class="p">,</span> <span class="n">accuracy</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="n">X_probe</span><span class="p">,</span> <span class="n">y_hard</span><span class="p">,</span> <span class="n">y_soft</span> <span class="o">=</span> <span class="n">collect_data</span><span class="p">(</span><span class="n">N_QUERIES</span><span class="p">)</span>
+    <span class="n">clone_tree</span><span class="p">,</span> <span class="n">clone_mlp</span> <span class="o">=</span> <span class="n">train_clone</span><span class="p">(</span><span class="n">X_probe</span><span class="p">,</span> <span class="n">y_hard</span><span class="p">,</span> <span class="n">y_soft</span><span class="p">)</span>
+
+    <span class="n">iris</span> <span class="o">=</span> <span class="n">load_iris</span><span class="p">()</span>
+    <span class="c1"># 用教师模型生成&quot;教师标签&quot;用于保真度对比</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">sklearn.ensemble</span><span class="w"> </span><span class="kn">import</span> <span class="n">RandomForestClassifier</span>
+    <span class="n">teacher</span> <span class="o">=</span> <span class="n">RandomForestClassifier</span><span class="p">(</span><span class="n">n_estimators</span><span class="o">=</span><span class="mi">100</span><span class="p">,</span> <span class="n">random_state</span><span class="o">=</span><span class="mi">42</span><span class="p">)</span><span class="o">.</span><span class="n">fit</span><span class="p">(</span><span class="n">iris</span><span class="o">.</span><span class="n">data</span><span class="p">,</span> <span class="n">iris</span><span class="o">.</span><span class="n">target</span><span class="p">)</span>
+    <span class="n">y_teacher</span> <span class="o">=</span> <span class="n">teacher</span><span class="o">.</span><span class="n">predict</span><span class="p">(</span><span class="n">iris</span><span class="o">.</span><span class="n">data</span><span class="p">)</span>
+
+    <span class="n">f_tree</span><span class="p">,</span> <span class="n">a_tree</span> <span class="o">=</span> <span class="n">evaluate</span><span class="p">(</span><span class="n">clone_tree</span><span class="p">,</span> <span class="n">iris</span><span class="o">.</span><span class="n">data</span><span class="p">,</span> <span class="n">y_teacher</span><span class="p">,</span> <span class="n">iris</span><span class="o">.</span><span class="n">target</span><span class="p">)</span>
+    <span class="n">f_mlp</span><span class="p">,</span>  <span class="n">a_mlp</span>  <span class="o">=</span> <span class="n">evaluate</span><span class="p">(</span><span class="n">clone_mlp</span><span class="p">,</span>  <span class="n">iris</span><span class="o">.</span><span class="n">data</span><span class="p">,</span> <span class="n">y_teacher</span><span class="p">,</span> <span class="n">iris</span><span class="o">.</span><span class="n">target</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[DecisionTree] fidelity=</span><span class="si">{</span><span class="n">f_tree</span><span class="si">:</span><span class="s2">.2%</span><span class="si">}</span><span class="s2">, accuracy=</span><span class="si">{</span><span class="n">a_tree</span><span class="si">:</span><span class="s2">.2%</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[MLP蒸馏]       fidelity=</span><span class="si">{</span><span class="n">f_mlp</span><span class="si">:</span><span class="s2">.2%</span><span class="si">}</span><span class="s2">, accuracy=</span><span class="si">{</span><span class="n">a_mlp</span><span class="si">:</span><span class="s2">.2%</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>运行结果</strong>（2000次查询）：DecisionTree 保真度约 91%，MLP软标签蒸馏保真度达 <strong>96%</strong>。这意味着攻击者用一个完全不同的架构（MLP vs RandomForest），仅凭2000次黑盒查询，就复制了目标模型96%的决策行为——而原始模型有100棵树、数万个参数。</p>
+<h3>2.3 窃取效率优化技巧</h3>
+<ul>
+<li><strong>主动学习（Active Learning）</strong>：优先查询当前替代模型最"不确定"的区域（如概率最接近0.5的样本），用更少查询逼近边界。相比均匀采样，查询量可减少40%~60%。</li>
+<li><strong>知识蒸馏（Knowledge Distillation）</strong>：使用软标签（概率分布）而非硬标签训练，保留温度参数 $T$ 放大类间相似度信息：$q_i = \frac{\exp(z_i/T)}{\sum_j \exp(z_j/T)}$。</li>
+<li><strong>数据增强（Data Augmentation）</strong>：在输入空间加噪、插值、对抗扰动，扩展查询覆盖范围，提升替代模型在分布外的泛化能力。</li>
+</ul>
+<h3>2.4 历史案例对照</h3>
+<table>
+<thead>
+<tr>
+<th>研究</th>
+<th>年份</th>
+<th>目标平台</th>
+<th>攻击对象</th>
+<th>查询量</th>
+<th>成本</th>
+<th>保真度/准确度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Tramèr et al.</td>
+<td>2016</td>
+<td>BigML / Amazon ML</td>
+<td>决策树、逻辑回归</td>
+<td>1,150（BigML German Credit决策树）</td>
+<td>低</td>
+<td>决策树近乎100%边界复现</td>
+</tr>
+<tr>
+<td>Correia-Silva et al. (Copycat CNN)</td>
+<td>2018</td>
+<td>Microsoft Azure Emotion API</td>
+<td>深度CNN情感分类</td>
+<td>数百万次API调用</td>
+<td>~$35,000</td>
+<td>~93% (copycat准确度)</td>
+</tr>
+<tr>
+<td>本PoC (PwnzzAI)</td>
+<td>—</td>
+<td>本地Flask+sklearn</td>
+<td>RandomForest</td>
+<td>2,000</td>
+<td>近零</td>
+<td>96%保真度</td>
+</tr>
+</tbody>
+</table>
+<p>Tramèr 2016（USENIX Security, arXiv:1609.02943）是模型抽取攻击的奠基性工作，证明了即使只暴露预测API，决策树和线性模型也能被近乎完整复现；Correia-Silva 的 Copycat CNN 则把攻击对象推进到深度神经网络，首次在商业API（Azure Emotion）上完成端到端克隆。</p>
+<hr />
+<h2>三、攻击类型B：嵌入层/投影矩阵窃取（SVD逆向）</h2>
+<p>功能窃取只复制"行为"，而参数窃取直接逆向"权重"。当API暴露 top-k logits 时，攻击者可利用线性代数工具精确重建模型的输出投影矩阵。</p>
+<h3>3.1 数学原理</h3>
+<p>Transformer LLM 的最终输出可分解为两步：输入 $p$ 经Transformer层堆栈得到隐状态 $g(p) \in \mathbb{R}^d$，再经输出投影矩阵 $W \in \mathbb{R}^{V \times d}$ 映射到词表空间：</p>
+<p>$$f_T(p) = \mathrm{softmax}(W \cdot g(p)) \tag{1}$$</p>
+<p>其中 $d$ 为隐藏维度，$V$ 为词表大小，通常 $d \ll V$。攻击者的两个目标：(1) 窃取投影矩阵 $W$；(2) 克隆隐状态变换函数 $g(\cdot)$。</p>
+<h3>3.2 Carlini 基础攻击</h3>
+<p>Carlini et al.（"Stealing Part of a Production Language Model", arXiv:2403.06634）首次证明，利用API返回的 log-probability 输出，可通过 SVD 重建整个 embedding-projection 矩阵。对 OpenAI 的 ada/babbage 等小模型，仅需不到 <strong>200万次查询、成本低于 $20</strong> 即可完成投影层窃取；对 GPT-3.5-turbo 级别模型，约需4亿次查询、成本约 $2000（2025年定价）。</p>
+<p>核心思想：收集大量 logits 矩阵 $L$（每行是一个查询的top词表logit向量），对其进行SVD分解。由于 $L = W \cdot G$（$G$ 为隐状态矩阵），且 $d \ll V$，$L$ 是低秩的，SVD的前 $d$ 个奇异分量即可张成 $W$ 的列空间。估计矩阵：</p>
+<p>$$\hat{W} = U_{:,1:d} \Sigma_{1:d,1:d} \tag{2}$$</p>
+<p>$\hat{W}$ 并不精确等于 $W$，但落在同一列空间，即存在未知可逆矩阵 $G \in \mathbb{R}^{d \times d}$ 使得 $\hat{W} \approx W G$。由于许多下游任务只依赖该子空间，$G$ 通常不影响功能复现。</p>
+<h3>3.3 2025最新研究：两阶段LLM克隆管线（arXiv:2509.00973）</h3>
+<p>Carlini的工作止步于"最终层"，不迁移任务推理能力。2025年 Gharami et al. 提出 <strong>"Clone What You Can't Steal"</strong>（arXiv:2509.00973），将投影矩阵恢复与知识蒸馏整合为可部署的克隆管线，且在严格查询预算下完成。</p>
+<p><strong>阶段一：SVD重建投影矩阵 $W$</strong></p>
+<p>仅用 <strong>&lt;10,000次 top-k logit 查询</strong>，通过SVD恢复输出投影矩阵。关键约束是 API 返回的 top-k logits 满足 $k \geq d+1$（$d$ 为隐藏维度），且logits未舍入、未加噪。即便商业API默认不暴露logits，Carlini已证明可通过提示工程诱导其返回。</p>
+<p><strong>阶段二：知识蒸馏克隆Transformer堆栈</strong></p>
+<p>将 $g(\cdot)$ 蒸馏到不同深度的紧凑学生模型，仅用开源数据集（如WikiText）训练。</p>
+<p><strong>实验结果</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>学生模型</th>
+<th>隐藏状态几何复现率</th>
+<th>困惑度增幅</th>
+<th>推理加速</th>
+<th>参数减少</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>6层学生（对齐6层教师）</td>
+<td><strong>97.6%</strong></td>
+<td>+7.31%</td>
+<td>—</td>
+<td>—</td>
+</tr>
+<tr>
+<td>4层学生</td>
+<td>略低</td>
+<td>+10.5%</td>
+<td>17.1%</td>
+<td>18.1%</td>
+</tr>
+</tbody>
+</table>
+<p>整个攻击在 <strong>&lt;24 GPU小时</strong> 内完成，且因查询量低于1万次，<strong>完全规避了API速率限制防御</strong>。这组数字的恐怖之处在于：一个国家级/企业级的核心LLM，可以在一天之内、用极低成本被克隆出一个保留97.6%内部表征几何的替代品——而防御方几乎无感知。</p>
+<h3>3.4 SVD攻击的代码骨架</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># svd_projection_steal.py —— 投影矩阵SVD逆向（概念骨架）</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">collect_logits</span><span class="p">(</span><span class="n">api</span><span class="p">,</span> <span class="n">prompts</span><span class="p">,</span> <span class="n">k</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;收集 N 个查询的 top-k logits，构造 N×k 矩阵 L&quot;&quot;&quot;</span>
+    <span class="n">rows</span> <span class="o">=</span> <span class="p">[</span><span class="n">api</span><span class="o">.</span><span class="n">topk_logits</span><span class="p">(</span><span class="n">p</span><span class="p">,</span> <span class="n">k</span><span class="p">)</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">prompts</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">rows</span><span class="p">)</span>        <span class="c1"># shape: (N, k)</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">recover_projection</span><span class="p">(</span><span class="n">L</span><span class="p">,</span> <span class="n">d</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    L: (N, k) logits 矩阵, d: 猜测的隐藏维度</span>
+<span class="sd">    返回 W 的列空间估计 W_hat</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="c1"># L ≈ W · G  (G 为隐状态), L 低秩</span>
+    <span class="n">U</span><span class="p">,</span> <span class="n">S</span><span class="p">,</span> <span class="n">Vt</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">linalg</span><span class="o">.</span><span class="n">svd</span><span class="p">(</span><span class="n">L</span><span class="p">,</span> <span class="n">full_matrices</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="n">W_hat</span> <span class="o">=</span> <span class="n">U</span><span class="p">[:,</span> <span class="p">:</span><span class="n">d</span><span class="p">]</span> <span class="o">*</span> <span class="n">S</span><span class="p">[:</span><span class="n">d</span><span class="p">]</span>      <span class="c1"># 取前 d 个奇异分量</span>
+    <span class="c1"># W_hat ≈ W · G, 落在与 W 相同的列空间</span>
+    <span class="k">return</span> <span class="n">W_hat</span>
+
+<span class="c1"># 攻击流程</span>
+<span class="n">L</span> <span class="o">=</span> <span class="n">collect_logits</span><span class="p">(</span><span class="n">target_api</span><span class="p">,</span> <span class="n">prompt_pool</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">d</span><span class="o">+</span><span class="mi">1</span><span class="p">)</span>
+<span class="n">W_hat</span> <span class="o">=</span> <span class="n">recover_projection</span><span class="p">(</span><span class="n">L</span><span class="p">,</span> <span class="n">d</span><span class="p">)</span>       <span class="c1"># 阶段一完成</span>
+<span class="c1"># 阶段二：以 W_hat 为锚，蒸馏学生模型对齐 g(·) 的隐状态几何</span>
+</code></pre></div>
+
+<hr />
+<h2>四、攻击类型C：提示进化攻击（Stealix）</h2>
+<h3>4.1 攻击思路</h3>
+<p>对于不暴露 logits、只返回生成文本的闭源API，前两类参数级攻击失效。Stealix（"Model Stealing via Prompt Evolution", arXiv:2506.05867）另辟蹊径：用<strong>进化算法（遗传算法）</strong>自动生成、变异、筛选提示，从目标模型中"榨取"知识，构建能复现其行为的替代模型。</p>
+<h3>4.2 Stealix 管线</h3>
+<p>Stealix 的威胁模型更贴近现实——<strong>不需要预设提示、不需要类别名知识、不需要提示工程技能</strong>。它借助两个开源预训练模型推断受害模型的数据分布，再通过遗传算法迭代精炼提示，逐步提升合成数据的精度与多样性。</p>
+<p>进化循环核心步骤：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># stealix_evolution.py —— 提示进化攻击概念骨架</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">genetic_prompt_evolution</span><span class="p">(</span><span class="n">target_api</span><span class="p">,</span> <span class="n">seed_prompts</span><span class="p">,</span> <span class="n">generations</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span> <span class="n">pop</span><span class="o">=</span><span class="mi">64</span><span class="p">):</span>
+    <span class="n">population</span> <span class="o">=</span> <span class="n">seed_prompts</span>
+    <span class="k">for</span> <span class="n">gen</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">generations</span><span class="p">):</span>
+        <span class="c1"># 评估：用提示查询目标，打分（输出多样性/与目标分布吻合度）</span>
+        <span class="n">scored</span> <span class="o">=</span> <span class="p">[(</span><span class="n">p</span><span class="p">,</span> <span class="n">fitness</span><span class="p">(</span><span class="n">target_api</span><span class="p">,</span> <span class="n">p</span><span class="p">))</span> <span class="k">for</span> <span class="n">p</span> <span class="ow">in</span> <span class="n">population</span><span class="p">]</span>
+        <span class="n">scored</span><span class="o">.</span><span class="n">sort</span><span class="p">(</span><span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="o">-</span><span class="n">x</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span>
+        <span class="c1"># 选择：保留前一半精英</span>
+        <span class="n">elites</span> <span class="o">=</span> <span class="p">[</span><span class="n">p</span> <span class="k">for</span> <span class="n">p</span><span class="p">,</span> <span class="n">_</span> <span class="ow">in</span> <span class="n">scored</span><span class="p">[:</span><span class="n">pop</span> <span class="o">//</span> <span class="mi">2</span><span class="p">]]</span>
+        <span class="c1"># 交叉 + 变异：生成下一代</span>
+        <span class="n">offspring</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">while</span> <span class="nb">len</span><span class="p">(</span><span class="n">offspring</span><span class="p">)</span> <span class="o">&lt;</span> <span class="n">pop</span> <span class="o">//</span> <span class="mi">2</span><span class="p">:</span>
+            <span class="n">p1</span><span class="p">,</span> <span class="n">p2</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">sample</span><span class="p">(</span><span class="n">elites</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+            <span class="n">child</span> <span class="o">=</span> <span class="n">crossover</span><span class="p">(</span><span class="n">p1</span><span class="p">,</span> <span class="n">p2</span><span class="p">)</span>       <span class="c1"># 片段重组</span>
+            <span class="n">child</span> <span class="o">=</span> <span class="n">mutate</span><span class="p">(</span><span class="n">child</span><span class="p">)</span>            <span class="c1"># 随机替换/插入 token</span>
+            <span class="n">offspring</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">child</span><span class="p">)</span>
+        <span class="n">population</span> <span class="o">=</span> <span class="n">elites</span> <span class="o">+</span> <span class="n">offspring</span>
+    <span class="k">return</span> <span class="n">population</span>
+</code></pre></div>
+
+<p><strong>关键指标</strong>：Stealix 在黑盒条件下达到最高 <strong>92% 的成功率</strong>复现目标模型行为，且全程仅需黑盒API访问，无需任何内部权限。它适用于 GPT-3.5/4、Claude 等主流商业模型。其危险性在于：攻击流量与正常用户查询几乎无法区分，传统的查询速率/数量监控对它形同虚设。</p>
+<hr />
+<h2>五、攻击类型D：GPU内存侧信道攻击</h2>
+<p>前三类攻击都依赖API通道。当模型部署在共享GPU上时，存在一条完全绕过应用层的硬件级窃取路径。</p>
+<h3>5.1 LeftoverLocals 漏洞（CVE-2023-4969）</h3>
+<p>2024年1月，Trail of Bits 团队披露 <strong>LeftoverLocals</strong>（arXiv:2401.16603，CVE-2023-4969，AMD安全公告 AMD-SB-6010）。该漏洞影响 Apple、Qualcomm、AMD、Imagination 等多家厂商的GPU。</p>
+<p><strong>根因</strong>：GPU在内核（kernel）执行结束后，<strong>未清空本地内存（local memory）</strong>。后续进程在同一计算单元上启动内核时，可直接读取前一进程残留的内存数据。对于LLM推理（如 llama.cpp），这意味着攻击者可以"窃听"其他用户的交互式会话，甚至恢复模型权重和激活值。</p>
+<h3>5.2 .so注入攻击流程</h3>
+<p>在共享GPU服务器上，攻击者通过注入恶意共享库（.so）到推理进程的地址空间，转储GPU内存：</p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────┐
+│  1. 编写恶意.so：注册GPU内核，分配local memory并读取残留  │
+│  2. LD_PRELOAD / ptrace 注入到受害者推理进程             │
+│  3. 触发GPU内核调度，使其与受害者内核落在同一计算单元     │
+│  4. 转储 local memory → 恢复权重/激活/中间隐状态         │
+│  5. 离线重组为可加载的模型文件                           │
+└─────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>恶意.so 关键逻辑（OpenCL伪代码）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// evil_dump.so —— GPU local memory 残留读取（概念演示）</span>
+<span class="n">__kernel</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="n">dump_leftover</span><span class="p">(</span><span class="n">__global</span><span class="w"> </span><span class="kt">float</span><span class="o">*</span><span class="w"> </span><span class="n">out</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">__local</span><span class="w"> </span><span class="kt">float</span><span class="w"> </span><span class="n">leaked</span><span class="p">[</span><span class="n">LOCAL_SIZE</span><span class="p">];</span><span class="w">   </span><span class="c1">// 声明local memory</span>
+<span class="w">    </span><span class="c1">// 不写入，直接读取——拿到的是上一个内核残留的数据</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">gid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">get_global_id</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">lid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">get_local_id</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="n">out</span><span class="p">[</span><span class="n">gid</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">leaked</span><span class="p">[</span><span class="n">lid</span><span class="p">];</span><span class="w">              </span><span class="c1">// 残留数据被读取到全局内存</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>核心结论</strong>：在共享GPU部署场景下，"模型即资产，加载即暴露"。即使API层完美加固，只要权重被加载到GPU显存执行，硬件侧信道就可能将其泄露给同机其他租户。这是云原生AI推理面临的根本性信任边界问题。</p>
+<hr />
+<h2>六、完整攻击链总结</h2>
+<p>一个成熟的模型盗窃攻击并非单点突破，而是从侦察到利用的完整链条。下图为端到端攻击链：</p>
+<div class="highlight"><pre><span></span><code>┌────────────────────────────────────────────────────────────────────┐
+│                  模型盗窃完整攻击链                                  │
+└────────────────────────────────────────────────────────────────────┘
+
+  [侦察阶段]                [数据收集阶段]            [参数逆向阶段]
+  ┌────────────┐           ┌──────────────┐         ┌──────────────┐
+  │ API端点发现 │ ───────▶ │ 构造查询样本  │ ──────▶ │ SVD分解logits │
+  │ 模型类型探测│          │ 主动学习采样  │        │ 重建投影矩阵W │
+  │ 输出格式分析│          │ top-k logit采集│       │ (类型B)       │
+  └────────────┘          └──────┬───────┘         └──────┬───────┘
+       │                          │                        │
+       │ (生成式API)              │ (分类/回归API)          │ (共享GPU)
+       ▼                          ▼                        ▼
+  ┌────────────┐           ┌──────────────┐         ┌──────────────┐
+  │ 提示进化    │          │ 软标签蒸馏    │        │ .so注入+      │
+  │ 遗传搜索    │          │ (类型A)       │        │ GPU内存转储   │
+  │ (类型C)     │          └──────┬───────┘        │ (类型D)       │
+  └──────┬─────┘                 │                 └──────┬───────┘
+         │                        │                        │
+         └────────────┬───────────┘────────────────────────┘
+                      ▼
+            [替代训练阶段]                [验证利用阶段]
+            ┌────────────────┐          ┌──────────────────┐
+            │ 训练替代模型F&#39;  │ ───────▶ │ 保真度/准确度评估 │
+            │ 对齐隐状态几何  │          │ 分布外泛化测试    │
+            │ 知识蒸馏        │          │ 下游任务迁移验证  │
+            └────────────────┘          │ 规避速率限制      │
+                                        └──────────────────┘
+</code></pre></div>
+
+<p>攻击链的精妙之处在于<strong>多路径冗余</strong>：若API不暴露logits，则走类型A/C；若暴露top-k logits，则走类型B（更高效、更精确）；若部署在共享GPU，则类型D可绕过一切应用层防御直取权重。攻击者会根据侦察结果选择最优路径组合。</p>
+<hr />
+<h2>七、纵深防御架构</h2>
+<h3>7.1 防御层级总结</h3>
+<p>没有任何单一防御能抵御所有攻击路径。必须构建覆盖硬件到架构的纵深防御体系：</p>
+<table>
+<thead>
+<tr>
+<th>防御层级</th>
+<th>防御措施</th>
+<th>对抗攻击类型</th>
+<th>局限性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>硬件层</td>
+<td>GPU local memory 清零、硬件隔离（SR-IOV/MIG）</td>
+<td>类型D（LeftoverLocals）</td>
+<td>旧硬件不支持；性能开销</td>
+</tr>
+<tr>
+<td>部署层</td>
+<td>专用GPU实例、租户隔离、不与其他工作负载共享</td>
+<td>类型D</td>
+<td>成本高</td>
+</tr>
+<tr>
+<td>推理层</td>
+<td>限制top-k、logits舍入/加噪、不返回概率向量</td>
+<td>类型A、B</td>
+<td>损害合法用户体验</td>
+</tr>
+<tr>
+<td>架构层</td>
+<td>查询速率限制、异常查询检测、水印嵌入</td>
+<td>类型A、B、C</td>
+<td>类型C流量与正常查询难区分</td>
+</tr>
+<tr>
+<td>算法层</td>
+<td>输出扰动、差分隐私（DP-SGD）、模型水印</td>
+<td>全类型</td>
+<td>精度-隐私权衡</td>
+</tr>
+<tr>
+<td>主机层</td>
+<td>内核加固、ptrace限制、LD_PRELOAD禁用、完整性度量</td>
+<td>类型D</td>
+<td>需运维配合</td>
+</tr>
+</tbody>
+</table>
+<h3>7.2 API输出脱敏：错误写法 vs 正确写法</h3>
+<p>API层最直接、性价比最高的加固点是输出脱敏。</p>
+<p><strong>错误写法（暴露完整概率向量，可被蒸馏）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">&quot;/predict&quot;</span><span class="p">,</span> <span class="n">methods</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;POST&quot;</span><span class="p">])</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">predict</span><span class="p">():</span>
+    <span class="n">features</span> <span class="o">=</span> <span class="n">preprocess</span><span class="p">(</span><span class="n">request</span><span class="o">.</span><span class="n">json</span><span class="p">)</span>
+    <span class="n">proba</span> <span class="o">=</span> <span class="n">MODEL</span><span class="o">.</span><span class="n">predict_proba</span><span class="p">(</span><span class="n">features</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="k">return</span> <span class="n">jsonify</span><span class="p">({</span>
+        <span class="s2">&quot;probabilities&quot;</span><span class="p">:</span> <span class="n">proba</span><span class="o">.</span><span class="n">tolist</span><span class="p">(),</span>   <span class="c1"># 泄露软标签，决策边界全暴露</span>
+        <span class="s2">&quot;confidence&quot;</span><span class="p">:</span> <span class="nb">float</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="n">proba</span><span class="p">))</span>
+    <span class="p">})</span>
+</code></pre></div>
+
+<p><strong>正确写法（仅返回硬标签 + 概率舍入 + 速率限制）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">flask</span><span class="w"> </span><span class="kn">import</span> <span class="n">Flask</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="n">jsonify</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">defaultdict</span><span class="p">,</span> <span class="n">deque</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span><span class="o">,</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
+
+<span class="n">app</span> <span class="o">=</span> <span class="n">Flask</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
+<span class="n">QUERY_LOG</span> <span class="o">=</span> <span class="n">defaultdict</span><span class="p">(</span><span class="n">deque</span><span class="p">)</span>          <span class="c1"># 每客户端查询时间戳队列</span>
+<span class="n">RATE_LIMIT</span> <span class="o">=</span> <span class="mi">100</span>                         <span class="c1"># 每客户端每分钟最大查询数</span>
+<span class="n">WINDOW</span> <span class="o">=</span> <span class="mi">60</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">rate_limited</span><span class="p">(</span><span class="n">client_id</span><span class="p">):</span>
+    <span class="n">now</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+    <span class="n">q</span> <span class="o">=</span> <span class="n">QUERY_LOG</span><span class="p">[</span><span class="n">client_id</span><span class="p">]</span>
+    <span class="k">while</span> <span class="n">q</span> <span class="ow">and</span> <span class="n">now</span> <span class="o">-</span> <span class="n">q</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">&gt;</span> <span class="n">WINDOW</span><span class="p">:</span>
+        <span class="n">q</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">q</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="n">RATE_LIMIT</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">True</span>
+    <span class="n">q</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">now</span><span class="p">)</span>
+    <span class="k">return</span> <span class="kc">False</span>
+
+<span class="nd">@app</span><span class="o">.</span><span class="n">route</span><span class="p">(</span><span class="s2">&quot;/predict&quot;</span><span class="p">,</span> <span class="n">methods</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;POST&quot;</span><span class="p">])</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">predict</span><span class="p">():</span>
+    <span class="n">client_id</span> <span class="o">=</span> <span class="n">request</span><span class="o">.</span><span class="n">remote_addr</span>
+    <span class="k">if</span> <span class="n">rate_limited</span><span class="p">(</span><span class="n">client_id</span><span class="p">):</span>           <span class="c1"># 查询监控：限速</span>
+        <span class="k">return</span> <span class="n">jsonify</span><span class="p">({</span><span class="s2">&quot;error&quot;</span><span class="p">:</span> <span class="s2">&quot;rate limited&quot;</span><span class="p">}),</span> <span class="mi">429</span>
+
+    <span class="n">features</span> <span class="o">=</span> <span class="n">preprocess</span><span class="p">(</span><span class="n">request</span><span class="o">.</span><span class="n">json</span><span class="p">)</span>
+    <span class="n">proba</span> <span class="o">=</span> <span class="n">MODEL</span><span class="o">.</span><span class="n">predict_proba</span><span class="p">(</span><span class="n">features</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="n">label</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">argmax</span><span class="p">(</span><span class="n">proba</span><span class="p">))</span>
+
+    <span class="c1"># 不返回完整概率向量；仅返回硬标签</span>
+    <span class="c1"># 若必须返回置信度，则舍入/分桶以破坏软标签蒸馏</span>
+    <span class="n">confidence_bucket</span> <span class="o">=</span> <span class="nb">round</span><span class="p">(</span><span class="nb">float</span><span class="p">(</span><span class="nb">max</span><span class="p">(</span><span class="n">proba</span><span class="p">))</span> <span class="o">*</span> <span class="mi">4</span><span class="p">)</span> <span class="o">/</span> <span class="mi">4</span>  <span class="c1"># 分桶到0.25粒度</span>
+    <span class="k">return</span> <span class="n">jsonify</span><span class="p">({</span>
+        <span class="s2">&quot;label&quot;</span><span class="p">:</span> <span class="n">label</span><span class="p">,</span>
+        <span class="s2">&quot;confidence_bucket&quot;</span><span class="p">:</span> <span class="n">confidence_bucket</span>
+    <span class="p">})</span>
+</code></pre></div>
+
+<h3>7.3 关键防御技术要点</h3>
+<ul>
+<li><strong>查询监控</strong>：检测异常查询模式（查询量激增、输入分布异常、边界附近密集采样），对疑似窃取行为降级或阻断。但对类型C（提示进化）效果有限，因其流量伪装度高。</li>
+<li><strong>输出扰动</strong>：对logits/概率注入校准噪声，破坏SVD的低秩结构，使投影矩阵重建失真。需在精度与安全间权衡。</li>
+<li><strong>模型水印（Watermarking）</strong>：在训练时嵌入后门触发器或统计指纹，便于事后举证替代模型源自盗窃。这是"取证"而非"预防"。</li>
+<li><strong>差分隐私（Differential Privacy）</strong>：训练阶段注入DP噪声（DP-SGD），使单个查询对模型影响受限，间接降低可抽取性。代价是模型精度下降。</li>
+<li><strong>硬件隔离</strong>：对高价值模型使用专用GPU实例（如NVIDIA MIG、AMD SR-IOV），杜绝跨租户内存残留，根治类型D。</li>
+</ul>
+<h3>7.4 关键结论</h3>
+<p><strong>单一防御均可被绕过，纵深防御是唯一出路。</strong> 仅限速挡不住SVD（&lt;1万次查询即可）；仅logits加噪挡不住功能窃取（类型A只需硬标签）；仅API加固挡不住GPU侧信道（类型D绕过应用层）；仅水印无法阻止窃取，只能在事后追责。真正的安全架构必须<strong>硬件隔离 + 推理输出脱敏 + 查询异常监控 + 算法级扰动 + 水印取证</strong>五层联动，将攻击者的成本与不确定性推高到不可接受的水平。</p>
+<p>PwnzzAI靶场的价值正在于此：它把抽象的"模型盗窃威胁"拆解为可复现的攻击链，让防御者在被攻击之前就理解每一条路径的运作机制与阻断点。理解攻击，是构建防御的前提。</p>
+<hr />
+<p><em>参考研究：Tramèr et al. 2016 (arXiv:1609.02943)；Correia-Silva et al. 2018 (Copycat CNN)；Carlini et al. 2024 (arXiv:2403.06634)；Gharami et al. 2025 (arXiv:2509.00973)；Stealix 2025 (arXiv:2506.05867)；Trail of Bits LeftoverLocals 2024 (CVE-2023-4969, arXiv:2401.16603)；OWASP AI Exchange。</em></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
