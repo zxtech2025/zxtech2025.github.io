@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>26B模型塞进2GB内存：TurboFieldfare的MoE流式推理引擎深度拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>26B模型塞进2GB内存：TurboFieldfare的MoE流式推理引擎深度拆解</h1>
+<time>2026-07-30</time>
+<ul>
+<li>LLM</li>
+<li>Apple Silicon</li>
+<li>模型推理</li>
+<li>MoE</li>
+<li>本地AI</li>
+</ul>
+<hr />
+<p>一个26B参数的模型，不加载全部权重，内存占用2GB。这就是 TurboFieldfare 做的事。</p>
+<p>上周末，这个开源项目登上了 HN 榜首（849分，300条讨论）。作者用 Swift + Metal 写了一个专门针对 Google Gemma 4 26B-A4B 的推理引擎，让它在任何 M 系列 Mac 上都能跑，包括只有 8GB 内存的 M2 MacBook Air。</p>
+<h2>Gemma 4 26B-A4B：一个被架构拯救的模型</h2>
+<p>先看模型本身。Gemma 4 26B-A4B 是 Google 的 MoE（Mixture of Experts）模型：总共 26B 参数，但每个 token 只激活约 3.88B 参数。30 层 Transformer，其中 25 层用滑动窗口注意力（1024 token 窗口），5 层用全局注意力。</p>
+<p>每层有 128 个路由专家，路由器为每个 token 选 8 个。还配了一个密集共享专家，输出直接加到路由专家的输出上，不带路由权重。</p>
+<p>这个 MoE 结构天然适合"不全加载"的策略。共享权重（shared expert、attention 投影、embedding、router）大约 1.35GB，必须常驻内存。128 个路由专家的 4-bit 量化权重加起来约 13GB，这部分可以按需从 SSD 流式读取，每次只加载被选中的 8 个专家的权重块。</p>
+<p>核心思路一句话：<strong>把必须的留在内存，把可以按需取的放在 SSD 上</strong>。</p>
+<h2>为什么内存只要 2GB</h2>
+<p>TurboFieldfare 的 2GB 内存占用拆开来是这样的：</p>
+<ul>
+<li><strong>共享权重（1.35GB）</strong>：embedding/lm head、attention 的 Q/K/V/O 投影、FFN 的 shared expert、router、LayerNorm、标量参数。这些每个 token 都要用到，必须常驻内存。</li>
+<li><strong>FP16 KV Cache（~500MB）</strong>：滑动窗口层的 1024-token ring buffer + 全局注意力层的完整上下文 append-only 存储。实际值取决于上下文长度。</li>
+<li><strong>选中的专家权重（按需流式加载）</strong>：8/128 的路由专家，约 800MB 的 4-bit 数据，用完即弃。</li>
+</ul>
+<p>对比：MLX 跑同一个模型需要 14.7-15.3GB GPU 分配，进程 RSS 8.3-9.8GB。TurboFieldfare 把内存需求压到了 MLX 的 <strong>1/7</strong>。</p>
+<p>代价是速度。M2 上 5.1-6.3 tok/s，比 MLX 慢了 12-15 倍。但问题是：MLX 根本跑不进 8GB 的机器。TurboFieldfare 解决的首先是"能不能跑"，其次才是"跑得快不快"。在 M5 Pro 上，它能到 31-35 tok/s，已经能用了。</p>
+<h2>KV Cache 的双布局设计</h2>
+<p>KV Cache 是推理引擎里最微妙的组件之一。TurboFieldfare 给两类注意力层用了完全不同的存储策略：</p>
+<p><strong>滑动窗口层（25层，1024 token 窗口）</strong>：K/V 存在 1152 行的 ring buffer 里。多出来的 128 行是给 chunked-prefill 用的写缓冲区。窗口滑出范围的历史 token 自然被覆盖，不需要显式逐出。</p>
+<p>全局注意力层（5层）：K/V 存在 append-only 存储里，保留完整上下文。这里的 K 投影同时供应 K 和 V。K 走 scaled per-head normalization + RoPE，V 走 no-scale normalization，不经过 RoPE。所以 cache 里 K 和 V 是分开存的。</p>
+<p>注意这个细节：全局注意力的 K 投影输出在分叉之前是同一份数据，这说明 Gemma 4 的全局注意力没有独立的 V 投影矩阵，直接从 K 投影衍生 V。省参数，但增加 KV Cache 存储开销。</p>
+<h2>量化和精度</h2>
+<p>模型使用 MLX affine 量化：权重存 4-bit packed，每个 group（64 个权重）配一个 BF16 scale 和一个 BF16 bias。Router 投影用 8-bit，共享和路由专家用 4-bit。</p>
+<p>关键细节：安装器（Repacker）只负责把 HuggingFace 上的 safetensors 重新打包成 <code>.gturbo</code> 目录，<strong>不解量不反量化</strong>。量化值原样拷贝。这消除了精度损失的可能来源，也节省了大量计算。</p>
+<p>运行时还有一些 Gemma 4 特有的实现细节需要匹配：NeoX RoPE、attention scale 固定为 1.0、无 router-logit softcap、共享和路由 FFN 并行计算、layer scalar、最终 logit softcap 为 30.0。每个细节没对齐都会导致输出漂移。</p>
+<h2>M2 上的时间去哪儿了</h2>
+<p>一个单独的诊断 pass 把 M2 上一个 162.8ms 的 decode step 拆成了四块：</p>
+<table>
+<thead>
+<tr>
+<th>工作</th>
+<th>ms/token</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>专家权重 SSD 读取</td>
+<td>83.1</td>
+</tr>
+<tr>
+<td>Command-buffer pipeline 等待</td>
+<td>55.6</td>
+</tr>
+<tr>
+<td>Tied output head</td>
+<td>14.2</td>
+</tr>
+<tr>
+<td>其他运行时开销</td>
+<td>9.9</td>
+</tr>
+</tbody>
+</table>
+<p>一目了然：<strong>超过一半的时间花在从 SSD 读专家权重上</strong>。Metal command-buffer pipeline 的等待也占了 1/3。这两项加起来已经 85% 了。</p>
+<p>这完全符合预期：TurboFieldfare 的核心 tradeoff 就是拿 SSD 带宽换内存。Apple Silicon 的统一内存架构让 GPU 和 CPU 共享同一个内存池，SSD 读进来的数据可以直接映射到 Metal buffer，没有 PCIe 的拷贝开销。</p>
+<p>M5 上 31-35 tok/s 说明新芯片的 SSD 和内存带宽提升直接转化为了推理速度。而 MLX 能在 M5 上跑到 76-82 tok/s，是因为它把所有权重都预加载到了 GPU 内存里：14.7GB+，8GB 机器根本做不到。</p>
+<h2>流式安装器：15GB 源文件不落盘</h2>
+<p>除了推理引擎本身，安装器也值得细看。传统做法是下载完整 checkpoint（15GB+），解压 safetensors，再转换格式，磁盘上同时存在源文件和目标文件，30GB+ 临时占用。</p>
+<p>TurboFieldfare 的 Repacker 完全不走这条路：</p>
+<ol>
+<li>读取 HuggingFace 的 index 和 tensor 元数据</li>
+<li>计算出每个 tensor 在 safetensors 里的字节范围</li>
+<li>发送 HTTP Range 请求，只拉需要的字节片段</li>
+<li>通过 tile-sized scratch buffer（最大 524KB）直接写入最终文件</li>
+<li>写完后验证 digest，写入 manifest</li>
+</ol>
+<p>整个过程最大的堆内存只有 524KB，全量 15GB 的 checkpoint 从不在 Swift 的堆中出现。安装过程可以随时取消和恢复：已完成的 range 会记录 digest，resume 时跳过。</p>
+<p>最终产物是一个 <code>.gturbo</code> 目录结构：<code>model_weights.bin</code>（共享权重）+ <code>packed_experts/layer_00.bin</code> 到 <code>layer_29.bin</code>（每层 128 个固定步长的专家 blob）+ tokenizer + manifest。</p>
+<h2>这和 llama.cpp / MLX 有什么区别</h2>
+<p>TurboFieldfare 不是一个通用推理框架的包装，它是<strong>模型专用的原生实现</strong>。</p>
+<p>llama.cpp 走的是通用路线：GGUF 格式，支持数百种模型架构，用大量的 <code>if (arch == ...)</code> 分支来适配。MLX 是 Apple 的通用 ML 框架，提供基础算子，模型作者在它上面搭建。</p>
+<p>TurboFieldfare 反其道而行：只支持一个模型（Gemma 4 26B-A4B），把推理引擎、Metal kernel、内存管理、专家流式加载全部硬编码。这听起来像是缩小了适用范围，但这种专一性让作者可以做极端优化：无需顾虑通用性，每个字节怎么放、每个 buffer 什么时候 flush 都可以精确控制。</p>
+<p>103 个实验记录（存在 <code>docs/experiments/EXPERIMENT_INVENTORY.md</code> 里）证明了这种"专一"的价值：从 kernel 设计到 caching 策略到 I/O 模式，每个决策都有实测数据支撑。</p>
+<h2>这意味着什么</h2>
+<p>对我而言，TurboFieldfare 最大的意义不是技术本身，而是它<strong>验证了一个方向</strong>：MoE 架构加上按需流式加载，可以把大模型的硬件门槛降一个数量级。</p>
+<p>8GB 内存的 MacBook Air 跑 26B 模型，一年前说这个会被人当笑话。现在 5-6 tok/s 虽然慢，但能用。M5 上 31-35 tok/s 已经够日常聊天用。</p>
+<p>更有意思的是，这套思路不限于 Apple Silicon。MoE 模型 + 共享权重驻留 + 专家权重流式加载，在任何有 NVMe SSD 的设备上都能复制。Windows 笔记本、Steam Deck、甚至高端 Android 手机，只要 SSD 够快，就能跑比内存大得多的模型。</p>
+<p>当然，现在的局限也很明显：只支持一个模型，macOS 26+ 的门槛拦住了大多数 Mac 用户，速度在低端设备上还比较勉强。但这些是工程问题，不是原理问题。Gemma 4 开了个头，后续会有更多 MoE 模型和对应的专用引擎出现。</p>
+<p>项目地址：<a href="https://github.com/drumih/turbo-fieldfare">drumih/turbo-fieldfare</a>，Apache 2.0 协议，1767 star。如果你有台 M 系列 Mac，clone 下来跑一下：看着 26B 模型在你的 8GB Air 上吐出第一个 token，那种感觉值得体验。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

