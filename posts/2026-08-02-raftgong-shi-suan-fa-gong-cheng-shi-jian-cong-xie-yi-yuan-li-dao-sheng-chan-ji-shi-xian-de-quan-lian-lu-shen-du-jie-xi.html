@@ -1,0 +1,1288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Raft 共识算法工程实践：从协议原理到生产级实现的全链路深度解析 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Raft 共识算法工程实践：从协议原理到生产级实现的全链路深度解析</h1>
+<time>2026-08-02</time>
+<ul>
+<li>技术
+Slug: raft共识算法工程实践-从协议原理到生产级实现的全链路深度解析</li>
+</ul>
+<hr />
+<h2>一、Raft 协议核心：三大子问题</h2>
+<h3>1.1 角色与状态机</h3>
+<p>Raft 集群中的每个节点在任意时刻处于三种角色之一：</p>
+<div class="highlight"><pre><span></span><code>状态转换图：
+
+                    ┌─────────────┐
+                    │   Follower  │ ◀── 启动默认状态
+                    │             │
+                    │ 被动接收    │
+                    │ Leader 指令 │
+                    │ 通过心跳    │
+                    │ 检测存活    │
+                    └──────┬──────┘
+                           │
+                           │ 选举超时
+                           │ (随机化 150-300ms)
+                           │ 未收到心跳
+                           ▼
+                    ┌─────────────┐
+                    │  Candidate  │
+                    │             │
+                    │ 递增 term   │
+                    │ 发起选举     │
+                    │ 并行发送     │
+                    │ RequestVote │
+                    └──────┬──────┘
+                           │
+                    ┌──────┴──────┐
+                    │             │
+           获得多数票 │             │ 未获得多数票
+                    ▼             ▼
+              ┌──────────┐  ┌─────────────┐
+              │  Leader  │  │  Follower   │
+              │          │  │ (回到跟随者) │
+              │ 处理客户端│  └─────────────┘
+              │ 请求     │
+              │ 日志复制 │
+              │ 发送心跳 │
+              └──────────┘
+</code></pre></div>
+
+<h3>1.2 Leader 选举</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// Leader 选举核心逻辑（Go 实现）</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">Node</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">currentTerm</span><span class="w"> </span><span class="kt">int64</span>
+<span class="w">    </span><span class="nx">votedFor</span><span class="w">    </span><span class="kt">int32</span><span class="w">       </span><span class="c1">// -1 表示未投票</span>
+<span class="w">    </span><span class="nx">state</span><span class="w">       </span><span class="nx">State</span><span class="w">       </span><span class="c1">// Follower / Candidate / Leader</span>
+<span class="w">    </span><span class="nx">log</span><span class="w">         </span><span class="p">[]</span><span class="nx">LogEntry</span>
+
+<span class="w">    </span><span class="c1">// 选举相关</span>
+<span class="w">    </span><span class="nx">electionTimeout</span><span class="w">  </span><span class="nx">time</span><span class="p">.</span><span class="nx">Duration</span><span class="w">  </span><span class="c1">// 随机化 150-300ms</span>
+<span class="w">    </span><span class="nx">heartbeatInterval</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Duration</span><span class="w">  </span><span class="c1">// 通常 50ms</span>
+<span class="w">    </span><span class="nx">lastHeartbeat</span><span class="w">    </span><span class="nx">time</span><span class="p">.</span><span class="nx">Time</span>
+
+<span class="w">    </span><span class="c1">// 集群配置</span>
+<span class="w">    </span><span class="nx">peers</span><span class="w">  </span><span class="p">[]</span><span class="kt">string</span>
+<span class="w">    </span><span class="nx">selfID</span><span class="w"> </span><span class="kt">int32</span>
+<span class="p">}</span>
+
+<span class="c1">// RequestVote RPC 请求/响应</span>
+<span class="kd">type</span><span class="w"> </span><span class="nx">RequestVoteRequest</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">Term</span><span class="w">         </span><span class="kt">int64</span><span class="w">  </span><span class="c1">// Candidate 的当前 term</span>
+<span class="w">    </span><span class="nx">CandidateID</span><span class="w">  </span><span class="kt">int32</span><span class="w">  </span><span class="c1">// Candidate 的 ID</span>
+<span class="w">    </span><span class="nx">LastLogIndex</span><span class="w"> </span><span class="kt">int64</span><span class="w">  </span><span class="c1">// Candidate 最后一条日志的索引</span>
+<span class="w">    </span><span class="nx">LastLogTerm</span><span class="w">  </span><span class="kt">int64</span><span class="w">  </span><span class="c1">// Candidate 最后一条日志的 term</span>
+<span class="p">}</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">RequestVoteResponse</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">Term</span><span class="w">        </span><span class="kt">int64</span><span class="w">  </span><span class="c1">// 响应者的当前 term</span>
+<span class="w">    </span><span class="nx">VoteGranted</span><span class="w"> </span><span class="kt">bool</span><span class="w">   </span><span class="c1">// 是否投票</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">n</span><span class="w"> </span><span class="o">*</span><span class="nx">Node</span><span class="p">)</span><span class="w"> </span><span class="nx">startElection</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">state</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">Candidate</span>
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="o">++</span>
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">votedFor</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">selfID</span><span class="w">  </span><span class="c1">// 为自己投票</span>
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastHeartbeat</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Now</span><span class="p">()</span>
+
+<span class="w">    </span><span class="c1">// 重置选举超时（随机化，防止活锁）</span>
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">electionTimeout</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">randomElectionTimeout</span><span class="p">()</span>
+
+<span class="w">    </span><span class="nx">votes</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="mi">1</span><span class="w">  </span><span class="c1">// 自己的一票</span>
+<span class="w">    </span><span class="nx">needed</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="nx">n</span><span class="p">.</span><span class="nx">peers</span><span class="p">)</span><span class="o">/</span><span class="mi">2</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="w">  </span><span class="c1">// 多数票</span>
+
+<span class="w">    </span><span class="c1">// 并行向所有其他节点发送 RequestVote</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="nx">peer</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">peers</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">peer</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">selfID</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">continue</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">go</span><span class="w"> </span><span class="kd">func</span><span class="p">(</span><span class="nx">peerID</span><span class="w"> </span><span class="kt">int32</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">req</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">RequestVoteRequest</span><span class="p">{</span>
+<span class="w">                </span><span class="nx">Term</span><span class="p">:</span><span class="w">         </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="p">,</span>
+<span class="w">                </span><span class="nx">CandidateID</span><span class="p">:</span><span class="w">  </span><span class="nx">n</span><span class="p">.</span><span class="nx">selfID</span><span class="p">,</span>
+<span class="w">                </span><span class="nx">LastLogIndex</span><span class="p">:</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastLogIndex</span><span class="p">(),</span>
+<span class="w">                </span><span class="nx">LastLogTerm</span><span class="p">:</span><span class="w">  </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastLogTerm</span><span class="p">(),</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">            </span><span class="nx">resp</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">sendRequestVote</span><span class="p">(</span><span class="nx">peerID</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="p">)</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="k">return</span>
+<span class="w">            </span><span class="p">}</span>
+
+<span class="w">            </span><span class="c1">// 如果响应者的 term 更高，回退为 Follower</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="nx">n</span><span class="p">.</span><span class="nx">becomeFollower</span><span class="p">(</span><span class="nx">resp</span><span class="p">.</span><span class="nx">Term</span><span class="p">)</span>
+<span class="w">                </span><span class="k">return</span>
+<span class="w">            </span><span class="p">}</span>
+
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">VoteGranted</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="nx">votes</span><span class="o">++</span>
+<span class="w">                </span><span class="k">if</span><span class="w"> </span><span class="nx">votes</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="nx">needed</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">state</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="nx">Candidate</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                    </span><span class="nx">n</span><span class="p">.</span><span class="nx">becomeLeader</span><span class="p">()</span>
+<span class="w">                </span><span class="p">}</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}(</span><span class="nx">peer</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">n</span><span class="w"> </span><span class="o">*</span><span class="nx">Node</span><span class="p">)</span><span class="w"> </span><span class="nx">handleRequestVote</span><span class="p">(</span><span class="nx">req</span><span class="w"> </span><span class="o">*</span><span class="nx">RequestVoteRequest</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="nx">RequestVoteResponse</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">resp</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">RequestVoteResponse</span><span class="p">{</span><span class="nx">Term</span><span class="p">:</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 规则 1: 如果请求的 term &lt; 当前 term，拒绝</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="p">&lt;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">resp</span><span class="p">.</span><span class="nx">VoteGranted</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">resp</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 如果请求的 term &gt; 当前 term，更新 term 并回退</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">Term</span>
+<span class="w">        </span><span class="nx">n</span><span class="p">.</span><span class="nx">votedFor</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="o">-</span><span class="mi">1</span>
+<span class="w">        </span><span class="nx">n</span><span class="p">.</span><span class="nx">state</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">Follower</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 规则 2: 如果已经投过票（给别的候选人），拒绝</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">votedFor</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="o">-</span><span class="mi">1</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">votedFor</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">CandidateID</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">resp</span><span class="p">.</span><span class="nx">VoteGranted</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">resp</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 规则 3: 候选人的日志必须至少和自己的日志一样新</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">!</span><span class="nx">n</span><span class="p">.</span><span class="nx">isLogUpToDate</span><span class="p">(</span><span class="nx">req</span><span class="p">.</span><span class="nx">LastLogIndex</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">LastLogTerm</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">resp</span><span class="p">.</span><span class="nx">VoteGranted</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">resp</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 投票</span>
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">votedFor</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">CandidateID</span>
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastHeartbeat</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Now</span><span class="p">()</span><span class="w">  </span><span class="c1">// 重置选举超时</span>
+<span class="w">    </span><span class="nx">resp</span><span class="p">.</span><span class="nx">VoteGranted</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">true</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">resp</span>
+<span class="p">}</span>
+
+<span class="c1">// 检查候选人的日志是否至少和自己一样新</span>
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">n</span><span class="w"> </span><span class="o">*</span><span class="nx">Node</span><span class="p">)</span><span class="w"> </span><span class="nx">isLogUpToDate</span><span class="p">(</span><span class="nx">candidateLastIndex</span><span class="w"> </span><span class="kt">int64</span><span class="p">,</span><span class="w"> </span><span class="nx">candidateLastTerm</span><span class="w"> </span><span class="kt">int64</span><span class="p">)</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">myLastTerm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastLogTerm</span><span class="p">()</span>
+<span class="w">    </span><span class="nx">myLastIndex</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastLogIndex</span><span class="p">()</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">candidateLastTerm</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">myLastTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">candidateLastTerm</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nx">myLastTerm</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">candidateLastIndex</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="nx">myLastIndex</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="nx">randomElectionTimeout</span><span class="p">()</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Duration</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 随机化 150-300ms，防止多个节点同时发起选举（活锁）</span>
+<span class="w">    </span><span class="nx">min</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="mi">150</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Millisecond</span>
+<span class="w">    </span><span class="nx">max</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="mi">300</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Millisecond</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">min</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Duration</span><span class="p">(</span><span class="nx">rand</span><span class="p">.</span><span class="nx">Int63n</span><span class="p">(</span><span class="nb">int64</span><span class="p">(</span><span class="nx">max</span><span class="o">-</span><span class="nx">min</span><span class="p">)))</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>1.3 日志复制</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// 日志复制核心逻辑</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">LogEntry</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">Term</span><span class="w">    </span><span class="kt">int64</span><span class="w">       </span><span class="c1">// 创建该条目时的 Leader term</span>
+<span class="w">    </span><span class="nx">Index</span><span class="w">   </span><span class="kt">int64</span><span class="w">       </span><span class="c1">// 日志索引</span>
+<span class="w">    </span><span class="nx">Command</span><span class="w"> </span><span class="kd">interface</span><span class="p">{}</span><span class="w"> </span><span class="c1">// 状态机命令</span>
+<span class="p">}</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">AppendEntriesRequest</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">Term</span><span class="w">         </span><span class="kt">int64</span><span class="w">        </span><span class="c1">// Leader 的当前 term</span>
+<span class="w">    </span><span class="nx">LeaderID</span><span class="w">     </span><span class="kt">int32</span><span class="w">        </span><span class="c1">// Leader 的 ID</span>
+<span class="w">    </span><span class="nx">PrevLogIndex</span><span class="w"> </span><span class="kt">int64</span><span class="w">        </span><span class="c1">// 紧接新条目之前的日志索引</span>
+<span class="w">    </span><span class="nx">PrevLogTerm</span><span class="w">  </span><span class="kt">int64</span><span class="w">        </span><span class="c1">// PrevLogIndex 条目的 term</span>
+<span class="w">    </span><span class="nx">Entries</span><span class="w">      </span><span class="p">[]</span><span class="nx">LogEntry</span><span class="w">   </span><span class="c1">// 待复制的日志条目（心跳时为空）</span>
+<span class="w">    </span><span class="nx">LeaderCommit</span><span class="w"> </span><span class="kt">int64</span><span class="w">        </span><span class="c1">// Leader 的 commitIndex</span>
+<span class="p">}</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">AppendEntriesResponse</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">Term</span><span class="w">    </span><span class="kt">int64</span><span class="w">  </span><span class="c1">// 响应者的当前 term</span>
+<span class="w">    </span><span class="nx">Success</span><span class="w"> </span><span class="kt">bool</span><span class="w">   </span><span class="c1">// 如果 Follower 包含匹配 PrevLogIndex 和 PrevLogTerm 的条目则为 true</span>
+<span class="w">    </span><span class="c1">// 优化字段（etcd 的 Fast Backup）</span>
+<span class="w">    </span><span class="nx">ConflictIndex</span><span class="w"> </span><span class="kt">int64</span><span class="w">  </span><span class="c1">// 冲突的第一条日志索引</span>
+<span class="w">    </span><span class="nx">ConflictTerm</span><span class="w">  </span><span class="kt">int64</span><span class="w">  </span><span class="c1">// 冲突的 term</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">n</span><span class="w"> </span><span class="o">*</span><span class="nx">Node</span><span class="p">)</span><span class="w"> </span><span class="nx">handleAppendEntries</span><span class="p">(</span><span class="nx">req</span><span class="w"> </span><span class="o">*</span><span class="nx">AppendEntriesRequest</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="nx">AppendEntriesResponse</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">resp</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">AppendEntriesResponse</span><span class="p">{</span><span class="nx">Term</span><span class="p">:</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 规则 1: 如果请求的 term &lt; 当前 term，拒绝</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="p">&lt;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">resp</span><span class="p">.</span><span class="nx">Success</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">resp</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 如果请求的 term &gt; 当前 term，更新</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">Term</span>
+<span class="w">        </span><span class="nx">n</span><span class="p">.</span><span class="nx">votedFor</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="o">-</span><span class="mi">1</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">state</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">Follower</span>
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastHeartbeat</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Now</span><span class="p">()</span><span class="w">  </span><span class="c1">// 重置选举超时</span>
+
+<span class="w">    </span><span class="c1">// 规则 2: 检查日志匹配</span>
+<span class="w">    </span><span class="c1">// Follower 必须包含与 PrevLogIndex 和 PrevLogTerm 匹配的条目</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">PrevLogIndex</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">prevEntry</span><span class="p">,</span><span class="w"> </span><span class="nx">exists</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">getLogEntry</span><span class="p">(</span><span class="nx">req</span><span class="p">.</span><span class="nx">PrevLogIndex</span><span class="p">)</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">!</span><span class="nx">exists</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">resp</span><span class="p">.</span><span class="nx">Success</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">            </span><span class="nx">resp</span><span class="p">.</span><span class="nx">ConflictIndex</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastLogIndex</span><span class="p">()</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="nx">resp</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">prevEntry</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">PrevLogTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 日志冲突，找到冲突 term 的第一条日志</span>
+<span class="w">            </span><span class="nx">resp</span><span class="p">.</span><span class="nx">Success</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">            </span><span class="nx">resp</span><span class="p">.</span><span class="nx">ConflictTerm</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">prevEntry</span><span class="p">.</span><span class="nx">Term</span>
+<span class="w">            </span><span class="nx">resp</span><span class="p">.</span><span class="nx">ConflictIndex</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">firstIndexForTerm</span><span class="p">(</span><span class="nx">prevEntry</span><span class="p">.</span><span class="nx">Term</span><span class="p">)</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="nx">resp</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 规则 3: 删除冲突的条目并追加新条目</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">i</span><span class="p">,</span><span class="w"> </span><span class="nx">entry</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">Entries</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">existingEntry</span><span class="p">,</span><span class="w"> </span><span class="nx">exists</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">getLogEntry</span><span class="p">(</span><span class="nx">req</span><span class="p">.</span><span class="nx">PrevLogIndex</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">int64</span><span class="p">(</span><span class="nx">i</span><span class="p">))</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">exists</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">existingEntry</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">entry</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="c1">// 冲突：删除此条目及之后所有条目</span>
+<span class="w">                </span><span class="nx">n</span><span class="p">.</span><span class="nx">truncateLog</span><span class="p">(</span><span class="nx">req</span><span class="p">.</span><span class="nx">PrevLogIndex</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">int64</span><span class="p">(</span><span class="nx">i</span><span class="p">))</span>
+<span class="w">                </span><span class="nx">n</span><span class="p">.</span><span class="nx">appendLogEntry</span><span class="p">(</span><span class="nx">entry</span><span class="p">)</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">            </span><span class="c1">// 否则跳过（已存在）</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">n</span><span class="p">.</span><span class="nx">appendLogEntry</span><span class="p">(</span><span class="nx">entry</span><span class="p">)</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 规则 4: 更新 commitIndex</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">LeaderCommit</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">commitIndex</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">newCommit</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nb">min</span><span class="p">(</span><span class="nx">req</span><span class="p">.</span><span class="nx">LeaderCommit</span><span class="p">,</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastLogIndex</span><span class="p">())</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">newCommit</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">commitIndex</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">n</span><span class="p">.</span><span class="nx">commitIndex</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">newCommit</span>
+<span class="w">            </span><span class="nx">n</span><span class="p">.</span><span class="nx">applyCommittedEntries</span><span class="p">()</span><span class="w">  </span><span class="c1">// 应用到状态机</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nx">resp</span><span class="p">.</span><span class="nx">Success</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">true</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">resp</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">n</span><span class="w"> </span><span class="o">*</span><span class="nx">Node</span><span class="p">)</span><span class="w"> </span><span class="nx">replicateLog</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// Leader 并行向所有 Follower 发送 AppendEntries</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="nx">peer</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">peers</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">peer</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">selfID</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">continue</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">go</span><span class="w"> </span><span class="kd">func</span><span class="p">(</span><span class="nx">peerID</span><span class="w"> </span><span class="kt">int32</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">nextIndex</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">nextIndex</span><span class="p">[</span><span class="nx">peerID</span><span class="p">]</span>
+<span class="w">            </span><span class="nx">prevLogIndex</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">nextIndex</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">            </span><span class="nx">prevLogTerm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nb">int64</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">prevLogIndex</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="nx">entry</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">getLogEntry</span><span class="p">(</span><span class="nx">prevLogIndex</span><span class="p">)</span>
+<span class="w">                </span><span class="nx">prevLogTerm</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">entry</span><span class="p">.</span><span class="nx">Term</span>
+<span class="w">            </span><span class="p">}</span>
+
+<span class="w">            </span><span class="nx">entries</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">logSlice</span><span class="p">(</span><span class="nx">nextIndex</span><span class="p">,</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastLogIndex</span><span class="p">())</span>
+
+<span class="w">            </span><span class="nx">req</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">AppendEntriesRequest</span><span class="p">{</span>
+<span class="w">                </span><span class="nx">Term</span><span class="p">:</span><span class="w">         </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="p">,</span>
+<span class="w">                </span><span class="nx">LeaderID</span><span class="p">:</span><span class="w">     </span><span class="nx">n</span><span class="p">.</span><span class="nx">selfID</span><span class="p">,</span>
+<span class="w">                </span><span class="nx">PrevLogIndex</span><span class="p">:</span><span class="w"> </span><span class="nx">prevLogIndex</span><span class="p">,</span>
+<span class="w">                </span><span class="nx">PrevLogTerm</span><span class="p">:</span><span class="w">  </span><span class="nx">prevLogTerm</span><span class="p">,</span>
+<span class="w">                </span><span class="nx">Entries</span><span class="p">:</span><span class="w">      </span><span class="nx">entries</span><span class="p">,</span>
+<span class="w">                </span><span class="nx">LeaderCommit</span><span class="p">:</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">commitIndex</span><span class="p">,</span>
+<span class="w">            </span><span class="p">}</span>
+
+<span class="w">            </span><span class="nx">resp</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">sendAppendEntries</span><span class="p">(</span><span class="nx">peerID</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="p">)</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="k">return</span>
+<span class="w">            </span><span class="p">}</span>
+
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="nx">n</span><span class="p">.</span><span class="nx">becomeFollower</span><span class="p">(</span><span class="nx">resp</span><span class="p">.</span><span class="nx">Term</span><span class="p">)</span>
+<span class="w">                </span><span class="k">return</span>
+<span class="w">            </span><span class="p">}</span>
+
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">Success</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="c1">// 更新 nextIndex 和 matchIndex</span>
+<span class="w">                </span><span class="nx">n</span><span class="p">.</span><span class="nx">nextIndex</span><span class="p">[</span><span class="nx">peerID</span><span class="p">]</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">PrevLogIndex</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">int64</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="nx">entries</span><span class="p">))</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">                </span><span class="nx">n</span><span class="p">.</span><span class="nx">matchIndex</span><span class="p">[</span><span class="nx">peerID</span><span class="p">]</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">nextIndex</span><span class="p">[</span><span class="nx">peerID</span><span class="p">]</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">                </span><span class="nx">n</span><span class="p">.</span><span class="nx">updateCommitIndex</span><span class="p">()</span>
+<span class="w">            </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="c1">// Fast Backup: 使用冲突信息快速回退</span>
+<span class="w">                </span><span class="k">if</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">ConflictIndex</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                    </span><span class="nx">n</span><span class="p">.</span><span class="nx">nextIndex</span><span class="p">[</span><span class="nx">peerID</span><span class="p">]</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">ConflictIndex</span>
+<span class="w">                </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                    </span><span class="nx">n</span><span class="p">.</span><span class="nx">nextIndex</span><span class="p">[</span><span class="nx">peerID</span><span class="p">]</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">nextIndex</span><span class="p">[</span><span class="nx">peerID</span><span class="p">]</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+<span class="w">                </span><span class="p">}</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}(</span><span class="nx">peer</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>1.4 五个安全性保证</h3>
+<p>Raft 的正确性依赖五个核心性质，已通过 TLA+ 形式化验证：</p>
+<table>
+<thead>
+<tr>
+<th>性质</th>
+<th>说明</th>
+<th>保证机制</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>Election Safety</strong></td>
+<td>每个 term 最多一个 Leader</td>
+<td>多数派投票：一个节点一个 term 只能投一票</td>
+</tr>
+<tr>
+<td><strong>Leader Append-Only</strong></td>
+<td>Leader 日志只追加不修改</td>
+<td>Leader 永远不覆盖或删除自己的日志</td>
+</tr>
+<tr>
+<td><strong>Log Matching</strong></td>
+<td>相同 index+term 的条目内容一致且前序一致</td>
+<td>AppendEntries 的 PrevLogIndex/PrevLogTerm 校验</td>
+</tr>
+<tr>
+<td><strong>Leader Completeness</strong></td>
+<td>已 commit 的条目在后续所有 term 的 Leader 中都存在</td>
+<td>选举时日志新旧比较 + 多数派交集</td>
+</tr>
+<tr>
+<td><strong>State Machine Safety</strong></td>
+<td>同一 index 已 apply 的命令相同</td>
+<td>Leader Completeness + Log Matching</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>二、Raft vs Paxos 对比</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Paxos</th>
+<th>Raft</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>理解难度</strong></td>
+<td>极高（论文晦涩，实现复杂）</td>
+<td>中等（分解为三个子问题）</td>
+</tr>
+<tr>
+<td><strong>Leader 角色</strong></td>
+<td>可选（Multi-Paxos 引入）</td>
+<td>强 Leader（所有请求经 Leader）</td>
+</tr>
+<tr>
+<td><strong>日志结构</strong></td>
+<td>不保证有序（需额外机制）</td>
+<td>连续有序（简化日志一致性）</td>
+</tr>
+<tr>
+<td><strong>成员变更</strong></td>
+<td>复杂（需 α 方法或联合共识）</td>
+<td>两种方法：联合共识 + 单节点变更</td>
+</tr>
+<tr>
+<td><strong>日志压缩</strong></td>
+<td>需自行设计</td>
+<td>内置快照机制</td>
+</tr>
+<tr>
+<td><strong>工程实现</strong></td>
+<td>难（Google Chubby、Spanner 等）</td>
+<td>相对简单（etcd、Consul、TiKV 等）</td>
+</tr>
+<tr>
+<td><strong>线性一致性读</strong></td>
+<td>需额外设计</td>
+<td>ReadIndex / Lease Read</td>
+</tr>
+<tr>
+<td><strong>形式化验证</strong></td>
+<td>TLA+（Lamport 本人）</td>
+<td>TLA+ / PVS（UW 团队）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>三、生产级实现深度对比：etcd vs Consul</h2>
+<h3>3.1 架构对比</h3>
+<div class="highlight"><pre><span></span><code><span class="nv">etcd</span><span class="w"> </span>架构:
+┌────────────────────────────────────────────────────┐
+│<span class="w">                    </span><span class="nv">etcd</span><span class="w"> </span><span class="nv">Server</span><span class="w">                     </span>│
+├────────────────────────────────────────────────────┤
+│<span class="w">                                                    </span>│
+│<span class="w">  </span>┌──────────┐<span class="w">  </span>┌──────────┐<span class="w">  </span>┌───────────────┐<span class="w">   </span>│
+│<span class="w">  </span>│<span class="w">  </span><span class="nv">Raft</span><span class="w">    </span>│<span class="w">  </span>│<span class="w">  </span><span class="nv">KV</span><span class="w">      </span>│<span class="w">  </span>│<span class="w">  </span><span class="nv">gRPC</span><span class="w"> </span><span class="nv">API</span><span class="w">     </span>│<span class="w">   </span>│
+│<span class="w">  </span>│<span class="w">  </span><span class="nv">Layer</span><span class="w">   </span>│──│<span class="w">  </span><span class="nv">Store</span><span class="w">   </span>│<span class="w">  </span>│<span class="w">  </span><span class="ss">(</span><span class="nv">Watch</span><span class="o">/</span><span class="nv">Lease</span><span class="w"> </span>│<span class="w">   </span>│
+│<span class="w">  </span>│<span class="w">          </span>│<span class="w">  </span>│<span class="w">  </span><span class="ss">(</span><span class="nv">BBolt</span><span class="ss">)</span><span class="w"> </span>│<span class="w">  </span>│<span class="w">   </span><span class="o">/</span><span class="nv">Elect</span><span class="ss">)</span><span class="w">     </span>│<span class="w">   </span>│
+│<span class="w">  </span>└────┬─────┘<span class="w">  </span>└──────────┘<span class="w">  </span>└───────────────┘<span class="w">   </span>│
+│<span class="w">       </span>│<span class="w">                                            </span>│
+│<span class="w">  </span>┌────┴─────┐<span class="w">  </span>┌──────────────┐<span class="w">                  </span>│
+│<span class="w">  </span>│<span class="w">  </span><span class="nv">WAL</span><span class="w">     </span>│<span class="w">  </span>│<span class="w">  </span><span class="nv">Snapshot</span><span class="w">    </span>│<span class="w">                  </span>│
+│<span class="w">  </span>│<span class="w">  </span><span class="ss">(</span>预写<span class="w">   </span>│<span class="w">  </span>│<span class="w">  </span><span class="ss">(</span>定期快照<span class="w">   </span>│<span class="w">                  </span>│
+│<span class="w">  </span>│<span class="w">   </span>日志<span class="ss">)</span><span class="w">  </span>│<span class="w">  </span>│<span class="w">   </span>压缩日志<span class="ss">)</span><span class="w">  </span>│<span class="w">                  </span>│
+│<span class="w">  </span>└──────────┘<span class="w">  </span>└──────────────┘<span class="w">                  </span>│
+│<span class="w">                                                    </span>│
+│<span class="w">  </span>典型用途:<span class="w"> </span><span class="nv">Kubernetes</span><span class="w"> </span>配置存储、分布式锁<span class="w">            </span>│
+│<span class="w">                                                    </span>│
+└────────────────────────────────────────────────────┘
+
+<span class="nv">Consul</span><span class="w"> </span>架构:
+┌────────────────────────────────────────────────────┐
+│<span class="w">                   </span><span class="nv">Consul</span><span class="w"> </span><span class="nv">Server</span><span class="w">                    </span>│
+├────────────────────────────────────────────────────┤
+│<span class="w">                                                    </span>│
+│<span class="w">  </span>┌──────────┐<span class="w">  </span>┌──────────┐<span class="w">  </span>┌───────────────┐<span class="w">   </span>│
+│<span class="w">  </span>│<span class="w">  </span><span class="nv">Raft</span><span class="w">    </span>│<span class="w">  </span>│<span class="w">  </span><span class="nv">KV</span><span class="w">      </span>│<span class="w">  </span>│<span class="w">  </span><span class="nv">HTTP</span><span class="o">/</span><span class="nv">gRPC</span><span class="w">    </span>│<span class="w">   </span>│
+│<span class="w">  </span>│<span class="w">  </span><span class="nv">Layer</span><span class="w">   </span>│──│<span class="w">  </span><span class="nv">Store</span><span class="w">   </span>│<span class="w">  </span>│<span class="w">  </span><span class="nv">API</span><span class="w">          </span>│<span class="w">   </span>│
+│<span class="w">  </span>│<span class="w">          </span>│<span class="w">  </span>│<span class="w">  </span><span class="ss">(</span><span class="nv">BBolt</span><span class="ss">)</span><span class="w"> </span>│<span class="w">  </span>│<span class="w">               </span>│<span class="w">   </span>│
+│<span class="w">  </span>└────┬─────┘<span class="w">  </span>└────┬─────┘<span class="w">  </span>└───────────────┘<span class="w">   </span>│
+│<span class="w">       </span>│<span class="w">              </span>│<span class="w">                             </span>│
+│<span class="w">  </span>┌────┴─────┐<span class="w">  </span>┌────┴─────────────┐<span class="w">              </span>│
+│<span class="w">  </span>│<span class="w">  </span><span class="nv">WAL</span><span class="w">     </span>│<span class="w">  </span>│<span class="w">  </span><span class="nv">Service</span><span class="w">         </span>│<span class="w">              </span>│
+│<span class="w">  </span>│<span class="w">  </span><span class="o">+</span><span class="w"> </span><span class="nv">Snap</span><span class="w">  </span>│<span class="w">  </span>│<span class="w">  </span><span class="nv">Discovery</span><span class="w">       </span>│<span class="w">              </span>│
+│<span class="w">  </span>│<span class="w">          </span>│<span class="w">  </span>│<span class="w">  </span><span class="o">+</span><span class="w"> </span><span class="nv">Health</span><span class="w"> </span><span class="nv">Check</span><span class="w">  </span>│<span class="w">              </span>│
+│<span class="w">  </span>└──────────┘<span class="w">  </span>│<span class="w">  </span><span class="o">+</span><span class="w"> </span><span class="nv">WAN</span><span class="w"> </span><span class="nv">Gossip</span><span class="w">    </span>│<span class="w">              </span>│
+│<span class="w">                </span>│<span class="w">  </span><span class="o">+</span><span class="w"> </span><span class="k">Connect</span><span class="w"> </span><span class="ss">(</span><span class="nv">mTLS</span><span class="ss">)</span>│<span class="w">              </span>│
+│<span class="w">                </span>└──────────────────┘<span class="w">              </span>│
+│<span class="w">                                                    </span>│
+│<span class="w">  </span>典型用途:<span class="w"> </span>服务网格、服务注册发现、健康检查<span class="w">         </span>│
+│<span class="w">                                                    </span>│
+└────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>3.2 关键工程优化对比</h3>
+<table>
+<thead>
+<tr>
+<th>优化项</th>
+<th>etcd</th>
+<th>Consul</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>读一致性</strong></td>
+<td>ReadIndex + Lease</td>
+<td>Leader Read Forward</td>
+<td>etcd 支持 Lease Read 避免每次 RPC</td>
+</tr>
+<tr>
+<td><strong>批量写入</strong></td>
+<td>Batch Commit</td>
+<td>Batch Commit</td>
+<td>两者均支持批量提交提升吞吐</td>
+</tr>
+<tr>
+<td><strong>日志压缩</strong></td>
+<td>快照 + WAL 截断</td>
+<td>快照 + WAL 截断</td>
+<td>机制类似</td>
+</tr>
+<tr>
+<td><strong>成员变更</strong></td>
+<td>v2 联合共识 / v3 单节点</td>
+<td>单节点变更</td>
+<td>etcd v3 简化为单节点变更</td>
+</tr>
+<tr>
+<td><strong>WAL 优化</strong></td>
+<td>fdatasync 批量化</td>
+<td>fdatasync 批量化</td>
+<td>减少 fsync 开销</td>
+</tr>
+<tr>
+<td><strong>网络</strong></td>
+<td>gRPC (HTTP/2)</td>
+<td>Serf (Gossip) + gRPC</td>
+<td>Consul 多了 WAN Gossip 层</td>
+</tr>
+<tr>
+<td><strong>跨数据中心</strong></td>
+<td>需上层方案（如 Mirror Maker）</td>
+<td>原生 WAN Gossip 支持</td>
+<td>Consul 跨 DC 更友好</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>四、关键工程优化技术</h2>
+<h3>4.1 快速回退（Fast Backup）</h3>
+<p>原始 Raft 论文中，当 Leader 和 Follower 日志不一致时，Leader 每次 nextIndex 减 1 逐条重试，效率低下。etcd 引入了 Fast Backup 优化：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// Fast Backup: 使用冲突信息快速定位不一致点</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">n</span><span class="w"> </span><span class="o">*</span><span class="nx">Node</span><span class="p">)</span><span class="w"> </span><span class="nx">handleAppendEntriesFastBackup</span><span class="p">(</span>
+<span class="w">    </span><span class="nx">req</span><span class="w"> </span><span class="o">*</span><span class="nx">AppendEntriesRequest</span><span class="p">,</span>
+<span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="nx">AppendEntriesResponse</span><span class="w"> </span><span class="p">{</span>
+
+<span class="w">    </span><span class="c1">// 如果 PrevLogIndex 超出 Follower 日志长度</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">PrevLogIndex</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastLogIndex</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">AppendEntriesResponse</span><span class="p">{</span>
+<span class="w">            </span><span class="nx">Success</span><span class="p">:</span><span class="w">       </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">            </span><span class="nx">ConflictIndex</span><span class="p">:</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastLogIndex</span><span class="p">()</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w">  </span><span class="c1">// 告诉 Leader 从哪里开始</span>
+<span class="w">            </span><span class="nx">ConflictTerm</span><span class="p">:</span><span class="w">  </span><span class="o">-</span><span class="mi">1</span><span class="p">,</span><span class="w">                     </span><span class="c1">// 没有 conflict term</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nx">entry</span><span class="p">,</span><span class="w"> </span><span class="nx">exists</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">getLogEntry</span><span class="p">(</span><span class="nx">req</span><span class="p">.</span><span class="nx">PrevLogIndex</span><span class="p">)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">!</span><span class="nx">exists</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">AppendEntriesResponse</span><span class="p">{</span>
+<span class="w">            </span><span class="nx">Success</span><span class="p">:</span><span class="w">       </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">            </span><span class="nx">ConflictIndex</span><span class="p">:</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastLogIndex</span><span class="p">()</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">            </span><span class="nx">ConflictTerm</span><span class="p">:</span><span class="w">  </span><span class="o">-</span><span class="mi">1</span><span class="p">,</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">entry</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">PrevLogTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 找到冲突 term 的第一条日志</span>
+<span class="w">        </span><span class="nx">conflictTerm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">entry</span><span class="p">.</span><span class="nx">Term</span>
+<span class="w">        </span><span class="nx">conflictIndex</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">req</span><span class="p">.</span><span class="nx">PrevLogIndex</span>
+
+<span class="w">        </span><span class="c1">// 向前查找直到找到不同 term 的条目</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="nx">conflictIndex</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">prev</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">getLogEntry</span><span class="p">(</span><span class="nx">conflictIndex</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">)</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">prev</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">conflictTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="k">break</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">            </span><span class="nx">conflictIndex</span><span class="o">--</span>
+<span class="w">        </span><span class="p">}</span>
+
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">AppendEntriesResponse</span><span class="p">{</span>
+<span class="w">            </span><span class="nx">Success</span><span class="p">:</span><span class="w">       </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">            </span><span class="nx">ConflictIndex</span><span class="p">:</span><span class="w"> </span><span class="nx">conflictIndex</span><span class="p">,</span>
+<span class="w">            </span><span class="nx">ConflictTerm</span><span class="p">:</span><span class="w">  </span><span class="nx">conflictTerm</span><span class="p">,</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">AppendEntriesResponse</span><span class="p">{</span><span class="nx">Success</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c1">// Leader 端处理 Fast Backup 响应</span>
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">n</span><span class="w"> </span><span class="o">*</span><span class="nx">Node</span><span class="p">)</span><span class="w"> </span><span class="nx">handleFastBackupResponse</span><span class="p">(</span><span class="nx">peerID</span><span class="w"> </span><span class="kt">int32</span><span class="p">,</span><span class="w"> </span><span class="nx">resp</span><span class="w"> </span><span class="o">*</span><span class="nx">AppendEntriesResponse</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">ConflictTerm</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 在 Leader 日志中查找 ConflictTerm 的最后一条条目</span>
+<span class="w">        </span><span class="nx">lastIndexForTerm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">findLastIndexForTerm</span><span class="p">(</span><span class="nx">resp</span><span class="p">.</span><span class="nx">ConflictTerm</span><span class="p">)</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">lastIndexForTerm</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">n</span><span class="p">.</span><span class="nx">nextIndex</span><span class="p">[</span><span class="nx">peerID</span><span class="p">]</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">lastIndexForTerm</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">n</span><span class="p">.</span><span class="nx">nextIndex</span><span class="p">[</span><span class="nx">peerID</span><span class="p">]</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">ConflictIndex</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">n</span><span class="p">.</span><span class="nx">nextIndex</span><span class="p">[</span><span class="nx">peerID</span><span class="p">]</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">ConflictIndex</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>4.2 日志压缩与快照</h3>
+<div class="highlight"><pre><span></span><code>日志压缩与快照机制：
+
+压缩前:
+┌─────────────────────────────────────────────────────┐
+│ Log: [1][2][3][4][5][6][7][8][9][10][11][12][13]   │
+│       │  │  │  │  │                                 │
+│       │  │  │  │  └── 已应用到状态机的最新条目       │
+│       │  │  │  └── 重复操作（可压缩）                │
+│       │  │  └── 已被后续操作覆盖（可压缩）           │
+│       │  └── 初始化操作（可压缩到快照）              │
+│       └── 集群配置变更（可压缩）                     │
+└─────────────────────────────────────────────────────┘
+
+压缩后:
+┌──────────────┬──────────────────────────────────────┐
+│   Snapshot   │  Log: [11][12][13]                  │
+│              │                                     │
+│ compactIndex │  (仅保留快照之后的条目)              │
+│ = 10         │                                     │
+│ compactTerm  │                                     │
+│ = 5          │                                     │
+│              │                                     │
+│ 状态机快照   │                                     │
+│ (包含 1-10   │                                     │
+│  的所有状态  │                                     │
+│  变更结果)   │                                     │
+└──────────────┴──────────────────────────────────────┘
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1">// 快照管理实现</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">Snapshot</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">LastIndex</span><span class="w"> </span><span class="kt">int64</span><span class="w">       </span><span class="c1">// 快照包含的最后一条日志索引</span>
+<span class="w">    </span><span class="nx">LastTerm</span><span class="w">  </span><span class="kt">int64</span><span class="w">       </span><span class="c1">// 该条目的 term</span>
+<span class="w">    </span><span class="nx">Data</span><span class="w">      </span><span class="p">[]</span><span class="kt">byte</span><span class="w">      </span><span class="c1">// 状态机快照数据</span>
+<span class="w">    </span><span class="nx">Metadata</span><span class="w">  </span><span class="nx">SnapshotMeta</span><span class="w"> </span><span class="c1">// 集群配置等元数据</span>
+<span class="p">}</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">SnapshotStore</span><span class="w"> </span><span class="kd">interface</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">Create</span><span class="p">(</span><span class="nx">index</span><span class="w"> </span><span class="kt">int64</span><span class="p">,</span><span class="w"> </span><span class="nx">term</span><span class="w"> </span><span class="kt">int64</span><span class="p">,</span><span class="w"> </span><span class="nx">data</span><span class="w"> </span><span class="p">[]</span><span class="kt">byte</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span>
+<span class="w">    </span><span class="nx">List</span><span class="p">()</span><span class="w"> </span><span class="p">([]</span><span class="o">*</span><span class="nx">Snapshot</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span>
+<span class="w">    </span><span class="nx">Open</span><span class="p">(</span><span class="nx">index</span><span class="w"> </span><span class="kt">int64</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="nx">Snapshot</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span>
+<span class="p">}</span>
+
+<span class="c1">// 触发快照的条件</span>
+<span class="kd">type</span><span class="w"> </span><span class="nx">SnapshotConfig</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">Threshold</span><span class="w">  </span><span class="kt">int64</span><span class="w">  </span><span class="c1">// 日志条目数超过此值触发快照</span>
+<span class="w">    </span><span class="nx">Interval</span><span class="w">   </span><span class="nx">time</span><span class="p">.</span><span class="nx">Duration</span><span class="w">  </span><span class="c1">// 定期触发间隔</span>
+<span class="w">    </span><span class="nx">Compact</span><span class="w">    </span><span class="kt">int64</span><span class="w">  </span><span class="c1">// 快照后保留的日志条目数</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">n</span><span class="w"> </span><span class="o">*</span><span class="nx">Node</span><span class="p">)</span><span class="w"> </span><span class="nx">maybeSnapshot</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastApplied</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">snapshotIndex</span><span class="w"> </span><span class="p">&lt;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">snapshotConfig</span><span class="p">.</span><span class="nx">Threshold</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w">  </span><span class="c1">// 未达阈值，跳过</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 1. 创建状态机快照</span>
+<span class="w">    </span><span class="nx">snapshotData</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">stateMachine</span><span class="p">.</span><span class="nx">Snapshot</span><span class="p">()</span>
+
+<span class="w">    </span><span class="c1">// 2. 保存快照</span>
+<span class="w">    </span><span class="nx">snapshot</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">Snapshot</span><span class="p">{</span>
+<span class="w">        </span><span class="nx">LastIndex</span><span class="p">:</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastApplied</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">LastTerm</span><span class="p">:</span><span class="w">  </span><span class="nx">n</span><span class="p">.</span><span class="nx">getLogEntry</span><span class="p">(</span><span class="nx">n</span><span class="p">.</span><span class="nx">lastApplied</span><span class="p">).</span><span class="nx">Term</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">Data</span><span class="p">:</span><span class="w">      </span><span class="nx">snapshotData</span><span class="p">,</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">snapshotStore</span><span class="p">.</span><span class="nx">Create</span><span class="p">(</span><span class="nx">snapshot</span><span class="p">.</span><span class="nx">LastIndex</span><span class="p">,</span><span class="w"> </span><span class="nx">snapshot</span><span class="p">.</span><span class="nx">LastTerm</span><span class="p">,</span><span class="w"> </span><span class="nx">snapshotData</span><span class="p">)</span>
+
+<span class="w">    </span><span class="c1">// 3. 截断已快照的日志</span>
+<span class="w">    </span><span class="nx">compactIndex</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">snapshot</span><span class="p">.</span><span class="nx">LastIndex</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">snapshotConfig</span><span class="p">.</span><span class="nx">Compact</span>
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">log</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">log</span><span class="p">[</span><span class="nx">compactIndex</span><span class="p">:]</span>
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">snapshotIndex</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">snapshot</span><span class="p">.</span><span class="nx">LastIndex</span>
+
+<span class="w">    </span><span class="c1">// 4. 通知 Follower 发送快照（如果需要）</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="nx">peer</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">peers</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">matchIndex</span><span class="p">[</span><span class="nx">peer</span><span class="p">]</span><span class="w"> </span><span class="p">&lt;</span><span class="w"> </span><span class="nx">snapshot</span><span class="p">.</span><span class="nx">LastIndex</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">go</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">sendSnapshot</span><span class="p">(</span><span class="nx">peer</span><span class="p">,</span><span class="w"> </span><span class="nx">snapshot</span><span class="p">)</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c1">// InstallSnapshot RPC: Leader 向落后的 Follower 发送快照</span>
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">n</span><span class="w"> </span><span class="o">*</span><span class="nx">Node</span><span class="p">)</span><span class="w"> </span><span class="nx">sendSnapshot</span><span class="p">(</span><span class="nx">peerID</span><span class="w"> </span><span class="kt">int32</span><span class="p">,</span><span class="w"> </span><span class="nx">snapshot</span><span class="w"> </span><span class="o">*</span><span class="nx">Snapshot</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">req</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">InstallSnapshotRequest</span><span class="p">{</span>
+<span class="w">        </span><span class="nx">Term</span><span class="p">:</span><span class="w">              </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">LeaderID</span><span class="p">:</span><span class="w">          </span><span class="nx">n</span><span class="p">.</span><span class="nx">selfID</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">LastIndex</span><span class="p">:</span><span class="w">         </span><span class="nx">snapshot</span><span class="p">.</span><span class="nx">LastIndex</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">LastTerm</span><span class="p">:</span><span class="w">          </span><span class="nx">snapshot</span><span class="p">.</span><span class="nx">LastTerm</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">Data</span><span class="p">:</span><span class="w">              </span><span class="nx">snapshot</span><span class="p">.</span><span class="nx">Data</span><span class="p">,</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nx">resp</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">sendInstallSnapshot</span><span class="p">(</span><span class="nx">peerID</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="p">)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">n</span><span class="p">.</span><span class="nx">becomeFollower</span><span class="p">(</span><span class="nx">resp</span><span class="p">.</span><span class="nx">Term</span><span class="p">)</span>
+<span class="w">        </span><span class="k">return</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 更新 nextIndex 和 matchIndex</span>
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">nextIndex</span><span class="p">[</span><span class="nx">peerID</span><span class="p">]</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">snapshot</span><span class="p">.</span><span class="nx">LastIndex</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="nx">n</span><span class="p">.</span><span class="nx">matchIndex</span><span class="p">[</span><span class="nx">peerID</span><span class="p">]</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">snapshot</span><span class="p">.</span><span class="nx">LastIndex</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>4.3 线性一致性读</h3>
+<p>Raft 的线性一致性读有三种实现方式，各有取舍：</p>
+<div class="highlight"><pre><span></span><code>线性一致性读的三种实现：
+
+方式 1: ReadIndex (最准确)
+┌──────────────────────────────────────────────────┐
+│ Client → Leader: Read(key)                       │
+│                                                  │
+│ Leader: 1. 记录当前 commitIndex 作为 readIndex   │
+│         2. 向多数节点发送心跳确认自己仍是 Leader  │
+│         3. 等待状态机执行到 readIndex            │
+│         4. 从状态机读取并返回                    │
+│                                                  │
+│ 延迟: 1 RTT (心跳确认) + 等待 apply              │
+│ 一致性: 强线性一致                                │
+└──────────────────────────────────────────────────┘
+
+方式 2: Lease Read (最优性能)
+┌──────────────────────────────────────────────────┐
+│ Client → Leader: Read(key)                       │
+│                                                  │
+│ Leader: 1. 基于租约确认自己仍是 Leader           │
+│         (租约期内无需心跳确认)                    │
+│         2. 等待状态机执行到 lastApplied          │
+│         3. 从状态机读取并返回                    │
+│                                                  │
+│ 延迟: 0 RTT (租约期内) + 等待 apply              │
+│ 一致性: 依赖时钟准确性（有争议）                  │
+└──────────────────────────────────────────────────┘
+
+方式 3: Read Through Raft Log (最简单)
+┌──────────────────────────────────────────────────┐
+│ Client → Leader: Read(key)                       │
+│                                                  │
+│ Leader: 1. 将读操作作为日志条目提交              │
+│         2. 等待日志 commit + apply               │
+│         3. 从状态机读取并返回                    │
+│                                                  │
+│ 延迟: 1 RTT (日志复制) + 等待 commit + apply     │
+│ 一致性: 强线性一致（但性能最差）                  │
+└──────────────────────────────────────────────────┘
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1">// ReadIndex 实现（etcd 风格）</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">n</span><span class="w"> </span><span class="o">*</span><span class="nx">Node</span><span class="p">)</span><span class="w"> </span><span class="nx">readIndex</span><span class="p">(</span><span class="nx">key</span><span class="w"> </span><span class="kt">string</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">state</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">Leader</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="s">&quot;&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">ErrNotLeader</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 1. 记录当前 commitIndex</span>
+<span class="w">    </span><span class="nx">readIndex</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">commitIndex</span>
+
+<span class="w">    </span><span class="c1">// 2. 向多数节点发送心跳确认自己仍是 Leader</span>
+<span class="w">    </span><span class="nx">confirmations</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="mi">1</span><span class="w">  </span><span class="c1">// 自己</span>
+<span class="w">    </span><span class="nx">needed</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="nx">n</span><span class="p">.</span><span class="nx">peers</span><span class="p">)</span><span class="o">/</span><span class="mi">2</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="nx">peer</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">peers</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">peer</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">selfID</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">continue</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">go</span><span class="w"> </span><span class="kd">func</span><span class="p">(</span><span class="nx">peerID</span><span class="w"> </span><span class="kt">int32</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">resp</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">sendHeartbeat</span><span class="p">(</span><span class="nx">peerID</span><span class="p">)</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="nx">confirmations</span><span class="o">++</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}(</span><span class="nx">peer</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 等待多数确认（带超时）</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">!</span><span class="nx">n</span><span class="p">.</span><span class="nx">waitForConfirmations</span><span class="p">(</span><span class="nx">needed</span><span class="p">,</span><span class="w"> </span><span class="mi">100</span><span class="o">*</span><span class="nx">time</span><span class="p">.</span><span class="nx">Millisecond</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="s">&quot;&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">ErrLeaderConfirmation</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 3. 等待状态机执行到 readIndex</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastApplied</span><span class="w"> </span><span class="p">&lt;</span><span class="w"> </span><span class="nx">readIndex</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">time</span><span class="p">.</span><span class="nx">Sleep</span><span class="p">(</span><span class="mi">100</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Microsecond</span><span class="p">)</span>
+<span class="w">        </span><span class="c1">// 可配 select + context 超时</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 4. 从状态机读取</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">stateMachine</span><span class="p">.</span><span class="nx">Get</span><span class="p">(</span><span class="nx">key</span><span class="p">),</span><span class="w"> </span><span class="kc">nil</span>
+<span class="p">}</span>
+
+<span class="c1">// Lease Read 实现（性能最优）</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">n</span><span class="w"> </span><span class="o">*</span><span class="nx">Node</span><span class="p">)</span><span class="w"> </span><span class="nx">leaseRead</span><span class="p">(</span><span class="nx">key</span><span class="w"> </span><span class="kt">string</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">state</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">Leader</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="s">&quot;&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">ErrNotLeader</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 检查租约是否有效</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Since</span><span class="p">(</span><span class="nx">n</span><span class="p">.</span><span class="nx">lastLeaseRenewal</span><span class="p">)</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">leaseDuration</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 租约过期，降级为 ReadIndex</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">readIndex</span><span class="p">(</span><span class="nx">key</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 租约有效，直接读取（无需心跳确认）</span>
+<span class="w">    </span><span class="c1">// 等待状态机执行到 lastApplied</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">lastApplied</span><span class="w"> </span><span class="p">&lt;</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">commitIndex</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">time</span><span class="p">.</span><span class="nx">Sleep</span><span class="p">(</span><span class="mi">100</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Microsecond</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">n</span><span class="p">.</span><span class="nx">stateMachine</span><span class="p">.</span><span class="nx">Get</span><span class="p">(</span><span class="nx">key</span><span class="p">),</span><span class="w"> </span><span class="kc">nil</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>4.4 WAL 预写日志优化</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// WAL (Write-Ahead Log) 实现</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">WAL</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">dir</span><span class="w">       </span><span class="kt">string</span>
+<span class="w">    </span><span class="nx">file</span><span class="w">      </span><span class="o">*</span><span class="nx">os</span><span class="p">.</span><span class="nx">File</span>
+<span class="w">    </span><span class="nx">encoder</span><span class="w">   </span><span class="o">*</span><span class="nx">WALEncoder</span>
+<span class="w">    </span><span class="nx">pipeline</span><span class="w">  </span><span class="kd">chan</span><span class="w"> </span><span class="o">*</span><span class="nx">walEntry</span><span class="w">  </span><span class="c1">// 管道化写入</span>
+<span class="w">    </span><span class="nx">batch</span><span class="w">     </span><span class="p">[]</span><span class="o">*</span><span class="nx">walEntry</span><span class="w">     </span><span class="c1">// 批量缓冲</span>
+<span class="w">    </span><span class="nx">batchLock</span><span class="w"> </span><span class="nx">sync</span><span class="p">.</span><span class="nx">Mutex</span>
+<span class="w">    </span><span class="nx">flushTimer</span><span class="w"> </span><span class="o">*</span><span class="nx">time</span><span class="p">.</span><span class="nx">Timer</span>
+<span class="p">}</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">walEntry</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">Type</span><span class="w">     </span><span class="nx">EntryType</span><span class="w">  </span><span class="c1">// Entry / State / CRC</span>
+<span class="w">    </span><span class="nx">Term</span><span class="w">     </span><span class="kt">int64</span>
+<span class="w">    </span><span class="nx">Index</span><span class="w">    </span><span class="kt">int64</span>
+<span class="w">    </span><span class="nx">Data</span><span class="w">     </span><span class="p">[]</span><span class="kt">byte</span>
+<span class="p">}</span>
+
+<span class="c1">// 批量 + 管道化写入优化</span>
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">w</span><span class="w"> </span><span class="o">*</span><span class="nx">WAL</span><span class="p">)</span><span class="w"> </span><span class="nx">Save</span><span class="p">(</span><span class="nx">entries</span><span class="w"> </span><span class="p">[]</span><span class="nx">LogEntry</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">w</span><span class="p">.</span><span class="nx">batchLock</span><span class="p">.</span><span class="nx">Lock</span><span class="p">()</span>
+<span class="w">    </span><span class="k">defer</span><span class="w"> </span><span class="nx">w</span><span class="p">.</span><span class="nx">batchLock</span><span class="p">.</span><span class="nx">Unlock</span><span class="p">()</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="nx">entry</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">entries</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">data</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">encode</span><span class="p">(</span><span class="nx">entry</span><span class="p">)</span>
+<span class="w">        </span><span class="nx">w</span><span class="p">.</span><span class="nx">batch</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nb">append</span><span class="p">(</span><span class="nx">w</span><span class="p">.</span><span class="nx">batch</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">walEntry</span><span class="p">{</span>
+<span class="w">            </span><span class="nx">Type</span><span class="p">:</span><span class="w">  </span><span class="nx">EntryType</span><span class="p">,</span>
+<span class="w">            </span><span class="nx">Term</span><span class="p">:</span><span class="w">  </span><span class="nx">entry</span><span class="p">.</span><span class="nx">Term</span><span class="p">,</span>
+<span class="w">            </span><span class="nx">Index</span><span class="p">:</span><span class="w"> </span><span class="nx">entry</span><span class="p">.</span><span class="nx">Index</span><span class="p">,</span>
+<span class="w">            </span><span class="nx">Data</span><span class="p">:</span><span class="w">  </span><span class="nx">data</span><span class="p">,</span>
+<span class="w">        </span><span class="p">})</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 批量达到阈值或超时后刷盘</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="nx">w</span><span class="p">.</span><span class="nx">batch</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="nx">w</span><span class="p">.</span><span class="nx">batchSize</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nx">w</span><span class="p">.</span><span class="nx">flushTimer</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">w</span><span class="p">.</span><span class="nx">flush</span><span class="p">()</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="kc">nil</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">w</span><span class="w"> </span><span class="o">*</span><span class="nx">WAL</span><span class="p">)</span><span class="w"> </span><span class="nx">flush</span><span class="p">()</span><span class="w"> </span><span class="kt">error</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="nx">w</span><span class="p">.</span><span class="nx">batch</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="kc">nil</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 1. 编码批量写入文件</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="nx">entry</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">w</span><span class="p">.</span><span class="nx">batch</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">w</span><span class="p">.</span><span class="nx">encoder</span><span class="p">.</span><span class="nx">Encode</span><span class="p">(</span><span class="nx">entry</span><span class="p">);</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="nx">err</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 2. fdatasync 刷盘（不是 fsync，省略元数据同步）</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">w</span><span class="p">.</span><span class="nx">file</span><span class="p">.</span><span class="nx">Sync</span><span class="p">();</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">err</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 3. 清空批量缓冲</span>
+<span class="w">    </span><span class="nx">w</span><span class="p">.</span><span class="nx">batch</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">w</span><span class="p">.</span><span class="nx">batch</span><span class="p">[:</span><span class="mi">0</span><span class="p">]</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="kc">nil</span>
+<span class="p">}</span>
+
+<span class="c1">// 预分配文件空间（减少写入时的文件扩展开销）</span>
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">w</span><span class="w"> </span><span class="o">*</span><span class="nx">WAL</span><span class="p">)</span><span class="w"> </span><span class="nx">preallocate</span><span class="p">(</span><span class="nx">size</span><span class="w"> </span><span class="kt">int64</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">w</span><span class="p">.</span><span class="nx">file</span><span class="p">.</span><span class="nx">Truncate</span><span class="p">(</span><span class="nx">size</span><span class="p">)</span>
+<span class="p">}</span>
+
+<span class="c1">// Segment 日志切分（防止单文件过大）</span>
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">w</span><span class="w"> </span><span class="o">*</span><span class="nx">WAL</span><span class="p">)</span><span class="w"> </span><span class="nx">maybeRotate</span><span class="p">()</span><span class="w"> </span><span class="kt">error</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">stat</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">w</span><span class="p">.</span><span class="nx">file</span><span class="p">.</span><span class="nx">Stat</span><span class="p">()</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">stat</span><span class="p">.</span><span class="nx">Size</span><span class="p">()</span><span class="w"> </span><span class="p">&lt;</span><span class="w"> </span><span class="nx">w</span><span class="p">.</span><span class="nx">segmentSize</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="kc">nil</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 关闭当前段</span>
+<span class="w">    </span><span class="nx">w</span><span class="p">.</span><span class="nx">file</span><span class="p">.</span><span class="nx">Sync</span><span class="p">()</span>
+<span class="w">    </span><span class="nx">w</span><span class="p">.</span><span class="nx">file</span><span class="p">.</span><span class="nx">Close</span><span class="p">()</span>
+
+<span class="w">    </span><span class="c1">// 创建新段</span>
+<span class="w">    </span><span class="nx">segName</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">fmt</span><span class="p">.</span><span class="nx">Sprintf</span><span class="p">(</span><span class="s">&quot;%016d-%016d.wal&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">w</span><span class="p">.</span><span class="nx">lastIndex</span><span class="p">,</span><span class="w"> </span><span class="nx">w</span><span class="p">.</span><span class="nx">currentTerm</span><span class="p">)</span>
+<span class="w">    </span><span class="nx">w</span><span class="p">.</span><span class="nx">file</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">os</span><span class="p">.</span><span class="nx">Create</span><span class="p">(</span><span class="nx">filepath</span><span class="p">.</span><span class="nx">Join</span><span class="p">(</span><span class="nx">w</span><span class="p">.</span><span class="nx">dir</span><span class="p">,</span><span class="w"> </span><span class="nx">segName</span><span class="p">))</span>
+<span class="w">    </span><span class="nx">w</span><span class="p">.</span><span class="nx">encoder</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">NewWALEncoder</span><span class="p">(</span><span class="nx">w</span><span class="p">.</span><span class="nx">file</span><span class="p">)</span>
+<span class="w">    </span><span class="nx">w</span><span class="p">.</span><span class="nx">preallocate</span><span class="p">(</span><span class="nx">w</span><span class="p">.</span><span class="nx">segmentSize</span><span class="p">)</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="kc">nil</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<hr />
+<h2>五、选举超时调优</h2>
+<h3>5.1 参数选择指南</h3>
+<div class="highlight"><pre><span></span><code><span class="err">参数关系约束</span><span class="o">:</span>
+<span class="w">  </span><span class="n">heartbeatInterval</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">electionTimeout</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">MTBF</span><span class="w"> </span><span class="o">(</span><span class="err">平均故障间隔</span><span class="o">)</span>
+
+<span class="err">推荐配置</span><span class="o">:</span>
+<span class="err">┌──────────────────┬───────────────┬───────────────┬──────────────┐</span>
+<span class="err">│</span><span class="w"> </span><span class="err">场景</span><span class="w">             </span><span class="err">│</span><span class="w"> </span><span class="n">heartbeat</span><span class="w">     </span><span class="err">│</span><span class="w"> </span><span class="n">election</span><span class="w">      </span><span class="err">│</span><span class="w"> </span><span class="err">备注</span><span class="w">         </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                  </span><span class="err">│</span><span class="w"> </span><span class="n">Interval</span><span class="w">      </span><span class="err">│</span><span class="w"> </span><span class="n">Timeout</span><span class="w">       </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">├──────────────────┼───────────────┼───────────────┼──────────────┤</span>
+<span class="err">│</span><span class="w"> </span><span class="err">局域网</span><span class="w"> </span><span class="o">(</span><span class="err">低延迟</span><span class="o">)</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="mi">25</span><span class="o">-</span><span class="mi">50</span><span class="n">ms</span><span class="w">       </span><span class="err">│</span><span class="w"> </span><span class="mi">100</span><span class="o">-</span><span class="mi">300</span><span class="n">ms</span><span class="w">     </span><span class="err">│</span><span class="w"> </span><span class="n">etcd</span><span class="w"> </span><span class="err">默认</span><span class="w">    </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">跨可用区</span><span class="w">        </span><span class="err">│</span><span class="w"> </span><span class="mi">50</span><span class="o">-</span><span class="mi">100</span><span class="n">ms</span><span class="w">      </span><span class="err">│</span><span class="w"> </span><span class="mi">300</span><span class="o">-</span><span class="mi">500</span><span class="n">ms</span><span class="w">     </span><span class="err">│</span><span class="w"> </span><span class="err">适当增大</span><span class="w">     </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">跨地域</span><span class="w"> </span><span class="o">(</span><span class="n">WAN</span><span class="o">)</span><span class="w">    </span><span class="err">│</span><span class="w"> </span><span class="mi">100</span><span class="o">-</span><span class="mi">200</span><span class="n">ms</span><span class="w">     </span><span class="err">│</span><span class="w"> </span><span class="mi">500</span><span class="o">-</span><span class="mi">1500</span><span class="n">ms</span><span class="w">    </span><span class="err">│</span><span class="w"> </span><span class="n">Consul</span><span class="w"> </span><span class="n">WAN</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">高负载环境</span><span class="w">      </span><span class="err">│</span><span class="w"> </span><span class="mi">50</span><span class="n">ms</span><span class="w">          </span><span class="err">│</span><span class="w"> </span><span class="mi">200</span><span class="o">-</span><span class="mi">400</span><span class="n">ms</span><span class="w">     </span><span class="err">│</span><span class="w"> </span><span class="err">增大超时</span><span class="w">     </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">测试环境</span><span class="w">        </span><span class="err">│</span><span class="w"> </span><span class="mi">10</span><span class="n">ms</span><span class="w">          </span><span class="err">│</span><span class="w"> </span><span class="mi">50</span><span class="o">-</span><span class="mi">100</span><span class="n">ms</span><span class="w">      </span><span class="err">│</span><span class="w"> </span><span class="err">快速故障检测</span><span class="w"> </span><span class="err">│</span>
+<span class="err">└──────────────────┴───────────────┴───────────────┴──────────────┘</span>
+
+<span class="err">关键公式</span><span class="o">:</span>
+<span class="w">  </span><span class="n">electionTimeout</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="n">broadcastTime</span><span class="w"> </span><span class="err">×</span><span class="w"> </span><span class="o">(</span><span class="n">bestCaseStable</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">worstCaseUnstable</span><span class="o">)</span>
+
+<span class="w">  </span><span class="err">即</span><span class="o">:</span><span class="w"> </span><span class="err">选举超时必须远大于网络往返时间</span>
+<span class="w">  </span><span class="err">通常</span><span class="o">:</span><span class="w"> </span><span class="n">electionTimeout</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">10</span><span class="w"> </span><span class="err">×</span><span class="w"> </span><span class="n">heartbeatInterval</span>
+</code></pre></div>
+
+<h3>5.2 不当配置的后果</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">// 选举超时过短的后果：频繁切主</span>
+
+<span class="c1">// ❌ 错误配置: electionTimeout = 50ms, heartbeatInterval = 40ms</span>
+<span class="c1">// 后果: 网络抖动 10ms 就触发选举，导致频繁切主</span>
+<span class="c1">// 症状: Leader 频繁变更，日志复制中断，客户端请求超时</span>
+
+<span class="c1">// ❌ 错误配置: 所有节点使用相同的 electionTimeout</span>
+<span class="c1">// 后果: 多个节点同时超时并发起选举，导致选票分裂，无法选出 Leader</span>
+<span class="c1">// 症状: 集群长时间无 Leader，拒绝服务</span>
+
+<span class="c1">// ✅ 正确配置: 随机化 electionTimeout</span>
+<span class="kd">func</span><span class="w"> </span><span class="nx">randomElectionTimeout</span><span class="p">(</span><span class="nx">base</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Duration</span><span class="p">)</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Duration</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// base 的 1.0-1.5 倍随机</span>
+<span class="w">    </span><span class="nx">jitter</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Duration</span><span class="p">(</span><span class="nx">rand</span><span class="p">.</span><span class="nx">Int63n</span><span class="p">(</span><span class="nb">int64</span><span class="p">(</span><span class="nx">base</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">2</span><span class="p">)))</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">base</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">jitter</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<hr />
+<h2>六、完整 Raft 实现示例</h2>
+<div class="highlight"><pre><span></span><code><span class="c1">// 最小化 Raft 实现（教学用途，约 200 行核心逻辑）</span>
+
+<span class="kn">package</span><span class="w"> </span><span class="nx">raft</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="s">&quot;context&quot;</span>
+<span class="w">    </span><span class="s">&quot;sync&quot;</span>
+<span class="w">    </span><span class="s">&quot;time&quot;</span>
+<span class="p">)</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">State</span><span class="w"> </span><span class="kt">int</span>
+
+<span class="kd">const</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="nx">Follower</span><span class="w"> </span><span class="nx">State</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">iota</span>
+<span class="w">    </span><span class="nx">Candidate</span>
+<span class="w">    </span><span class="nx">Leader</span>
+<span class="p">)</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">Raft</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">mu</span><span class="w"> </span><span class="nx">sync</span><span class="p">.</span><span class="nx">Mutex</span>
+
+<span class="w">    </span><span class="c1">// 持久化状态</span>
+<span class="w">    </span><span class="nx">currentTerm</span><span class="w"> </span><span class="kt">int64</span>
+<span class="w">    </span><span class="nx">votedFor</span><span class="w">    </span><span class="kt">int32</span>
+<span class="w">    </span><span class="nx">log</span><span class="w">         </span><span class="p">[]</span><span class="nx">LogEntry</span>
+
+<span class="w">    </span><span class="c1">// 易失性状态</span>
+<span class="w">    </span><span class="nx">commitIndex</span><span class="w"> </span><span class="kt">int64</span>
+<span class="w">    </span><span class="nx">lastApplied</span><span class="w"> </span><span class="kt">int64</span>
+
+<span class="w">    </span><span class="c1">// Leader 易失性状态</span>
+<span class="w">    </span><span class="nx">nextIndex</span><span class="w">  </span><span class="kd">map</span><span class="p">[</span><span class="kt">int32</span><span class="p">]</span><span class="kt">int64</span>
+<span class="w">    </span><span class="nx">matchIndex</span><span class="w"> </span><span class="kd">map</span><span class="p">[</span><span class="kt">int32</span><span class="p">]</span><span class="kt">int64</span>
+
+<span class="w">    </span><span class="c1">// 配置</span>
+<span class="w">    </span><span class="nx">id</span><span class="w">             </span><span class="kt">int32</span>
+<span class="w">    </span><span class="nx">peers</span><span class="w">          </span><span class="p">[]</span><span class="kt">int32</span>
+<span class="w">    </span><span class="nx">state</span><span class="w">          </span><span class="nx">State</span>
+<span class="w">    </span><span class="nx">electionTimer</span><span class="w">  </span><span class="o">*</span><span class="nx">time</span><span class="p">.</span><span class="nx">Timer</span>
+<span class="w">    </span><span class="nx">heartbeatTimer</span><span class="w"> </span><span class="o">*</span><span class="nx">time</span><span class="p">.</span><span class="nx">Timer</span>
+
+<span class="w">    </span><span class="c1">// 通道</span>
+<span class="w">    </span><span class="nx">applyCh</span><span class="w">   </span><span class="kd">chan</span><span class="w"> </span><span class="nx">ApplyMsg</span>
+<span class="w">    </span><span class="nx">commitCh</span><span class="w">  </span><span class="kd">chan</span><span class="w"> </span><span class="kd">struct</span><span class="p">{}</span>
+<span class="p">}</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">LogEntry</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">Term</span><span class="w">    </span><span class="kt">int64</span>
+<span class="w">    </span><span class="nx">Index</span><span class="w">   </span><span class="kt">int64</span>
+<span class="w">    </span><span class="nx">Command</span><span class="w"> </span><span class="kd">interface</span><span class="p">{}</span>
+<span class="p">}</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">ApplyMsg</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">Index</span><span class="w">   </span><span class="kt">int64</span>
+<span class="w">    </span><span class="nx">Command</span><span class="w"> </span><span class="kd">interface</span><span class="p">{}</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="nx">NewRaft</span><span class="p">(</span><span class="nx">id</span><span class="w"> </span><span class="kt">int32</span><span class="p">,</span><span class="w"> </span><span class="nx">peers</span><span class="w"> </span><span class="p">[]</span><span class="kt">int32</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="nx">Raft</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">r</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">Raft</span><span class="p">{</span>
+<span class="w">        </span><span class="nx">id</span><span class="p">:</span><span class="w">           </span><span class="nx">id</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">peers</span><span class="p">:</span><span class="w">        </span><span class="nx">peers</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">state</span><span class="p">:</span><span class="w">        </span><span class="nx">Follower</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">currentTerm</span><span class="p">:</span><span class="w">  </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">votedFor</span><span class="p">:</span><span class="w">     </span><span class="o">-</span><span class="mi">1</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">log</span><span class="p">:</span><span class="w">          </span><span class="p">[]</span><span class="nx">LogEntry</span><span class="p">{{</span><span class="nx">Term</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nx">Index</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">}},</span>
+<span class="w">        </span><span class="nx">commitIndex</span><span class="p">:</span><span class="w">  </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">lastApplied</span><span class="p">:</span><span class="w">  </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">nextIndex</span><span class="p">:</span><span class="w">    </span><span class="nb">make</span><span class="p">(</span><span class="kd">map</span><span class="p">[</span><span class="kt">int32</span><span class="p">]</span><span class="kt">int64</span><span class="p">),</span>
+<span class="w">        </span><span class="nx">matchIndex</span><span class="p">:</span><span class="w">   </span><span class="nb">make</span><span class="p">(</span><span class="kd">map</span><span class="p">[</span><span class="kt">int32</span><span class="p">]</span><span class="kt">int64</span><span class="p">),</span>
+<span class="w">        </span><span class="nx">applyCh</span><span class="p">:</span><span class="w">      </span><span class="nb">make</span><span class="p">(</span><span class="kd">chan</span><span class="w"> </span><span class="nx">ApplyMsg</span><span class="p">,</span><span class="w"> </span><span class="mi">100</span><span class="p">),</span>
+<span class="w">        </span><span class="nx">commitCh</span><span class="p">:</span><span class="w">     </span><span class="nb">make</span><span class="p">(</span><span class="kd">chan</span><span class="w"> </span><span class="kd">struct</span><span class="p">{},</span><span class="w"> </span><span class="mi">1</span><span class="p">),</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">resetElectionTimer</span><span class="p">()</span>
+<span class="w">    </span><span class="k">go</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">electionLoop</span><span class="p">()</span>
+<span class="w">    </span><span class="k">go</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">applyLoop</span><span class="p">()</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">r</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">Raft</span><span class="p">)</span><span class="w"> </span><span class="nx">resetElectionTimer</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">electionTimer</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">r</span><span class="p">.</span><span class="nx">electionTimer</span><span class="p">.</span><span class="nx">Stop</span><span class="p">()</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="nx">timeout</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Duration</span><span class="p">(</span><span class="mi">150</span><span class="o">+</span><span class="nx">time</span><span class="p">.</span><span class="nx">Now</span><span class="p">().</span><span class="nx">UnixNano</span><span class="p">()</span><span class="o">%</span><span class="mi">150</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Millisecond</span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">electionTimer</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">AfterFunc</span><span class="p">(</span><span class="nx">timeout</span><span class="p">,</span><span class="w"> </span><span class="kd">func</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Lock</span><span class="p">()</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">state</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">Leader</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">r</span><span class="p">.</span><span class="nx">startElection</span><span class="p">()</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Unlock</span><span class="p">()</span>
+<span class="w">    </span><span class="p">})</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">Raft</span><span class="p">)</span><span class="w"> </span><span class="nx">startElection</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">state</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">Candidate</span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">currentTerm</span><span class="o">++</span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">votedFor</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">id</span>
+
+<span class="w">    </span><span class="nx">votes</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="nx">needed</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="nx">r</span><span class="p">.</span><span class="nx">peers</span><span class="p">)</span><span class="o">/</span><span class="mi">2</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span>
+
+<span class="w">    </span><span class="nx">lastLogIndex</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="p">)</span><span class="o">-</span><span class="mi">1</span><span class="p">].</span><span class="nx">Index</span>
+<span class="w">    </span><span class="nx">lastLogTerm</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="p">)</span><span class="o">-</span><span class="mi">1</span><span class="p">].</span><span class="nx">Term</span>
+
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="nx">peer</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">peers</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">peer</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">id</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">continue</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">go</span><span class="w"> </span><span class="kd">func</span><span class="p">(</span><span class="nx">peer</span><span class="w"> </span><span class="kt">int32</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">req</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">RequestVoteRequest</span><span class="p">{</span>
+<span class="w">                </span><span class="nx">Term</span><span class="p">:</span><span class="w">         </span><span class="nx">r</span><span class="p">.</span><span class="nx">currentTerm</span><span class="p">,</span>
+<span class="w">                </span><span class="nx">CandidateID</span><span class="p">:</span><span class="w">  </span><span class="nx">r</span><span class="p">.</span><span class="nx">id</span><span class="p">,</span>
+<span class="w">                </span><span class="nx">LastLogIndex</span><span class="p">:</span><span class="w"> </span><span class="nx">lastLogIndex</span><span class="p">,</span>
+<span class="w">                </span><span class="nx">LastLogTerm</span><span class="p">:</span><span class="w">  </span><span class="nx">lastLogTerm</span><span class="p">,</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">            </span><span class="nx">resp</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">sendRequestVote</span><span class="p">(</span><span class="nx">peer</span><span class="p">,</span><span class="w"> </span><span class="nx">req</span><span class="p">)</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="k">return</span>
+<span class="w">            </span><span class="p">}</span>
+
+<span class="w">            </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Lock</span><span class="p">()</span>
+<span class="w">            </span><span class="k">defer</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Unlock</span><span class="p">()</span>
+
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="nx">r</span><span class="p">.</span><span class="nx">becomeFollower</span><span class="p">(</span><span class="nx">resp</span><span class="p">.</span><span class="nx">Term</span><span class="p">)</span>
+<span class="w">                </span><span class="k">return</span>
+<span class="w">            </span><span class="p">}</span>
+
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">state</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">Candidate</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">Term</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="k">return</span>
+<span class="w">            </span><span class="p">}</span>
+
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">resp</span><span class="p">.</span><span class="nx">VoteGranted</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="nx">votes</span><span class="o">++</span>
+<span class="w">                </span><span class="k">if</span><span class="w"> </span><span class="nx">votes</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="nx">needed</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                    </span><span class="nx">r</span><span class="p">.</span><span class="nx">becomeLeader</span><span class="p">()</span>
+<span class="w">                </span><span class="p">}</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}(</span><span class="nx">peer</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">resetElectionTimer</span><span class="p">()</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">Raft</span><span class="p">)</span><span class="w"> </span><span class="nx">becomeLeader</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">state</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">Leader</span>
+<span class="w">    </span><span class="nx">lastIdx</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="p">)</span><span class="o">-</span><span class="mi">1</span><span class="p">].</span><span class="nx">Index</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="nx">peer</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">peers</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">r</span><span class="p">.</span><span class="nx">nextIndex</span><span class="p">[</span><span class="nx">peer</span><span class="p">]</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">lastIdx</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">        </span><span class="nx">r</span><span class="p">.</span><span class="nx">matchIndex</span><span class="p">[</span><span class="nx">peer</span><span class="p">]</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="mi">0</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">startHeartbeat</span><span class="p">()</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">Raft</span><span class="p">)</span><span class="w"> </span><span class="nx">becomeFollower</span><span class="p">(</span><span class="nx">term</span><span class="w"> </span><span class="kt">int64</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">state</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">Follower</span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">term</span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">votedFor</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="o">-</span><span class="mi">1</span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">resetElectionTimer</span><span class="p">()</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">Raft</span><span class="p">)</span><span class="w"> </span><span class="nx">startHeartbeat</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">heartbeatTimer</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">AfterFunc</span><span class="p">(</span><span class="mi">50</span><span class="o">*</span><span class="nx">time</span><span class="p">.</span><span class="nx">Millisecond</span><span class="p">,</span><span class="w"> </span><span class="kd">func</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Lock</span><span class="p">()</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">state</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">Leader</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Unlock</span><span class="p">()</span>
+<span class="w">            </span><span class="k">return</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="nx">r</span><span class="p">.</span><span class="nx">broadcastAppendEntries</span><span class="p">()</span>
+<span class="w">        </span><span class="nx">r</span><span class="p">.</span><span class="nx">heartbeatTimer</span><span class="p">.</span><span class="nx">Reset</span><span class="p">(</span><span class="mi">50</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="nx">time</span><span class="p">.</span><span class="nx">Millisecond</span><span class="p">)</span>
+<span class="w">        </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Unlock</span><span class="p">()</span>
+<span class="w">    </span><span class="p">})</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">Raft</span><span class="p">)</span><span class="w"> </span><span class="nx">Submit</span><span class="p">(</span><span class="nx">command</span><span class="w"> </span><span class="kd">interface</span><span class="p">{})</span><span class="w"> </span><span class="p">(</span><span class="kt">int64</span><span class="p">,</span><span class="w"> </span><span class="kt">int64</span><span class="p">,</span><span class="w"> </span><span class="kt">bool</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Lock</span><span class="p">()</span>
+<span class="w">    </span><span class="k">defer</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Unlock</span><span class="p">()</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">state</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">Leader</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="nx">index</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="p">)</span><span class="o">-</span><span class="mi">1</span><span class="p">].</span><span class="nx">Index</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="nx">entry</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">LogEntry</span><span class="p">{</span>
+<span class="w">        </span><span class="nx">Term</span><span class="p">:</span><span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">currentTerm</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">Index</span><span class="p">:</span><span class="w">   </span><span class="nx">index</span><span class="p">,</span>
+<span class="w">        </span><span class="nx">Command</span><span class="p">:</span><span class="w"> </span><span class="nx">command</span><span class="p">,</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nb">append</span><span class="p">(</span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="p">,</span><span class="w"> </span><span class="nx">entry</span><span class="p">)</span>
+
+<span class="w">    </span><span class="nx">r</span><span class="p">.</span><span class="nx">broadcastAppendEntries</span><span class="p">()</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">index</span><span class="p">,</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">currentTerm</span><span class="p">,</span><span class="w"> </span><span class="kc">true</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">Raft</span><span class="p">)</span><span class="w"> </span><span class="nx">applyLoop</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">commitCh</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Lock</span><span class="p">()</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">lastApplied</span><span class="w"> </span><span class="p">&lt;</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">commitIndex</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">r</span><span class="p">.</span><span class="nx">lastApplied</span><span class="o">++</span>
+<span class="w">            </span><span class="nx">entry</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="p">[</span><span class="nx">r</span><span class="p">.</span><span class="nx">lastApplied</span><span class="p">]</span>
+<span class="w">            </span><span class="nx">r</span><span class="p">.</span><span class="nx">applyCh</span><span class="w"> </span><span class="o">&lt;-</span><span class="w"> </span><span class="nx">ApplyMsg</span><span class="p">{</span>
+<span class="w">                </span><span class="nx">Index</span><span class="p">:</span><span class="w">   </span><span class="nx">entry</span><span class="p">.</span><span class="nx">Index</span><span class="p">,</span>
+<span class="w">                </span><span class="nx">Command</span><span class="p">:</span><span class="w"> </span><span class="nx">entry</span><span class="p">.</span><span class="nx">Command</span><span class="p">,</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="nx">r</span><span class="p">.</span><span class="nx">mu</span><span class="p">.</span><span class="nx">Unlock</span><span class="p">()</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">r</span><span class="w"> </span><span class="o">*</span><span class="nx">Raft</span><span class="p">)</span><span class="w"> </span><span class="nx">updateCommitIndex</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">n</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="p">)</span><span class="o">-</span><span class="mi">1</span><span class="p">].</span><span class="nx">Index</span><span class="p">;</span><span class="w"> </span><span class="nx">n</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">commitIndex</span><span class="p">;</span><span class="w"> </span><span class="nx">n</span><span class="o">--</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">log</span><span class="p">[</span><span class="nx">n</span><span class="p">].</span><span class="nx">Term</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">currentTerm</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">continue</span><span class="w">  </span><span class="c1">// 只 commit 当前 term 的条目</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="nx">count</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">        </span><span class="k">for</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="nx">peer</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">peers</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">peer</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">id</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="k">continue</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">matchIndex</span><span class="p">[</span><span class="nx">peer</span><span class="p">]</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="nx">n</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="nx">count</span><span class="o">++</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="nx">count</span><span class="w"> </span><span class="p">&gt;</span><span class="w"> </span><span class="nb">len</span><span class="p">(</span><span class="nx">r</span><span class="p">.</span><span class="nx">peers</span><span class="p">)</span><span class="o">/</span><span class="mi">2</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="nx">r</span><span class="p">.</span><span class="nx">commitIndex</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="nx">n</span>
+<span class="w">            </span><span class="k">select</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">case</span><span class="w"> </span><span class="nx">r</span><span class="p">.</span><span class="nx">commitCh</span><span class="w"> </span><span class="o">&lt;-</span><span class="w"> </span><span class="kd">struct</span><span class="p">{}{}:</span>
+<span class="w">            </span><span class="k">default</span><span class="p">:</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">            </span><span class="k">break</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<hr />
+<h2>七、生产环境最佳实践清单</h2>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>实践</th>
+<th>优先级</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>部署</strong></td>
+<td>奇数节点（3 或 5 或 7），容忍 (N-1)/2 节点故障</td>
+<td>P0</td>
+</tr>
+<tr>
+<td><strong>部署</strong></td>
+<td>跨可用区部署，避免单 AZ 故障导致集群不可用</td>
+<td>P0</td>
+</tr>
+<tr>
+<td><strong>网络</strong></td>
+<td>选举超时 &gt; 10 × 心跳间隔；随机化选举超时</td>
+<td>P0</td>
+</tr>
+<tr>
+<td><strong>存储</strong></td>
+<td>WAL 和快照使用独立磁盘（避免 I/O 竞争）</td>
+<td>P0</td>
+</tr>
+<tr>
+<td><strong>存储</strong></td>
+<td>SSD 存储，WAL 使用 fdatasync 而非 fsync</td>
+<td>P1</td>
+</tr>
+<tr>
+<td><strong>监控</strong></td>
+<td>监控 Leader 变更次数（频繁切主 = 网络问题）</td>
+<td>P0</td>
+</tr>
+<tr>
+<td><strong>监控</strong></td>
+<td>监控 commit 延迟（commitIndex - lastApplied 差值）</td>
+<td>P0</td>
+</tr>
+<tr>
+<td><strong>监控</strong></td>
+<td>监控日志增长速率（快照频率不足的信号）</td>
+<td>P1</td>
+</tr>
+<tr>
+<td><strong>调优</strong></td>
+<td>批量写入 + 管道化提交提升吞吐</td>
+<td>P1</td>
+</tr>
+<tr>
+<td><strong>调优</strong></td>
+<td>使用 Lease Read 避免每次读的心跳确认</td>
+<td>P1</td>
+</tr>
+<tr>
+<td><strong>安全</strong></td>
+<td>节点间通信加密（mTLS）</td>
+<td>P0</td>
+</tr>
+<tr>
+<td><strong>安全</strong></td>
+<td>客户端请求认证 + RBAC</td>
+<td>P0</td>
+</tr>
+<tr>
+<td><strong>运维</strong></td>
+<td>成员变更一次只增减一个节点</td>
+<td>P0</td>
+</tr>
+<tr>
+<td><strong>运维</strong></td>
+<td>快照文件定期备份到对象存储</td>
+<td>P1</td>
+</tr>
+<tr>
+<td><strong>运维</strong></td>
+<td>定期验证快照可恢复（灾难恢复演练）</td>
+<td>P1</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>免责声明</h2>
+<p>本文仅供技术学习和研究使用。文中涉及的代码示例为教学性质的最小化实现，未经过完整的安全审计和生产环境验证。在生产环境中使用 Raft 共识算法时，建议使用经过社区验证的成熟实现（如 etcd-raft、hashicorp/raft 等），并遵循官方部署指南。读者应根据自身业务需求进行充分的测试和评估。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

