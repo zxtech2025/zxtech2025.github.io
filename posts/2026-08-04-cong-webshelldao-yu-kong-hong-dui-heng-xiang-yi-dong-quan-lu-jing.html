@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>从 Webshell 到域控：一次红队内网横向移动全路径复盘 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>从 Webshell 到域控：一次红队内网横向移动全路径复盘</h1>
+<time>2026-08-04</time>
+<ul>
+<li>安全</li>
+<li>攻防演练</li>
+<li>内网渗透</li>
+</ul>
+<hr />
+<h1>从 Webshell 到域控：一次红队内网横向移动全路径复盘</h1>
+<h2>一、一切从一个上传点开始</h2>
+<p>红队项目里最常见的开场：目标对外 Web 应用存在一个文件上传漏洞（或后台弱口令 + 图片马），红队拿到一个 Webshell。很多防守方觉得"一个 Webshell 而已，业务系统隔离在外网，影响有限"——这是最大的误解。Webshell 只是入场券，真正的目标是<strong>域控</strong>，中间隔着整条内网横向移动路径。</p>
+<p>这篇文章复盘一条典型的攻击路径：Webshell → 内网主机 → 凭据窃取 → 横向移动 → 域管 → 域控。每个阶段拆技术细节和检测点。</p>
+<h2>二、阶段一：Webshell 立足与权限提升</h2>
+<p>拿到 Webshell 后的第一件事不是急着翻文件，而是<strong>确认身份和位置</strong>：</p>
+<ol>
+<li><strong>看自己是哪个用户</strong>：<code>whoami</code>、<code>whoami /all</code>、<code>ipconfig /all</code>。Webshell 通常跑在 IIS/应用池账户（<code>iis apppool\xxx</code>）或 www-data，权限很低</li>
+<li><strong>看网络位置</strong>：网关、DNS、是否在域内（<code>systeminfo</code> 看 Domain 字段、<code>nltest /dclist</code> 测域控连通）</li>
+<li><strong>权限提升</strong>：低权限账户先提权。Windows 上检查：未修补内核漏洞、服务权限配置错误（<code>accesschk</code> 找可写服务）、<code>SeImpersonate</code> 令牌（土豆家族：Potato 系列提权到 SYSTEM）。Linux 上检查：sudo 配置、SUID 文件、内核漏洞</li>
+</ol>
+<p>提权后拿到 SYSTEM/root，才算有"移动"的资格。</p>
+<h2>三、阶段二：内网侦察——画地图</h2>
+<p>横向移动的前提是知道往哪走。侦察三件套：</p>
+<ol>
+<li><strong>网络拓扑</strong>：<code>arp -a</code>、<code>route print</code>、<code>ipconfig /all</code> 收集内网网段；<code>net view /domain</code> 列域内机器</li>
+<li><strong>域信息</strong>：<code>net group "domain admins" /domain</code>（域管名单）、<code>net user /domain</code>（用户列表）、<code>net group "domain computers" /domain</code>（机器列表）</li>
+<li><strong>端口扫描</strong>：用轻量工具（fscan、nmap）扫关键网段，重点找 445（SMB）、3389（RDP）、5985/5986（WinRM）、22（SSH）、1433（MSSQL）、3306（MySQL）、6379（Redis）</li>
+</ol>
+<p>侦察的目标是产出三张表：<strong>可达主机清单、域管名单、开放服务清单</strong>。后面的每一步移动都基于这三张表决策。</p>
+<h2>四、阶段三：凭据窃取——横向移动的燃料</h2>
+<p>横向移动的本质是<strong>复用凭据</strong>。Windows 域环境的凭据无处不在：</p>
+<ol>
+<li><strong>LSASS 内存 dump</strong>：<code>procdump -ma lsass.exe</code> 或 Mimikatz <code>sekurlsa::logonpasswords</code>，抓内存里的明文密码/NTLM 哈希。需要 SYSTEM 或 SeDebugPrivilege</li>
+<li><strong>SAM 数据库</strong>：本地账户哈希 <code>registry save HKLM\SAM</code></li>
+<li><strong>NTDS.dit</strong>：域控上的全域哈希库，<code>ntdsutil</code> 或卷影拷贝导出（vssadmin）——这是"一把梭"的终点</li>
+<li><strong>DPAPI 凭据</strong>：浏览器保存的密码、<code>cmdkey /list</code> 记住的凭据、计划任务里的账号密码</li>
+<li><strong>内存中的其他令牌</strong>：Mimikatz <code>sekurlsa::tickets</code> 抓 Kerberos 票据（Golden/Silver Ticket 的前提）</li>
+</ol>
+<p>拿到哈希后，横向移动就简单了——<strong>哈希传递（Pass-the-Hash）</strong>：不需要明文密码，直接拿 NTLM 哈希认证。</p>
+<h2>五、阶段四：横向移动——从一台到一片</h2>
+<p>横向移动的常用通道：</p>
+<ol>
+<li><strong>SMB + PsExec 系</strong>：<code>psexec.py domain\admin@target cmd.exe</code>——用 admin 凭据在目标上创建服务执行命令。注意：创建服务会留痕迹（事件 ID 7045 服务安装）</li>
+<li><strong>WinRM</strong>：5985/5986 端口，<code>evil-winrm -i target -u admin -H hash</code>，比 PsExec 干净，走 WinRM 协议</li>
+<li><strong>WMI</strong>：<code>wmic /node:target process call create "cmd /c ..."</code>，无文件执行，日志少</li>
+<li><strong>计划任务</strong>：<code>schtasks /create /s target /u ... /tn x /tr "cmd" /sc once</code>，持久化 + 执行</li>
+<li><strong>服务控制</strong>：<code>sc \\target create x binPath= "cmd /c ..."</code>，执行后删除服务</li>
+</ol>
+<p>移动的节奏是"一步一停"：拿到一台新机器 → 重复侦察 + 凭据窃取 → 继续移动。<strong>千万不要拿到域管就直接跳域控</strong>——先验证域管凭据在哪些机器上有效（<code>net session</code>、SMB 连接测试），因为域管密码往往在多台机器上复用。</p>
+<h2>六、阶段五：拿下域控——终点还是新起点</h2>
+<p>路径终点通常是：</p>
+<ol>
+<li>用域管哈希直接登录域控（RDP/WinRM/SMB）</li>
+<li>导出 NTDS.dit：全域所有用户的哈希一次到手</li>
+<li>做持久化：Golden Ticket（krbtgt 哈希 + 伪造任意用户票据）、域管账户克隆（<code>mimikatz lsadump::dcsync</code>）、SID History 注入</li>
+</ol>
+<p>到这一步，红队已经拥有"上帝视角"——全域凭据、全机器控制权。防守方如果在前面几个阶段没拦住，到这里基本是覆盘状态。</p>
+<h2>七、防守方的检测点（按阶段对应）</h2>
+<p>每一阶段都有对应的检测信号：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>攻击行为</th>
+<th>检测信号</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>立足</td>
+<td>Webshell 上传</td>
+<td>上传行为审计、WAF 拦截、文件完整性监控</td>
+</tr>
+<tr>
+<td>提权</td>
+<td>Potato/内核提权</td>
+<td>异常进程提权事件、服务创建（7045）</td>
+</tr>
+<tr>
+<td>侦察</td>
+<td>域查询、端口扫描</td>
+<td>域控上的 LDAP 查询日志、异常扫描流量</td>
+</tr>
+<tr>
+<td>凭据</td>
+<td>LSASS dump</td>
+<td><strong>LSASS 访问审计</strong>（Sysmon Event 10）、Mimikatz 特征</td>
+</tr>
+<tr>
+<td>移动</td>
+<td>PsExec/WMI/计划任务</td>
+<td>远程服务创建（7045）、WMI 活动（Sysmon Event 19/20）</td>
+</tr>
+<tr>
+<td>终点</td>
+<td>NTDS 导出</td>
+<td>卷影拷贝创建、ntdsutil 调用审计</td>
+</tr>
+</tbody>
+</table>
+<p>红队视角的教训：<strong>每一步都要快，但每一步都要留后手</strong>。Webshell 会掉（被清），通道会断（被封），所以要：初始立足点多做几个（内存马 + 落地马）、移动路径多备几条（SMB 不通走 WinRM）、凭据多抓几份（哈希 + 票据 + 明文）。防守方视角的教训：<strong>横向移动的阶段检测是唯一的机会窗口</strong>——立足阶段拦不住是常态，但凭据窃取和横向移动阶段的异常行为（LSASS 访问、服务创建、WMI 调用）完全可以也必须要拦。</p>
+<p>攻防演练里，从 Webshell 到域控的平均路径不算长（熟练队伍 1-2 小时内），但每一个跳板都意味着防守方多一次发现机会。把"账号异常登录"“特权操作审计”“关键进程保护”三个基础做扎实，就能把红队的舒适区压缩一大半。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

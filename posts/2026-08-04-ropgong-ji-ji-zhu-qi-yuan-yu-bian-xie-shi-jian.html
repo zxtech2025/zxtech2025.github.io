@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ROP攻击：技术起源与编写实践 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>ROP攻击：技术起源与编写实践</h1>
+<time>2026-08-04</time>
+<ul>
+<li>安全</li>
+<li>漏洞利用</li>
+<li>二进制安全</li>
+</ul>
+<hr />
+<h1>ROP攻击：技术起源与编写实践</h1>
+<h2>一、从 ret2libc 到 ROP：一段被 NX 逼出来的历史</h2>
+<p>上世纪 90 年代的漏洞利用很简单：栈溢出后把 shellcode 塞进栈里，改返回地址跳过去执行。2001 年 PaX 项目引入 NX（不可执行栈），栈上的 shellcode 再也跑不起来了。攻击者的第一反应是 ret2libc——不执行栈上的代码，而是跳转到 libc 里现成的函数，比如 <code>system("/bin/sh")</code>。</p>
+<p>ret2libc 的思路是：溢出点覆盖返回地址为 <code>system</code> 的地址，返回地址后面跟返回参数。32 位下调用约定是参数全压栈，所以布局是 <code>system_addr | 返回地址 | "/bin/sh" 地址</code>，一次跳转就能弹 shell。</p>
+<p>但 ret2libc 有个致命弱点：攻击者的目的往往不是一次函数调用，而是一连串操作——先 <code>mprotect</code> 把栈改成可执行，再跳回 shellcode，或者连续调用多个函数完成复杂逻辑。单个函数跳转做不到。2007 年 Hovav Shacham 的论文《The Geometry of Innocent Flesh on the Bone》给出了答案：既然不能执行新代码，那就执行<strong>已有的代码碎片</strong>。</p>
+<p>这就是 ROP：把程序自身（含动态库）里的指令序列——以 <code>ret</code> 结尾的短片段，叫 gadget——串联起来。每个 gadget 做一点点事，执行完 <code>ret</code> 弹出下一个地址，控制流像多米诺骨牌一样沿着攻击者布置在栈上的地址链走下去。栈就是"程序计数器"：<code>ret</code> 指令相当于 <code>pop rip</code>，每弹一个地址就跳到下一段。</p>
+<h2>二、gadget：ROP 的基本积木</h2>
+<p>一个 gadget 是程序中以 <code>ret</code>（0xC3）结尾的任意指令序列。<code>pop rdi; ret</code>、<code>pop rsi; ret</code>、<code>mov rax, [rdi]; ret</code>、<code>syscall; ret</code> 都是典型的 gadget。</p>
+<p>为什么 <code>ret</code> 结尾是关键？因为 <code>ret</code> 的本质是 <code>pop rip</code>——从栈顶取 8 字节（x64）作为下一条指令地址，同时 rsp 加 8。攻击者在栈上预埋一串地址，每执行一个 gadget 的 <code>ret</code>，就自动"消费"一个地址并跳转。整个过程不需要栈可执行，只依赖控制流劫持（第一步拿到 RIP 控制权）。</p>
+<p>查找 gadget 的经典工具是 ROPgadget 和 ropper：</p>
+<div class="highlight"><pre><span></span><code>ROPgadget --binary ./vuln --only &quot;pop|ret&quot;
+ropgadget --binary libc.so.6 | grep &quot;pop rdi&quot;
+</code></pre></div>
+
+<p>x64 下前六个参数走寄存器（rdi, rsi, rdx, rcx, r8, r9），所以最常用的 gadget 是 <code>pop rdi; ret</code>、<code>pop rsi; pop r15; ret</code> 这类"参数搬运工"。栈布局形如：</p>
+<div class="highlight"><pre><span></span><code><span class="k">[padding 到返回地址]</span>
+<span class="k">[pop rdi; ret] [参数1]</span>
+<span class="k">[pop rsi; pop r15; ret] [参数2] [垃圾]</span>
+<span class="k">[目标函数地址]</span>
+</code></pre></div>
+
+<p>执行流：溢出覆盖返回地址为 <code>pop rdi; ret</code> → ret 跳到 gadget → gadget 把栈上参数1 弹进 rdi → 自身 ret 弹出下一地址（<code>pop rsi; pop r15; ret</code>）→ 继续搬运参数2 → ret 跳到目标函数。函数返回时 <code>ret</code> 又弹出攻击者布置的下一个 gadget 地址，链式推进。</p>
+<h2>三、编写一条完整 ROP 链</h2>
+<p>以经典的 x64 栈溢出为例，目标是用 ROP 调 <code>execve("/bin/sh", 0, 0)</code> 或 <code>system("/bin/sh")</code>。</p>
+<p><strong>第一步：确定偏移。</strong> 用 cyclic pattern（pwntools 的 <code>cyclic(200)</code>）定位覆盖返回地址所需的字节数。</p>
+<p><strong>第二步：泄漏地址。</strong> 现代系统开 ASLR，libc 基址每次启动随机。需要先泄漏：用 <code>puts@plt</code> 打印 <code>puts@got</code> 里存的真实地址，再返回 <code>main</code> 重新进入漏洞函数。pwntools 写法：</p>
+<div class="highlight"><pre><span></span><code><span class="n">payload</span> <span class="o">=</span> <span class="sa">b</span><span class="s2">&quot;A&quot;</span><span class="o">*</span><span class="n">offset</span>
+<span class="n">payload</span> <span class="o">+=</span> <span class="n">p64</span><span class="p">(</span><span class="n">pop_rdi_ret</span><span class="p">)</span> <span class="o">+</span> <span class="n">p64</span><span class="p">(</span><span class="n">puts_got</span><span class="p">)</span> <span class="o">+</span> <span class="n">p64</span><span class="p">(</span><span class="n">puts_plt</span><span class="p">)</span> <span class="o">+</span> <span class="n">p64</span><span class="p">(</span><span class="n">main</span><span class="p">)</span>
+</code></pre></div>
+
+<p>收到的输出里提取 6 字节地址，减去 libc 中 <code>puts</code> 的偏移，得到 libc 基址，进而算出 <code>system</code>、<code>/bin/sh</code> 的真实地址。</p>
+<p><strong>第三步：构造最终链。</strong> 常见两种：
+- 调 <code>system("/bin/sh")</code>：<code>pop rdi; ret</code> + binsh_addr + <code>system_addr</code>
+- 调 <code>execve</code> 更优雅：<code>pop rdi; ret</code> + binsh + <code>pop rsi; pop r15; ret</code> + 0 + 0 + <code>pop rdx; ret</code> + 0 + <code>syscall; ret</code>——需要 libc 里有 <code>pop rdx; ret</code>（新版 glibc 里常见）</p>
+<p><strong>第四步：处理栈对齐。</strong> x64 的 <code>movaps</code> 指令要求 16 字节对齐，直接跳 <code>system</code> 常因 rsp 不对齐而 SIGSEGV。解决办法是在链里多塞一个 <code>ret</code> gadget 或调整 padding 让 rsp 在函数入口处 16 字节对齐。这是新手最容易卡壳的地方，症状是"明明地址都对却崩在 movaps"。</p>
+<h2>四、x86 与 x64 的差异</h2>
+<p>32 位下参数全走栈，ROP 链更简单但也更笨重：每个函数调用要在栈上铺参数，链子长得快。x64 参数走寄存器，需要 <code>pop rdi; ret</code> 之类的 gadget，但链子短、更精确。</p>
+<p>另一个差异是 gadget 的可用性。32 位二进制里 <code>ret</code> 附近常有 <code>pop esi; pop edi; pop ebp; ret</code> 这种"全家桶"gadget，一次弹三个寄存器，参数布局要跟着调整。x64 则常拆成单寄存器 gadget，灵活但要求 gadget 齐全。所以写 x64 ROP 链前先用 ROPgadget 确认目标 gadget 存在，缺了就换函数或换利用思路（比如改用 <code>one_gadget</code>——glibc 里现成的"一条地址直接 execve"的 magic gadget）。</p>
+<h2>五、缓解措施与绕过</h2>
+<p>现代防御体系给 ROP 上了四道锁：</p>
+<ol>
+<li><strong>ASLR</strong>：库基址随机化，需要泄漏步骤（如上）。</li>
+<li><strong>NX</strong>：栈不可执行，这正是 ROP 存在的前提——ROP 不执行栈上代码，天然免疫 NX。</li>
+<li><strong>CFI / CET</strong>：Intel CET 的 shadow stack 和 indirect branch tracking 专门针对 ROP——shadow stack 用独立栈记录合法返回地址，<code>ret</code> 时比对，不匹配直接异常。这是 ROP 的终结者级别防御，目前绕过研究集中在：<code>syscall</code> 侧信道、信号处理（sigreturn）、或者干脆不用 <code>ret</code> 改用 <code>jmp</code> 链（JOP）。</li>
+<li><strong>stack canary</strong>：栈上放随机值，溢出覆盖到 canary 就触发检查。绕过方式是泄漏 canary（格式化字符串、堆溢出读）或对 fork 型服务逐字节爆破。</li>
+</ol>
+<p>个人实践：写利用时永远先 <code>checksec</code> 看开了哪些保护，再决定是 ret2libc、ROP 还是混合。真实场景里最实用的组合是"canary 泄漏 + ROP 链 + ret2csu"——ret2csu 是 glibc 里 <code>__libc_csu_init</code> 的一段万能 gadget，能控制 rdi/rsi/rdx 三个参数寄存器，几乎每个 x64 程序里都有，是 ROP 链的兜底方案。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

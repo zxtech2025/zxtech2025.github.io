@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>80B模型跑在4.3GB内存的Mac上——Swiftlet的MoE专家流式加载技术深度解析 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>80B模型跑在4.3GB内存的Mac上——Swiftlet的MoE专家流式加载技术深度解析</h1>
+<time>2026-08-04</time>
+<ul>
+<li>LLM</li>
+<li>模型推理</li>
+<li>MoE</li>
+<li>Apple Silicon</li>
+<li>开源</li>
+</ul>
+<hr />
+<p>HN今天有个项目拿了230分：Swiftlet，一个Swift+Metal写的推理运行时，能让80B的Qwen模型在只有4.3GB内存的Mac上跑起来，35B版本甚至能塞进iPhone。听起来像标题党，但看完源码之后，这不是压缩魔术，是一套精心设计的存储-计算管线。</p>
+<h2>MoE的内存幻觉</h2>
+<p>先理清一个基础事实：80B参数不代表80B同时活跃。</p>
+<p>Qwen3-Next-80B-A3B是Mixture-of-Experts架构。每层有512个专家，每个token只路由到其中10个。加上dense部分（注意力、DeltaNet投影、router、共享专家），每个token实际激活的参数大约3B。3B活跃参数用4-bit量化，理论内存需求不到2GB。</p>
+<p>那为什么普通推理框架加载这个模型要几十GB？</p>
+<p>因为传统的模型加载方式是"全量映射"：把所有权重一次性读到内存（mmap）或GPU显存，不管用不用。512个专家×每一层的权重全在内存里等着，虽然99%不会参与当前token的计算。这就是MoE模型"参数大、推理贵"的根本矛盾：存储的是全量参数，用的只是冰山一角。</p>
+<p>Swiftlet的思路直接：既然是冰山一角，那就只把冰山一角留在内存里。</p>
+<h2>专家流式加载（Expert Streaming）</h2>
+<p>核心设计分三层：</p>
+<p>第一层是驻留权重和流式权重的切分。</p>
+<p>Swiftlet把模型权重切成两块。dense部分（注意力QKV投影、DeltaNet循环状态、router网络、共享专家、embedding）始终驻留内存。80B模型的dense部分4-bit量化后约2.5GB。这是硬下限，每个token都要过这些层。</p>
+<p>Routed expert走流式：需要时才从SSD读。模型有几百层，每层几百个专家，每个token只用每层的10个。前一层的expert用完就释放，给下一层的expert腾地方。</p>
+<p>第二层是.qpack容器格式。它的设计目标很明确：读一个expert只需要一次磁盘IO。</p>
+<p>这里有个容易被忽略的细节：读取一个expert需要读多少数据？一个expert包含gate_proj、up_proj、down_proj三组矩阵，每组有权重、scale、bias，共6个tensor。如果这6个tensor分散在文件的不同位置，那就是6次磁盘IO。一个token过几十层，每层10个expert，IO次数直接炸。</p>
+<p>.qpack的做法是把每个expert的6个tensor<strong>连续打包</strong>在一个固定步长（stride）的blob里。读一个expert = 一次pread系统调用、一次磁盘寻道。所有expert按层组织——<code>layer_00.bin</code>，<code>layer_01.bin</code>……——文件内部每个expert起始偏移 = expert_id × stride。不需要索引表，不需要解析，直接定位。</p>
+<p>这个设计来自TurboFieldfare的经验教训：mmap让内核管理页面换入换出，但MoE的访问模式（每层随机访问10/512个expert，用完即弃）跟LRU页面替换完全不匹配，会导致持续thrashing。pread + 显式缓存池是更合理的方案。</p>
+<p>第三层是LFU缓存，但不是你以为的那种。</p>
+<p>专家缓存是一个固定大小的slot池。每个slot存一个expert blob（Metal buffer形式），绑定到一个(layer, expert) key。缓存的LFU与众不同：计数器不衰减，但用recency做tie-break——两个expert访问次数相同时，踢出更早被访问的那个。</p>
+<p>更重要的是缓存行为的一个实测发现：命中率从43%到70%的区间内，<strong>吞吐量几乎不变</strong>。原因很简单——Apple Silicon的SSD太快了，miss的延迟被Metal的compute时间盖住了。这个发现影响了整体设计：不追求高命中率，不搞预取，不搞智能替换策略。一个朴素的LFU就够了，缓存只是"顺便缓存一下"，真正的性能来自I/O和GPU计算的流水线重叠。</p>
+<p>缓存大小只设一个上限（默认2GB），slot按需分配——这在iOS上尤其关键。如果启动时就分配2GB Metal buffer，iOS的jetsam机制可能在模型还没跑起来之前就把进程杀了。延迟分配让内存在真正需要时才增长。</p>
+<h2>第二个关键技术：DeltaNet线性注意力</h2>
+<p>75%的层不使用标准的多头注意力，而是Gated DeltaNet——一种线性注意力变体。</p>
+<p>标准注意力有一个KV cache，长度随上下文线性增长。长对话时KV cache是主要的内存消耗者。DeltaNet把注意力建模为一个固定大小的循环状态矩阵，无论上下文多长，状态大小不变。所以Swiftlet在长对话场景下没有KV cache膨胀问题——这是它能用4.3GB跑80B模型的另一半原因。</p>
+<p>具体实现上：DeltaNet层维护一个d×d的循环状态（d是head_dim），每个新token通过一个门控机制更新这个状态。注意力输出 = 状态 × query，不需要存储历史K/V。Qwen3-Next的DeltaNet实现使用了Gated DeltaNet（在状态更新时加学习到的门控），比原始DeltaNet更稳定。</p>
+<p>剩下的25%层是标准的GQA（分组查询注意力），用于需要精确位置感知的任务。这一部分保留了KV cache，但因为只有1/4的层需要，总开销可控。</p>
+<h2>Metal实现：从Mac到iPhone</h2>
+<p>Swiftlet的GPU后端有三个值得注意的设计。</p>
+<p>运行时编译Metal着色器，不依赖Xcode的工具链。着色器源码（<code>Kernels.metal</code>）以文本形式打包，运行时通过<code>MTLLibrary</code>动态编译，同一份代码在macOS和iOS上都能跑，不需要平台条件编译。</p>
+<p>INT4计算直接写在Metal kernel里。MLX的affine量化方案（group_size × INT4 weight + per-group scale）的解量化-矩阵乘被融合成一个Metal kernel。配合simdgroup协作的GEMV快速路径，decode阶段的主要瓶颈从内存带宽转向dispatch开销——这就是为什么4.5 tok/s还不是上限。</p>
+<p>显式hazard管理。多GB的Metal buffer需要64位偏移寻址，Swiftlet自己管理buffer生命周期和同步，而不是依赖Metal的资源管理，避免了隐式的command buffer提交和等待。</p>
+<p>iPhone端的结果是35B模型（Qwen3.6-35B-A3B）跑在2.5GB内存里，速度约1 tok/s。不是快，是能跑：这是一个"能不能"的问题。1 tok/s意味着你可以跟一个35B的模型在手机上对话，虽然要耐心等待，但对话确实可以进行。</p>
+<h2>实测数据</h2>
+<p>从README和HN讨论中整理的关键数字：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>Qwen3.6-35B-A3B</th>
+<th>Qwen3-Next-80B-A3B</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>磁盘占用</td>
+<td>18 GB</td>
+<td>42 GB</td>
+</tr>
+<tr>
+<td>峰值内存</td>
+<td>2.6 GB</td>
+<td>4.3 GB</td>
+</tr>
+<tr>
+<td>解码速度(M5 Mac)</td>
+<td>7-11 tok/s</td>
+<td>4.5-5 tok/s</td>
+</tr>
+<tr>
+<td>4-bit量化</td>
+<td>✓</td>
+<td>✓</td>
+</tr>
+<tr>
+<td>active params/token</td>
+<td>~3B</td>
+<td>~3B</td>
+</tr>
+<tr>
+<td>DeltaNet层占比</td>
+<td>~75%</td>
+<td>~75%</td>
+</tr>
+<tr>
+<td>iOS支持</td>
+<td>✓ (iPhone 17, ~1 tok/s)</td>
+<td>✗ (磁盘太大)</td>
+</tr>
+</tbody>
+</table>
+<p>一个需要诚实说明的限制：只有3B参数活跃，意味着模型的知识存储受限于这3B——它会像一个大模型一样思考和表达，但像一个小模型一样记忆事实。"It chats and writes like a large model but recalls facts like a small one"，这是架构取舍。</p>
+<h2>三种使用方式</h2>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. CLI 对话</span>
+swiftlet<span class="w"> </span>chat<span class="w"> </span>~/models/qwen3.6-35b.qpack<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span><span class="s2">&quot;解释一下专家流式加载的原理&quot;</span>
+
+<span class="c1"># 2. OpenAI兼容服务器</span>
+swiftlet-server<span class="w"> </span>--model<span class="w"> </span>~/models/qwen3.6-35b.qpack<span class="w"> </span>--port<span class="w"> </span><span class="m">8080</span>
+<span class="c1"># 然后任何兼容OpenAI API的客户端都能用</span>
+
+<span class="c1"># 3. Swift Package 嵌入App</span>
+//<span class="w"> </span>Package.swift<span class="w"> </span>添加依赖
+//<span class="w"> </span>然后用<span class="w"> </span>SwiftletSession<span class="w"> </span>直接调用
+</code></pre></div>
+
+<p><code>SwiftletSession</code> API设计得很干净：异步streaming delta，内置conversation缓存（后续对话只需prefill新增token），重复控制（presence_penalty 1.5 + frequency_penalty 0.5），min_new=8防止模型在"be concise"的system prompt下过早输出EOS。这些细节说明这不是一个demo，是按生产级应用设计的。</p>
+<h2>个人看法</h2>
+<p>本地大模型推理正在经历一个范式转换。过去一年的思路是"把模型塞进内存"——量化、蒸馏、剪枝，一直在压缩模型本身。Swiftlet代表的是另一种思路：<strong>不压缩模型，而是改变模型和存储的关系</strong>。</p>
+<p>这跟数据库领域的Buffer Pool是一个道理。你不需要把所有数据放在内存里，只需要把热数据放在内存里，冷数据留在磁盘上，用一个高效的缓存策略保证大多数访问命中内存。MoE模型天然适合这个模型——每个token只用一小部分参数，访问有明显的局部性（相邻token倾向于路由到相似的expert集合）。</p>
+<p>几个值得关注的方向：</p>
+<ol>
+<li>
+<p><strong>预取（prefetch）</strong>。当前实现是同步pread——expert miss时GPU等待IO。如果能根据router的logits预测下一层可能需要的expert，提前发起异步读取，速度还有提升空间。</p>
+</li>
+<li>
+<p><strong>分层缓存</strong>。当前所有层共享一个LFU池。如果分析不同层的expert访问模式——浅层可能有更均匀的分布，深层更集中——可以给不同层分配不同的缓存预算。</p>
+</li>
+<li>
+<p><strong>这个思路不是Apple Silicon独有的</strong>。NVMe SSD加GPU Direct Storage在Linux上也能做到类似的专家流式加载。现有的推理框架（vLLM、SGLang）在MoE支持上还没走到这一步——它们更关注多GPU张量并行和prefill/decode分离，专家流式加载是一个互补的方向。</p>
+</li>
+</ol>
+<p>Swiftlet用约10,000行Swift和Metal实现了这个设计，全部基于mlx-lm的参考实现验证正确性。模型权重用Apache 2.0许可，代码同样开源。如果你有一台Apple Silicon Mac，可以clone下来跑一下——下载18GB的35B模型，然后看它只占2.6GB内存生成文本，这个体验是直观的。</p>
+<hr />
+<p>参考链接：
+- Swiftlet GitHub: <a href="https://github.com/leonickson1/Swiftlet">https://github.com/leonickson1/Swiftlet</a>
+- Qwen3-Next模型: <a href="https://huggingface.co/Qwen/Qwen3-Next-80B-A3B">https://huggingface.co/Qwen/Qwen3-Next-80B-A3B</a>
+- TurboFieldfare (前身项目): <a href="https://github.com/drumih/turbo-fieldfare">https://github.com/drumih/turbo-fieldfare</a>
+- ANEMLL (397B MoE on iPhone PoC): <a href="https://www.anemll.com/">https://www.anemll.com/</a></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
