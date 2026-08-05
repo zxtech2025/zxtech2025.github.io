@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>三元量化MoE登上移动端——Maple-Preview在Mac Mini上跑到218 tok/s意味着什么 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>三元量化MoE登上移动端——Maple-Preview在Mac Mini上跑到218 tok/s意味着什么</h1>
+<time>2026-08-05</time>
+<ul>
+<li>AI</li>
+<li>模型量化</li>
+<li>边缘推理</li>
+<li>开源模型</li>
+<li>MoE</li>
+</ul>
+<hr />
+<p>DeepGrove 今天发布了 Maple-Preview，一个 20B-A1B 的三元量化 MoE 推理模型。这件事在 HN 上拿到了 147 分，但围观群众的反应两极分化：有人惊叹于速度，有人在质疑 benchmark 的选取。</p>
+<p>但真正值得谈的，不是 218 tok/s 这个数字本身，而是它背后那套把 MoE + 三元量化 + llama.cpp 攒到一起的工程方案。</p>
+<h2>三元量化到底干了什么</h2>
+<p>传统量化是从 FP16 往低比特位压缩——INT8、INT4，每降一级都有精度损失。三元量化更进一步：每个权重只能取三个值，-1、0、+1。</p>
+<p>在 GGUF 格式里，这叫 <code>tq2_0</code> 类型（还可以选更极端的 <code>tq1_0</code>）。存一个三态权重只需要约 1.6 bit，比 INT4 的 4 bit 少了 60%。而推理的时候，三元矩阵乘法不需要浮点乘法——只需要加法和符号翻转。每个 token 的计算量直接砍掉一个数量级。</p>
+<p>这就是为什么一个 20B 的 MoE 模型能在 M4 Mac Mini 上跑到 218 tok/s。</p>
+<p>代价当然有。三元模型对训练过程的要求完全不同。大多数量化方法是在 FP16 模型训练完之后做后处理，但 Maple-Preview 的做法是<strong>从头用三元权重训练</strong>。DeepGrove 在发布页里直接写了："Current approaches to low precision primarily focus on converting models trained in full precision to lower bitwidths. We view this as fundamentally the wrong approach."</p>
+<p>这跟 PrismML 团队之前的 Bonsai 系列是一脉相承的路线：在训练阶段就让模型学会用三态空间表达，而不是事后削足适履。</p>
+<h2>MoE 在三元量化下的特殊适配</h2>
+<p>MoE 架构跟三元量化是天然的好搭档。</p>
+<p>Maple-Preview 的结构是 20B-A1B：总共 20B 参数分布在 256 个 expert 里，每个 token 只激活 7 个 expert（clamp-7），实际前向计算量约 1B 参数。三元量化让每个 expert 的体积进一步压缩——整个 checkpoint 只有 5.31 GB。</p>
+<p>对比一下：一个常规的 7B 密集模型在 FP16 下约 14 GB。Maple-Preview 总参数是它的近三倍，但 checkpoint 体积不到一半，而且每个 token 只跑三分之一的活跃参数。这一来一回，在边缘设备上的可行性完全不一样。</p>
+<p>注意那 128K 的上下文窗口。长上下文的 KV cache 在移动端通常是瓶颈——iPhone 的 jetsam 机制在内存压力超过约 4-5 GB 时就会杀进程。HN 上有人实测 "dreaming demo peaks at 5.9 GB"，在 iOS 上第三方 app 直接会被干掉。所以 DeepGrove 展示的跑分用的是 M4 Mac Mini 而非 iPhone——标题里的 "iPhone" 是有水分的。</p>
+<h2>推理引擎不是黑科技</h2>
+<p>Maple-Preview 的推理引擎是 llama.cpp 的一个 fork，由 PrismML 维护。这条路选得很务实——llama.cpp 的 ggml 后端对 ARM/Metal 的优化已经极其成熟，三元量化的支持通过新增 <code>MOSTLY_TQ2_0</code> 类型加进去，不需要另起炉灶。</p>
+<p>几个架构细节：
+- <strong>Hybrid SWA/GA attention</strong>：滑动窗口注意力 + 全局注意力的混合模式，在处理 128K 长上下文时兼顾了计算效率和远距离依赖。
+- <strong>Flash-head QK</strong>：对 attention 的 QK 计算做融合优化，减少中间张量的显存占用。
+- <strong>MLX 后端</strong>：在 Apple Silicon 上走 MLX，这是 Apple 自家的数组框架，对 M 系列芯片的 AMX 协处理器和统一内存架构利用得最充分。这也是为什么 M5 Pro 上能跑到 281.5 tok/s。</p>
+<h2>速度对比到底有多夸张</h2>
+<p>DeepGrove 给出的数据是，在 16GB M4 Mac Mini 上，Maple-Preview 比 Qwen3.5、Gemma 4、gpt-oss 快 5-16 倍。质量指标用的是 LCBv6、AIME 2026、HMMT 2026 和 GPQA-D 四项的平均。</p>
+<p>注意这里的对比条件：对比模型用的是 4-bit 量化跑速度，但质量评分用的是全精度——也就是说图表上标的质量分数是对比模型的"最佳情况"。Maple-Preview 则是三元权重下同时测速度和质量，没有这个"作弊空间"。</p>
+<p>有一个细节被 HN 讨论区抓住了：比较对象是 Qwen 3.5 35B-A3B 而非更新的 Qwen 3.6。这个版本差在 benchmark 上可能有不小的影响。</p>
+<p>更直观的展示是 IMO 数学推理：Maple-Preview 在 M5 Pro 上以 281.5 tok/s 的速度解出了 IMO 2024 Problem 1，拿到了满分 7/7。发布页里放了完整的证明过程——从 "Let α = a + r" 开始，一步步推到最终结论。不管你是不是数学竞赛出身，看到模型输出这种质量的推理链，体感冲击是很直接的。</p>
+<h2>Hallucination 和实际可用性</h2>
+<p>但 HN 上的质疑也同样具体。有人让模型写 250 词的词源学分析，结果它给出了完全错误的答案——而且极其自信。跑得再快，胡说的话还是胡说的。</p>
+<p>这个问题对三元量化的小模型尤其突出。大模型靠参数量可以在一定程度上"记住"事实性知识，但三元量化把每个权重的表达能力压缩到了三个值——模型本质上失去了存储事实的能力，只能依赖推理链。如果推理链的第一环就是错的，后面全白搭。</p>
+<p>所以 HN 上有一个判断我觉得很准确：这种模型的最佳用例不是独立回答问题，而是做 tool calling。把它当成一个高速路由器——识别意图、调用工具、聚合结果——速度是核心竞争力，准确性由工具保证。已经有开发者在尝试用 Maple-Preview 替代家用语音助手的后端模型，跑在本地 Mac Mini 上，延迟从几秒降到毫秒级。</p>
+<h2>"Dreaming"和 on-device 微调的未来</h2>
+<p>DeepGrove 在发布页里提到了一个叫 "Dreaming" 的概念——在设备端根据用户数据动态调整模型权重。对于三元模型来说这个想法特别诱人：权重只有 -1、0、+1 三种状态，微调的搜索空间比浮点模型小了多个数量级。</p>
+<p>但目前这还只是个概念。GitHub 仓库里没有看到 Dreaming 的实现代码，发布页里也没有给出具体方案。从工程直觉判断，三元权重的离散性虽然降低了搜索成本，但也带来了梯度传播的问题——反向传播需要连续可微的损失函数，而 {-1, 0, +1} 空间天然不可微。可能的路线是走强化学习（用奖励信号代替梯度）或者进化算法——但这些都是比量化本身更硬的骨头。</p>
+<h2>我的看法</h2>
+<p>Maple-Preview 不是一个完美的产品，但它标志着一个重要的工程拐点：<strong>在消费级设备上跑 SOTA 级推理的门槛已经降到了 5 GB 显存和 200+ tok/s</strong>。</p>
+<p>三年前大家在兴奋地讨论 GPT-3 的 175B 参数，现在一个 20B-A1B 的三元 MoE 模型在 Mac Mini 上的推理速度已经超过了人类阅读速度。这个跨越靠的不是算法突破，而是量化 + MoE + 开源推理引擎的组合拳。每一项单独看都不是新鲜事，但凑到一起的时候，门槛就塌了。</p>
+<p>如果你想在本地试试，起点是 DeepGrove 的 mlx-lm fork：</p>
+<div class="highlight"><pre><span></span><code>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/deepgrove-ai/mlx-lm-deepgrove
+</code></pre></div>
+
+<p>模型权重在 HuggingFace 的 <code>deepgrove/maple-preview</code>。</p>
+<p>还有一个附带的提醒：别在 iPhone 上期望同样的性能。Mac Mini 的 16GB 统一内存和主动散热是 iPhone 没有的——jetsam 和热降频会吃掉大部分理论性能。等 M 系列芯片下放到 iPad Pro 级别的散热方案，才算真正打通了移动端。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

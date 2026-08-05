@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NSD 权威 DNS 服务器三重危机：SVCB 堆溢出与区域传输认证绕过 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>NSD 权威 DNS 服务器三重危机：SVCB 堆溢出与区域传输认证绕过</h1>
+<time>2026-08-05</time>
+<ul>
+<li>技术
+Slug: nsd权威dns服务器三重危机-svcb堆溢出与区域传输认证绕过</li>
+</ul>
+<hr />
+<p>2026 年 7 月，NLnet Labs 开源的权威 DNS 服务器 NSD（Name Server Daemon）一次性披露了四个 CVE。其中最致命的一击并非来自外部查询路径，而是来自区域传输（zone transfer）这条本应"受信任"的内部同步链路——一个 <code>uint16_t</code> 整数溢出让攻击者可以在堆上写入最多 65509 字节可控数据，而一个 TLS 认证条件判断的短路缺陷让证书校验形同虚设。二者叠加，构成了"恶意主服务器 → AXFR 投毒 → 堆溢出 RCE / 未授权区域传输"的完整攻击链。</p>
+<p>本文从 NSD 架构入手，逐个拆解这四个漏洞的根因、补丁与组合利用逻辑。</p>
+<hr />
+<h2>一、背景：权威 DNS 的信任模型</h2>
+<p>NSD 是与 BIND、Knot DNS 并列的主流开源权威 DNS 服务器，约 8 万行 C 代码。与递归解析器（如 Unbound）不同，权威服务器只回答自己持有区域的查询，不替客户端向其他服务器递归。其安全模型建立在两个边界上：</p>
+<ul>
+<li><strong>外部边界</strong>：来自任意客户端的 DNS 查询（UDP/TCP 53、DoT 853）。</li>
+<li><strong>内部边界</strong>：区域传输（AXFR/IXFR），用于主从服务器间同步区域数据。</li>
+</ul>
+<p>传统安全建设往往把注意力放在外部边界，认为区域传输走的是管理网络、受 TSIG 或 ACL 保护。但 NSD 本轮漏洞恰恰揭示了：<strong>从不可信主服务器同步区域数据时，权威服务器会把对端返回的每一条 RR 当作"可信输入"解析</strong>——一旦解析器存在内存破坏缺陷，区域传输就从数据同步通道变成了 RCE 入口。</p>
+<p>四个漏洞的概览如下：</p>
+<table>
+<thead>
+<tr>
+<th>CVE</th>
+<th>类型</th>
+<th>CVSS</th>
+<th>位置</th>
+<th>利用前提</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE-2026-12244</td>
+<td>堆溢出</td>
+<td>8.8</td>
+<td>rdata.c <code>read_svcb_rdata()</code></td>
+<td>控制区域主服务器，AXFR 投毒</td>
+</tr>
+<tr>
+<td>CVE-2026-12490</td>
+<td>认证绕过</td>
+<td>高危</td>
+<td>options.c <code>acl_check_incoming()</code></td>
+<td>经 TCP 53 发起 AXFR，未设 <code>tls-auth-xfr-only</code></td>
+</tr>
+<tr>
+<td>CVE-2026-12245</td>
+<td>UAF 崩溃</td>
+<td>中危</td>
+<td>server.c <code>handle_tls_writing()</code></td>
+<td>DoT 端口发送查询后断连</td>
+</tr>
+<tr>
+<td>CVE-2026-12246</td>
+<td>栈溢出</td>
+<td>中危</td>
+<td>APL RR 处理</td>
+<td>特制 APL RR，区域写盘时触发</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2>二、NSD 架构：多进程模型与攻击面</h2>
+<p>NSD 采用经典的多进程隔离模型，将不同职责分配到独立进程，通过共享内存与管道通信：</p>
+<div class="highlight"><pre><span></span><code>                       ┌──────────────────────────────────────────────┐
+                       │              NSD 父进程 (main)                │
+                       │   读取 nsd.conf / 管理信号 / 监督子进程        │
+                       └───────────┬──────────────────┬────────────────┘
+                                   │ fork             │ fork
+                      ┌────────────▼─────────┐   ┌────▼──────────────────┐
+                      │  子服务进程 (server)  │   │   xfrd 进程 (区域传输) │
+                      │                      │   │                       │
+                      │  UDP/TCP 53 查询处理  │   │  AXFR/IXFR 拉取/推送  │
+                      │  DoT 853 (TLS)       │   │  TSIG / TLS 认证      │
+                      │  RR 解析 rdata.c     │   │  写区域文件/通知 server│
+                      │  ACL options.c       │   │                       │
+                      └──────────┬───────────┘   └───────────┬───────────┘
+                                 │                            │
+                                 └────────── 共享内存区域 ─────┘
+                                       (区域数据 / 统计)
+</code></pre></div>
+
+<p>关键源文件与职责：</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>行数(约)</th>
+<th>职责</th>
+<th>本轮关联漏洞</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>server.c</code></td>
+<td>—</td>
+<td>查询处理、TCP/TLS 连接管理</td>
+<td>CVE-2026-12245 (UAF)</td>
+</tr>
+<tr>
+<td><code>xfrd.c</code></td>
+<td>—</td>
+<td>区域传输状态机、主从协商</td>
+<td>攻击链入口</td>
+</tr>
+<tr>
+<td><code>rdata.c</code></td>
+<td>3300</td>
+<td>RR（资源记录）解析与编码</td>
+<td>CVE-2026-12244 (SVCB)</td>
+</tr>
+<tr>
+<td><code>options.c</code></td>
+<td>—</td>
+<td>配置解析、ACL 访问控制</td>
+<td>CVE-2026-12490 (认证绕过)</td>
+</tr>
+</tbody>
+</table>
+<p>网络入口分布：</p>
+<div class="highlight"><pre><span></span><code>   客户端                         NSD 主机
+  ┌────────┐   UDP/TCP 53   ┌─────────────────────────────┐
+  │ 查询者  │───────────────▶│ server 子进程                │
+  └────────┘   DoT 853(TLS) │  └─ rdata.c 解析 SVCB/HTTPS  │
+                            │                             │
+  ┌────────┐   AXFR/IXFR    │ xfrd 进程                    │
+  │ 从服务器│◀──────────────│  └─ 从主服务器拉取区域        │
+  └────────┘  (TSIG/TLS)    │  └─ 调用 rdata.c 解析每条 RR  │ ◀─ 溢出发生处
+                            └─────────────────────────────┘
+</code></pre></div>
+
+<p>理解这张图是理解后续攻击链的关键：<strong><code>rdata.c</code> 同时服务于外部查询解析与区域传输解析</strong>，因此一个 RR 解析缺陷既可以被外部查询触发，更可以被区域传输触发——而后者往往绕过了外部查询的速率限制与过滤。</p>
+<hr />
+<h2>三、CVE-2026-12244：SVCB 堆溢出（CVSS 8.8）</h2>
+<h3>3.1 SVCB RR 格式回顾</h3>
+<p>SVCB（Service Binding）记录由 RFC 9460 定义，用于将服务端点与域名绑定，是 HTTPS 记录的通用形式。其 RDATA 结构为：</p>
+<div class="highlight"><pre><span></span><code><span class="c"> 0                   1                   2                   3</span>
+<span class="c"> 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1</span>
+<span class="nb">+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+</span>
+<span class="c">|           SvcPriority (2 字节)                                |</span>
+<span class="nb">+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+</span>
+<span class="c">/                       TargetName (压缩域名)                   /</span>
+<span class="nb">+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+</span>
+<span class="c">/                   SvcParams (变长键值对，可至 ~64KB)           /</span>
+<span class="nb">+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+</span>
+</code></pre></div>
+
+<p><code>SvcParams</code> 是一组 TLV（Type-Length-Value）键值对，整体长度受 DNS 报文与 RR <code>rdlength</code>（uint16，最大 65535）约束。正因为 <code>rdlength</code> 是 16 位，为后续的整数溢出埋下伏笔。</p>
+<h3>3.2 漏洞根因：uint16_t 截断</h3>
+<p>漏洞位于 <code>rdata.c</code> 约 3282 行的 <code>read_svcb_rdata()</code> 函数。核心问题是用于累加 SVCB 参数区段长度的局部变量 <code>size</code> 被声明为 <code>uint16_t</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// rdata.c, 约 line 3282 (修复前)</span>
+<span class="k">static</span><span class="w"> </span><span class="n">rdata_atom_type</span><span class="w"> </span><span class="o">*</span>
+<span class="nf">read_svcb_rdata</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">domain_table</span><span class="w"> </span><span class="o">*</span><span class="n">domains</span><span class="p">,</span><span class="w"> </span><span class="kt">uint16_t</span><span class="w"> </span><span class="n">rdlength</span><span class="p">,</span><span class="w"> </span><span class="p">...)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="kt">uint16_t</span><span class="w"> </span><span class="n">length</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="n">svcparams_length</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">uint16_t</span><span class="w"> </span><span class="n">size</span><span class="p">;</span><span class="w">          </span><span class="c1">// ← 漏洞根因：16 位宽度无法承载真实大小</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="w">    </span><span class="c1">// 计算 size：累加 SvcPriority(2) + TargetName + SvcParams</span>
+<span class="w">    </span><span class="c1">// 当 rdata 接近 65512 字节时，加上 RR 头部开销后总长超过 65535</span>
+<span class="w">    </span><span class="c1">// uint16_t 发生回绕，size 变成一个极小的值</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="w">    </span><span class="c1">// 基于【回绕后的 size】分配堆缓冲区</span>
+<span class="w">    </span><span class="n">buffer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">region_alloc</span><span class="p">(</span><span class="n">region</span><span class="p">,</span><span class="w"> </span><span class="n">size</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// 但后续写入使用【真实大小】，造成大规模堆溢出</span>
+<span class="w">    </span><span class="n">memcpy</span><span class="p">(</span><span class="n">buffer</span><span class="p">,</span><span class="w"> </span><span class="p">...,</span><span class="w"> </span><span class="n">svcparams_length</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>溢出的数学推导如下：</p>
+<div class="highlight"><pre><span></span><code><span class="w">  </span><span class="n">DNS</span><span class="w"> </span><span class="err">报文最大载荷约</span><span class="w"> </span><span class="mh">65535</span><span class="w"> </span><span class="err">字节</span>
+<span class="w">  </span><span class="n">SVCB</span><span class="w"> </span><span class="n">RR</span><span class="w"> </span><span class="err">的</span><span class="w"> </span><span class="n">rdata</span><span class="w"> </span><span class="err">最大可达约</span><span class="w"> </span><span class="mh">65512</span><span class="w"> </span><span class="err">字节</span>
+<span class="w">              </span><span class="err">↓</span>
+<span class="w">  </span><span class="n">size</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SvcPriority</span><span class="p">(</span><span class="mh">2</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">TargetName</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">SvcParams</span><span class="p">(</span><span class="mh">65512</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="err">头部开销</span>
+<span class="w">       </span><span class="err">≈</span><span class="w"> </span><span class="mh">65512</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mh">23</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="p">...</span><span class="w">   </span><span class="err">←</span><span class="w"> </span><span class="err">真实值</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mh">65535</span>
+<span class="w">              </span><span class="err">↓</span>
+<span class="w">  </span><span class="p">(</span><span class="n">uint16_t</span><span class="p">)</span><span class="w"> </span><span class="n">size</span><span class="w">  </span><span class="err">→</span><span class="w">  </span><span class="err">回绕为极小值</span><span class="w"> </span><span class="p">(</span><span class="err">例如几十字节</span><span class="p">)</span>
+<span class="w">              </span><span class="err">↓</span>
+<span class="w">  </span><span class="n">region_alloc</span><span class="p">(</span><span class="n">size</span><span class="p">)</span><span class="w">            </span><span class="err">←</span><span class="w"> </span><span class="err">仅分配极小堆块</span>
+<span class="w">              </span><span class="err">↓</span>
+<span class="w">  </span><span class="err">写入</span><span class="w"> </span><span class="mh">65512</span><span class="w"> </span><span class="err">字节</span><span class="w"> </span><span class="n">SvcParams</span><span class="w">     </span><span class="err">←</span><span class="w"> </span><span class="err">越界写入最多</span><span class="w"> </span><span class="mh">65509</span><span class="w"> </span><span class="err">字节</span>
+<span class="w">              </span><span class="err">↓</span>
+<span class="w">  </span><span class="err">堆元数据被覆盖</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">任意写原语</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">RCE</span>
+</code></pre></div>
+
+<p>最大溢出量约 <strong>65509 字节</strong>，且写入内容来自攻击者构造的 SVCB <code>SvcParams</code>，<strong>完全可控</strong>。这是一个教科书级的"分配用窄类型、写入用宽真实值"的不一致缺陷。</p>
+<h3>3.3 触发条件</h3>
+<p>关键在于触发路径。<code>read_svcb_rdata()</code> 在两条路径上被调用：</p>
+<ol>
+<li><strong>外部查询路径</strong>：客户端发送含 SVCB RR 的响应——但权威服务器通常不解析外部响应，此路径难以直接触发。</li>
+<li><strong>区域传输路径</strong>：xfrd 进程从主服务器拉取 AXFR，逐条解析返回的 RR——<strong>这是真实可利用路径</strong>。</li>
+</ol>
+<p>触发条件：攻击者控制区域的主服务器（或中间人篡改 AXFR），在 AXFR 响应中塞入一条 <code>rdlength</code> 约为 65512 字节的特制 SVCB RR。从服务器在解析该 RR 时即触发堆溢出。</p>
+<div class="highlight"><pre><span></span><code>  攻击者控制的&quot;主服务器&quot;            受害从服务器 (NSD)
+  ┌────────────────────┐         ┌──────────────────────┐
+  │ 恶意区域文件        │         │  xfrd: 发起 AXFR      │
+  │  evil.com SVCB ... │◄────────│  dig AXFR evil.com    │
+  │  (rdata=65512)     │  AXFR   │                       │
+  └────────────────────┘ 响应    │  rdata.c: 解析 SVCB    │
+                                │   size 回绕 → alloc 极小│
+                                │   写入 65509B → 堆溢出  │
+                                │        → RCE            │
+                                └──────────────────────┘
+</code></pre></div>
+
+<h3>3.4 补丁分析</h3>
+<p>修复极为精简——一行类型提升：</p>
+<div class="highlight"><pre><span></span><code><span class="gd">--- a/rdata.c</span>
+<span class="gi">+++ b/rdata.c</span>
+<span class="gu">@@ static rdata_atom_type *</span>
+<span class="w"> </span>read_svcb_rdata(struct domain_table *domains, uint16_t rdlength, ...)
+<span class="w"> </span>{
+<span class="w"> </span>    uint16_t length = 2, svcparams_length = 0;
+<span class="gd">-    uint16_t size;</span>
+<span class="gi">+    size_t size;</span>
+<span class="w"> </span>    ...
+</code></pre></div>
+
+<p>将 <code>size</code> 从 <code>uint16_t</code> 提升为 <code>size_t</code>（64 位系统上为 8 字节），从根本上消除回绕。这种"窄类型承载宽运算结果"的缺陷在 C 代码审计中极为常见，值得作为静态扫描规则：<strong>任何参与 <code>region_alloc</code>/<code>malloc</code> 长度计算的累加变量，其类型宽度必须大于被累加字段的最大可能值。</strong></p>
+<hr />
+<h2>四、CVE-2026-12490：区域传输认证绕过</h2>
+<p>如果说 12244 是内存破坏，12490 则是逻辑缺陷——它让管理员精心配置的 TLS 客户端证书认证在特定路径下完全失效。</p>
+<h3>4.1 NSD 的区域传输认证模型</h3>
+<p>NSD 支持三种区域传输认证机制：</p>
+<table>
+<thead>
+<tr>
+<th>机制</th>
+<th>配置项</th>
+<th>适用场景</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>IP ACL</td>
+<td><code>provide-xfr: &lt;ip&gt; NOKEY</code></td>
+<td>限制来源 IP</td>
+</tr>
+<tr>
+<td>TSIG</td>
+<td><code>provide-xfr: &lt;ip&gt; &lt;tsig-name&gt;</code></td>
+<td>共享密钥签名</td>
+</tr>
+<tr>
+<td>TLS 客户端证书</td>
+<td><code>tls-auth: ...</code> + <code>provide-xfr: &lt;ip&gt; &lt;tls-auth-name&gt;</code></td>
+<td>DoT 853 证书校验</td>
+</tr>
+</tbody>
+</table>
+<p>当配置了 TLS 认证时，期望的行为是：只有携带正确客户端证书的连接才被允许执行 AXFR。关键开关 <code>tls-auth-xfr-only</code>（默认 <strong>no</strong>）决定是否强制所有区域传输走 TLS。</p>
+<h3>4.2 漏洞根因：条件短路</h3>
+<p>漏洞位于 <code>options.c</code> 的 <code>acl_check_incoming()</code> 函数。问题出在校验 TLS 证书的条件判断：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// options.c, acl_check_incoming() (修复前)</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">acl</span><span class="o">-&gt;</span><span class="n">tls_auth_name</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tls_auth</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w">     </span><span class="c1">// ← 漏洞条件</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">acl</span><span class="o">-&gt;</span><span class="n">tls_auth_options</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">acl</span><span class="o">-&gt;</span><span class="n">tls_auth_options</span><span class="o">-&gt;</span><span class="n">auth_domain_name</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">acl_tls_hostname_matches</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tls_auth</span><span class="p">,</span><span class="w"> </span><span class="p">...))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 证书不匹配，拒绝</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>致命之处在 <code>&amp;&amp; q-&gt;tls_auth</code> 这个与条件。其逻辑是"只有当 ACL 要求 TLS 认证 <strong>且</strong> 当前连接确实建立了 TLS（<code>q-&gt;tls_auth</code> 非空）时，才执行证书校验"。</p>
+<p>反过来看：<strong>如果攻击者通过普通 TCP 端口 53（或未启用客户端证书的普通 tls-port）发起 AXFR，<code>q-&gt;tls_auth</code> 为 NULL</strong>，整个 <code>if</code> 块被跳过——证书验证逻辑根本不执行。此时只要 IP ACL 匹配（或未限制 IP），区域传输即被放行。</p>
+<div class="highlight"><pre><span></span><code><span class="w">  </span><span class="err">正常</span><span class="w"> </span><span class="n">TLS</span><span class="w"> </span><span class="err">路径</span><span class="w"> </span><span class="p">(</span><span class="err">期望</span><span class="p">)</span><span class="o">:</span><span class="w">                      </span><span class="err">攻击路径</span><span class="w"> </span><span class="p">(</span><span class="err">实际绕过</span><span class="p">)</span><span class="o">:</span>
+<span class="w">  </span><span class="err">┌──────────┐</span><span class="w">  </span><span class="n">DoT</span><span class="w"> </span><span class="mi">853</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="err">客户端证书</span><span class="w">  </span><span class="err">┌───────┐</span><span class="w">    </span><span class="err">┌──────────┐</span><span class="w">  </span><span class="n">TCP</span><span class="w"> </span><span class="mi">53</span><span class="w"> </span><span class="p">(</span><span class="err">无证书</span><span class="p">)</span><span class="w">  </span><span class="err">┌───────┐</span>
+<span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">从服务器</span><span class="w">  </span><span class="err">│──────────────────────▶│</span><span class="w"> </span><span class="n">NSD</span><span class="w">   </span><span class="err">│</span><span class="w">    </span><span class="err">│</span><span class="w"> </span><span class="err">攻击者</span><span class="w">   </span><span class="err">│─────────────────▶│</span><span class="w"> </span><span class="n">NSD</span><span class="w">   </span><span class="err">│</span>
+<span class="w">  </span><span class="err">└──────────┘</span><span class="w">                        </span><span class="err">└───────┘</span><span class="w">    </span><span class="err">└──────────┘</span><span class="w">                  </span><span class="err">└───────┘</span>
+<span class="w">        </span><span class="err">│</span><span class="w">  </span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tls_auth</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">证书上下文</span><span class="w">         </span><span class="err">│</span><span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tls_auth</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">NULL</span><span class="w">           </span><span class="err">│</span>
+<span class="w">        </span><span class="err">│</span><span class="w">  </span><span class="err">↓</span><span class="w">                              </span><span class="err">│</span><span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="err">↓</span><span class="w">                           </span><span class="err">│</span>
+<span class="w">        </span><span class="err">│</span><span class="w">  </span><span class="n">acl</span><span class="o">-&gt;</span><span class="n">tls_auth_name</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tls_auth</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">真</span><span class="w">      </span><span class="err">│</span><span class="w">  </span><span class="n">acl</span><span class="o">-&gt;</span><span class="n">tls_auth_name</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tls_auth</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">假</span>
+<span class="w">        </span><span class="err">│</span><span class="w">  </span><span class="err">↓</span><span class="w"> </span><span class="err">执行证书匹配</span><span class="w">                  </span><span class="err">│</span><span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="err">↓</span><span class="w"> </span><span class="err">跳过整个证书校验块</span><span class="w">          </span><span class="err">│</span>
+<span class="w">        </span><span class="err">│</span><span class="w">  </span><span class="err">匹配</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">允许</span><span class="w"> </span><span class="n">AXFR</span><span class="w">               </span><span class="err">│</span><span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="n">IP</span><span class="w"> </span><span class="err">命中</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">允许</span><span class="w"> </span><span class="n">AXFR</span><span class="w"> </span><span class="p">(</span><span class="err">无证书</span><span class="o">!</span><span class="p">)</span><span class="w"> </span><span class="err">│</span>
+<span class="w">                                        </span><span class="err">│</span><span class="w">                                          </span><span class="err">│</span>
+<span class="w">                                  </span><span class="err">期望行为</span><span class="w">                                  </span><span class="err">漏洞行为</span><span class="p">(</span><span class="err">绕过</span><span class="p">)</span>
+</code></pre></div>
+
+<p>这是一个典型的"检查存在性而非缺失性"缺陷：代码把 <code>q-&gt;tls_auth</code> 的存在当作"应该校验"的前提，而非"必须存在否则拒绝"的强制条件。正确的逻辑应当是——只要 ACL 要求了 TLS 认证，连接没有提供 TLS 身份就应直接拒绝。</p>
+<h3>4.3 利用前提</h3>
+<ul>
+<li><code>tls-auth-xfr-only</code> 未设为 <code>yes</code>（默认即不是 yes），允许 TCP 53 上的区域传输。</li>
+<li>攻击者源 IP 未被 IP ACL 拒绝（例如管理员只配了 TLS 认证、依赖证书而非 IP 限制）。</li>
+</ul>
+<h3>4.4 补丁分析</h3>
+<p>补丁新增了对"要求 TLS 但未提供 TLS"的拒绝逻辑，并修正了后续条件：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// options.c, acl_check_incoming() (修复后)</span>
+<span class="c1">// 新增：ACL 要求 TLS 认证，但连接未提供 TLS 身份 → 跳过此 ACL</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">acl</span><span class="o">-&gt;</span><span class="n">tls_auth_name</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="o">!</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tls_auth</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">number</span><span class="o">++</span><span class="p">;</span>
+<span class="w">    </span><span class="n">acl</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">acl</span><span class="o">-&gt;</span><span class="n">next</span><span class="p">;</span>
+<span class="w">    </span><span class="k">continue</span><span class="p">;</span><span class="w">   </span><span class="c1">// 该 ACL 不匹配，继续检查下一条</span>
+<span class="p">}</span>
+<span class="c1">// 修正：不再要求 &amp;&amp; q-&gt;tls_auth，因为上面已保证 q-&gt;tls_auth 非空</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">acl</span><span class="o">-&gt;</span><span class="n">tls_auth_name</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">acl</span><span class="o">-&gt;</span><span class="n">tls_auth_options</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">acl</span><span class="o">-&gt;</span><span class="n">tls_auth_options</span><span class="o">-&gt;</span><span class="n">auth_domain_name</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">acl_tls_hostname_matches</span><span class="p">(</span><span class="n">q</span><span class="o">-&gt;</span><span class="n">tls_auth</span><span class="p">,</span><span class="w"> </span><span class="p">...))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="c1">// 证书不匹配，拒绝</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>修复思路从"有 TLS 才校验"转为"无 TLS 即拒绝"，将缺失的 TLS 身份视为拒绝条件而非跳过校验的理由。这是认证类缺陷修复的通用范式：<strong>认证要求必须是强制前置条件，而非可选附加项。</strong></p>
+<hr />
+<h2>五、CVE-2026-12245：DoT UAF 崩溃</h2>
+<p>该漏洞位于 <code>server.c</code> 的 <code>handle_tls_writing()</code> 函数，是一个 Use-After-Free。</p>
+<h3>5.1 根因</h3>
+<p>在处理 DoT（DNS-over-TLS）连接的写响应流程中，资源释放与日志记录的顺序错误：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// server.c, handle_tls_writing() (修复前, 简化)</span>
+<span class="k">static</span><span class="w"> </span><span class="kt">void</span><span class="w"> </span><span class="nf">handle_tls_writing</span><span class="p">(</span><span class="k">struct</span><span class="w"> </span><span class="nc">nsd</span><span class="w"> </span><span class="o">*</span><span class="n">nsd</span><span class="p">,</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">tcp_handler_data</span><span class="w"> </span><span class="o">*</span><span class="n">data</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// ... TLS 写入逻辑 ...</span>
+<span class="w">    </span><span class="n">cleanup_tcp_handler</span><span class="p">(</span><span class="n">data</span><span class="p">);</span><span class="w">     </span><span class="c1">// ← 释放 data 及 data-&gt;query</span>
+
+<span class="w">    </span><span class="c1">// 以下日志代码仍访问已释放的 data-&gt;query  ← UAF</span>
+<span class="w">    </span><span class="n">log_msg</span><span class="p">(</span><span class="n">LOG_INFO</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;responded query %u&quot;</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="kt">unsigned</span><span class="p">)</span><span class="n">data</span><span class="o">-&gt;</span><span class="n">query</span><span class="o">-&gt;</span><span class="n">id</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>cleanup_tcp_handler(data)</code> 释放了 <code>data</code> 及其成员 <code>query</code>，但随后的日志语句仍解引用 <code>data-&gt;query</code>，构成 UAF。在多数情况下这只是一次崩溃（DoS），但在特定堆布局下可能被提升为更严重的利用。</p>
+<h3>5.2 触发方式</h3>
+<p>攻击者建立一个到 DoT 端口 853 的 TLS 连接，发送一个 DNS 查询，在读取响应之前立即关闭连接（TCP RST / FIN）。这会驱动 <code>handle_tls_writing</code> 走入错误处理分支并触发上述释放-使用顺序。</p>
+<h3>5.3 补丁</h3>
+<div class="highlight"><pre><span></span><code><span class="gd">-    cleanup_tcp_handler(data);</span>
+<span class="gd">-    log_msg(LOG_INFO, &quot;responded query %u&quot;, (unsigned)data-&gt;query-&gt;id);</span>
+<span class="gi">+    log_msg(LOG_INFO, &quot;responded query %u&quot;, (unsigned)data-&gt;query-&gt;id);</span>
+<span class="gi">+    cleanup_tcp_handler(data);</span>
+</code></pre></div>
+
+<p>将 <code>cleanup_tcp_handler</code> 调用移到日志代码之后，确保日志访问发生在释放之前。修复虽简单，却揭示了 TLS 写路径错误处理中资源生命周期管理的脆弱性——任何在 cleanup 之后访问 handler 成员的代码都是潜在 UAF。</p>
+<hr />
+<h2>六、CVE-2026-12246：APL RR 栈溢出</h2>
+<p>APL（Address Prefix List，RFC 3123）记录用于表达地址前缀列表。该漏洞与 SVCB 堆溢出异曲同工，但发生在区域文件写盘路径，且为栈溢出。</p>
+<h3>6.1 根因</h3>
+<p>处理特制 APL RR 时，<code>adflength</code>（地址族数据长度）字段被设为大于该地址族允许的最大长度（例如 IPv4 地址族却声明了远超 4 字节的长度）。当 xfrd 将区域数据写盘时，未对 <code>adflength</code> 做边界校验，直接拷贝到栈上定长缓冲区，造成栈溢出。</p>
+<ul>
+<li><strong>最大溢出</strong>：约 111 字节。</li>
+<li><strong>触发路径</strong>：与 12244 类似，需通过区域传输投毒，或由管理员加载恶意区域文件。</li>
+</ul>
+<p>栈溢出虽然可写量较小（111 字节），但栈上通常紧邻返回地址与帧指针，足以用于控制流劫持。该漏洞进一步证明：<strong>NSD 的 RR 解析/序列化路径普遍缺乏对变长字段与声明长度一致性的校验。</strong></p>
+<hr />
+<h2>七、PoC 构造思路</h2>
+<p>以下为概念性构造思路，仅用于理解漏洞机理，不含可直接运行的攻击代码。</p>
+<h3>7.1 CVE-2026-12244：AXFR 投毒堆溢出</h3>
+<div class="highlight"><pre><span></span><code><span class="err">步骤</span><span class="w"> </span><span class="mi">1</span><span class="p">:</span><span class="w"> </span><span class="err">在攻击者控制的</span><span class="s2">&quot;主服务器&quot;</span><span class="err">上，构造恶意区域文件，</span>
+<span class="w">        </span><span class="err">其中包含一条</span><span class="w"> </span><span class="n">SVCB</span><span class="w"> </span><span class="n">RR</span><span class="err">，其</span><span class="w"> </span><span class="n">SvcParams</span><span class="w"> </span><span class="err">填充至约</span><span class="w"> </span><span class="mi">65512</span><span class="w"> </span><span class="err">字节</span>
+<span class="w">        </span><span class="p">(</span><span class="err">使用合法的</span><span class="w"> </span><span class="n">TLV</span><span class="w"> </span><span class="err">键值对填充，确保整体</span><span class="w"> </span><span class="n">rdlength</span><span class="w"> </span><span class="err">接近上限</span><span class="p">)</span>
+
+<span class="err">步骤</span><span class="w"> </span><span class="mi">2</span><span class="p">:</span><span class="w"> </span><span class="err">在受害从服务器</span><span class="w"> </span><span class="n">nsd</span><span class="o">.</span><span class="n">conf</span><span class="w"> </span><span class="err">中，将</span><span class="w"> </span><span class="n">evil</span><span class="o">.</span><span class="n">com</span><span class="w"> </span><span class="err">的</span><span class="w"> </span><span class="k">master</span><span class="w"> </span><span class="err">指向攻击者</span><span class="p">:</span>
+<span class="w">        </span><span class="n">zone</span><span class="p">:</span>
+<span class="w">            </span><span class="n">name</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;evil.com&quot;</span>
+<span class="w">            </span><span class="n">zonefile</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;evil.com.zone&quot;</span>
+<span class="w">            </span><span class="n">request</span><span class="o">-</span><span class="n">xfr</span><span class="p">:</span><span class="w"> </span><span class="n">AXFR</span><span class="w"> </span><span class="o">&lt;</span><span class="n">attacker</span><span class="o">-</span><span class="n">ip</span><span class="o">&gt;</span><span class="w"> </span><span class="n">NOKEY</span>
+
+<span class="err">步骤</span><span class="w"> </span><span class="mi">3</span><span class="p">:</span><span class="w"> </span><span class="err">触发区域传输</span><span class="w"> </span><span class="p">(</span><span class="err">或等待</span><span class="w"> </span><span class="n">xfrd</span><span class="w"> </span><span class="err">定时拉取</span><span class="p">):</span>
+<span class="w">        </span><span class="c1"># 在从服务器上</span>
+<span class="w">        </span><span class="n">nsd</span><span class="o">-</span><span class="n">control</span><span class="w"> </span><span class="n">reload</span><span class="w">        </span><span class="c1"># 或等待 zone refresh</span>
+
+<span class="err">步骤</span><span class="w"> </span><span class="mi">4</span><span class="p">:</span><span class="w"> </span><span class="n">xfrd</span><span class="w"> </span><span class="err">解析</span><span class="w"> </span><span class="n">AXFR</span><span class="w"> </span><span class="err">响应中的巨型</span><span class="w"> </span><span class="n">SVCB</span><span class="w"> </span><span class="n">RR</span>
+<span class="w">        </span><span class="err">→</span><span class="w"> </span><span class="n">read_svcb_rdata</span><span class="p">()</span><span class="w"> </span><span class="err">中</span><span class="w"> </span><span class="n">size</span><span class="w"> </span><span class="err">回绕</span>
+<span class="w">        </span><span class="err">→</span><span class="w"> </span><span class="err">极小堆分配</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">65509</span><span class="n">B</span><span class="w"> </span><span class="err">越界写</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">堆破坏</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">RCE</span>
+</code></pre></div>
+
+<h3>7.2 CVE-2026-12490：未授权区域传输</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 前提: 目标 NSD 配置了 TLS 认证的 provide-xfr，但未设 tls-auth-xfr-only: yes</span>
+<span class="c1">#       且未通过 IP ACL 拒绝攻击者 IP</span>
+
+<span class="c1"># 通过普通 TCP 53 端口发起 AXFR，不提供任何客户端证书</span>
+dig<span class="w"> </span>@target-ns<span class="w"> </span>evil.com<span class="w"> </span>AXFR<span class="w"> </span>+tcp
+
+<span class="c1"># 若漏洞存在且 IP 未被拒，将直接返回完整区域数据</span>
+<span class="c1"># (期望: 应要求 TLS 客户端证书; 实际: 跳过证书校验直接放行)</span>
+</code></pre></div>
+
+<h3>7.3 CVE-2026-12245：DoT UAF 崩溃</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. 与 DoT 端口 853 建立 TLS 连接 (openssl s_client)</span>
+<span class="c1"># 2. 发送一个标准 DNS 查询</span>
+<span class="c1"># 3. 在读取响应前立即关闭连接 (发送 FIN/RST)</span>
+<span class="c1"># 期望: NSD 正常清理连接; 实际: handle_tls_writing 走错误分支 → UAF → 进程崩溃</span>
+</code></pre></div>
+
+<hr />
+<h2>八、攻击链组合</h2>
+<p>CVE-2026-12244 与 CVE-2026-12490 可构成两条互补的攻击链，分别面向"代码执行"与"数据窃取/投毒"两个目标：</p>
+<div class="highlight"><pre><span></span><code>                         攻击者控制的恶意主服务器
+                                    │
+                          ┌─────────┴─────────┐
+                          │                   │
+                    路径 A: RCE            路径 B: 数据窃取
+                          │                   │
+                  ┌───────▼────────┐  ┌───────▼────────┐
+                  │ AXFR 投毒       │  │ 直接向从服务器  │
+                  │ 含巨型 SVCB RR  │  │ TCP 53 发 AXFR  │
+                  └───────┬────────┘  └───────┬────────┘
+                          │                   │
+                  ┌───────▼────────┐  ┌───────▼────────┐
+                  │ CVE-2026-12244 │  │ CVE-2026-12490 │
+                  │ 堆溢出 65509B  │  │ 认证绕过       │
+                  └───────┬────────┘  └───────┬────────┘
+                          │                   │
+                  ┌───────▼────────┐  ┌───────▼────────┐
+                  │ 堆元数据覆盖    │  │ 拉取完整区域    │
+                  │ → 任意写原语    │  │ → DNS 记录泄露  │
+                  │ → RCE           │  │ → 后续投毒下级  │
+                  └────────────────┘  └────────────────┘
+</code></pre></div>
+
+<p>两条链的协同价值在于：路径 B（认证绕过）让攻击者以零内存破坏成本读取区域数据，获取内网拓扑、服务端点（SVCB/HTTPS 记录直接暴露内部服务地址）等敏感信息；路径 A（堆溢出）则在对端不可信或可投毒时实现 RCE，拿下服务器本体。此外，一旦通过 12244 在从服务器上获得 RCE，攻击者可篡改该服务器对外提供的权威数据，进一步投毒其下游递归解析器，形成 DNS 层面的持久化。</p>
+<p>值得注意的是，CVE-2026-12490 的认证绕过还降低了 12244 的利用门槛——攻击者无需 TSIG 共享密钥，只要能影响区域的主从关系即可投毒。</p>
+<hr />
+<h2>九、防御方案</h2>
+<h3>9.1 升级到修复版本</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 从源码编译 (推荐)</span>
+wget<span class="w"> </span>https://www.nlnetlabs.nl/downloads/nsd/nsd-4.14.3.tar.gz
+tar<span class="w"> </span>xzf<span class="w"> </span>nsd-4.14.3.tar.gz<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">cd</span><span class="w"> </span>nsd-4.14.3
+./configure<span class="w"> </span>--with-ssl<span class="w"> </span>--enable-tls
+make<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>sudo<span class="w"> </span>make<span class="w"> </span>install
+
+<span class="c1"># 验证版本</span>
+nsd<span class="w"> </span>-v
+<span class="c1"># 应输出 NSD version 4.14.3</span>
+
+<span class="c1"># 重启服务</span>
+sudo<span class="w"> </span>systemctl<span class="w"> </span>restart<span class="w"> </span>nsd
+</code></pre></div>
+
+<h3>9.2 配置加固</h3>
+<p>核心是启用 <code>tls-auth-xfr-only</code> 强制区域传输走 TLS，并配合 TSIG 双重认证：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># /etc/nsd/nsd.conf</span>
+<span class="nt">server</span><span class="p">:</span>
+<span class="w">    </span><span class="c1"># 强制所有区域传输走 TLS，杜绝 TCP 53 上的认证绕过</span>
+<span class="w">    </span><span class="nt">tls-auth-xfr-only</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yes</span>
+<span class="w">    </span><span class="c1"># 关闭未使用的服务端口，最小化攻击面</span>
+<span class="w">    </span><span class="c1"># 如不需要 DoT，注释掉 tls-service-key 等</span>
+
+<span class="c1"># 定义 TLS 客户端证书认证 (双向 mTLS)</span>
+<span class="nt">tls-auth</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;xfr-mtls&quot;</span>
+<span class="w">    </span><span class="nt">auth-domain-name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;xfr-slave.example.com&quot;</span>
+<span class="w">    </span><span class="nt">client-cert</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/etc/nsd/certs/slave.crt&quot;</span>
+<span class="w">    </span><span class="nt">client-key</span><span class="p">:</span><span class="w">  </span><span class="s">&quot;/etc/nsd/certs/slave.key&quot;</span>
+
+<span class="c1"># 定义 TSIG 密钥 (双重认证)</span>
+<span class="nt">key</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;tsig-xfr&quot;</span>
+<span class="w">    </span><span class="nt">algorithm</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">hmac-sha256</span>
+<span class="w">    </span><span class="nt">secret</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&lt;base64-encoded-shared-secret&gt;&quot;</span>
+
+<span class="c1"># 区域配置: 同时启用 IP ACL + TSIG + TLS 认证 (纵深防御)</span>
+<span class="nt">zone</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;example.com&quot;</span>
+<span class="w">    </span><span class="nt">zonefile</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;example.com.zone&quot;</span>
+<span class="w">    </span><span class="c1"># 从服务器拉取时: TSIG + TLS 双认证</span>
+<span class="w">    </span><span class="nt">request-xfr</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">AXFR &lt;master-ip&gt; &quot;tsig-xfr&quot; tls-auth &quot;xfr-mtls&quot;</span>
+<span class="w">    </span><span class="c1"># 提供给从服务器时: 同样要求双认证</span>
+<span class="w">    </span><span class="nt">provide-xfr</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">&lt;slave-ip&gt; &quot;tsig-xfr&quot; tls-auth &quot;xfr-mtls&quot;</span>
+</code></pre></div>
+
+<h3>9.3 纵深防御清单</h3>
+<table>
+<thead>
+<tr>
+<th>防御层</th>
+<th>措施</th>
+<th>阻断的漏洞</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>版本</td>
+<td>升级 NSD ≥ 4.14.3</td>
+<td>全部四个</td>
+</tr>
+<tr>
+<td>配置</td>
+<td><code>tls-auth-xfr-only: yes</code></td>
+<td>CVE-2026-12490</td>
+</tr>
+<tr>
+<td>认证</td>
+<td>区域传输强制 TSIG + mTLS 双因子</td>
+<td>CVE-2026-12490 / 投毒链</td>
+</tr>
+<tr>
+<td>网络</td>
+<td>区域传输端口仅对管理网段开放，与查询端口分离</td>
+<td>CVE-2026-12245 / 攻击链</td>
+</tr>
+<tr>
+<td>监控</td>
+<td>对 AXFR 请求源 IP、TLS 证书不匹配事件告警</td>
+<td>CVE-2026-12490</td>
+</tr>
+<tr>
+<td>供应链</td>
+<td>仅从可信上游同步区域，校验主服务器身份</td>
+<td>CVE-2026-12244 / 12246</td>
+</tr>
+</tbody>
+</table>
+<p>审计时可用 <code>grep -i tls-auth-xfr-only /etc/nsd/nsd.conf</code> 确认开关、<code>grep -E "provide-xfr|request-xfr" /etc/nsd/nsd.conf</code> 核对所有区域是否同时具备 TSIG 与 <code>tls-auth</code>，并用 <code>nsd -v</code> 确认版本已离开 4.14.0–4.14.2 受影响区间。</p>
+<hr />
+<h2>十、时间线</h2>
+<table>
+<thead>
+<tr>
+<th>时间</th>
+<th>事件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2025-09-03</td>
+<td>NSD 4.13.0 引入 SVCB/HTTPS RR 支持（引入脆弱代码面）</td>
+</tr>
+<tr>
+<td>2026-06-22</td>
+<td>Qifan Zhang 将四个 CVE 报告至 Red Hat / NLnet Labs</td>
+</tr>
+<tr>
+<td>2026-06-24</td>
+<td>NLnet Labs 提交修复补丁</td>
+</tr>
+<tr>
+<td>2026-06-25</td>
+<td>NSD 4.14.3 安全版本发布</td>
+</tr>
+<tr>
+<td>2026-07</td>
+<td>漏洞详情公开披露</td>
+</tr>
+</tbody>
+</table>
+<p>从引入到修复约 9 个月，从报告到修复仅 3 天，体现了负责任的披露协调。值得注意的是，CVE-2026-12244 的脆弱代码随 SVCB 支持一同在 4.13.0 引入——新协议支持往往是新增攻击面的高发区，RR 解析器的新增代码应作为安全审计的重点。</p>
+<hr />
+<h2>十一、总结</h2>
+<p>NSD 本轮四个漏洞从不同维度揭示了权威 DNS 服务器的安全薄弱点：<strong>CVE-2026-12244（SVCB 堆溢出）</strong> 是经典的窄类型整数溢出，一行 <code>uint16_t → size_t</code> 的修复背后是 65509 字节可控堆写，警示 RR 解析路径的累加长度必须用足够宽的类型承载；<strong>CVE-2026-12490（认证绕过）</strong> 是逻辑缺陷，把"身份存在性"误用为"是否校验"的前提，警示认证要求必须是强制前置条件；<strong>CVE-2026-12245（UAF）</strong> 与 <strong>CVE-2026-12246（APL 栈溢出）</strong> 则分别暴露了 TLS 错误路径的资源生命周期管理与 RR 序列化路径的长度一致性校验缺失。</p>
+<p>更深层的问题在于信任模型：权威服务器在区域传输时把对端返回的 RR 当作可信输入解析，使区域传输从"数据同步"变为"代码执行入口"。防御上，除升级与配置加固外，更应从架构层面重新审视区域传输的输入信任级别——<strong>任何来自网络的数据，即便来自"可信"对端，都应经过完整边界校验。</strong></p>
+<hr />
+<h2>免责声明</h2>
+<p>本文仅供安全研究和技术学习使用。文中涉及的漏洞分析、PoC 构造思路和攻击链组合仅用于防御目的，旨在帮助安全从业者理解 NSD 权威 DNS 服务器的安全风险并制定防御策略。所有漏洞信息均来自公开披露的 CVE 与厂商安全公告，相关漏洞已在 NSD 4.14.3 及以上版本中修复。请勿将本文内容用于任何非法用途。读者应在合法授权的环境下进行安全测试，并遵守所在地区的法律法规。因不当使用本文内容所造成的任何后果，作者不承担任何责任。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Windows 绑定链接滥用：致盲 EDR、绕过 AMSI/AppLocker/Sysmon - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Windows 绑定链接滥用：致盲 EDR、绕过 AMSI/AppLocker/Sysmon</h1>
+<time>2026-08-05</time>
+<ul>
+<li>技术
+Slug: windows绑定链接滥用-致盲edr绕过amsi-applocker-sysmon</li>
+</ul>
+<hr />
+<p>Windows 安全体系里有一条被几乎所有防御机制默认成立的公理：<strong>"路径决定文件"</strong>。进程创建时内核报告的镜像路径、AppLocker 评估的可执行路径、EDR 传感器注入 DLL 的受信任目录、PowerShell 启动时加载的 <code>amsi.dll</code>——所有这些决策背后都假设"被评估的路径映射到所有人认为它映射到的那个文件"。2026 年 7 月，Bitdefender Labs 在 InsomniHack 2026 上系统化披露了一组攻击技术，证明这条公理可以被一种名为 <strong>Bind Links（绑定链接）</strong> 的 Windows 原生文件系统虚拟化机制彻底打破，且不依赖任何 CVE、不需要漏洞驱动、仅凭文档化的管理员 API 即可实现致盲 EDR、绕过 AMSI/AppLocker/Sysmon。</p>
+<p>本文从 <code>bindflt.sys</code> 微过滤器驱动的底层机制出发，逐层拆解文件绑定、进程绑定、隔离舱绑定三种滥用变体的技术递进关系，并覆盖 EDR-Redir 工具的循环重定向构造、Docker Desktop 提权场景，最后给出面向安全厂商的检测信号与防御方案。</p>
+<hr />
+<h2>一、Bind Links 机制详解</h2>
+<h3>1.1 这是什么</h3>
+<p>Bind Links 是 Windows 10 RS4（1803）及以后版本、以及全部 Windows 11 上引入的文件系统虚拟化功能，由 <strong>Bind Filter 微过滤器驱动（<code>bindflt.sys</code>）</strong> 实现。它允许管理员把一个本地虚拟路径透明地重定向到一个本地或远程后备路径。当应用以"看似正常"的方式打开虚拟路径时，内核实际返回的是后备路径对应的文件内容，且对调用者完全透明——调用者拿到的句柄、读到的字节、甚至文件元数据，都让它相信自己访问的就是虚拟路径本身。</p>
+<p>这套功能最初的工程目标是支撑 Windows 容器、打包应用（MSIX）与 Windows Sandbox 的文件系统隔离需求：让同一逻辑路径在不同隔离边界内解析到不同物理文件。然而正是这种"按需、按作用域改写路径解析结果"的能力，使其成为攻击者操控安全软件"看见的世界"的理想原语。</p>
+<h3>1.2 与 NTFS 硬链接/符号链接的关键区别</h3>
+<p>理解 Bind Link 的攻击价值，首先要厘清它与开发者更熟悉的 NTFS 链接机制的本质差异：</p>
+<table>
+<thead>
+<tr>
+<th>属性</th>
+<th>Bind Link</th>
+<th>符号链接（Symbolic Link）</th>
+<th>硬链接（Hard Link）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>重定向存放位置</td>
+<td><code>bindflt.sys</code> 内核内存映射表</td>
+<td>磁盘上的重解析点（Reparse Point）</td>
+<td>MFT 多个文件名条目</td>
+</tr>
+<tr>
+<td>正常文件枚举可见性</td>
+<td>通常不可见</td>
+<td>可见</td>
+<td>可见</td>
+</tr>
+<tr>
+<td>能否遮盖已存在文件</td>
+<td>可以（影子链接）</td>
+<td>通常需要创建链接对象</td>
+<td>不适用</td>
+</tr>
+<tr>
+<td>持久性</td>
+<td>删除或关机后消失</td>
+<td>持久</td>
+<td>持久</td>
+</tr>
+<tr>
+<td>所需权限</td>
+<td>管理员</td>
+<td>取决于配置</td>
+<td>适当文件权限</td>
+</tr>
+<tr>
+<td>是否创建物理文件</td>
+<td>否</td>
+<td>是（reparse point）</td>
+<td>否</td>
+</tr>
+<tr>
+<td>是否影响磁盘上的原始文件</td>
+<td>否</td>
+<td>否</td>
+<td>否</td>
+</tr>
+</tbody>
+</table>
+<p>最关键的一点在表格最后一行：<strong>Bind Link 的重定向发生在文件系统微过滤器栈内部，而不是磁盘上的 reparse point</strong>。原始源文件保持不动、数字签名依然有效、磁盘快照里看起来完全干净——但任何打开该路径的调用者实际接收到的字节，来自另一个由攻击者控制的后备文件。这意味着传统基于磁盘扫描、签名校验、文件哈希的检测逻辑全部失效，因为它们检查的"那个文件"根本没有被改动。</p>
+<h3>1.3 NT 底层实现组件</h3>
+<p>Bind Links 在 Windows 内核与用户态的组件分工如下：</p>
+<ul>
+<li><strong><code>bindflt.sys</code></strong>：执行重定向的内核微过滤器驱动，挂载在文件系统过滤器栈上，维护一份内部的"虚拟路径 → 后备路径"映射表。所有经过过滤器栈的文件 I/O 请求（IRP_MJ_CREATE 等）在到达底层文件系统之前，会先被 <code>bindflt.sys</code> 查表改写。</li>
+<li><strong><code>bindfltapi.dll</code> / <code>bindlink.dll</code></strong>：用户态 API 层，封装与驱动的通信。</li>
+<li><strong><code>CreateBindLink</code> / <code>RemoveBindLink</code></strong>：用户态 API，分别用于创建与移除绑定链接。</li>
+<li><strong>作用域</strong>：创建后绑定链接在系统范围内全局生效，直到调用 <code>RemoveBindLink</code> 或系统关机。Silo 作用域的链接则仅在对应隔离舱内可见。</li>
+</ul>
+<h3>1.4 两种链接类型</h3>
+<ul>
+<li><strong>无锚点链接（Anchorless）</strong>：虚拟路径在创建链接前并不存在于磁盘上，整个路径完全由 <code>bindflt.sys</code> 在内存中合成。对枚举者而言，这条路径像是"凭空出现"的。</li>
+<li><strong>影子链接（Shadow）</strong>：虚拟路径在创建链接前已经存在于磁盘上，创建链接后原内容被隐藏，后备内容取而代之变得可见。这是劫持受信任系统文件（如 <code>amsi.dll</code>）所依赖的模式。</li>
+</ul>
+<h3>1.5 机制架构图</h3>
+<p>下图展示 Bind Link 在 Windows 文件系统过滤器栈中的位置与数据流向：</p>
+<div class="highlight"><pre><span></span><code><span class="c">   用户态应用 / 安全软件 / PowerShell / EDR 传感器</span>
+<span class="c">        |  CreateFile(&quot;C:\Windows\System32\amsi</span><span class="nt">.</span><span class="c">dll&quot;)</span>
+<span class="c">        v</span>
+<span class="c">  </span><span class="nb">+----------------------------------------------------+</span>
+<span class="c">  |  I/O 管理器  </span><span class="nb">-</span><span class="nv">&gt;</span><span class="c">  IRP_MJ_CREATE                       |</span>
+<span class="c">  </span><span class="nb">+----------------------------------------------------+</span>
+<span class="c">        |</span>
+<span class="c">        v</span>
+<span class="c">  </span><span class="nb">+----------------------------------------------------+</span>
+<span class="c">  |  过滤器栈 (Filter Manager altitude 排序)            |</span>
+<span class="c">  |    </span><span class="k">[</span><span class="c">上方</span><span class="k">]</span><span class="c"> WdFilter / EDR 微过滤器 / 杀软过滤驱动    |</span>
+<span class="c">  |    </span><span class="nb">----------------</span><span class="c"> bindflt</span><span class="nt">.</span><span class="c">sys </span><span class="nb">--------------------</span><span class="c">|</span><span class="nv">&lt;</span><span class="nb">--</span><span class="c"> 维护虚拟</span><span class="nb">-</span><span class="nv">&gt;</span><span class="c">后备映射表</span>
+<span class="c">  |    </span><span class="k">[</span><span class="c">下方</span><span class="k">]</span><span class="c"> NTFS / ReFS                               |    (内核内存</span><span class="nt">,</span><span class="c"> 非磁盘)</span>
+<span class="c">  </span><span class="nb">+----------------------------------------------------+</span>
+<span class="c">        |  bindflt</span><span class="nt">.</span><span class="c">sys 命中映射:</span>
+<span class="c">        |     虚拟  C:\Windows\System32\amsi</span><span class="nt">.</span><span class="c">dll</span>
+<span class="c">        |     后备  C:\temp\amsi_neutered</span><span class="nt">.</span><span class="c">dll</span>
+<span class="c">        v</span>
+<span class="c">  </span><span class="nb">+----------------------------------------------------+</span>
+<span class="c">  |  底层文件系统打开 后备路径 真实文件                  |</span>
+<span class="c">  </span><span class="nb">+----------------------------------------------------+</span>
+<span class="c">        |</span>
+<span class="c">        v   返回文件内容(攻击者控制) </span><span class="nb">-</span><span class="nv">&gt;</span><span class="c"> 透明回传给调用者</span>
+<span class="c">   调用者认为读到了 System32\amsi</span><span class="nt">.</span><span class="c">dll</span><span class="nt">,</span><span class="c"> 实际是替换 DLL</span>
+</code></pre></div>
+
+<p>注意一个微妙但致命的细节：<code>bindflt.sys</code> 在 altitude 排序中的位置决定了它能否拦截到 EDR 微过滤器"之上"的请求。攻击者构造的映射在过滤器栈内被解析，这意味着安全软件如果只是简单地"在进程创建回调里拿镜像路径再打开它"，它打开的依然是已经被改写后的路径结果。</p>
+<hr />
+<h2>二、三种滥用技术</h2>
+<p>Bitdefender Labs 在 2026 年 7 月的研究与 InsomniHack 2026 演示中，将 Bind Links 的滥用归纳为三种递进变体。它们的威胁模型一致：</p>
+<ul>
+<li><strong>影响范围</strong>：Windows 10 RS4+ 与全部 Windows 11 系统</li>
+<li><strong>前提条件</strong>：攻击者已获得本地管理员权限</li>
+<li><strong>是否需要漏洞驱动</strong>：否，仅使用文档化的 Windows 功能与管理员权限</li>
+<li><strong>关联 CVE</strong>：无，不是零日漏洞</li>
+</ul>
+<p>也就是说，这不是一个传统意义上的"漏洞利用"，而是对合法功能的<strong>滥用（abuse）</strong>。这一点对防御侧意义重大：补丁无法修复它，因为它并非缺陷而是设计行为。</p>
+<h3>2.1 技术一：File-Binding（文件绑定）——劫持文件与工件</h3>
+<p><strong>原理</strong>：选择其他组件信任的文件路径，创建一条从该受信任源路径指向攻击者控制的后备文件的绑定链接。此后任何打开受信任路径的调用者，实际拿到的都是后备文件的内容。</p>
+<p><strong>绕过 AMSI 的完整链路</strong>：</p>
+<ol>
+<li>PowerShell 启动时按惯例从 <code>C:\Windows\System32\amsi.dll</code> 加载 AMSI 提供者。</li>
+<li>攻击者创建一条从真实 AMSI 路径到替换 DLL 的影子绑定链接。</li>
+<li>替换 DLL 导出与原 <code>amsi.dll</code> 完全相同的函数符号（<code>AmsiScanBuffer</code>、<code>AmsiScanString</code>、<code>AmsiInitialize</code> 等），但内部不执行任何安全检查，对所有扫描一律返回 <code>AMSI_RESULT_CLEAN</code>。</li>
+<li>PowerShell 仍认为自己从 System32 加载了合法的 AMSI，但实际映射进地址空间的是攻击者的代码。</li>
+<li>所有后续脚本扫描返回"干净"，AMSI 被彻底中和。</li>
+</ol>
+<p><strong>关键点</strong>：整个过程无需 patch PowerShell 进程、无需 patch 磁盘上的 <code>amsi.dll</code>、无需经典的远程进程注入 API（<code>CreateRemoteThread</code>/<code>WriteProcessMemory</code>）。这些传统手法恰好是 EDR 重点监控的高敏信号，而 Bind Link 路径完全绕开了它们。磁盘上的原始 <code>amsi.dll</code> 签名校验仍然通过——因为那个文件根本没有被触碰。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 概念性 PoC：创建绑定链接劫持 AMSI</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;windows.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;bindlink.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span>
+
+<span class="n">HRESULT</span><span class="w"> </span><span class="nf">hijackAmsi</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 虚拟路径：受信任的 AMSI DLL 路径(系统加载点)</span>
+<span class="w">    </span><span class="n">PCWSTR</span><span class="w"> </span><span class="n">virtualPath</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sa">L</span><span class="s">&quot;C:</span><span class="se">\\</span><span class="s">Windows</span><span class="se">\\</span><span class="s">System32</span><span class="se">\\</span><span class="s">amsi.dll&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="c1">// 后备路径：攻击者控制的替换 DLL(导出同名函数, 无安全检查)</span>
+<span class="w">    </span><span class="n">PCWSTR</span><span class="w"> </span><span class="n">backingPath</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sa">L</span><span class="s">&quot;C:</span><span class="se">\\</span><span class="s">temp</span><span class="se">\\</span><span class="s">amsi_neutered.dll&quot;</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 创建影子绑定链接(覆盖已存在的 amsi.dll)</span>
+<span class="w">    </span><span class="c1">// CREATE_BIND_LINK_FLAG_READ_ONLY: 只读映射</span>
+<span class="w">    </span><span class="n">HRESULT</span><span class="w"> </span><span class="n">hr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">CreateBindLink</span><span class="p">(</span>
+<span class="w">        </span><span class="n">virtualPath</span><span class="p">,</span>
+<span class="w">        </span><span class="n">backingPath</span><span class="p">,</span>
+<span class="w">        </span><span class="n">CREATE_BIND_LINK_FLAG_READ_ONLY</span><span class="p">,</span>
+<span class="w">        </span><span class="mi">0</span><span class="p">,</span><span class="w">        </span><span class="c1">// 无例外路径数量</span>
+<span class="w">        </span><span class="nb">NULL</span><span class="w">      </span><span class="c1">// 无例外路径数组</span>
+<span class="w">    </span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">SUCCEEDED</span><span class="p">(</span><span class="n">hr</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 下次 PowerShell(或任何加载 amsi.dll 的宿主)启动时,</span>
+<span class="w">        </span><span class="c1">// bindflt.sys 将返回攻击者的 DLL,</span>
+<span class="w">        </span><span class="c1">// 而磁盘上的原始 amsi.dll 完好无损、签名有效。</span>
+<span class="w">        </span><span class="n">wprintf</span><span class="p">(</span><span class="sa">L</span><span class="s">&quot;[+] Bind link created: %s -&gt; %s</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span>
+<span class="w">                </span><span class="n">virtualPath</span><span class="p">,</span><span class="w"> </span><span class="n">backingPath</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">wprintf</span><span class="p">(</span><span class="sa">L</span><span class="s">&quot;[-] CreateBindLink failed: 0x%08lx</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">hr</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">hr</span><span class="p">;</span>
+<span class="p">}</span>
+
+<span class="c1">// 清理: RemoveBindLink(virtualPath) 或直接关机即失效</span>
+</code></pre></div>
+
+<p>AMSI 只是这条链路最直观的目标。同样的原语可以劫持任何"按固定受信任路径加载"的工件：EDR 传感器注入的 DLL、Defender 的定义文件、甚至证书信任链里的目录文件。只要安全逻辑从一条固定路径取内容，就可以被一条影子链接替换。</p>
+<h3>2.2 技术二：Process-Binding（进程绑定）——创建虚假进程身份</h3>
+<p><strong>原理</strong>：把重定向应用于可执行文件本身。进程创建时，Windows 向各回调订阅者（包括 EDR、Sysmon、AppLocker）报告的镜像路径是受信任的源路径，但实际提供执行代码的却是另一个不同的后备可执行文件。</p>
+<p><strong>Bitdefinder 演示</strong>：源路径指向 <code>winver.exe</code>（关于 Windows 的小工具，签名、可信），后备路径指向 <code>cmd.exe</code>。启动 <code>winver.exe</code> 后，实际运行的是 <code>cmd.exe</code> 的代码，但进程创建的多个信号（<code>PsSetCreateProcessNotifyRoutine</code> 回调、ETW 日志、任务管理器镜像列）继续报告 <code>winver.exe</code> 为镜像路径。</p>
+<p><strong>击败的安全机制</strong>：</p>
+<ul>
+<li>基于镜像路径的应用白名单（如 AppLocker 路径规则）</li>
+<li>基于发布者/签名的策略检查（因为报告的路径指向签名有效的合法程序）</li>
+<li>依赖进程镜像路径做哈希的取证工具</li>
+</ul>
+<p><strong>局限性</strong>：全局映射存在一个固有弱点——如果安全工具在进程已经启动后，重新打开"报告的镜像路径"并检查其加载模块或重新计算哈希，它会发现：进程实际加载的代码段对应的文件，与磁盘上 <code>winver.exe</code> 的内容对不上。这种"先记录事件、再回头验证"的模式是检测进程绑定的切入点，也正是技术三要解决的问题。</p>
+<div class="highlight"><pre><span></span><code><span class="w">   </span><span class="err">攻击者</span><span class="o">:</span><span class="w"> </span><span class="err">启动</span><span class="w"> </span><span class="n">C</span><span class="o">:</span><span class="err">\</span><span class="n">Windows</span><span class="err">\</span><span class="n">System32</span><span class="err">\</span><span class="n">winver</span><span class="p">.</span><span class="n">exe</span>
+<span class="w">        </span><span class="o">|</span>
+<span class="w">        </span><span class="n">v</span>
+<span class="w">   </span><span class="n">CreateProcess</span><span class="w"> </span><span class="err">镜像路径</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">winver</span><span class="p">.</span><span class="n">exe</span><span class="w"> </span><span class="p">(</span><span class="err">报告给所有回调</span><span class="p">)</span>
+<span class="w">        </span><span class="o">|</span>
+<span class="w">        </span><span class="n">v</span>
+<span class="w">   </span><span class="o">+--------------------------------------------------+</span>
+<span class="w">   </span><span class="o">|</span><span class="w">  </span><span class="n">bindflt</span><span class="p">.</span><span class="n">sys</span><span class="w"> </span><span class="err">映射</span><span class="o">:</span><span class="w">                                </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">    </span><span class="err">虚拟</span><span class="w">  </span><span class="n">C</span><span class="o">:</span><span class="err">\</span><span class="p">...</span><span class="err">\</span><span class="n">winver</span><span class="p">.</span><span class="n">exe</span><span class="w">                        </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">    </span><span class="err">后备</span><span class="w">  </span><span class="n">C</span><span class="o">:</span><span class="err">\</span><span class="p">...</span><span class="err">\</span><span class="n">cmd</span><span class="p">.</span><span class="n">exe</span><span class="w">  </span><span class="p">(</span><span class="err">实际执行代码来源</span><span class="p">)</span><span class="w">        </span><span class="o">|</span>
+<span class="w">   </span><span class="o">+--------------------------------------------------+</span>
+<span class="w">        </span><span class="o">|</span>
+<span class="w">        </span><span class="n">v</span>
+<span class="w">   </span><span class="err">进程地址空间加载的是</span><span class="w"> </span><span class="n">cmd</span><span class="p">.</span><span class="n">exe</span><span class="w"> </span><span class="err">的代码段</span>
+<span class="w">        </span><span class="o">|</span>
+<span class="w">   </span><span class="o">+-------------------+</span><span class="w">       </span><span class="o">+------------------------+</span>
+<span class="w">   </span><span class="o">|</span><span class="w"> </span><span class="n">EDR</span><span class="w"> </span><span class="err">进程创建回调</span><span class="w">   </span><span class="o">|</span><span class="w">       </span><span class="o">|</span><span class="w"> </span><span class="n">AppLocker</span><span class="w"> </span><span class="err">策略评估</span><span class="w">     </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w"> </span><span class="err">收到镜像</span><span class="o">=</span><span class="n">winver</span><span class="p">.</span><span class="n">exe</span><span class="o">|</span><span class="w">       </span><span class="o">|</span><span class="w"> </span><span class="err">路径受信任</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">放行</span><span class="w">     </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w"> </span><span class="err">记录</span><span class="s">&quot;运行了 winver&quot;</span><span class="o">|</span><span class="w">       </span><span class="o">|</span><span class="w"> </span><span class="p">(</span><span class="err">实际跑的是</span><span class="w"> </span><span class="n">cmd</span><span class="p">)</span><span class="w">       </span><span class="o">|</span>
+<span class="w">   </span><span class="o">+-------------------+</span><span class="w">       </span><span class="o">+------------------------+</span>
+<span class="w">        </span><span class="o">|</span>
+<span class="w">   </span><span class="err">弱点</span><span class="o">:</span><span class="w"> </span><span class="n">EDR</span><span class="w"> </span><span class="err">稍后重开</span><span class="w"> </span><span class="n">winver</span><span class="p">.</span><span class="n">exe</span><span class="w"> </span><span class="err">路径做哈希</span><span class="o">/</span><span class="err">模块枚举</span>
+<span class="w">         </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">发现加载代码与磁盘</span><span class="w"> </span><span class="n">winver</span><span class="p">.</span><span class="n">exe</span><span class="w"> </span><span class="err">不一致</span>
+</code></pre></div>
+
+<h3>2.3 技术三：Silo-Binding（隔离舱绑定）——最先进变体</h3>
+<p><strong>原理</strong>：利用 Windows 的 <strong>Silo（隔离舱，Server Silo）</strong>——容器、打包应用与 Windows Sandbox 背后的隔离边界——使同一条路径在隔离进程组的内部和外部分辨出不同的结果。这是三种变体里最接近"完美欺骗"的构造。</p>
+<p>Silo 是 Windows 内核对进程集合的隔离抽象：同一 Silo 内的进程共享一套独立的命名空间视图（包括文件系统路径解析、注册表、对象目录），而 Silo 之外的进程看到的是宿主系统的原始视图。<code>bindflt.sys</code> 支持按 Silo 作用域注册绑定链接，这天然提供了"双视图"能力。</p>
+<p><strong>双向重定向构造</strong>：</p>
+<ol>
+<li><strong>Silo 内部</strong>：受信任可执行文件路径（<code>trusted.exe</code>）重定向到恶意代码（payload 执行）。</li>
+<li><strong>Silo 外部</strong>：反向绑定链接将恶意文件路径（<code>malware.exe</code>）重定向回干净的可执行文件。</li>
+<li>安全软件在隔离环境之外运行，当它重新打开同一路径计算哈希或扫描时，反向映射返回的是干净文件。</li>
+<li>恶意后备文件隐藏在反向映射之后，外部任何"按路径取文件"的尝试都拿到合法内容。</li>
+</ol>
+<p><strong>绕过 AppLocker 的逻辑</strong>：假设策略允许 <code>trusted.exe</code>、阻止 <code>malware.exe</code>。Silo-Binding 使受信任路径在 Silo 内部返回被阻止的可执行文件的代码——也就是说，AppLocker 从外部基于受信任身份批准了进程创建，但 Silo 内实际执行的是被阻止的程序。AppLocker 的评估发生在 Silo 之外的宿主上下文，它看到的路径身份是合法的；而进程实际运行的代码来自 Silo 内的映射，AppLocker 看不见。</p>
+<p><strong>绕过 Sysmon 哈希记录</strong>：</p>
+<ul>
+<li>Sysmon 在进程创建事件（Event ID 1）中记录镜像路径，并按配置为每个程序记录哈希值（SHA1/SHA256/IMPHASH 等）。</li>
+<li>Silo-Binding 使 Sysmon 在进程启动时收到的镜像路径是受信任的源路径。</li>
+<li>关键在于 Sysmon（以及大多数 EDR）的哈希计算存在一个时间差：事件先被记录，哈希可能延迟到稍后才通过对路径重新打开文件计算。</li>
+<li>如果 Sysmon 稍后从 Silo 外部打开该路径计算哈希，反向映射返回的是干净文件。</li>
+<li><strong>结果</strong>：事件日志里包含合法程序名称 + 有效且正确的哈希值，与白名单基线完全吻合，没有任何异常可触发告警。</li>
+</ul>
+<p>需要强调：这并非 Sysmon 特有的缺陷。任何采用"<strong>先记录事件、再重新打开文件进行哈希/扫描/签名验证</strong>"架构的工具都会被欺骗——而这几乎是所有现代 EDR 与取证工具的共同设计模式。</p>
+<div class="highlight"><pre><span></span><code><span class="o">===</span><span class="w"> </span><span class="n">Silo</span><span class="o">-</span><span class="n">Binding</span><span class="w"> </span><span class="err">双向重定向</span><span class="w"> </span><span class="o">===</span>
+
+<span class="w">      </span><span class="err">宿主系统</span><span class="w"> </span><span class="p">(</span><span class="n">Silo</span><span class="w"> </span><span class="err">外</span><span class="p">,</span><span class="w"> </span><span class="n">EDR</span><span class="o">/</span><span class="n">Sysmon</span><span class="o">/</span><span class="n">AppLocker</span><span class="w"> </span><span class="err">运行于此</span><span class="p">)</span>
+<span class="w">   </span><span class="o">+----------------------------------------------------------+</span>
+<span class="w">   </span><span class="o">|</span><span class="w">  </span><span class="err">反向绑定链接</span><span class="p">(</span><span class="err">全局</span><span class="o">/</span><span class="err">宿主作用域</span><span class="p">):</span><span class="w">                            </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">     </span><span class="n">C</span><span class="p">:</span>\<span class="o">...</span>\<span class="n">malware</span><span class="o">.</span><span class="n">exe</span><span class="w">  </span><span class="o">-&gt;</span><span class="w">  </span><span class="n">C</span><span class="p">:</span>\<span class="o">...</span>\<span class="n">winver</span><span class="o">.</span><span class="n">exe</span><span class="w"> </span><span class="p">(</span><span class="err">干净</span><span class="p">)</span><span class="w">      </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">                                                            </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">  </span><span class="n">EDR</span><span class="w"> </span><span class="err">重开路径做哈希</span><span class="o">/</span><span class="err">扫描</span><span class="p">:</span><span class="w">                                  </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">     </span><span class="err">打开</span><span class="w"> </span><span class="n">C</span><span class="p">:</span>\<span class="o">...</span>\<span class="n">trusted</span><span class="o">.</span><span class="n">exe</span><span class="w">  </span><span class="p">(</span><span class="err">假设无反向映射则见</span><span class="w"> </span><span class="n">payload</span><span class="p">)</span><span class="w">  </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">     </span><span class="err">打开</span><span class="w"> </span><span class="n">C</span><span class="p">:</span>\<span class="o">...</span>\<span class="n">malware</span><span class="o">.</span><span class="n">exe</span><span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">返回</span><span class="w"> </span><span class="n">winver</span><span class="o">.</span><span class="n">exe</span><span class="w"> </span><span class="err">干净内容</span><span class="w">   </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">     </span><span class="err">哈希</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">winver</span><span class="o">.</span><span class="n">exe</span><span class="w"> </span><span class="err">的合法哈希</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">通过校验</span><span class="w">              </span><span class="o">|</span>
+<span class="w">   </span><span class="o">+----------------------------------------------------------+</span>
+<span class="w">                           </span><span class="o">^</span><span class="w">   </span><span class="o">|</span>
+<span class="w">                           </span><span class="o">|</span><span class="w">   </span><span class="o">|</span><span class="w"> </span><span class="err">路径解析请求</span>
+<span class="w">                           </span><span class="o">|</span><span class="w">   </span><span class="n">v</span>
+<span class="w">   </span><span class="o">+----------------------------------------------------------+</span>
+<span class="w">   </span><span class="o">|</span><span class="w">  </span><span class="n">Silo</span><span class="w"> </span><span class="err">内部</span><span class="w"> </span><span class="p">(</span><span class="err">隔离进程组</span><span class="p">,</span><span class="w"> </span><span class="err">攻击</span><span class="w"> </span><span class="n">payload</span><span class="w"> </span><span class="err">运行于此</span><span class="p">)</span><span class="w">            </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">  </span><span class="err">正向绑定链接</span><span class="p">(</span><span class="n">Silo</span><span class="w"> </span><span class="err">作用域</span><span class="p">):</span><span class="w">                                </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">     </span><span class="n">C</span><span class="p">:</span>\<span class="o">...</span>\<span class="n">trusted</span><span class="o">.</span><span class="n">exe</span><span class="w">  </span><span class="o">-&gt;</span><span class="w">  </span><span class="n">C</span><span class="p">:</span>\<span class="o">...</span>\<span class="n">malware</span><span class="o">.</span><span class="n">exe</span><span class="w"> </span><span class="p">(</span><span class="n">payload</span><span class="p">)</span><span class="w">  </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">                                                            </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">  </span><span class="n">Silo</span><span class="w"> </span><span class="err">内进程启动</span><span class="w"> </span><span class="n">trusted</span><span class="o">.</span><span class="n">exe</span><span class="p">:</span><span class="w">                              </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">     </span><span class="n">bindflt</span><span class="w"> </span><span class="err">命中</span><span class="w"> </span><span class="n">Silo</span><span class="w"> </span><span class="err">作用域映射</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">执行</span><span class="w"> </span><span class="n">malware</span><span class="o">.</span><span class="n">exe</span><span class="w"> </span><span class="err">代码</span><span class="w">  </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w">     </span><span class="err">报告镜像路径</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">trusted</span><span class="o">.</span><span class="n">exe</span><span class="w"> </span><span class="p">(</span><span class="err">受信任身份</span><span class="p">)</span><span class="w">                </span><span class="o">|</span>
+<span class="w">   </span><span class="o">+----------------------------------------------------------+</span>
+</code></pre></div>
+
+<h3>2.4 三种技术的递进关系</h3>
+<p>三种变体并非平行选项，而是一条不断"关闭检测弱点"的演进路径：</p>
+<div class="highlight"><pre><span></span><code><span class="w">   </span><span class="n">File</span><span class="o">-</span><span class="n">Binding</span><span class="w"> </span><span class="p">(</span><span class="err">文件级劫持</span><span class="p">)</span>
+<span class="w">     </span><span class="o">|</span><span class="w">  </span><span class="err">劫持</span><span class="w"> </span><span class="n">amsi</span><span class="o">.</span><span class="n">dll</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="err">传感器</span><span class="w"> </span><span class="n">DLL</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="err">定义文件</span>
+<span class="w">     </span><span class="o">|</span><span class="w">  </span><span class="err">弱点</span><span class="p">:</span><span class="w"> </span><span class="err">全局映射</span><span class="p">,</span><span class="w"> </span><span class="err">安全工具重开路径可见不一致</span>
+<span class="w">     </span><span class="n">v</span>
+<span class="w">   </span><span class="n">Process</span><span class="o">-</span><span class="n">Binding</span><span class="w"> </span><span class="p">(</span><span class="err">进程级身份伪造</span><span class="p">)</span>
+<span class="w">     </span><span class="o">|</span><span class="w">  </span><span class="err">报告</span><span class="w"> </span><span class="n">winver</span><span class="o">.</span><span class="n">exe</span><span class="p">,</span><span class="w"> </span><span class="err">实跑</span><span class="w"> </span><span class="n">cmd</span><span class="o">.</span><span class="n">exe</span>
+<span class="w">     </span><span class="o">|</span><span class="w">  </span><span class="err">弱点</span><span class="p">:</span><span class="w"> </span><span class="err">外部工具重开镜像路径仍可能看到代码不一致</span>
+<span class="w">     </span><span class="n">v</span>
+<span class="w">   </span><span class="n">Silo</span><span class="o">-</span><span class="n">Binding</span><span class="w"> </span><span class="p">(</span><span class="err">双视图隔离</span><span class="p">)</span>
+<span class="w">     </span><span class="o">|</span><span class="w">  </span><span class="n">Silo</span><span class="w"> </span><span class="err">内恶意执行</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">Silo</span><span class="w"> </span><span class="err">外干净视图</span>
+<span class="w">     </span><span class="o">|</span><span class="w">  </span><span class="err">正向映射</span><span class="p">(</span><span class="n">payload</span><span class="p">)</span><span class="o">+</span><span class="err">反向映射</span><span class="p">(</span><span class="err">干净</span><span class="p">)</span><span class="o">=</span><span class="w"> </span><span class="err">完全欺骗</span>
+<span class="w">     </span><span class="n">v</span>
+<span class="w">   </span><span class="err">完美欺骗</span><span class="p">:</span><span class="w"> </span><span class="err">报告路径</span><span class="o">/</span><span class="err">哈希</span><span class="o">/</span><span class="err">签名全部合法</span><span class="p">,</span><span class="w"> </span><span class="err">检测信号归零</span>
+</code></pre></div>
+
+<p>每一次演进都精准地封堵了上一代的检测切口：File-Binding 解决了"如何在不碰磁盘文件的前提下替换内容"，Process-Binding 解决了"如何让进程身份本身受信任"，Silo-Binding 则解决了"如何让外部验证看到的是干净视图"。到 Silo-Binding 这一层，攻击者构造的不再是一条单向欺骗，而是一个<strong>对称的双面世界</strong>——隔离舱内的进程看到并执行恶意代码，隔离舱外的安全软件看到并验证干净文件，两者都"正确"，只是看的不是同一个文件。</p>
+<hr />
+<h2>三、EDR-Redir 工具：另一种构造方式</h2>
+<p>除了 Bitdefender 披露的三种变体，开源工具 <strong>EDR-Redir</strong> 提供了另一条利用 <code>bindflt.sys</code> 的实战路径，其演化分两个版本：</p>
+<h3>3.1 V1（2025 年 10 月）：直接文件夹重定向</h3>
+<ul>
+<li>利用 <code>bindflt.sys</code> 与云文件过滤器 <code>cldflt.sys</code>（Cloud Files Mini Filter）实现文件夹级重定向。</li>
+<li>成功重定向 <strong>Elastic Defend</strong> 与 <strong>Sophos Intercept X</strong> 的传感器目录，使其加载攻击者控制的 DLL 而非厂商签名模块。</li>
+<li>对 <strong>Windows Defender</strong>：单独使用 <code>bindflt.sys</code> 不够，因为 Defender 对自身目录有额外保护。EDR-Redir 转而使用 <strong>Cloud Files API（CFAPI）</strong> 将 Defender 文件夹注册为同步根（sync root），从而获得对该目录内容的重定向能力。</li>
+<li>结果：Defender 的实时扫描传感器被替换为空操作实现，扫描结果恒为"未发现威胁"。</li>
+</ul>
+<h3>3.2 V2（2025 年 11 月）：重定向循环技术</h3>
+<ul>
+<li>升级为<strong>重定向循环</strong>：用两条方向相反的绑定链接构成一个环，路径 A 重定向到路径 B，路径 B 又重定向回路径 A。</li>
+<li>这种构造使得任何试图"沿后备链回溯到真实文件"的验证逻辑陷入循环，无法终止或被诱导返回受控内容。</li>
+<li>成功在 Windows 11 上致盲 Windows Defender，使其扫描引擎在循环映射中始终取到攻击者预设的"干净"视图。</li>
+</ul>
+<p>EDR-Redir 的存在证明：Bind Links 的攻击面不止于 Bitdefender 描述的三种身份欺骗变体，任何能操控"安全软件加载自身组件的路径解析"的构造，都属于同一攻击原语的实例化。</p>
+<hr />
+<h2>四、核心攻击原语</h2>
+<p>把上述所有技术抽象一下，会发现它们共享同一个底层原语：<strong>打破"路径 → 文件"的单一映射假设</strong>。大量 Windows 安全逻辑都始于一条路径，并默认这条路径稳定地指向同一个文件：</p>
+<div class="highlight"><pre><span></span><code><span class="c">=== 攻击原语: 路径信任链的断裂 ===</span>
+
+<span class="c">   传统假设(防御侧默认成立):</span>
+<span class="c">   </span><span class="nb">+---------+</span><span class="c">        1:1        </span><span class="nb">+-----------+</span>
+<span class="c">   |  路径   |  </span><span class="nb">----------------</span><span class="nv">&gt;</span><span class="c"> |  文件     |</span>
+<span class="c">   </span><span class="nb">+---------+</span><span class="c">                    </span><span class="nb">+-----------+</span>
+<span class="c">   C:\</span><span class="nt">...</span><span class="c">\amsi</span><span class="nt">.</span><span class="c">dll                磁盘上唯一的 amsi</span><span class="nt">.</span><span class="c">dll</span>
+
+<span class="c">   Bind Link 引入后(攻击者可改写):</span>
+<span class="c">   </span><span class="nb">+---------+</span><span class="c">     bindflt 映射    </span><span class="nb">+-----------+</span>
+<span class="c">   |  路径   |  </span><span class="nb">-----------------</span><span class="nv">&gt;</span><span class="c"> |  后备文件 |  </span><span class="nv">&lt;</span><span class="nb">-</span><span class="c"> 调用者实际拿到</span>
+<span class="c">   </span><span class="nb">+---------+</span><span class="c">                     </span><span class="nb">+-----------+</span>
+<span class="c">       |   ^</span>
+<span class="c">       |   | 磁盘上原始文件(签名有效</span><span class="nt">,</span><span class="c"> 扫描干净) </span><span class="nv">&lt;</span><span class="nb">-</span><span class="c"> 防御侧校验对象</span>
+<span class="c">       v   |</span>
+<span class="c">   </span><span class="nb">+-----------+</span>
+<span class="c">   | 原始文件  |</span>
+<span class="c">   </span><span class="nb">+-----------+</span>
+</code></pre></div>
+
+<p>具体的安全决策点与对应的攻击实例：</p>
+<table>
+<thead>
+<tr>
+<th>安全决策（始于路径）</th>
+<th>默认假设</th>
+<th>Bind Link 如何打破</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>进程创建 → 驱动收到镜像路径 → 安全产品打开路径算哈希</td>
+<td>镜像路径 = 实际执行代码文件</td>
+<td>进程绑定：报告 trusted.exe，实跑 malware.exe</td>
+</tr>
+<tr>
+<td>AppLocker 检查路径/哈希/发布者规则</td>
+<td>评估的路径对应将被执行的代码</td>
+<td>Silo-Binding：外部评估 trusted.exe，内部执行 malware.exe</td>
+</tr>
+<tr>
+<td>防火墙规则基于可执行路径</td>
+<td>路径决定出站/入站授权</td>
+<td>文件绑定：路径不变，内容替换</td>
+</tr>
+<tr>
+<td>EDR 传感器从受信任产品目录注入 DLL</td>
+<td>目录里的 DLL 是厂商签名模块</td>
+<td>EDR-Redir：重定向传感器目录到攻击者 DLL</td>
+</tr>
+<tr>
+<td>PowerShell 从 System32 加载 amsi.dll</td>
+<td>System32\amsi.dll 是微软签名安全模块</td>
+<td>文件绑定：amsi.dll → 替换 DLL，扫描恒干净</td>
+</tr>
+<tr>
+<td>Sysmon 延迟计算进程镜像哈希</td>
+<td>事件时与哈希时的路径解析一致</td>
+<td>Silo-Binding：事件时见 payload，哈希时见干净文件</td>
+</tr>
+</tbody>
+</table>
+<p>所有这些决策背后的假设完全相同：<strong>被评估的路径映射到所有人认为它映射到的那个文件</strong>。Bind Links 打破的正是这一假设，而且是在内核过滤器栈这一安全软件难以察觉的层级打破的。</p>
+<hr />
+<h2>五、检测信号与防御方案</h2>
+<h3>5.1 Microsoft 的 Veto（否决）机制</h3>
+<p>Windows 11 24H2 引入了微过滤器<strong>否决绑定链接</strong>机制，允许安全微过滤器对自己关心的目录否决绑定链接的创建，从源头阻止对其目录的劫持。但该机制存在明确限制：</p>
+<ul>
+<li><strong>作用范围受限</strong>：仅在系统启动分区（<code>DO_SYSTEM_BOOT_PARTITION</code>）上可否决。非启动分区上的绑定链接无法被否决。</li>
+<li><strong>位置要求</strong>：要否决绑定链接的微过滤器必须在 <strong>BindFlt 之下</strong>（更低 altitude）才能生效。多数 EDR 微过滤器为了拦截所有 I/O，通常挂在较高 altitude，反而不满足否决条件。</li>
+<li>因此，Veto 机制目前更像一个针对性缓解，而非全面防御，安全厂商不能依赖它作为唯一防线。</li>
+</ul>
+<h3>5.2 面向安全厂商的检测建议</h3>
+<p>核心思路：<strong>不要把进程创建期间报告的镜像路径视为权威</strong>。任何"先拿路径、后取文件"的逻辑都存在 TOCTOU（Time-Of-Check-Time-Of-Use）窗口，而 Bind Links 恰恰利用这个窗口构造双视图。</p>
+<ol>
+<li><strong>解析真正的后备文件</strong>：在进程创建回调中，除了记录报告的镜像路径，还应主动查询 <code>bindflt.sys</code> 当前的路径映射，解析出真实的后备文件，对后备文件做哈希、签名、扫描。</li>
+<li><strong>重复验证</strong>：延迟哈希、异步扫描、签名检查等每一次"事后取文件"的操作，都应重复验证路径映射是否与事件发生时一致。若不一致，直接判定为可疑。</li>
+<li><strong>枚举活动的 Bind Filter 映射</strong>：定期枚举全局及各 Silo 作用域内的绑定链接，建立基线，对新增映射告警。</li>
+<li><strong>对比报告路径与实际映射镜像</strong>：对每个进程，比较回调报告的镜像路径与按当前映射解析出的实际文件，不匹配即告警。</li>
+<li><strong>监控 Silo/容器创建</strong>：异常的 Server Silo 创建往往伴随绑定链接的配置，应与后续进程活动关联分析。</li>
+<li><strong>关联提权与 EDR 篡改</strong>：将绑定链接创建活动与本地提权、EDR 自保护告警关联，作为高置信度攻击指标。</li>
+</ol>
+<h3>5.3 检测信号汇总表</h3>
+<table>
+<thead>
+<tr>
+<th>检测信号</th>
+<th>说明</th>
+<th>命中的攻击变体</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>枚举全局和 Silo 作用域的绑定链接映射</td>
+<td>直接发现异常重定向</td>
+<td>全部三种 + EDR-Redir</td>
+</tr>
+<tr>
+<td>监控 <code>bindflt.sys</code> 驱动活动</td>
+<td>异常的 <code>CreateBindLink</code> 调用</td>
+<td>全部三种 + EDR-Redir</td>
+</tr>
+<tr>
+<td>监控 Silo/容器创建</td>
+<td>与进程活动关联分析</td>
+<td>Silo-Binding</td>
+</tr>
+<tr>
+<td>对比报告镜像路径与实际映射镜像</td>
+<td>发现身份不匹配</td>
+<td>Process-Binding、Silo-Binding</td>
+</tr>
+<tr>
+<td>延迟哈希/扫描时的后备文件验证</td>
+<td>防止"先记录后重开"被欺骗</td>
+<td>Silo-Binding（Sysmon 哈希绕过）</td>
+</tr>
+<tr>
+<td>关键目录绑定链接监控（System32、传感器目录）</td>
+<td>检测 EDR-Redir 类攻击</td>
+<td>File-Binding、EDR-Redir</td>
+</tr>
+<tr>
+<td><code>cldflt.sys</code> / CFAPI 同步根注册异常</td>
+<td>检测对受保护目录的 Cloud Files 注册</td>
+<td>EDR-Redir V1（Defender）</td>
+</tr>
+<tr>
+<td>路径解析循环检测</td>
+<td>识别 V2 重定向循环</td>
+<td>EDR-Redir V2</td>
+</tr>
+</tbody>
+</table>
+<h3>5.4 架构级防御原则</h3>
+<p>从更深层次看，Bind Links 攻击暴露的是 Windows 安全生态对"路径即身份"这一假设的系统性依赖。防御的根本方向是<strong>从依赖路径转向依赖内容</strong>：</p>
+<ul>
+<li><strong>内容寻址优于路径寻址</strong>：进程身份的最终判定应基于实际加载进地址空间的代码段哈希（如内存镜像哈希），而非磁盘路径哈希。内存中正在执行的代码无法被路径映射欺骗。</li>
+<li><strong>映射一致性证明</strong>：在进程创建与后续验证之间，要求内核提供"路径解析未被改写"的证明，或在事件中直接内联后备文件内容，消除事后重开的 TOCTOU 窗口。</li>
+<li><strong>过滤器栈位置审计</strong>：安全微过滤器应评估自身 altitude 与 <code>bindflt.sys</code> 的相对位置，必要时调整或注册 Veto，确保对自己关键目录的绑定链接创建具备可见与可阻能力。</li>
+</ul>
+<hr />
+<h2>六、Docker Desktop 提权场景</h2>
+<p>除了安全软件致盲，Bind Links 还催生了一个现实的本地提权路径：<strong>docker-users 组成员</strong>（默认非本地管理员）可借助绑定链接达到 SYSTEM 权限。</p>
+<p>Docker Desktop 在 Windows 上以 Linux 容器模式运行时，依赖一个以 SYSTEM 权限运行的后台服务（<code>com.docker.service</code>）。docker-users 组成员对该服务的某些路径与配置具备控制权。攻击者利用这一权限创建一条精心构造的绑定链接，使 SYSTEM 服务在解析自身组件路径时取到攻击者控制的文件，进而以 SYSTEM 身份执行攻击者代码，完成从普通 docker-users 到 SYSTEM 的权限跃迁。</p>
+<p>该场景在 2026 年被报告后，Docker 更新了文档，明确提示 docker-users 组成员在安全模型上等价于本地管理员——因为通过绑定链接这条路径，组权限可被放大为 SYSTEM。这对企业终端管理有实际影响：任何被授予 docker-users 成员资格的账户，都应按本地管理员同等对待，纳入管理员治理与监控范围。</p>
+<hr />
+<h2>七、总结</h2>
+<p>Bind Links 滥用代表了一类值得警惕的攻击范式：<strong>合法的内核虚拟化功能，在管理员权限下，被重新组合为绕过整个安全软件栈的原语</strong>。它不依赖漏洞、不需要零日、不受补丁约束，因为它的基础能力本身就是 Windows 文件系统隔离的设计组成部分。</p>
+<p>三种技术变体构成清晰的演进链条——文件绑定劫持内容、进程绑定伪造身份、Silo-Binding 构造双视图——每一步都精准封堵上一步的检测切口。EDR-Redir 则从文件夹重定向与循环映射的角度，证明同一原语存在多种实例化路径。对防御侧而言，核心教训是：<strong>只要安全逻辑信任"路径稳定映射到唯一文件"这一假设，就存在被 Bind Links 欺骗的空间</strong>。检测的根本方向是从路径信任转向内容信任、从单次校验转向映射一致性证明。</p>
+<p>这项研究也再次印证一个反复出现的教训：操作系统的隔离与虚拟化机制是一把双刃剑。为容器、沙箱、打包应用提供便利的同一套内核能力，在攻击者手中就变成了对安全软件"所见世界"的操控工具。安全厂商在评估自身产品抗绕过能力时，应将"路径解析可被微过滤器改写"这一前提纳入威胁模型，而非继续假设磁盘上的文件就是调用者拿到的文件。</p>
+<hr />
+<blockquote>
+<p><strong>免责声明</strong>：本文仅用于网络安全技术研究与教育目的，旨在帮助安全从业者、防御方与系统管理员理解 Windows Bind Links 机制的攻击面及相应检测防御方法。文中所涉及的技术细节、代码示例与攻击链描述均基于 Bitdefender Labs、InsomniHack 2026 公开演讲及 EDR-Redir 开源项目的公开研究资料整理，不包含任何未公开的漏洞利用细节或武器化代码。所有技术内容仅供在已获授权的测试环境、红蓝对抗演练与防御能力建设中使用。读者严禁将本文所述技术用于任何未经授权的系统访问、数据窃取、恶意软件分发或其他违法活动。在实际生产环境中实施任何检测或缓解措施前，应充分评估其对系统稳定性与兼容性的影响。作者与发布平台对因不当使用本文信息所造成的任何直接或间接损失不承担法律责任。</p>
+</blockquote>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
