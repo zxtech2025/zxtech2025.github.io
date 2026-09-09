@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LiteLLM 连中三发：大模型网关为什么成了密钥金库的入口 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>LiteLLM 连中三发：大模型网关为什么成了密钥金库的入口</h1>
+<time>2026-09-09</time>
+<ul>
+<li>安全</li>
+<li>AI工程</li>
+<li>LLM</li>
+<li>攻击面</li>
+</ul>
+<hr />
+<h1>LiteLLM 连中三发：大模型网关为什么成了密钥金库的入口</h1>
+<p>9 月 2 日，CISA 把 BerriAI LiteLLM 的第三个漏洞 CVE-2026-59822（认证缺陷）拉进了 KEV 目录——已知被利用漏洞目录。加上 5 月的 CVE-2026-42208（SQL 注入）和 6 月的 CVE-2026-42271（命令注入），LiteLLM 在四个月里连中三发，而且三个都在野外被实际利用。这不是某个冷门组件被扫到了，而是一个 5.8 万 star、被大量团队当「大模型 nginx」用的网关，成了攻击者偷上游 API key 的入口。</p>
+<h2>LiteLLM 是什么，为什么它天生是攻击面</h2>
+<p>LiteLLM 的定位是 LLM 网关：你把 OpenAI、Anthropic、Azure、Bedrock、vLLM 这些上游的 key 都交给它，它对外统一暴露一个 OpenAI 格式的 <code>/v1/chat/completions</code>，负责路由、负载均衡、限流、预算追踪、guardrail 和日志。一句话，它是所有模型调用流量的咽喉。</p>
+<p>问题就出在这。它不像普通业务服务那样只握着「自己的」数据，它握着的是<strong>你所有云厂商的 LLM API key</strong>。一个部署在内网或公网上的 LiteLLM 实例，本质上是一个密钥金库：打穿它，等于同时打穿了 OpenAI、Anthropic、Azure 的账单。</p>
+<p>部署形态很简单：</p>
+<div class="highlight"><pre><span></span><code>litellm<span class="w"> </span>--config<span class="w"> </span>config.yaml<span class="w">   </span><span class="c1"># 默认监听 4000 端口</span>
+</code></pre></div>
+
+<p>三样东西构成了它的核心资产，也构成了攻击面：</p>
+<ol>
+<li><strong>master key</strong>：环境变量 <code>LITELLM_MASTER_KEY</code>，是访问代理全部能力的总钥匙。<strong>不设这个变量，代理默认无任何鉴权</strong>——谁能连到 4000 端口，谁就能白嫖你的模型额度，还能直接调管理接口。</li>
+<li><strong>virtual keys</strong>：<code>/key/generate</code> 给每个用户/团队发的子 key，带预算和速率上限。<code>/key/info</code>、<code>/key/delete</code>、<code>/key/update</code> 是它的管理端点。</li>
+<li><strong>config.yaml</strong>：<code>model_list</code> 里每个模型的 <code>litellm_params</code> 藏着真实的 <code>api_key</code> 和 <code>api_base</code>。预算追踪走 Postgres + Prisma，密钥元数据也落在这里。</li>
+</ol>
+<p>顺带说一句，LiteLLM 现在的核心是 Rust 写的，外面包一层 Python SDK，两者之间有进程边界和序列化开销。这个架构本身不是漏洞，但它解释了命令注入为什么危险：Rust core 和 Python 侧之间的参数传递，一旦有字段能落进 <code>subprocess</code> / <code>Command::new</code>，执行上下文就是代理进程自己的权限。</p>
+<p>认清这个结构，下面三个 CVE 就好理解了。</p>
+<h2>三个 CVE 逐一拆</h2>
+<h3>CVE-2026-42208：预算追踪层的 SQL 注入（5 月进 KEV）</h3>
+<p>LiteLLM 的 spend tracking 和 key 管理依赖数据库查询。SQL 注入发生在 key 查询、用户查询、预算统计这条链路上。攻击者一旦能构造恶意的查询参数，就能绕过预算校验，甚至直接把数据库里的 virtual key 和 master key 读出来。</p>
+<p>这类注入最典型的入口是那些「按字段过滤」的查询——按 user、team、model 名过滤 spend 记录的地方，参数拼接进了 SQL。对攻击者来说，SQLi 在这里的回报比普通 Web 应用高得多：表里存的是密钥和账单，不是普通的业务数据。</p>
+<h3>CVE-2026-42271：命令注入（6 月进 KEV）</h3>
+<p>命令注入通常藏在「把配置值传给子进程」的路径上。LiteLLM 现在的核心是 Rust 写的，Python SDK 和 Rust core 之间有进程边界；自定义 provider、<code>custom_llm_provider</code>、或者是某些把模型参数拼进 shell 的调用链，都是经典的命令注入点。</p>
+<p>对这类漏洞，攻击者不需要拿到 master key 就能开火：只要某个配置字段能落进 <code>subprocess</code> / <code>Command::new</code> 的参数，就能让代理进程以运行者的身份执行命令。而代理进程通常以 root 或高权限容器身份跑，因为它要读配置、写日志、连上游。</p>
+<h3>CVE-2026-59822：认证缺陷（9 月 2 日进 KEV，最新）</h3>
+<p>这是最新一个，也是 FreeBuf 那句「黑客正顺着 LiteLLM 偷你的大模型密钥」的直接来源。认证缺陷这一类，最典型的表现是：某些端点没挂在鉴权中间件后面，或者 master key 和 virtual key 的校验逻辑存在旁路。</p>
+<p>LiteLLM 的认证层覆盖的端点很多——<code>/v1/*</code>、<code>/key/*</code>、<code>/user/*</code>、<code>/team/*</code>、<code>/spend/*</code>、<code>/health</code>。只要其中一条路由漏了鉴权，攻击者就能在没 key 的情况下访问管理接口。这类漏洞最要命的地方在于：<strong>它不需要任何前置条件</strong>。SQLi 可能还要碰运气猜参数，命令注入要找到拼接点，但认证旁路只要命中一个漏网的端点，<code>/key/info</code> 直接吐给你所有 virtual key。</p>
+<h2>第四个没进 KEV、但同样危险的向量：SSRF</h2>
+<p>严格说 SSRF 不是这三个 CVE 里的，但它和「密钥集中」这个主题绑定得最紧，值得单独拎出来。LiteLLM 的 <code>config.yaml</code> 里，每个模型的 <code>litellm_params</code> 有两个字段：<code>api_key</code> 和 <code>api_base</code>。<code>api_base</code> 决定请求打到哪个 URL 上。</p>
+<p>这天然就是个 SSRF 温床：如果攻击者能控制模型配置——比如通过某个管理接口新增一个「自定义模型」，把 <code>api_base</code> 指到 <code>http://169.254.169.254/latest/meta-data/</code>，代理就会替它请求云元数据服务。即便拿不到 master key，只要能写 config 或者利用认证旁路新增模型，就能让 LiteLLM 变成内网探测的跳板。</p>
+<p>再叠加一个更阴的玩法：把 <code>api_base</code> 指到内网某个没鉴权的服务（Redis、K8s API、内部 LLM 推理端点），借网关的身份去打内网。对部署了 LiteLLM 的团队，这条链路的价值不在于「SSRF 本身」，而在于<strong>网关通常被部署在网络分区里比较靠里的位置</strong>——它够得着很多应用够不着的内网资产。</p>
+<h2>攻击链：从暴露端口到密钥失窃</h2>
+<p>把三个漏洞串起来，就是一条完整的攻击链，每个阶段都有对应的动作：</p>
+<p><strong>Step 1 — 发现</strong>。攻击者扫公网上的 4000 端口，或者在内网横向时撞到部署了 LiteLLM 的主机。指纹很好认：<code>GET /health/liveliness</code> 或 <code>/health/readiness</code> 返回典型的 LiteLLM JSON，<code>/ui</code> 是管理界面。</p>
+<p><strong>Step 2 — 认证旁路</strong>。打 CVE-2026-59822，或者干脆撞上「没设 <code>LITELLM_MASTER_KEY</code>」的裸奔实例——这类实例在真实环境里多到离谱，因为文档里的快速上手示例默认就是不带 key 起服务。</p>
+<p><strong>Step 3 — 枚举密钥</strong>。拿到访问权后，<code>GET /key/info</code> 列出所有 virtual key 及其对应的 model、spend、上限；<code>GET /user/info</code>、<code>GET /team/info</code> 摸清组织结构和预算。</p>
+<p><strong>Step 4 — 窃取上游 key</strong>。要么读 config.yaml 里的 <code>api_key</code>/<code>api_base</code>，要么直接通过代理转发调用上游——账单记在受害者头上。更隐蔽的做法是 SQLi / 命令注入直接拖库，把 master key 和所有上游 key 一次性带走。</p>
+<p><strong>Step 5 — 变现</strong>。偷来的 OpenAI/Anthropic key 转手倒卖，或者直接用受害者额度跑自己的任务（挖矿式消耗、批量内容生成、搭代理）。大模型 key 的「损耗」比云主机更难察觉，因为账单只在月底对账时才看得出来。</p>
+<h2>防御：三条硬规则</h2>
+<p><strong>规则一：master key 是必选项，不是可选项。</strong> 起服务前先设 <code>LITELLM_MASTER_KEY</code>，用强随机值。检查部署有没有裸奔：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 检查代理进程是否带着 master key 启动</span>
+ps<span class="w"> </span>aux<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>litellm
+docker<span class="w"> </span>inspect<span class="w"> </span>&lt;container&gt;<span class="w"> </span>--format<span class="w"> </span><span class="s1">&#39;{{.Config.Env}}&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>tr<span class="w"> </span><span class="s1">&#39;,&#39;</span><span class="w"> </span><span class="s1">&#39;\n&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-i<span class="w"> </span>master_key
+</code></pre></div>
+
+<p><strong>规则二：端口别裸奔。</strong> LiteLLM 默认绑 0.0.0.0:4000，公网部署等于把密钥库挂到门口。要么绑定内网地址，要么前面套反代只留白名单：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 绑定回环 / 内网网卡</span>
+litellm<span class="w"> </span>--config<span class="w"> </span>config.yaml<span class="w"> </span>--host<span class="w"> </span><span class="m">127</span>.0.0.1<span class="w"> </span>--port<span class="w"> </span><span class="m">4000</span>
+<span class="c1"># 或容器内只映射到宿主机内网</span>
+docker<span class="w"> </span>run<span class="w"> </span>-p<span class="w"> </span><span class="m">192</span>.168.1.10:4000:4000<span class="w"> </span>...
+</code></pre></div>
+
+<p>排查当前有没有暴露：</p>
+<div class="highlight"><pre><span></span><code>ss<span class="w"> </span>-tlnp<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span><span class="m">4000</span>
+</code></pre></div>
+
+<p>看到 <code>0.0.0.0:4000</code> 就说明公网可达，赶紧改。</p>
+<p><strong>规则三：virtual key 最小权限 + 轮换。</strong> 每个应用一个 virtual key，只授予它需要的 model 和预算上限，别把 master key 到处发。上游 key 一旦怀疑泄露，立刻在云厂商控制台轮换——LiteLLM 里存的只是引用，真正的止血在 OpenAI/Anthropic 那边。</p>
+<p><strong>一次到位的自查清单</strong>，照着一遍过，五个问题全绿才算安全：</p>
+<ol>
+<li><code>LITELLM_MASTER_KEY</code> 设了没？值是不是强随机？</li>
+<li>4000 端口绑的是回环/内网，还是 <code>0.0.0.0</code>？</li>
+<li><code>/key/info</code> 这种管理端点，不带头能不能访问？（<code>curl -s http://localhost:4000/key/info</code> 试试，能出数据就是裸奔）</li>
+<li>config.yaml 里有没有明文 <code>api_key</code>？</li>
+<li>有没有监控上游账单的异常调用量？</li>
+</ol>
+<h2>我的做法</h2>
+<p>我自己跑 LiteLLM 只用于内网开发和自用，几条底线：</p>
+<ol>
+<li><strong>永远回环 + 反代</strong>。代理只绑 <code>127.0.0.1:4000</code>，对外走 Caddy/Nginx 加一层 Basic Auth 或 IP 白名单。公网直连 4000 这种事一次都不干。</li>
+<li><strong>config.yaml 里不放明文上游 key</strong>。用环境变量引用（<code>os.environ/OPENAI_API_KEY</code>），避免配置文件被拖走时连带密钥。</li>
+<li><strong>开审计日志</strong>。LiteLLM 的 callback 日志会记每次调用的 key、model、token 数。定期 grep 出异常的 key 用量突增，比月底对账单早一个量级发现泄露：</li>
+</ol>
+<div class="highlight"><pre><span></span><code>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;&quot;user&quot;:|&quot;spend&quot;:&#39;</span><span class="w"> </span>litellm.log<span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-200
+</code></pre></div>
+
+<p>大模型网关这层，我见过太多团队把它当「又一个微服务」来部署，结果忘了它手里攥着的是所有云厂商的钥匙。三个 KEV 漏洞不是巧合，而是「密钥集中 + 攻击面大 + 默认配置宽松」三个条件叠加的必然。如果你已经在生产上用 LiteLLM，今天就去查一遍 master key 和端口绑定——这比任何新功能都值得先做。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
