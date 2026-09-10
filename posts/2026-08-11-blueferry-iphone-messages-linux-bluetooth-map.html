@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>在 Linux 上收发 iPhone 消息：BlueFerry 的三条蓝牙通道 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>在 Linux 上收发 iPhone 消息：BlueFerry 的三条蓝牙通道</h1>
+<time>2026-08-11</time>
+<ul>
+<li>Linux</li>
+<li>蓝牙</li>
+<li>BlueZ</li>
+<li>协议分析</li>
+<li>桌面开发</li>
+</ul>
+<hr />
+<p>iMessage 在 Linux 上一直没有正经客户端。常见的绕法是架一台 Mac 做中继、登录账号走云服务，或者干脆放弃。BlueFerry 换了一条路：不碰云端，不碰账号，只用一个配对的 iPhone 和蓝牙标准 profile，把 SMS、RCS 和 iMessage 拉到 Linux 桌面上读写。</p>
+<p>项目在 github.com/erikwb/blueferry，GPL-2.0-or-later，后端管连接、客户端走 GTK/KDE/Quickshell/TUI。我把它 PROTOCOL.md 里的经验逐条读了一遍。那份文档的价值不在于"能用"，而在于它把 iOS 在这几条协议上的灰色地带写清楚了，而且明确标注哪些是经验观测、哪些是 Apple 未承诺的行为。</p>
+<h2>三条通道各管一段</h2>
+<p>BlueFerry 用的是三个标准蓝牙服务，没有自定义协议：</p>
+<table>
+<thead>
+<tr>
+<th>通道</th>
+<th>承载</th>
+<th>职责</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MAP</td>
+<td>BR/EDR</td>
+<td>消息收发、已读状态</td>
+</tr>
+<tr>
+<td>PBAP</td>
+<td>BR/EDR</td>
+<td>通讯录同步</td>
+</tr>
+<tr>
+<td>ANCS</td>
+<td>BLE (GATT)</td>
+<td>通知，以及群聊展示元数据</td>
+</tr>
+</tbody>
+</table>
+<p>MAP 和 PBAP 是经典蓝牙上的传统 profile，ANCS 是苹果在 BLE 上做的通知服务。麻烦在于前后两者承载不同，要在一个适配器上同时活着。</p>
+<h2>配对才是真正的硬骨头</h2>
+<p>文档里最长的一节讲配对，理由很充分：iOS 会根据 Linux 在配对时呈现的能力决定开放哪些权限。</p>
+<p>可行做法有这么几条约束：</p>
+<ul>
+<li>适配器的 Class of Device 必须是 A/V Hands-Free：major class 4、minor class 8。<code>btmgmt class 4 8</code> 得到基础值 <code>0x240408</code>，BlueZ 可能再补几个 service 位，实际报成 <code>0x7c0408</code>。</li>
+<li>Classic 配对进行时不能有 LE 广播。未配对状态就发 ANCS 征求广播的话，iOS 会把 LE 外设当成另一个配件连上来，一台电脑在手机侧留下两条设备记录（在 Intel AX210 + BlueZ 5.87 + iOS 26.5 上复现过）。ANCS 的征求广播（UUID <code>7905f431-b5ce-4e99-a40f-4b1e122d00d0</code>）只能在 bond 建立、Classic 已连上之后再注册。</li>
+<li>由 Linux 主动发现 iPhone 并发起连接，用户不需要在 iOS 的"其他设备"里点选这台电脑。</li>
+</ul>
+<p>真正的门道在认证由谁发起。跨传输的密钥派生只在 LE 链路 central 一侧能跑：authentication initiator 在 BR/EDR 加密之后走 SMP-on-BR/EDR 派生 LE 密钥。而 iPhone 在观察到的每一次连接里都把自己切成 ACL 的 central。所以在 Intel AX210 上用 Linux 主动调 <code>Device1.Pair()</code> 只拿到一个 BR/EDR-only 的 bond。Linux 发起了认证但不是 central，iPhone 是 central 却没发起，btmon 抓包显示两边都通告了 SMP 通道却没人打开它，尽管 link key 已经是 Secure Connections（<code>Type=8</code>）。</p>
+<p>在 MediaTek MT7922 上，同样的 <code>Pair()</code> 却拿到了双 bond。这就是硬件和固件的差异，不是代码能控制的部分。</p>
+<p>能稳定跑通的序列是 connect-first：先注册带设备作用域的配对 agent，然后对一个尚未配对的设备调 <code>Device1.Connect()</code>。iOS 拒绝没有安全性的 profile 连接，于是它自己发起配对；作为 central 兼 authentication initiator，它跑完整的跨传输派生。btmon 里能看到加密后紧接着 <code>BR/EDR SMP: Pairing Request/Response</code>、IRK 交换、新 LTK，约一秒后 <code>Bearer.LE1</code> 带着 <code>LE.Paired/Bonded</code> 出现。用户只需要在两边确认一次数字比对，适配器全程不需要变成可发现状态。</p>
+<p>一个产品化细节：BlueZ 既不暴露自己注册过的 agent 列表，也不告诉你默认 agent 是谁，所以"自动挑一个桌面 agent"这条路走不通。项目最后放弃了启发式，直接注册自己的 agent 并固定用 connect-first。</p>
+<h2>MAP 线上的真实情况</h2>
+<p>下面这段是整份文档里最实用的部分，讲的是协议规范不会写、但抓包就是这样的事。</p>
+<p>iOS 通过 MAP 同时暴露 SMS 和 iMessage，而在线上两者<strong>无法区分</strong>：都报 <code>Type: sms-gsm</code>。</p>
+<ul>
+<li><code>ListMessages</code> 把消息正文塞在 <code>Subject</code> 属性里，顺带给出联系人、时间戳、文件夹、类型和已读状态，不需要完整下载 bMessage。</li>
+<li>改 <code>Message1.Read</code> 会同步反映到手机上；反过来，在手机上打开一条消息会产生读属性更新，可以把桌面上的弹窗关掉。</li>
+<li>完整 <code>Get()</code> 拿到标准 bMessage，发起人 vCard 里可能是 <code>TEL</code>（电话号码）也可能是 <code>EMAIL</code>（Apple-ID 地址）。</li>
+</ul>
+<p>发消息要构造 MAP 1.4 bMessage 推进 <code>telecom/msg/outbox</code>，结构有讲究：</p>
+<ol>
+<li><code>BENV</code> 之外放一个空的发起人 vCard；</li>
+<li><code>BENV</code> 之内放一个或多个收件人 vCard；</li>
+<li>一个 UTF-8 的 <code>BBODY</code>/<code>MSG</code> 正文；</li>
+<li><code>TYPE:SMS_GSM</code>。哪怕收件人是 Apple-ID、哪怕最终走 iMessage，也必须写这个值。</li>
+</ol>
+<p>电话号码走 vCard 的 <code>TEL</code>，Apple-ID 走 <code>EMAIL</code>。如果目标是 iMessage 注册用户，iOS 会选 iMessage，发出的气泡是蓝色；否则手机自己选可用路径。Linux 端既不能强制，也无法在发送前验证这个选择。</p>
+<p>还有一个容易踩的坑：如果 bMessage 里塞了多个收件人 vCard，而收件人集合正好匹配某个已有 iMessage 群，消息会进那个群，不会扇出成几条单聊。地址集合搞错就会发给错误的人，所以项目只在后端自己拥有、无歧义的名单上允许这么做，且第一次回复前要用户确认。</p>
+<p>另外，收件人文本是 bMessage 的结构性输入，插入前必须校验，否则 CR/LF 或 vCard 分隔符能注入额外收件人；正文里以 bMessage 结构 token 开头的行需要做 MAP 字节填充。这类注入面和 HTTP 头注入是同一个模型。</p>
+<h2>群聊靠 ANCS 补元数据</h2>
+<p>MAP 送来的群消息只有一个发件人，没有参与者列表，也没有会话 ID。缺失的展示信息从对应的 Apple 通知里补：</p>
+<ul>
+<li>ANCS 应用 ID 是 <code>com.apple.MobileSMS</code>；</li>
+<li>通知正文和 MAP 的正文一致（ANCS 请求的正文被截到 256 字符，所以更长的 MAP 正文只能匹配前缀）；</li>
+<li>未命名群：标题是发件人，副标题形如 <code>To you &amp; 参与者</code>，更多名字用逗号或 &amp; 分隔；</li>
+<li>命名群：标题是发件人，副标题是群名。</li>
+</ul>
+<p>这些都是展示元数据，不是唯一会话标识，也不含成员名单。项目只在有限时间窗内做关联，正文重复且歧义时直接拒绝；要开启未命名群的回复，必须每个名字都能唯一解析到一个地址。命名群默认只读，直到用户自己提供收件人名单。</p>
+<p>最诚实的一条限制：iOS 会给出群名但不给会话 ID，所以两个同名群在本地会被投影成同一个会话。本地键保留大小写、内部空白和兼容字符，<code>Family</code> 和 <code>FAMILY</code> 是两个会话，只做 NFC 规范化和首尾空白裁剪。</p>
+<h2>OBEX 会话很脆</h2>
+<p>iOS 和 obexd 在会话被反复创建、销毁或重叠时表现很差，文档列了一组硬规则：</p>
+<ul>
+<li>一台 iPhone 同一时间只允许一台电脑持有 MAP 会话。如果被别的电脑占着，iOS 会用 <code>Connection refused (111)</code> 拒绝 <code>CreateSession(MAP)</code>。这不是配对或授权失败，正确做法是保持 daemon 在线、把这个状态暴露给客户端、继续轮询。</li>
+<li>MAP 和 PBAP 要独立开、独立重试。一个 profile 被拒不能影响另一个，反之亦然。MAP 被拒尤其不该挡住通讯录访问。</li>
+<li>阻塞型的 MAP/PBAP 操作要在一个 worker 上串行化。</li>
+<li>遇到 <code>Forbidden</code> 先做针对性的 stale session 清理再重试一次，而不是重启整个 obexd。早期那种"每次操作前重启 obex.service"的土办法会打断 MAP 监听，导致直接收不到新消息。</li>
+<li>会话对象消失、或 <code>org.bluez.obex</code> 总线属主消失，都算连接丢失。首次连上前每 5 秒轮询，之后每 15 秒。</li>
+<li>发送必须有观察到的 <code>complete</code> 状态才算成功。转移对象在成功完成后可能消失，但消失本身不能证明完成；没有终态证据就报 <code>SendOutcomeUnknown</code>，让用户去手机上核对再重试。下载则还要独立检查输出文件才算数。</li>
+</ul>
+<h2>顺手解决音频被抢</h2>
+<p>把一台电脑配对到 iPhone 上，很容易把通话和音乐也一起劫走。项目在 WirePlumber 0.5+ 上会在配对前写一份 <code>~/.config/wireplumber/wireplumber.conf.d/99-blueferry-keep-phone-audio.conf</code>，去掉让本机变成 A2DP/HFP sink 的 adapter role，并禁用手机声卡的自动连接，避免后续的 <code>bluetooth-a2dp-autoconnect</code> 规则把流抢过去。配对失败会删掉这次尝试装上的片段，成功后 daemon 会持续维护这份配置。</p>
+<h2>我的做法</h2>
+<ol>
+<li><strong>先跑 <code>blueferry doctor</code></strong>。它会分别报告消息、通讯录、iPhone 通知三路的状态。消息和通讯录能通、通知不通，是完全正常的组合，组播权限是单独一项，两者不该互相拖累。</li>
+<li><strong>配对失败就两边都 forget</strong>。手机侧残留的蓝牙状态能撑过一次单边 forget，所以在旧记录上一遍遍重配对只会持续失败，两边都清掉再从头来。</li>
+<li><strong>装包按发行版对号</strong>。Arch/Fedora 的包会配好 iPhone 系统通知需要的新蓝牙支持；Debian 系的包不碰也不重启蓝牙服务，消息和通讯录照常，通知只在机器本来就支持时才加上。Ubuntu 24.04、Mint、Pop!_OS 缺 Qt 依赖，用 GTK 或终端客户端。</li>
+</ol>
+<p>最后一句提醒写在这里：别把它当成唯一收信方式。附件、表情回应、正在输入、FaceTime、通话、完整的已发件历史都不支持，也不会去下载 iCloud 里的历史归档，而且 Apple 随时可以改掉它依赖的蓝牙行为。这是一个把标准 profile 挖到极限的实验性软件，它的价值更多在于那份把 iOS 未文档化行为记录下来的 PROTOCOL.md。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
