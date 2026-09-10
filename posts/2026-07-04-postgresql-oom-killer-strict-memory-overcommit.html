@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PostgreSQL 与 OOM Killer：一次 kill 为什么能打掉整个实例 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>PostgreSQL 与 OOM Killer：一次 kill 为什么能打掉整个实例</h1>
+<time>2026-07-04</time>
+<ul>
+<li>PostgreSQL</li>
+<li>Linux内核</li>
+<li>内存管理</li>
+<li>数据库运维</li>
+</ul>
+<hr />
+<p>一台跑 PostgreSQL 的机器内存被打满，OOM killer 挑中一个 backend 干掉。很多人以为这只影响一条连接——用户重连一下就好。实际上整个实例会跟着倒下：所有连接被掐断、未提交事务回滚、下次启动走一遍 crash recovery。WAL 写得多的话，恢复要跑很久。一次内存打满能换来一段不短的停机。</p>
+<p>Ubicloud 的工程团队把他们踩过的坑写成了一篇很实在的复盘：为什么他们坚持给 PostgreSQL 开严格 overcommit，以及他们是怎么被内核一个字符的 bug 反咬一口的。我读完觉得这是今年最值得数据库运维细读的一篇，下面把关键部分拆开。</p>
+<h2>postmaster 架构决定了它受不了 OOM kill</h2>
+<p>PostgreSQL 的主进程叫 postmaster，每来一个连接就 fork 一个 backend。这些 backend 共享同一段内存：shared buffers、WAL buffers、锁表、各种共享状态。OOM killer 不理解这套架构，它只按启发式（通常是占内存最多的进程）挑一个杀。如果被杀的 backend 正在写共享内存段，这段内存就可能处在不一致状态——OS 层面共享内存没有事务保证，shared buffers 里一个写了一半的页就是静默的数据损坏。</p>
+<p>postmaster 的应对是：一旦发现任何子进程被杀，就假定最坏情况，主动把所有剩余 backend 全部终止。这个行为是对的，PostgreSQL 在保护你的数据，但代价是<strong>一次 OOM kill 不是一条连接的事，而是整个服务器所有连接一起掉</strong>。</p>
+<h2>Linux 的三种 overcommit 策略</h2>
+<p><code>vm.overcommit_memory</code> 控制内核面对内存申请时的态度：</p>
+<ul>
+<li><strong>0（启发式，默认）</strong>：只拒绝单个离谱的大申请（超过可用物理内存 + swap + 可回收的 page cache/slab），其余随便超卖。等于只挡"一次要 800GB"这种。</li>
+<li><strong>1（永远允许）</strong>：任何 malloc/mmap 都成功。真要用到物理页时不够了，才轮到 OOM killer 上场。</li>
+<li><strong>2（严格）</strong>：内核用 <code>Committed_AS</code> 记录全系统已提交的虚拟内存，并强制一个上限 <code>CommitLimit</code>。任何会把 Committed_AS 顶过这个上限的申请，当场返回 <code>ENOMEM</code>。</li>
+</ul>
+<p>CommitLimit 的算法很简单：</p>
+<div class="highlight"><pre><span></span><code>CommitLimit = overcommit_kbytes + swap
+<span class="gh">#</span> 如果没有设置 overcommit_kbytes：
+CommitLimit = overcommit_ratio / 100 × 可用内存 + swap
+</code></pre></div>
+
+<p>关键差别在失败形态。严格模式下申请失败就是一个 <code>ENOMEM</code>：backend 把错误报给客户端、取消当前事务、继续活着，postmaster 不掉，其他连接不受影响。<strong>这是把"晚来的、破坏性的失败"换成"早来的、优雅的失败"</strong>——代价是得接受偶尔的业务报错。</p>
+<p>这个取舍有个前提：机器基本专用给 PostgreSQL 加少量已知的 sidecar。共享机器上别的进程会吃掉 commit 预算，数据库负载正常也可能吃 <code>ENOMEM</code>。</p>
+<h2>648GB 幽灵内存</h2>
+<p>他们开了严格模式，几周后开始收到内存报错，而机器上物理内存明明还剩很多。查 <code>/proc/meminfo</code>，一台 <strong>8GB</strong> 的机器上：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>cat<span class="w"> </span>/proc/meminfo<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>Committed_AS
+Committed_AS:<span class="w"> </span><span class="m">683547672</span><span class="w"> </span>kB<span class="w">      </span><span class="c1"># 651 GB</span>
+</code></pre></div>
+
+<p>同规格健康机器的对照值：</p>
+<div class="highlight"><pre><span></span><code><span class="n">Committed_AS</span><span class="o">:</span><span class="w"> </span><span class="mi">2703940</span><span class="w"> </span><span class="n">kB</span><span class="w">        </span><span class="err">#</span><span class="w"> </span><span class="mf">2.6</span><span class="w"> </span><span class="n">GB</span>
+</code></pre></div>
+
+<p>先怀疑是自己的配置算错了，用 <code>ps</code> 看进程：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>ps<span class="w"> </span>-C<span class="w"> </span>postgres<span class="w"> </span>-o<span class="w"> </span>pid,vsz,rss,cmd<span class="w"> </span>--sort<span class="o">=</span>-vsz
+PID<span class="w">   </span>VSZ<span class="w">     </span>RSS<span class="w">   </span>CMD
+<span class="m">96622</span><span class="w"> </span><span class="m">2242244</span><span class="w"> </span><span class="m">95416</span><span class="w"> </span>postgres:<span class="w"> </span><span class="m">18</span>/main:<span class="w"> </span>postgres<span class="w"> </span>postgres...
+</code></pre></div>
+
+<p>每个 backend 的 VSZ 约 2GB，正好等于 <code>shared_buffers</code> 的大小：每个 backend 都把同一段共享内存映射进自己的地址空间，所以 VSZ 会重复统计；但这不该影响 Committed_AS，共享段物理上只有一份，而且他们开了 <code>huge_pages = on</code>，hugetlb 映射有独立的预留记账，本来就不该进 Committed_AS。</p>
+<p>验证方法是看 VMA 的 <code>ac</code> 标志（<code>VM_ACCOUNT</code>），它表示这段区域计入已提交内存：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>sudo<span class="w"> </span>cat<span class="w"> </span>/proc/321784/smaps<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-A<span class="w"> </span><span class="m">25</span><span class="w"> </span>hugepage
+7fce75000000-7fcef0c00000<span class="w"> </span>rw-s<span class="w"> </span><span class="m">00000000</span><span class="w"> </span><span class="m">00</span>:10<span class="w"> </span><span class="m">10723551</span><span class="w">  </span>/anon_hugepage<span class="w"> </span><span class="o">(</span>deleted<span class="o">)</span>
+Size:<span class="w">            </span><span class="m">2027520</span><span class="w"> </span>kB
+Shared_Hugetlb:<span class="w">   </span><span class="m">393216</span><span class="w"> </span>kB
+VmFlags:<span class="w"> </span>rd<span class="w"> </span>wr<span class="w"> </span>sh<span class="w"> </span>mr<span class="w"> </span>mw<span class="w"> </span>me<span class="w"> </span>ms<span class="w"> </span>de<span class="w"> </span>ht<span class="w"> </span>sd<span class="w">      </span><span class="c1"># 没有 ac</span>
+</code></pre></div>
+
+<p>假设被排除。再手工把所有带 <code>ac</code> 的 VMA 加总：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>sudo<span class="w"> </span>awk<span class="w"> </span><span class="s1">&#39;/^Size/{s=$2} /VmFlags:/ &amp;&amp; / ac/{sum+=s} END{printf &quot;%.2f GB\n&quot;, sum/1048576}&#39;</span><span class="w"> </span>/proc/<span class="o">[</span><span class="m">0</span>-9<span class="o">]</span>*/smaps
+<span class="m">2</span>.43<span class="w"> </span>GB
+</code></pre></div>
+
+<p><strong>2.43GB 的实际记账 vs 651GB 的上报值，648GB 是凭空多出来的。</strong> 计数器在泄漏：申请时加了账，释放时没有减回来。</p>
+<h2>机队横向对比，把范围锁死</h2>
+<p>把整个 PostgreSQL 机队按内核版本和上线时长拉出来对比 Committed_AS / MemTotal 的比值：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>内核 6.5.0</th>
+<th>内核 6.8.0</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>比值中位数</td>
+<td>0.55</td>
+<td>0.27</td>
+</tr>
+<tr>
+<td>比值均值</td>
+<td>24.97</td>
+<td>0.32</td>
+</tr>
+<tr>
+<td>比值最大值</td>
+<td>3405</td>
+<td>1.86</td>
+</tr>
+<tr>
+<td>比值 &gt; 1.0 的机器</td>
+<td>23%</td>
+<td>&lt; 1%</td>
+</tr>
+</tbody>
+</table>
+<p>统计上，跑 6.5 内核的机器出现计价膨胀的概率是 <strong>52 倍</strong>。而且 6.5 上膨胀与 uptime 正相关，大约<strong>每周复合增长 4.7%</strong>；6.8 上没有这种相关性。</p>
+<h2>一个字符的内核 bug</h2>
+<p>定位到具体提交后，事情就清楚了。Linux 6.5 的 commit <code>408579c</code> 改了 <code>do_vmi_align_munmap()</code> 的返回值约定：原来 <code>0 = 成功、1 = 成功但锁降级、负数 = 错误</code>，改成<code>一律 0 = 成功、负数 = 错误</code>，并同步更新了调用方。但 <code>mm/mremap.c</code> 里 <code>move_vma()</code> 的判断改错了：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 正确：&lt; 0 才进错误分支</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">do_vmi_munmap</span><span class="p">(</span><span class="o">&amp;</span><span class="n">vmi</span><span class="p">,</span><span class="w"> </span><span class="n">mm</span><span class="p">,</span><span class="w"> </span><span class="n">old_addr</span><span class="p">,</span><span class="w"> </span><span class="n">old_len</span><span class="p">,</span><span class="w"> </span><span class="n">uf_unmap</span><span class="p">,</span><span class="w"> </span><span class="nb">false</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cm">/* OOM: unable to split vma, just get accounts right */</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">vm_flags</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="n">VM_ACCOUNT</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="o">!</span><span class="p">(</span><span class="n">flags</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="n">MREMAP_DONTUNMAP</span><span class="p">))</span>
+<span class="w">        </span><span class="n">vm_acct_memory</span><span class="p">(</span><span class="n">old_len</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="n">PAGE_SHIFT</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="c1">// 实际合入：! 反转了条件</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">do_vmi_munmap</span><span class="p">(</span><span class="o">&amp;</span><span class="n">vmi</span><span class="p">,</span><span class="w"> </span><span class="n">mm</span><span class="p">,</span><span class="w"> </span><span class="n">old_addr</span><span class="p">,</span><span class="w"> </span><span class="n">old_len</span><span class="p">,</span><span class="w"> </span><span class="n">uf_unmap</span><span class="p">,</span><span class="w"> </span><span class="nb">false</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="p">...</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>move_vma()</code> 的逻辑是：先为旧区域减少 Committed_AS，再调 <code>do_vmi_munmap()</code> 真正解除映射；如果 unmap 失败（旧区域还在），就必须把账加回来。条件反转之后，<strong>这段"补账"代码变成每次 mremap 成功都执行</strong>，计数器只增不减。</p>
+<p>Linus 亲自分析了根因，用一行改动修回来（把 <code>!</code> 改回 <code>&lt; 0</code>），并留下这段话：</p>
+<blockquote>
+<p>This didn't change any actual VM behavior <em>except</em> for memory accounting when 'VM_ACCOUNT' was set... the "Committed memory" accounting goes all wonky (Committed_AS value in /proc/meminfo), and depending on settings that then causes problems much much later as the VM relies on bogus statistics for its heuristics.</p>
+</blockquote>
+<p>这类 bug 之所以藏得住：默认启发式模式下 Committed_AS 纯粹是信息展示，内核不拿它当分配门禁，所以数字烂掉也没人管；只有严格模式才会因为它拒绝分配。而且失效是间接的——计数器安静地漂几周，直到越过 CommitLimit 才开始报错。</p>
+<h2>CommitLimit 怎么定</h2>
+<p>修复就位后再回过头开严格模式，他们的经验公式是：</p>
+<div class="highlight"><pre><span></span><code>overcommit_kbytes = total_memory_kb × 0.8 + 2 × 1048576
+</code></pre></div>
+
+<p>也就是<strong>物理内存的 80% 再加 2GB</strong>。</p>
+<p><strong>为什么留 20%</strong>：这部分给内核自己的数据结构（页表、slab、网络缓冲）兜底。20% 不是浪费，内核仍然拿空闲物理内存做 page cache，这是 PostgreSQL 读性能最大的帮手，而 page cache 是可回收的，本来就不计进 Committed_AS。</p>
+<p><strong>为什么固定加 2GB</strong>：每台机器上还有一堆 sidecar——prometheus、node_exporter、postgres_exporter、wal-g，清一色 Go 程序。Go runtime 启动就 mmap 预留大片虚拟内存，按需 fault in，<strong>它们提交的内存远大于实际 RSS</strong>。机队统计显示 96% 的机器 sidecar 提交量在 1GB 以内（和 vCPU 数只有弱相关，r = 0.22），固定 2GB 能覆盖 99% 以上，宁可给宽一点：这个额度给少了，sidecar 会悄悄吃掉剩余 commit 预算，最后吃 <code>ENOMEM</code> 的是 PostgreSQL 而不是 sidecar。</p>
+<p>实现里有个细节值得抄：他们用了 <code>vm.overcommit_kbytes</code> 而不是 <code>overcommit_ratio</code>，因为公式里那固定 2GB 没法用百分比表达（4GB 机器上它是 50%，64GB 上只有 3%）。另外如果是 hugepage 部署，还要先扣掉预留部分：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">configure_memory_overcommit</span><span class="p">(</span><span class="ss">strict</span><span class="p">:</span><span class="w"> </span><span class="kp">false</span><span class="p">)</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="n">strict</span>
+<span class="w">    </span><span class="n">total_mem_kb</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="no">File</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="s2">&quot;/proc/meminfo&quot;</span><span class="p">)</span><span class="o">.</span><span class="n">match</span><span class="p">(</span><span class="sr">/MemTotal:\s+(\d+)/</span><span class="p">)</span><span class="o">[</span><span class="mi">1</span><span class="o">].</span><span class="n">to_i</span>
+<span class="w">    </span><span class="c1"># 25% 内存留给 hugepage，不计入 commit limit，只剩 75% 可用</span>
+<span class="w">    </span><span class="n">non_hugepage_mem_kb</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">total_mem_kb</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">0</span><span class="o">.</span><span class="mi">75</span>
+<span class="w">    </span><span class="n">overcommit_kbytes</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">non_hugepage_mem_kb</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">0</span><span class="o">.</span><span class="mi">8</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1048576</span><span class="p">)</span><span class="o">.</span><span class="n">round</span>
+<span class="w">    </span><span class="n">safe_write_to_file</span><span class="p">(</span><span class="s2">&quot;/etc/sysctl.d/99-overcommit.conf&quot;</span><span class="p">,</span>
+<span class="w">      </span><span class="s2">&quot;vm.overcommit_memory=2</span><span class="se">\n</span><span class="s2">vm.overcommit_kbytes=</span><span class="si">#{</span><span class="n">overcommit_kbytes</span><span class="si">}</span><span class="se">\n</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="w">  </span><span class="k">else</span>
+<span class="w">    </span><span class="sb">`sudo rm -f /etc/sysctl.d/99-overcommit.conf`</span>
+<span class="w">  </span><span class="k">end</span>
+<span class="w">  </span><span class="sb">`sudo sysctl --system`</span>
+<span class="k">end</span>
+</code></pre></div>
+
+<h2>我的做法</h2>
+<p>给数据库开严格 overcommit 之前，先做三件事，不然就是给自己造故障：</p>
+<ol>
+<li><strong>量化基线</strong>，别凭感觉设。采集一段时间 <code>Committed_AS</code> 和 <code>CommitLimit</code>（<code>node_exporter</code> 的 <code>node_memory_Committed_AS_bytes</code> 就有），峰值留 30% 以上余量再开。</li>
+<li><strong>先修内核</strong>。看到 <code>Committed_AS</code> 远超实际值，用上面那条 <code>awk /proc/[0-9]*/smaps</code> 求和自查，比值超过 1.0 基本就是这个 mremap 记账 bug（内核 6.5 引入），升级即解。</li>
+<li><strong>盯住 sidecar</strong>。把 Go 写的 sidecar 的提交量单独监控起来，它们抢的是数据库的 commit 预算。真出问题时，报错的会是 PostgreSQL，而不是真正吃内存的那个。</li>
+</ol>
+<p>严格 overcommit 从来不是性能优化，它是把"半夜整个实例挂掉 + 长时间 crash recovery"换成"个别请求报 ENOMEM"。这个交易值不值，取决于你的业务能不能接受一条连接失败。对绝大多数线上库来说，能。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
