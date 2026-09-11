@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>240 万行 Python 的大迁徙：EVE Online 转向 Python 3 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>240 万行 Python 的大迁徙：EVE Online 转向 Python 3</h1>
+<time>2026-08-26</time>
+<ul>
+<li>Python</li>
+<li>大型工程</li>
+<li>技术债</li>
+<li>游戏服务器</li>
+</ul>
+<hr />
+<p>EVE Online 官方八月底发了篇《The Move to Python 3 Begins》。表面上是运营公告，实际上是技术博客——它透出的几个数字，比多数"架构升级"文章实在得多。</p>
+<p>EVE 这套服务器用 Python 跑了二十多年。2007 年升到 Stackless Python 2.5，2010 年升到 Stackless Python 2.7，现在开始往 Python 3 迁。中间隔了十几年没动大版本。</p>
+<h2>240 万行，以及"Python 3 根本解析不了"</h2>
+<p>第一个数字是代码量：<strong>EVE 的代码库有 240 万行 Python</strong>。</p>
+<p>第二个数字更麻烦：大量代码<strong>早于 Python 2.7</strong>，是按 2.3 和 2.5 时代的标准写的，Python 3 的解析器<strong>直接拒绝解析</strong>。</p>
+<p>注意这里说的不是"跑起来会报错"，是"连解析都过不去"。这两个的难度差一个量级。如果代码能解析、只是运行时行为不对，你可以靠测试和灰度慢慢找；解析都过不去，意味着连静态分析、自动重构这些工具都用不上——AST 都建不起来，怎么改。</p>
+<p>这也是为什么这次迁移的第一步不是"改代码"，而是"让代码能被 Python 3 的解析器接受"。这一步纯机械，但体量决定了它必须自动化，而自动化又依赖工具能读懂旧语法。作者没说具体怎么做，但从 2.3/2.5 时代的语法特征可以推测：<code>print</code> 语句、<code>&lt;&gt;</code> 不等号、八进制字面量 <code>0777</code>、<code>except X, e</code> 这类写法，都得先批量过一遍。</p>
+<h2>Stackless Python 才是真正的坎</h2>
+<p>代码语法是明面上的问题，更深的坑在运行时：EVE 一直跑在 <strong>Stackless Python</strong> 上。</p>
+<p>Stackless 是 CPython 的一个分支，它当年为了解决"用 Python 写高并发模拟"的问题而生。它提供了 tasklet、channel 这套微线程机制——本质上是在语言层面支持海量轻量协程，让 EVE 那种"成千上万个实体同时运转、每个实体有自己的状态机"的场景能跑得起来。用普通线程做这件事，光是栈内存和调度开销就撑不住。</p>
+<p>问题在于：Stackless 一直没跟上 Python 3。CPython 主线在 3.5 之后引入了 <code>async</code>/<code>await</code> 和原生协程，但那是另一套模型，和 Stackless 的 tasklet 不是同一个东西。所以这次迁移不只是"换个解释器版本"，而是要<strong>换掉整个并发模型</strong>。</p>
+<p>这是最重的一块。业务逻辑里所有的 tasklet 调度、channel 通信、微线程切换，都要映射到新的并发机制上。映射得不好，轻则丢性能，重则改变执行顺序——而 EVE 这种有实时战斗、市场撮合的系统，执行顺序的微小改变可能引发经济系统的连锁反应。</p>
+<p>作者没展开迁移方案，但"Stackless 到 Python 3"这件事本身就意味着这不是一次升级，是一次重写运行时。</p>
+<h2>23.75 小时：不能停机</h2>
+<p>第三个数字是可用性要求：这套系统<strong>每 24 小时里必须运转 23.75 小时</strong>。折算下来，允许的停机时间只有 15 分钟。</p>
+<p>这个约束把"停机升级"这条路彻底堵死了。你不可能说"我们今天晚上停服三小时，把 Python 3 版本切上去"。于是只能走<strong>在线迁移</strong>：新旧两套运行时并行跑，按模块逐步切流，每一步都能回滚。</p>
+<p>在线迁移难在哪里？难在状态。EVE 的整个宇宙是持续运转的：玩家的船在飞、技能在训练、市场订单在撮合、工业任务在排队。这些状态在内存里，跨版本迁移时既不能丢，也不能出现"一半旧代码一半新代码"导致的语义不一致。常见的做法是定义一层兼容接口，让新旧两侧通过它交互，逐步把实现从旧侧移到新侧。</p>
+<h2>为什么这件事值得记下来</h2>
+<p>大多数技术债故事讲的是"欠了债，后来还不上"。EVE 这个案例特别的地方在于：它欠的不只是债务，还有一套二十年的<strong>依赖惯性</strong>——语言版本、第三方库、运行时分支、运维工具，全都绑在 Python 2 的 Stackless 上。要动其中的任何一环，都得先把整条链一起动。</p>
+<p>它也暴露了一个规律：<strong>升级的难度跟"你落后了多久"不成正比，跟"你依赖了多少非主线的东西"成正比</strong>。如果 EVE 当年用的是标准 CPython，2 到 3 的迁移虽然也大，但有 <code>2to3</code>、有社区经验、有十几年的工具积累。因为用了 Stackless 这个分支，所有这些外部资源都用不上，只能自己造。</p>
+<h2>我的做法</h2>
+<p>从这件事里能抽出几条对长期项目有用的判断：</p>
+<ul>
+<li>运行时/分支的偏离是复利债务。用非主线的运行时（分支解释器、定制 JIT、私有补丁）短期省事，但每次主线大版本升级，你都要独自承担一整套迁移成本。选型时把"五年后跟不跟得上"算进去。</li>
+<li>语法债要早还。能解析的代码，工具链还能帮你；解析不了的代码，所有现代化手段都失效。定期跑一次"删掉兼容层、只用新语法"的检查，让代码不要离主线太远。</li>
+<li>可用性约束决定迁移策略。如果停机是硬约束，就必须从第一天设计在线迁移路径（双跑、兼容接口、逐步切流），而不是等到要迁的时候才想。</li>
+</ul>
+<p>240 万行 Python 的迁移不会快，也不会有戏剧性的瞬间。这类工程的成败全在能不能把大迁移切成一堆可回滚的小步骤——这大概也是 EVE 团队选择公开这件事的原因：让玩家理解为什么会有持续的后台调整。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MikroTrick：MikroTik RouterOS SSH 认证绕过攻击链全拆解（CVE-2026-67276/86060/67277） - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>MikroTrick：MikroTik RouterOS SSH 认证绕过攻击链全拆解（CVE-2026-67276/86060/67277）</h1>
+<time>2026-09-11</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析</li>
+<li>网络设备</li>
+<li>RouterOS</li>
+</ul>
+<hr />
+<p>9 月 5 日，CERT Polska 发了一份措辞少见的预警：他们发现并协调披露了 MikroTik RouterOS 里的 6 个漏洞，其中两条组合成一条被命名为「MikroTrick」的攻击链，能让攻击者在零认证的前提下，通过 SSH 完全控制一台暴露在公网的设备。更罕见的是，MikroTik 在修复版本里第一次向装了官方 App 的用户推送了通知，这是它历史上头一回。</p>
+<p>这不是一份普通的 CVE 公告，而是一条「认证绕过 + 提权」的完整在野利用链，而且它的发现方式本身也值得单独写一段。</p>
+<h2>CVE-2026-67276：RSA 公钥只比对了模数（CVSS 9.2）</h2>
+<p>SSH 公钥认证的整套安全假设，建立在一条规则上：服务器把客户端出示的公钥，和自己授权列表里的公钥做逐字节比对，确认「这把就是那把」，然后才让客户端证明自己持有对应私钥。</p>
+<p>把这一步放回协议里看更清楚。SSH 公钥认证（RFC 4252）的握手大致是：客户端发 <code>SSH_MSG_USERAUTH_REQUEST</code>，method 填 <code>publickey</code>，附带公钥 blob；服务器拿这个 blob 去授权列表里查，查到才回 <code>SSH_MSG_USERAUTH_PK_OK</code>，并给客户端一个带会话随机数的签名挑战；客户端用自己的私钥签名；服务器用列表里那把公钥验签。</p>
+<p>漏洞就出在第二步的「查」。RSA 公钥是一个 (n, e) 二元组，私钥是 (n, d)，正确实现必须连 n 带 e 一起比对。RouterOS 只比对了模数 n，没覆盖完整的 key blob。模数 n 只是公钥的一半，只比 n、不看 e，等于把「这把钥匙是不是授权的那把」降级成「钥匙柄像不像」。于是「授权列表里那把钥匙」和「签名验证用的那把钥匙」之间的绑定被切断了，这是典型的 key confusion。攻击者只要知道目标用户名，以及该用户公钥的模数 n，就能构造一把模数相同、其余部分不同的钥匙，通过 SSH 登录，全程不需要受害者的私钥。</p>
+<p>「知道模数」听起来苛刻，其实不然：公钥本来就是公开信息，而下面要讲的 CVE-2026-67277 能直接从内核缓冲区读出未初始化数据，两条漏洞之间形成了天然的配合。这是认证绕过里最危险的一类，它不猜密码、不爆破，直接瓦解了认证协议本身的前提。</p>
+<h2>CVE-2026-86060：一个非法开头的用户名，换来管理员权限（CVSS 9.2）</h2>
+<p>第二条更隐蔽。RouterOS 的 SSH 登录机制，对「以不允许字符开头的用户名」处理不当。攻击者用一个精心构造的用户名登录，就能把会话权限抬升到完整管理员级别。</p>
+<p>这类缺陷的本质是解析差异（parser differential）：某个字符在 RouterOS 内部有特殊含义，比如标记特权账户的前缀，当它出现在用户名开头时，登录路径里的权限校验就被跳过或绕过了。用户名在这里不是一个普通字符串，而是一个注入点。跟 SQL 注入、路径穿越是同一个家族：把「数据」混进了「控制」的语义里。</p>
+<h2>CVE-2026-67277：带宽测试服务的状态机越界（CVSS 8.8）</h2>
+<p>带宽测试（bandwidth-test）服务允许未认证连接进入一个「本该登录后才能到达」的状态。再叠加两个独立缺陷：数据包缓冲区的未初始化数据泄露，以及大小校验里的整数下溢，就能实现内核内存泄露，或远程 DoS 导致设备重启。</p>
+<p>整数下溢是这里最经典的一环。服务端对攻击者可控的长度字段做校验，但校验发生在错误的类型宽度上，或者用了有符号比较，攻击者传入一个能绕回负数的值，于是分配了一个很小的缓冲区，拷贝却按一个巨大的长度进行，读越界，把内核里没初始化过的内存字节原样回传给攻击者。泄露出来的字节里，就可能有别处的密钥材料、指针，甚至前面说的公钥模数。</p>
+<p>这里的关键词是「状态机」。一个协议实现里，客户端和服务端各自维护状态机，攻击者跳过了某个本应强制完成的阶段（认证），直接进入了后续状态。这正是后面要讲的发现方法论的核心。</p>
+<h2>MikroTrick：两条漏洞怎么串成一条链</h2>
+<p>MikroTrick 的杀伤力来自组合。67276 解决「能不能进门」，86060 解决「进门之后是什么权限」。单独看，67276 拿到的是目标账户的权限，可能只是普通用户；叠加 86060 的用户名提权，就变成完整管理员。于是「零认证 → 完全控制」这条链闭合了。官方公告里这 6 个漏洞还波及 SSH 服务器和客户端、X.509 证书处理、以及 WebFig 接口。修复版本是 7.25beta3、7.24.2、7.23.4、6.49.21。</p>
+<h2>在野利用：ops 用户和两个 IP</h2>
+<p>CERT Polska 确认攻击已经发生。被攻陷设备的日志里会留下这些痕迹：</p>
+<div class="highlight"><pre><span></span><code><span class="nv">login</span><span class="w"> </span><span class="nv">failure</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="nv">user</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span><span class="nv">from</span><span class="w"> </span><span class="o">&lt;</span><span class="nv">ip</span><span class="o">&gt;</span><span class="w"> </span><span class="nv">via</span><span class="w"> </span><span class="nv">ssh</span>
+<span class="nv">user</span><span class="w"> </span><span class="o">&lt;</span><span class="nv">name</span><span class="o">&gt;</span><span class="w"> </span><span class="nv">added</span><span class="w"> </span><span class="nv">by</span><span class="w"> </span><span class="nv">ssh</span>:<span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">2</span><span class="w"> </span>@<span class="o">&lt;</span><span class="nv">ip</span><span class="o">&gt;</span>
+</code></pre></div>
+
+<p>额外的一个 IOC 是：出现一个高权限用户，名字就叫「ops」。攻击至少从 9 月 2 日开始，源头是 82.192.72.4，另有 103.102.31.18 参与过尝试。出现任何一个痕迹，都要立刻排查。</p>
+<h2>「Flagged」机制：厂商的亡羊补牢</h2>
+<p>修复版本引入了一个「Flagged」机制：RouterOS 启动时扫描配置，寻找已知的未授权修改痕迹，禁用可疑配置项，写入 critical 日志，并打上标记。但 CERT 明确警告：这个标记只检测「选定的」痕迹，没有标记不等于设备安全。它应该被当作「可能已被攻陷」的提示，而不是「没被攻陷」的证明。</p>
+<h2>最值得写的一段：漏洞是 LLM 帮着挖出来的</h2>
+<p>这 6 个漏洞由 CERT Polska 的 Sławomir Rozbicki 发现，工具是 GPT-5.5-cyber 和 GPT-5.6-sol 模型，来自团队通过 OpenAI GTAC 计划获得的访问权限。模型跑在一个 agent 化的研究环境里：隔离实验室、自动化创建与恢复设备、下载并比对版本、分析 RFC 和二进制、生成验证 PoC 的脚本。</p>
+<p>最有价值的方法论，一句话就能概括：<strong>把协议建模成状态机，然后检查「跳过某个阶段、重复某个阶段、打乱顺序执行」会发生什么</strong>。这套方法被证明特别有效，而 CVE-2026-67277 恰好就是「跳过认证阶段进入后续状态」的 bug，方法论和结果形成了闭环。</p>
+<p>具体怎么做：先用 LLM 把 RFC 或反汇编结果整理成一张状态机图，标注每个状态和每条迁移的触发条件；然后系统性地试探三类非法迁移——跳过（skip，直接跳进后续状态）、重复（repeat，把同一个请求发两次）、乱序（reorder，调换两个阶段的先后）；每次试探都在干净状态的设备上做，看是否进入了本不该到达的状态。这套流程几乎可以直接照搬。</p>
+<p>CERT 特别强调这不是一句 prompt 的事。每一个假设都要在真实 RouterOS 上确认、做阴性对照测试、在干净状态的机器上重复、再评估真实影响。模型大幅加速了分析和假设探索，但没有替代这些环节。这句话对任何想用 LLM 做安全研究的人都值得抄下来。</p>
+<h2>我的做法：先查这三样，再谈修复</h2>
+<p>别急着只点升级。按顺序来：</p>
+<ol>
+<li>升级到 7.25beta3 / 7.24.2 / 7.23.4 / 6.49.21 之一。</li>
+<li>查 Flagged 标记：</li>
+</ol>
+<div class="highlight"><pre><span></span><code>/system/device-mode/print
+</code></pre></div>
+
+<ol>
+<li>查未知用户、脚本、定时任务、代理和隧道：</li>
+</ol>
+<div class="highlight"><pre><span></span><code>/user print
+/system script print
+/system scheduler print
+</code></pre></div>
+
+<ol>
+<li>如果日志里出现「ops」用户，或上面那两条日志特征，按「已被攻陷」处理：隔离设备，先保全日志和配置，再恢复出厂，重新基于可信配置部署，更换所有口令和密钥。不要盲目恢复一份来自可能被攻陷设备的完整配置备份。</li>
+</ol>
+<p>一句话收尾：路由器这种常年开着、很少登录的设备，最适合藏一个高权限后门。有空就上去看一眼 <code>/user print</code>，比任何应急响应都便宜。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和排查命令均基于 CERT Polska 公开披露的安全研究，旨在帮助开发者与网络管理员理解攻击原理、提升防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<p>参考：CERT Polska《Critical vulnerabilities in MikroTik RouterOS are being actively exploited》(2026-09-05)</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
