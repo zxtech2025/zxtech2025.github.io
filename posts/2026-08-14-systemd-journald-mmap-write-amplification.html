@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>一行日志写掉 110KB：systemd-journald 的 mmap 写放大解剖 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>一行日志写掉 110KB：systemd-journald 的 mmap 写放大解剖</h1>
+<time>2026-08-14</time>
+<ul>
+<li>Linux</li>
+<li>systemd</li>
+<li>文件系统</li>
+<li>性能分析</li>
+</ul>
+<hr />
+<p>八月十四号 Hacker News 上有个帖子很扎眼：《Single log line is 49KB+ (ext4) / 110KB+ (btrfs) of systemd-journald disk writes》。来源是 systemd 仓库的 issue #40262，标题更朴素——"Excessive IO caused by systemd-journald"，2026 年 1 月 3 日开的，到现在 24 条评论还没关。</p>
+<p>问题本身不新鲜。报 issue 的人在一台 VM 上每秒写两行日志，磁盘看到大约 50 IOPS。系统是 Debian 13、systemd 257.9、内核 6.12.57、XFS。他在 issue 里把同样的抱怨指向了 2020 年就被关掉的 #15292，那次维护者的结论是"iotop 不准，是内核把 IO 放大了"。这次他把内核这一层也测了，结论反过来了：不是量测工具的问题，是慢。</p>
+<h2>先复现，再谈责任</h2>
+<p>这种"到底谁在写盘"的争议，靠感觉吵架没有意义。评论里 ValdikSS 给了一套可复现的方法，值得抄下来：</p>
+<ul>
+<li>在 tmpfs 上建一个 ext4 loop 设备，专门挂到 <code>/var/log/journal</code></li>
+<li>同时采集 <code>/sys/block/loop0/stat</code> 的第 7 个字段（写扇区数）和 journald cgroup 的 <code>io.stat</code></li>
+<li>journald 侧配 <code>Compress=no</code>、<code>SyncIntervalSec=10s</code>，systemd 侧开 <code>DefaultIOAccounting=yes</code></li>
+<li>挑一台"绝对安静"的机器，保证除了测试注入的那条日志没有别的来源</li>
+</ul>
+<p>然后注入一条 <code>logger -p info test</code>，观察增量。他贴出来的原始数据是这样：</p>
+<div class="highlight"><pre><span></span><code><span class="mi">21</span><span class="o">:</span><span class="mi">40</span><span class="o">:</span><span class="mi">42</span><span class="o">:</span><span class="w"> </span><span class="n">Started</span><span class="w"> </span><span class="k">with</span><span class="w"> </span><span class="mi">8482816</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="n">loop0</span><span class="o">,</span><span class="w"> </span><span class="mi">442368</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="n">journald</span><span class="w"> </span><span class="n">cgroup</span>
+<span class="mi">21</span><span class="o">:</span><span class="mi">41</span><span class="o">:</span><span class="mi">38</span><span class="o">:</span><span class="w"> </span><span class="n">loop0</span><span class="o">:</span><span class="w"> </span><span class="mi">8556544</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="o">(+</span><span class="mi">73728</span><span class="o">)</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">cgroup</span><span class="o">:</span><span class="w"> </span><span class="mi">479232</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="o">(+</span><span class="mi">36864</span><span class="o">)</span>
+<span class="mi">21</span><span class="o">:</span><span class="mi">41</span><span class="o">:</span><span class="mi">48</span><span class="o">:</span><span class="w"> </span><span class="n">loop0</span><span class="o">:</span><span class="w"> </span><span class="mi">8765440</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="o">(+</span><span class="mi">208896</span><span class="o">)</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">cgroup</span><span class="o">:</span><span class="w"> </span><span class="mi">552960</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="o">(+</span><span class="mi">73728</span><span class="o">)</span>
+<span class="mi">21</span><span class="o">:</span><span class="mi">42</span><span class="o">:</span><span class="mi">09</span><span class="o">:</span><span class="w"> </span><span class="n">loop0</span><span class="o">:</span><span class="w"> </span><span class="mi">8904704</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="o">(+</span><span class="mi">139264</span><span class="o">)</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">cgroup</span><span class="o">:</span><span class="w"> </span><span class="mi">552960</span><span class="w"> </span><span class="n">bytes</span><span class="w"> </span><span class="o">(+</span><span class="mi">0</span><span class="o">)</span>
+</code></pre></div>
+
+<p>一条几十字节的日志，块设备层面先 +72KB，后续周期又追加了两百多 KB。这不是计量误差，<code>/sys/block/*/stat</code> 是块层统计，任何用户态工具都改不了它。</p>
+<p>顺带排除了一个常见误解：<code>SyncIntervalSec</code> 并不控制数据落盘的时间，它只控制 <code>fdatasync</code>/<code>fsync</code> 叫用的时机。journald 收到日志就立刻往持久文件里写，只是把 fsync 推迟了。想靠调大它来省 IO 的人可以放弃了。</p>
+<h2>根因一：mmap 写入撞上 large folio</h2>
+<p>journald 追加 <code>.journal</code> 文件用的是 mmap，不是 <code>pwrite</code>。这个选择在 2011 年可能是为了省一次拷贝，现在的代价是：mmap 的写缺页（write fault）会把整页标记为 dirty，而内核启用 large folio 之后，folio 可能是 16KB、64KB 甚至更大。一条 100 字节的日志把整个 folio 弄脏，写回时整块落到盘上。</p>
+<p>这个放大倍数能解释为什么不同文件系统差这么多：ext4 上的观测是 49KB+，btrfs 上 110KB+，CoW 文件系统还要额外承担写时复制的代价。有人贴了 bcachefs 作者在 Reddit 上的说法，大意是"large folio 落地之后每个文件系统都被 mmap 写坑了"，并建议在这些场景下关掉 folio。</p>
+<p>有意思的是两个方向完全不同的修复意见同时出现在这个 issue 里：</p>
+<ul>
+<li>内核侧。willy613 提交了一个 iomap 补丁，做的是"只弄脏具体那一页，而不是整个 folio"，覆盖 xfs、exfat、ntfs、zonefs。他自述能开机，但还没跑完 fstests；amluto 建议试试直接用硬件 dirty bit 优化。这个补丁到八月底还没进 mainline。</li>
+<li>应用侧。amluto 讲了他自己的经历：很多年前他做过一个用 mmap 追加写的数据库，踩了一堆坑，为此跑 LSF/MM 跟人对线，最后还写了补丁让 mmap 写别那么难受（至今没被合）。他的结论很硬——设计本身错了，应该用 <code>pwrite</code>。他还指出 Linux 上 <code>MAP_SHARED</code> 和普通 IO 是缓存一致的，journald 完全可以保留 mmap 映射、只把写改成 <code>pwrite</code>，改动不会很大。</li>
+</ul>
+<h2>根因二：磁盘格式自己就很浪费</h2>
+<p>就算 mmap 那边修好了，格式的问题还在，而且先被用户看见。issue 里有个人用 <code>iotop -a</code> 的累计模式量了一下，15 分钟 journald 写了将近 7GB，22 分钟接近 11GB，机器在那段时间里 IO 顶满、明显卡顿。一条日志的净荷是几十字节，剩下的全是元数据。</p>
+<p>打开 <code>journalctl -o verbose</code> 看一眼就知道钱花在哪了。你注入的那一行字，journald 会附上一整套隐式字段：<code>_BOOT_ID</code>、<code>_MACHINE_ID</code>、<code>_HOSTNAME</code>、<code>_PID</code>、<code>_COMM</code>、<code>_EXE</code>、<code>_CMDLINE</code>、<code>_SYSTEMD_CGROUP</code>、<code>_SYSTEMD_UNIT</code>、<code>_TRANSPORT</code>、<code>_SOURCE_REALTIME_TIMESTAMP</code>，随手就是十来个。每个 entry 对象带 64 字节头部，后面紧跟一串指向字段数据对象的偏移，字段值本身在同一文件里做过去重（同样的 <code>_BOOT_ID</code> 只存一份），但每条 entry 都要把这十几个引用重写一遍，加上时间戳序列和 xor 校验。短日志行的净荷占比因此低得可怜。</p>
+<p>这也解释了为什么格式换成 SQLite 或按列去重的日志存储会被反复提议：现在这个布局，写入贵、读取也贵——查找也没有为最常见的"按服务和时间段翻日志"做合理索引。issue 里维护者 XANi 的总结很直白：格式为了多数用户根本不在乎的目标膨胀，反而没命中用户真正在意的两点，快速查找和可接受的写性能。</p>
+<p>代价是抗损坏性和密封性下降，权衡是真实的，但"现在的格式浪费"基本是共识。</p>
+<p><code>Compress=no</code> 这个测试配置也暴露了一个细节：短日志行根本触发不了压缩，所以关不关压缩在短行场景下没差别。</p>
+<h2>能立刻做的事情</h2>
+<p>我不会等内核补丁。手上有几台跑 journald 的机器，按代价从低到高做了这几件事。</p>
+<p>第一，不需要重启后保留日志的机器直接 <code>Storage=volatile</code>。日志进 <code>/run</code>，走 tmpfs，零持久写。这一条几乎解决了所有日常开发机的写放大。</p>
+<p>第二，设上限，别让日志无边界膨胀：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># /etc/systemd/journald.conf</span>
+<span class="k">[Journal]</span>
+<span class="na">Storage</span><span class="o">=</span><span class="s">persistent</span>
+<span class="na">SystemMaxUse</span><span class="o">=</span><span class="s">512M</span>
+<span class="na">SystemMaxFileSize</span><span class="o">=</span><span class="s">64M</span>
+<span class="na">RuntimeMaxUse</span><span class="o">=</span><span class="s">128M</span>
+<span class="na">RateLimitIntervalSec</span><span class="o">=</span><span class="s">30s</span>
+<span class="na">RateLimitBurst</span><span class="o">=</span><span class="s">1000</span>
+</code></pre></div>
+
+<p>第三，观测手段要对。<code>iotop -a</code> 用累计模式看，别用瞬时值；要看块设备真实写入就差分 <code>/sys/block/&lt;dev&gt;/stat</code> 第 7 字段；<code>journalctl --disk-usage</code> 看总量；<code>systemd-cgtop</code> 看是哪个单元在贡献。</p>
+<p>第四，如果 <code>/var/log/journal</code> 在 btrfs 上且不需要 CoW，<code>chattr +C</code> 能省掉一层复制。ext4 上 <code>lazytime</code> 有意义，但 <code>atime</code> 本身不是这个 bug 的主因——大多数日志文件都是最近访问过的，relatime 已经处理了。</p>
+<p>最后一点经验：SSD 寿命被日志写没这件事，在这个 issue 里被好几个人当成段子讲，但它不全是段子。一台每秒两条日志的机器，按 100KB 的放大系数算，一天就是十几 GB 的写入量，对消费级 SSD 的 TBW 是实打实的消耗。如果你看到 SSD 的 Wear Leveling 计数掉得比预期快，先确认一下 journald 是不是元凶，方法就是上面那个 loop 设备差分。</p>
+<p>一行日志要写 110KB 才能落盘，这个数字本身已经足够说明问题：该由格式和写入路径负责的事，不该让文件系统和闪存来扛。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
