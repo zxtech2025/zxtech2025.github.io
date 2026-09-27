@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GitHub Actions 自建 Runner 的冷启动盲区：机器上线了，没人认识它 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>GitHub Actions 自建 Runner 的冷启动盲区：机器上线了，没人认识它</h1>
+<time>2026-07-13</time>
+<ul>
+<li>安全</li>
+<li>CI/CD</li>
+<li>GitHub Actions</li>
+<li>供应链</li>
+</ul>
+<hr />
+<p>FreeBuf 前两天有篇讲 self-hosted runner 的文章，角度是"新 runner 没人认识"。这句话在安全团队听起来应该刺耳：一台机器被注册进你的 CI 体系、拿到凭据、能跑任意代码，但资产库里没有它，EDR 不认识它，监控基线里也没有它。这就是冷启动盲区——不是漏洞，而是<strong>验证与检测链条上的一段真空</strong>。</p>
+<p>我把这套机制从头到尾捋一遍：runner 在主机上到底留下了什么、为什么这些痕迹天然难以被检测、攻击者能怎么用、以及怎么用几条命令把它拉回视野。</p>
+<h2>Runner 在主机上留下的东西</h2>
+<p>一次注册就是一条命令：</p>
+<div class="highlight"><pre><span></span><code>./config.sh<span class="w"> </span>--url<span class="w"> </span>https://github.com/OWNER/REPO<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--token<span class="w"> </span>&lt;REGISTRATION_TOKEN&gt;<span class="w"> </span>--name<span class="w"> </span>build-07<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--labels<span class="w"> </span>self-hosted,linux,x64,gpu<span class="w"> </span>--work<span class="w"> </span>/srv/actions-runner/_work<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--unattended<span class="w"> </span>--ephemeral
+./svc.sh<span class="w"> </span>install<span class="w"> </span>runner<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>./svc.sh<span class="w"> </span>start
+</code></pre></div>
+
+<p>注册 token 一小时的 TTL，作用域可以是仓库、组织或企业。注册完成后目录里会有这么几个文件，它们就是整台机器的身份：</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>.runner</code></td>
+<td>agentId、agentName、poolName、serverUrl、gitHubUrl</td>
+</tr>
+<tr>
+<td><code>.credentials</code></td>
+<td>与 GitHub 通信的认证 token</td>
+</tr>
+<tr>
+<td><code>.credentials_rsaparams</code></td>
+<td>RSA 私钥，用于任务负载的加密交换</td>
+</tr>
+<tr>
+<td><code>_diag/Runner_*.log</code></td>
+<td>每次 job 的完整诊断日志</td>
+</tr>
+<tr>
+<td><code>_work/_temp</code> / <code>_work/_actions</code> / <code>_work/_tool</code></td>
+<td>工作目录、拉下来的 action、工具缓存</td>
+</tr>
+</tbody>
+</table>
+<p>服务化之后还会有 <code>actions.runner.&lt;org&gt;-&lt;repo&gt;.&lt;runner-name&gt;.service</code> 这个 systemd unit。<strong>这几样东西凑在一起，等于一份完整的入侵凭据包</strong>：拿到 <code>.credentials</code> 和 RSA 私钥，就能冒充这个 runner 的身份、领取 job、接收加密后的任务载荷。</p>
+<p>另外还有两个属性值得单独拎出来：</p>
+<ul>
+<li><strong>自动更新</strong>。<code>Runner.Listener</code> 在领取 job 之前会检查新版本并自行升级，二进制几乎天天在变。任何基于文件哈希的完整性基线，都会被 runner 自己的正常升级冲掉。</li>
+<li><strong><code>--disableupdate</code></strong>。关掉自更新让版本可预测，代价是长期停在旧版本上，已知问题不会随上游修掉。很多团队为了稳定会这么干，然后忘了它。</li>
+</ul>
+<p>现在加上 ephemeral 模式，是另一套逻辑。<code>--ephemeral</code> 或 JIT config（<code>POST /repos/{owner}/{repo}/actions/runners/generate-jitconfig</code>）注册出来的 runner 只领取一个 job，跑完自己注销并退出，靠外部调度器（Actions Runner Controller 或自己的脚本）补新实例。安全性明显更好，但换来的结果是：<strong>runner 的进程、主机名、二进制哈希每次都不一样</strong>，基于"长期存在的实体"建模的检测思路会直接失效。</p>
+<h2>盲区是怎么形成的</h2>
+<p>我数了一下，至少四个环节同时失灵：</p>
+<ol>
+<li><strong>资产维度</strong>：runner 注册由开发或平台团队自助完成，不进 CMDB。等安全团队做资产盘点时，一台跑着生产凭据的机器不在清单里。</li>
+<li><strong>进程维度</strong>：CI runner 的进程名固定是 <code>Runner.Listener</code> / <code>Runner.Worker</code>，路径是 <code>/home/runner/actions-runner</code> 这类非标准位置。EDR 实施时最常见的妥协就是按进程名加白名单，避免 CI 被误杀，于是 runner 里跑出来的东西天然不受约束。</li>
+<li><strong>完整性维度</strong>：如上，自更新让哈希基线和 FIM 规则持续告警或被直接关掉。</li>
+<li><strong>网络维度</strong>：runner 必须能出网访问 github.com、<code>*.githubusercontent.com</code> 和各类包仓库。出口策略通常开得很宽，因为没人愿意为了 CI 天天调白名单。</li>
+</ol>
+<p>四个维度都开口，结论就是：<strong>从注册完成到第一次真正出事的这段时间，没有任何一层会主动说"这台机器我不认识"</strong>。</p>
+<h2>攻击面：五条能落地的路径</h2>
+<p><strong>一、注册 token 泄漏。</strong> 仓库级 token 能往该仓库加 runner，组织级 token 能往组织下任意仓库加。泄漏途径往往很朴素——CI 日志里 echo 出来的变量、共享的自动化脚本、离职人员的凭据残留。攻击者注册一个"影子 runner"，之后所有针对该仓库的 job 都可能落到他机器上，包括带着部署密钥和发布凭据的那些。</p>
+<p><strong>二、公网仓库上的不可信代码。</strong> <code>pull_request_target</code> 会带着 base 分支的 secrets 运行，如果在哪个 job 上写了 <code>runs-on: self-hosted</code>，外部贡献者的 PR 就能在你的内网机器上执行代码，GitHub 文档专门警告过这一点。<code>workflow_run</code> 链式触发是同类问题的变体。</p>
+<p><strong>三、缓存与工件投毒。</strong> <code>actions/cache</code> 的条目按分支/PR 作用域隔离，但 <code>restore-keys</code> 是前缀匹配的：不可信分支写一条 <code>build-deps-*</code> 的缓存，可信分支恢复时可能命中。工件同理——不可信 workflow 上传的产物被可信 workflow 下载并直接执行。</p>
+<p><strong>四、runner 自身的持久化。</strong> 用户通常把 runner 跑在 <code>docker</code> 组里（否则做不了容器化构建），而这个组等效于 root：job 里起个容器把宿主 <code>/</code> 挂进去就行。持久化手段也不需要多高级：往 <code>_work/_temp</code> 里丢脚本、改 <code>_actions/</code> 下已缓存的 action、给 systemd unit 加个 <code>ExecStartPre</code>、或者在 runner 用户的 crontab 里留一行。</p>
+<p><strong>五、绕过 EDR 的温床。</strong> 白名单 + 出网宽松 + 凭据齐备，组合起来就是理想的落脚点。攻击者甚至不需要什么新手法，用 CI 合法的机制就能完成从执行到外带的全过程。</p>
+<h2>怎么把它拉回视野</h2>
+<p>最少三条命令，成本很低：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1) 本地有哪些 runner 在跑</span>
+ps<span class="w"> </span>-ef<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;Runner\.(Listener|Worker)&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-v<span class="w"> </span>grep
+systemctl<span class="w"> </span>list-units<span class="w"> </span>--all<span class="w"> </span><span class="s1">&#39;actions.runner.*&#39;</span>
+
+<span class="c1"># 2) 平台侧登记了哪些 runner（含离线、异常状态）</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$GH_TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>https://api.github.com/repos/OWNER/REPO/actions/runners
+
+<span class="c1"># 3) runner 目录里的身份文件，谁在什么时候动过</span>
+sudo<span class="w"> </span>find<span class="w"> </span>/<span class="w"> </span>-name<span class="w"> </span><span class="s1">&#39;.credentials*&#39;</span><span class="w"> </span>-o<span class="w"> </span>-name<span class="w"> </span><span class="s1">&#39;.runner&#39;</span><span class="w"> </span><span class="m">2</span>&gt;/dev/null<span class="w"> </span><span class="p">|</span><span class="w"> </span>xargs<span class="w"> </span>-r<span class="w"> </span>ls<span class="w"> </span>-la
+</code></pre></div>
+
+<p>第 2 条是重点。API 返回的 <code>status</code> 会因为 runner 停止心跳变成 <code>offline</code>，但记录还在——<strong>离线却仍在清单里的 runner，往往就是某个已经报废、却还持有有效身份的历史遗留</strong>。和本地进程两两对账，多出来的、缺掉的、名字不对的，都是线索。</p>
+<p>再往下是行为层：</p>
+<ul>
+<li><code>_diag/Runner_*.log</code> 里有每次 job 的领取时间和 workflow 名称。把它们和 GitHub 审计日志里 <code>workflow_job</code> 事件的 <code>runner_name</code>、<code>runner_group_name</code> 对齐，能直接回答"某个陌生 runner 到底领走过哪些 job"。</li>
+<li>出网做基线。runner 真正需要的目标很有限：GitHub 域名 + 你明确定义过的包仓库白名单。任何额外的长连接、非常规端口、直连 IP，都值得看一眼。</li>
+<li>盯 <code>_work/_temp</code> 的残留脚本和 <code>_work/_actions</code> 下 action 目录的修改时间。CI 正常运行不会去改已下载的 action。</li>
+</ul>
+<h2>加固：把"不认识"变成"不信任"</h2>
+<p>按投入产出排，我会这么做：</p>
+<ol>
+<li><strong>可信与不可信分开</strong>。公网仓库的 PR 构建绝不能落在持有生产凭据的 runner 上。宁可多买一组一次性 runner。</li>
+<li><strong>ephemeral + 容器作业</strong>。每个 job 一个干净环境，跑完即弃；宿主上不留状态。</li>
+<li><strong>runner group 只授权给私有仓库</strong>，组织级注册 token 严格管控，最好禁掉手动 <code>config.sh</code>，全部走自动化。</li>
+<li><strong>出口白名单</strong>，而不是"能出网就行"。</li>
+<li><strong>凭据降权</strong>。job 上写 <code>permissions: {}</code> 或 <code>read-all</code>，action 一律 pin 到 commit SHA，别用 <code>@v4</code> 这种浮动引用；runner 用户坚决不进 <code>docker</code> 组，需要容器就上 rootless。</li>
+<li><strong>给 runner 资产打标签</strong>，让它进资产库、进 EDR 的正常策略而不是白名单。</li>
+</ol>
+<h2>我的做法</h2>
+<p>我把这套东西压成三个动作，每周跑一次：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1) runner 清单对账（平台 vs 本地），只输出差异</span>
+comm<span class="w"> </span>-3<span class="w"> </span>&lt;<span class="o">(</span>curl<span class="w"> </span>-s<span class="w"> </span>-H<span class="w"> </span><span class="s2">&quot;Authorization: Bearer </span><span class="nv">$GH_TOKEN</span><span class="s2">&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>https://api.github.com/repos/OWNER/REPO/actions/runners<span class="w"> </span><span class="p">|</span><span class="w"> </span>jq<span class="w"> </span>-r<span class="w"> </span><span class="s1">&#39;.runners[].name&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="o">)</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>&lt;<span class="o">(</span>ps<span class="w"> </span>-ef<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span><span class="s1">&#39;Runner.Listener&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-v<span class="w"> </span>grep<span class="w"> </span><span class="p">|</span><span class="w"> </span>awk<span class="w"> </span><span class="s1">&#39;{print $NF}&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>sort<span class="o">)</span>
+
+<span class="c1"># 2) 身份文件变更告警</span>
+sudo<span class="w"> </span>find<span class="w"> </span>/<span class="w"> </span>-name<span class="w"> </span><span class="s1">&#39;.credentials&#39;</span><span class="w"> </span>-mtime<span class="w"> </span>-7<span class="w"> </span><span class="m">2</span>&gt;/dev/null
+
+<span class="c1"># 3) 出口异常</span>
+sudo<span class="w"> </span>journalctl<span class="w"> </span>-u<span class="w"> </span><span class="s1">&#39;actions.runner.*&#39;</span><span class="w"> </span>--since<span class="w"> </span><span class="s1">&#39;24 hours ago&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-iE<span class="w"> </span><span class="s1">&#39;connect|timeout|proxy&#39;</span>
+</code></pre></div>
+
+<p>第 1 条是核心：差异为空才算健康。真实的盲区不是某个 CVE，而是"机器上线了，没有任何一层系统知道该认识它"。CI 的信任模型不能建立在主机上，它能建立的唯一位置是 job 边界。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

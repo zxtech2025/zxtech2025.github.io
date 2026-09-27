@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Engrim：一个 SQLite 文件，让 Claude Code / Cursor / Antigravity 共享同一份记忆 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Engrim：一个 SQLite 文件，让 Claude Code / Cursor / Antigravity 共享同一份记忆</h1>
+<time>2026-09-07</time>
+<ul>
+<li>AI Agent</li>
+<li>SQLite</li>
+<li>MCP</li>
+<li>开发工具</li>
+</ul>
+<hr />
+<p>上下文窗口越做越大，1M token 已经不算新闻，但开发者反而越来越频繁地遇到一件事：模型"失忆"。会话一长，推理质量就开始漂移，成本跟着每个回合线性上涨；一旦 <code>/clear</code> 清空上下文，之前敲定的架构决策、用户约束、项目状态全部蒸发，下一轮对话得从头解释。</p>
+<p>Engrim 这个项目想解决的就是这件事。作者在 README 开头写了一句很刺眼的话："为什么每个回合要为 20 万 token 被遗忘的噪声付费？模型是一次性工具，你项目的决策不是。"</p>
+<h2>思路：记忆外置，检索代替全量塞进窗口</h2>
+<p>Engrim 的做法是把"记忆"从上下文里剥离出来，落进一个本地 SQLite 文件（<code>~/.engrim/memory.db</code>），按项目维度打标。会话启动时只注入一小包精选记忆，默认 4000 字符预算，而不是把整个历史塞进去。</p>
+<p>它的定位是"跨模型、跨 agent 的情景记忆引擎"。同一个仓库，你可以在 Google Antigravity、Claude Code、Cursor、Windsurf 之间随意切换，记忆不丢，换模型不需要重新交代一遍背景。这背后的判断很朴素：上下文应该来自按需检索，不是全部塞进窗口。这也是它跟一堆"给 agent 加个向量库"的项目最本质的区别，它是把记忆当成一等公民来做，而不是往 prompt 里追加几个文件。</p>
+<h2>数据模型：四张表 + FTS5 + 来源追踪</h2>
+<p>核心是 <code>memories</code> 表，字段是 <code>id / ts / project / type / summary / detail / status / tags / links / source / origin_agent</code>。</p>
+<p><code>type</code> 有六种：<code>decision</code>（决策）、<code>fact</code>（事实）、<code>feedback</code>（反馈）、<code>state</code>（状态）、<code>user</code>（用户偏好）、<code>reference</code>（参考）。<code>status</code> 三种：<code>active / superseded / done</code>。这里有个细节值得学：<code>supersede</code> 只是标记一条记录作废，不删除历史，所以你能追到"这个决定当时为什么被推翻"。</p>
+<p><code>origin_agent</code> 是来源追踪字段，取值 <code>antigravity / claude-code / cursor / cli / user</code>。当多个 agent 协作同一个代码库时，每条记忆都能查到是谁写的。老库用 <code>ALTER TABLE memories ADD COLUMN origin_agent</code> 做非破坏迁移，不会丢数据。</p>
+<p>会话启动时注入的 boot pack 不是按时间排序，而是按一套优先级硬编码：</p>
+<div class="highlight"><pre><span></span><code><span class="n">_PRIO</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;user&quot;</span><span class="p">:</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;feedback&quot;</span><span class="p">:</span> <span class="mi">1</span><span class="p">,</span> <span class="s2">&quot;state&quot;</span><span class="p">:</span> <span class="mi">2</span><span class="p">,</span> <span class="s2">&quot;decision&quot;</span><span class="p">:</span> <span class="mi">3</span><span class="p">,</span> <span class="s2">&quot;fact&quot;</span><span class="p">:</span> <span class="mi">4</span><span class="p">,</span> <span class="s2">&quot;reference&quot;</span><span class="p">:</span> <span class="mi">5</span><span class="p">}</span>
+</code></pre></div>
+
+<p>用户偏好永远排第一，"怎么跟我协作"这类信息优先级最高，状态和决策次之，参考类垫底。这个顺序很有道理：一条"用户要求全部用 pytest"比十条历史决策更能避免模型在下一个会话里犯同样的错。注入时的样子大概是：</p>
+<div class="highlight"><pre><span></span><code>🧠 engrim · memory restored — you don&#39;t have to re-explain
+  18 of 54 curated records loaded (~3850 chars)
+
+[DECISION]
+- #942 (via Claude Code): Switched primary database from MongoDB to PostgreSQL
+- #910 (via Cursor): Standardized on Pydantic v2 schemas across API boundaries
+</code></pre></div>
+
+<p>预算内装不下的记录一条 <code>recall</code> 就能拉回来，所以"只加载 18 条"不是信息丢失，是延迟加载。</p>
+<p>全文检索用 FTS5 虚拟表，走的是外部内容表模式：</p>
+<div class="highlight"><pre><span></span><code><span class="k">CREATE</span><span class="w"> </span><span class="n">VIRTUAL</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="n">memories_fts</span><span class="w"> </span><span class="k">USING</span><span class="w"> </span><span class="n">fts5</span><span class="p">(</span>
+<span class="w">  </span><span class="n">summary</span><span class="p">,</span><span class="w"> </span><span class="n">detail</span><span class="p">,</span><span class="w"> </span><span class="n">tags</span><span class="p">,</span>
+<span class="w">  </span><span class="n">content</span><span class="o">=</span><span class="s1">&#39;memories&#39;</span><span class="p">,</span><span class="w"> </span><span class="n">content_rowid</span><span class="o">=</span><span class="s1">&#39;id&#39;</span><span class="p">,</span>
+<span class="w">  </span><span class="n">tokenize</span><span class="o">=</span><span class="s1">&#39;porter unicode61&#39;</span>
+<span class="p">);</span>
+</code></pre></div>
+
+<p><code>content='memories'</code> 让 FTS5 不重复存文本，行 id 直接关联 memories 表，<code>bm25(memories_fts)</code> 就是排序函数。分词器用 <code>porter unicode61</code>，英文词干化，查询 <code>database</code> 也能命中 <code>databases</code>。</p>
+<p>另外两张表：<code>embedding(memory_id / model / dim / vec)</code> 存向量，<code>log(id / ts / project / session / role / content / raw / msg_uuid)</code> 是"飞行记录仪"，记录每轮对话和动作行，供 <code>engrim review</code> 扫描还有哪些决策没被捕获。</p>
+<h2>混合检索 Minder：bm25 + 静态向量 + RRF</h2>
+<p>检索引擎叫 Minder，两路混合：</p>
+<p>一路是词法，用 FTS5 的 bm25 排名做关键词精确匹配。查询进来会先 tokenize 成裸词，这是防呆设计，不然一个 <code>C++</code> 或者 <code>useState()</code> 这种带符号的字符串直接扔给 FTS5，就会撞语法错误。</p>
+<p>一路是语义，用 <code>model2vec</code> 的静态嵌入算 cosine 相似度，命中同义表达。关键在"静态"两个字：model2vec 加载只要几十毫秒，纯 CPU 跑，不需要 GPU，也不做每次查询的神经网络前向。写入时 <code>add</code> 自动嵌入存进 embedding 表，读取时才算 cosine。</p>
+<p>两路结果用 reciprocal-rank fusion（RRF）融合，常数 <code>C=60</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="n">score</span><span class="p">[</span><span class="nb">id</span><span class="p">]</span> <span class="o">+=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="mi">60</span> <span class="o">+</span> <span class="n">rank_i</span><span class="p">)</span>   <span class="c1"># 对词法路和语义路各累加一次</span>
+</code></pre></div>
+
+<p>经典 RRF 公式，好处是不用归一化两路分数，直接按排名融合，实现起来几行代码。语义路是全程带保护的：<code>ENGRIM_EMBED=off</code> 强制纯词法（零第三方依赖），model2vec 加载失败也优雅降级到纯词法，检索永远不会因为语义后端挂了而崩。</p>
+<h2>多环境接入：hooks + MCP stdio</h2>
+<p>跨模型的能力来自接入层。<code>engrim setup</code> 自动探测机器上装了哪些环境，一键全部配好：</p>
+<ul>
+<li>Antigravity：写 <code>~/.gemini/config/hooks.json</code>，<code>PreInvocation</code> 跑 <code>engrim hook --agent agy --event boot</code>，<code>Stop</code> 跑 stop 事件。</li>
+<li>Claude Code：写 <code>~/.claude/settings.json</code> 的 <code>SessionStart / SessionEnd / Stop / UserPromptSubmit</code> 四个 hook，再往 <code>CLAUDE.md</code> 追加记忆使用说明。</li>
+<li>Cursor / Windsurf：往 <code>~/.cursor/mcp.json</code> 注册 MCP server，跑 <code>engrim serve --mcp</code>。</li>
+</ul>
+<p>MCP 是零依赖的 JSON-RPC 2.0 stdio server，stdout 严格只发 JSON-RPC 消息，诊断日志全走 stderr，不然会污染协议流。暴露四个工具：<code>engrim_recall(query, project, k, type)</code>、<code>engrim_add(type, summary, detail, tags)</code>、<code>engrim_context(project, budget=4000)</code>、<code>engrim_review(project)</code>。</p>
+<p>项目归属的判定是一套优先级：显式 <code>-p</code> &gt; <code>$ENGRIM_PROJECT</code> &gt; 当前目录的 git root &gt; cwd。它会往上找 <code>.git / .hg / .svn / .claude</code> 标记，到 <code>$HOME</code> 就停。这个"停"很关键：<code>~/.claude</code> 和 <code>~/.git</code> 几乎人人都有，要是继续往上走，所有非仓库项目会被坍缩成一个桶。Windows 上还要 <code>normcase + normpath</code> 归一化盘符大小写和分隔符，否则同一个目录从 <code>os.getcwd()</code> 和 Claude Code hook 的 payload 拼出来的 tag 不一样，记忆就裂成两个桶。</p>
+<h2>实证：105 会话，153k token 压到 1k 以内</h2>
+<p>README 里最硬的是这段案例：在一个跑真钱的 5 万行算法交易系统上，连续 105 个会话，186 个单元测试零回归，跨模型切换零失忆。</p>
+<p>具体数字：153,000 token 的工作量（架构决策、参数调优、调试），被压缩成不到 1,000 token 的活动记忆包。也就是说，每次会话重启重新加载的上下文成本，砍掉了 99% 以上。在 Antigravity CLI、Claude Code、Cursor MCP 三个环境之间切换同一个仓库，没有模型漂移，没有架构回归。</p>
+<h2>我的做法</h2>
+<p>几个我认可的取舍，准备直接照搬：</p>
+<p>第一，用 SQLite 而不是向量库。单文件、零运维，FTS5 内置全文检索，加一个 model2vec 静态向量表就够用，不用为"记忆"上一整套 RAG 基建。对个人开发者，这比向量数据库务实得多。</p>
+<p>第二，检索替代塞满。记忆预算 4000 字符，逼着你只保留决策、约束、状态这类高价值信息，而不是把每轮对话都记下来。这个克制本身就是产品设计。</p>
+<p>第三，<code>resume-pointer</code> 工作流。结束会话前加一条 <code>resume-pointer</code> 记录，标注下一步做什么，下个会话的 boot pack 顶部就钉着 <code>[▶ RESUME HERE]</code>。把"续写"从玄学变成机制，这个设计我特别喜欢。</p>
+<p>我准备在自己项目里挂两个用法：一是把 engrim 接进 Claude Code 的 <code>SessionStart</code> hook；二是把项目里的约定（比如"这个 repo 用 pytest 加 xdist 跑测试"）用 <code>engrim add -t user</code> 存进去，省得每个新会话都重新交代一遍。</p>
+<p>一句话收尾：上下文窗口会继续变大，但"记忆"这个问题的答案，大概率不是更大的窗口，而是更聪明的检索。</p>
+<hr />
+<p><em>Engrim 是一个 MIT 协议的 Python 项目，<code>pip install engrim</code> 即可安装，Python 3.10+，纯本地离线，无任何遥测。</em></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

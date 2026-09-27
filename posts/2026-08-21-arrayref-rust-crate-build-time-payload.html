@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>arrayref 被投毒：一个 build.rs 如何在编译期执行任意代码 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>arrayref 被投毒：一个 build.rs 如何在编译期执行任意代码</h1>
+<time>2026-08-21</time>
+<ul>
+<li>供应链安全</li>
+<li>Rust</li>
+<li>恶意软件分析</li>
+</ul>
+<hr />
+<p>2026 年 8 月 20 日，crates.io 上流行的 Rust crate <code>arrayref</code> 出了一个被污染的版本 0.3.10。它没有改自己的代码，而是给依赖树里塞了一个打字错误仿冒包 <code>proc-macro1</code>，后者的构建脚本会在你编译项目的时候下载并运行一个远端二进制。crates.io 团队已经下架了恶意版本。SafeDep 的分析写得比较细，这里把攻击链和检测面梳理一遍。</p>
+<h2>攻击链：三步就够</h2>
+<p>第一步是命名仿冒。<code>proc-macro1</code> 和生态里的核心包 <code>proc-macro2</code> 只差一个字符。<code>proc-macro2</code> 是 <code>syn</code>、<code>quote</code> 这一整套宏生态的地基，几乎每个用到过程宏的项目都会间接依赖它。把仿冒包的名字做成这样，是为了让任何粗略扫一眼依赖列表的人不会起疑。</p>
+<p>第二步是依赖链污染。<code>arrayref</code> 本身是个很干净的小工具包，被大量项目间接依赖。真正的攻击载荷不在它里面，而在它新增的那一行依赖上。这样一来，安全审计如果只看直接依赖的源码，会完全看不到问题——payload 在下一个环上。</p>
+<p>第三步是编译期执行。Rust 允许 crate 自带 <code>build.rs</code>，这个脚本在编译期以构建者的身份、构建者的权限运行。它常见的用途是探测环境、生成绑定代码、调用外部工具。攻击者把它变成下载器和执行器：编译一开始，脚本就去取远端二进制并运行。</p>
+<p>三步连起来就是一个成熟的供应链攻击：不需要你运行任何东西，只要你 <code>cargo build</code>。</p>
+<h2>为什么构建期比运行期更危险</h2>
+<p>多数人对"恶意代码"的直觉停在运行期——程序跑起来之后干了坏事。构建期攻击的可怕之处恰恰在于它发生在你以为自己在"安全地编译开源代码"的时候。</p>
+<p>构建机器上通常有什么？CI 里配的发布凭证（<code>cargo publish</code> token、registry 凭据）、云环境的临时凭证、代码签名密钥、甚至生产环境的访问令牌。这些是攻击者最想要的东西——拿到发布 token，就能以你的名义向 registry 推一个带毒的新版本，让攻击自我复制。Shai-Hulud 那类供应链蠕虫走的就是这条路。</p>
+<p>还有一层：构建期执行发生在你的开发机上，用的是你的权限。容器隔离如果没做好，恶意 payload 能摸到的东西跟你手动敲命令时一样多。</p>
+<h2>检测：几个能立刻上手的命令</h2>
+<p>这类攻击的检测点在依赖图和构建脚本两个地方：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 看有没有直接依赖可疑包</span>
+cargo<span class="w"> </span>tree<span class="w"> </span>-i<span class="w"> </span>proc-macro1
+
+<span class="c1"># 列出所有 build script 产物，人工扫一遍陌生的</span>
+find<span class="w"> </span>target<span class="w"> </span>-name<span class="w"> </span><span class="s2">&quot;build-script-build&quot;</span><span class="w"> </span>-o<span class="w"> </span>-name<span class="w"> </span><span class="s2">&quot;output&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-50
+
+<span class="c1"># 用现成的漏洞/恶意包库扫</span>
+cargo<span class="w"> </span>audit
+</code></pre></div>
+
+<p><code>cargo audit</code> 依赖 RustSec 库，恶意包通告的更新有延迟，所以它不能当作唯一防线。更可靠的是看 <code>build.rs</code> 本身——如果你的依赖树里出现了意料之外的 crate 带了构建脚本，这就是一个需要解释的信号。正常的小工具包（比如 <code>arrayref</code> 这种做数组引用转换的）没有理由需要构建脚本。</p>
+<p>另外一个信号是 <code>Cargo.lock</code> 的意外变动。如果你只是跑了一次 <code>cargo update</code>，发现多出来一个从没听说过的依赖，去看它的发布历史和下载量。仿冒包通常有几个特征：发布时间很短、下载量异常、维护者账号是新的。</p>
+<h2>防御：把构建期收窄</h2>
+<p>几条能实际降低风险的配置：</p>
+<ul>
+<li>提交并锁定 <code>Cargo.lock</code>，CI 里用 <code>cargo build --locked</code>。这样依赖版本不会被意外漂移，新增依赖必然出现在 diff 里，能被 code review 看到。</li>
+<li>对敏感项目做依赖 vendoring（<code>cargo vendor</code>），把依赖源码固化到仓库里。新增依赖时 diff 会非常显眼。</li>
+<li>给 CI 的构建步骤配最小权限的凭证，并且把"发布"和"构建"分成两个不同的凭据。这样构建环节被攻陷也拿不到发布权限。</li>
+<li>在沙箱里构建第三方代码。容器里跑 <code>cargo build</code> 时限制网络出口——很多构建脚本其实不需要联网，只有需要联网的那种才是可疑的。</li>
+</ul>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<h2>我的做法</h2>
+<p>供应链安全里，构建期是最容易被忽视的一段。我现在维护 Rust 项目的习惯是：</p>
+<ul>
+<li><code>build.rs</code> 出现就人工看一眼。这条规则成本很低，能挡掉大部分 build-time payload。</li>
+<li><code>Cargo.lock</code> 必须进版本控制，CI 必须 <code>--locked</code>。依赖漂移不进 diff 的团队，等于把审计权交给了 registry。</li>
+<li>把 <code>cargo install</code> 换成 <code>cargo install --locked</code>，别让工具链自己决定装哪个版本。</li>
+</ul>
+<p><code>arrayref</code> 这次的 payload 被及时下架了，但手法是通用的：找一个被广泛依赖的干净包，往依赖里加一个仿冒名字，靠构建脚本执行。防的不是这一个包，是这一类模式。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

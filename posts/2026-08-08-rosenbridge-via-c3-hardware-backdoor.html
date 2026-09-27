@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>rosenbridge：VIA C3 处理器里那条被默认打开的内核后门 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>rosenbridge：VIA C3 处理器里那条被默认打开的内核后门</h1>
+<time>2026-08-08</time>
+<ul>
+<li>硬件安全</li>
+<li>x86</li>
+<li>逆向工程</li>
+<li>提权</li>
+<li>内核</li>
+</ul>
+<hr />
+<p>现代 CPU 的信任模型建立在一条公理上：ring 3 的代码不可能直接碰 ring 0 的内存，除非先找到一个漏洞。project:rosenbridge 做的事情是绕开这条公理，不利用漏洞，直接在部分 x86 处理器上执行一条指令，把内核内存当自己的内存来读写。</p>
+<p>作者 Christopher Domas（@xoreaxeaxeax）把这套工具和研究开源在 github.com/xoreaxeaxeax/rosenbridge。这不是新发布，但它完整示范了"硬件后门长什么样、怎么被找出来、怎么关掉"这三件事，值得逐层拆开看。</p>
+<h2>后门本身长什么样</h2>
+<p>rosenbridge 不是软件漏洞，而是主 x86 核旁边多出来的一个非 x86 小核。访问路径分三步：</p>
+<ol>
+<li>一个 model-specific register（MSR）上的控制位负责使能；</li>
+<li>一条 launch instruction 把执行切进那个小核；</li>
+<li>之后命令被包在特殊格式的 x86 指令里送过去，小核执行所谓的 DEIS（Deeply Embedded Instruction Set）。</li>
+</ol>
+<p>它能绕过所有内存保护和特权检查。README 里有一句话值得单独拎出来：这个东西比 Management Engine 和 Platform Security Processor 嵌得更深，因为它不只能访问 CPU 的全部内存，还能访问寄存器堆和执行流水线。</p>
+<p>"应该需要 ring 0 才能打开"是设计意图，但实测发现部分系统上这个后门是<strong>默认打开的</strong>。也就是说，任何非特权代码都能改内核。</p>
+<h2>触发路径与 PoC</h2>
+<p><code>lock/lock.c</code> 里能看到关键常量：</p>
+<div class="highlight"><pre><span></span><code><span class="cp">#define BACKDOOR_MSR     0x00001107</span>
+<span class="cp">#define BACKDOOR_TOGGLE  0x00000001</span>
+<span class="cp">#define MSR_DEV &quot;/dev/cpu/0/msr&quot;</span>
+</code></pre></div>
+
+<p>控制位是 MSR <code>0x1107</code> 的 bit 0，清掉它就把后门锁上。<code>esc/escalate.c</code> 是提权的骨架：</p>
+<div class="highlight"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="nf">main</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">__asm__</span><span class="w"> </span><span class="p">(</span><span class="s">&quot;movl $payload, %eax&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">__asm__</span><span class="w"> </span><span class="p">(</span><span class="s">&quot;.byte 0x0f, 0x3f&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="n">__asm__</span><span class="w"> </span><span class="p">(</span><span class="s">&quot;payload:&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="cp">#include</span><span class="w"> </span><span class="cpf">&quot;bin/payload.h&quot;</span>
+<span class="w">    </span><span class="n">system</span><span class="p">(</span><span class="s">&quot;/bin/bash&quot;</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>EAX 指向 DEIS 程序，<code>0F 3F</code> 是那条 launch instruction，后面的字节交给隐藏核心执行。<code>esc/payload.asm</code> 用自定义的 DEIS 汇编写了一条完整提权链，注释说明是针对 Debian 6.0.10（i386）写的：</p>
+<ul>
+<li><code>lgd eax</code> 取 GDT 基址；</li>
+<li>读 GDT 偏移 0x78 处的内核段描述符，拆出 fs_base；</li>
+<li>从 fs_base 读出 <code>task_struct</code> 指针；</li>
+<li>从 task_struct 偏移 0x208 读出 <code>cred</code>；</li>
+<li>把 cred 偏移 0x4、0x8、0xc、0x10 上的 uid、gid、euid、egid 四个字段全部写 0。</li>
+</ul>
+<p>这段逻辑和常规内核提权 exploit 一模一样，区别在于它不靠任何内存破坏，每一步都是隐藏核心代劳。DEIS 的助记符也自成一套：<code>lgd</code>、<code>izx</code>、<code>ada</code>、<code>ad2</code>、<code>ld4</code>、<code>st4</code>、<code>zl3</code>、<code>la8</code>、<code>ra8</code>、<code>cmb</code>。</p>
+<h2>研究方法比结论更值得借</h2>
+<p>这套研究的方法论有参考价值：</p>
+<ul>
+<li><strong>sandsifter</strong> 用来系统性扫未知指令，launch instruction 和 bridge instruction 就是这么找出来的。</li>
+<li><code>fuzz/</code> 按阶段拆成三个工具：<code>deis</code> 探索隐藏核心的能力，<code>wrap</code> 定位 x86 侧的 bridge instruction，<code>exit</code> 是早期以为需要退出序列时写的，后来找到的处理器不需要，该目录直接废弃。这种把死路留在仓库里的做法很少见，但很有用。</li>
+<li><code>kern/</code> 是一组内核模块和工具，用来观察被模糊测试的 DEIS 指令到底改了哪块内核内存。<code>kern/deis_kernel.c</code> 注册了一个字符设备，暴露 <code>GET_BUFFER_ADDRESS</code>、<code>GET_BUFFER_SIZE</code>、<code>READ_BUFFER</code>、<code>RESET_BUFFER</code> 四个 ioctl，配一个 32 字节的哨兵 buffer：发一条 DEIS 指令，再看 buffer 变没变，就能确认读写是否穿透到了内核。</li>
+<li><code>proc/extract.py</code> 从模糊测试日志里归纳指令行为类别。</li>
+<li><code>asm/deis_asm.py</code> 是 DEIS 的汇编器，把自定义汇编翻译成 x86 字节。</li>
+</ul>
+<p>这里有个概念要分清：launch instruction 和 bridge instruction 是两个不同的东西。前者负责把执行从 x86 核切到隐藏核，后者负责把后续命令送进去。项目早期以为还需要一条 exit 序列切回来，后来发现找到的那颗处理器不需要，<code>fuzz/exit/</code> 就整体废弃了。</p>
+<p><code>fuzz/manager/</code> 是配套的分布式模糊测试调度器，也是整个仓库里工程量最容易被低估的部分。它把任务分到一组 worker 上执行，<code>power/relay_ftdi.py</code> 和 <code>power/relay_serial.py</code> 通过 FTDI 或串口继电器给被测机器物理断电重启，<code>watch_sessions.py</code> 盯着会话状态，<code>util/indent.py</code> 负责把日志缩进成可读的树。硬件模糊测试必然挂机，能远程断电是刚需而不是优化。</p>
+<p><code>lock</code> 和 <code>unlock</code> 两个工具直接操作那个 MSR 位；<code>fix/</code> 则把锁定动作包装成开机早期脚本，<code>fix/lock_deis.sh</code> 只有两行——<code>modprobe msr</code> 加一句执行 lock 二进制。</p>
+<h2>影响面，以及别夸大</h2>
+<p>README 写得很克制：只有 VIA C3 受影响，C3 之后的代次不再包含这个特性。C 系列的市场定位是工业自动化、POS、ATM、医疗设备，以及一部分消费级笔记本和台式机。所以这不是"所有 x86 都有后门"，而是特定一代嵌入式处理器的历史遗留。</p>
+<p>作者给的定性也值得引用：他们认为这个功能当初是作为嵌入式市场的有用特性善意实现的，在某些早期代次上被无意地留在了默认开启状态，研究没有暗示恶意意图。</p>
+<h2>检测与关闭</h2>
+<p>检测工具必须跑在裸机上，不能进虚拟机，而且处于 alpha 状态，在不受影响的系统上可能崩溃、panic 或挂住：</p>
+<div class="highlight"><pre><span></span><code>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/xoreaxeaxeax/rosenbridge
+<span class="nb">cd</span><span class="w"> </span>rosenbridge/util
+make
+sudo<span class="w"> </span>modprobe<span class="w"> </span>msr
+sudo<span class="w"> </span>./bin/check
+</code></pre></div>
+
+<p>如果确认中招，<code>fix/</code> 提供开机早期关闭的方案：</p>
+<div class="highlight"><pre><span></span><code><span class="nb">cd</span><span class="w"> </span>fix
+make
+sudo<span class="w"> </span>make<span class="w"> </span>install
+reboot
+</code></pre></div>
+
+<p>一个必须说清楚的局限：如果攻击者已经拿到内核权限，它仍然可以把后门重新打开。这个脚本是"在启动早期纠正问题"的范例，不同系统需要自行适配。</p>
+<h2>我的做法</h2>
+<ol>
+<li><strong>怀疑硬件之前先量化范围</strong>。这套工具是针对特定处理器家族和核心写的，稍微改过的实现就会漏检。所以 <code>check</code> 报告"没检测到"不等于安全，只等于"没匹配上已知形态"。</li>
+<li><strong>把这套方法论借过来</strong>。sandsifter 扫未知指令、自定义内核哨兵 buffer 观察内存变化、从模糊测试日志里归纳行为模式，这三段式可以套到任何"想验证某个不可见执行单元到底做了什么"的场景，不一定非得是 CPU。</li>
+<li><strong>该关的早关</strong>。如果设备清单里有 C3 工控机，别指望常规漏洞管理流程能覆盖到它。<code>modprobe msr</code> 加上开机早期 lock 是成本最低的一步，而且它只需要做一次。</li>
+</ol>
+<p>硬件后门研究里最实用的一句话大概是：你不是在找一个 bug，你是在找一块不在图纸上的硅。找得到的前提是，你先假设它存在。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

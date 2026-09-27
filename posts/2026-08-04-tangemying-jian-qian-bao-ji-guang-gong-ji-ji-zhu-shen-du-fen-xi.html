@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>激光重置硬件钱包密码：Tangem 被 Ledger Donjon 攻破的技术内幕 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>激光重置硬件钱包密码：Tangem 被 Ledger Donjon 攻破的技术内幕</h1>
+<time>2026-08-04</time>
+<ul>
+<li>技术
+Slug: tangem硬件钱包激光攻击技术深度分析</li>
+</ul>
+<hr />
+<h2>一、背景：当 EAL6+ 不再是免死金牌</h2>
+<p>2026 年 2 月 10 日，Ledger 旗下的安全研究团队 Ledger Donjon 向硬件钱包厂商 Tangem 提交了一份安全评估报告：他们通过<strong>激光故障注入</strong>技术，在物理接触卡片的前提下，成功绕过了 Tangem 卡片固件中的"恢复态校验（recovery-state check）"，从而在不知道原密码、不需要备份卡的情况下，调用普通的 <code>SetPin</code> 指令将卡片密码重置为任意值。密码一旦重置，攻击者即可完整控制钱包并签名转账。</p>
+<p>该漏洞在 2026 年 7 月公开披露，其技术意义远超"又一家钱包被黑"的层面，核心在于三点：</p>
+<ol>
+<li><strong>目标芯片通过 EAL6+ 认证</strong>：Tangem 卡片采用 Samsung S3D232A 安全元件（Secure Element, SE），达到 Common Criteria EAL6+ 级别，这是民用安全芯片中极高的认证等级。但 EAL6+ 认证的是"芯片及其内置防御"，而非"钱包厂商叠加在芯片之上的固件逻辑"——本次漏洞恰恰存在于固件逻辑层。</li>
+<li><strong>漏洞不可修复</strong>：Tangem 卡片设计上<strong>没有固件升级机制</strong>（厂商将其作为"不可远程篡改"的安全特性宣传）。这意味着所有已售出卡片将永久携带该缺陷，无法通过 OTA 推送补丁。</li>
+<li><strong>攻击可复现且参数稳定</strong>：Donjon 在锁定激光参数后，对每张测试卡片都能在约 2 小时内完成攻击，成功率稳定。</li>
+</ol>
+<p>这并非 Donjon 对 Tangem 的首次研究——此前他们还披露过 Android 应用 genuin check 绕过（软件层，可修）与卡片认证协议暴力破解（固件层，不可修）。LFI 攻击是这一研究线的延续，也是最具硬件安全教科书意义的一环。</p>
+<h2>二、故障注入攻击原理：用光子改写控制流</h2>
+<h3>2.1 故障注入（Fault Injection）家族</h3>
+<p>故障注入是侧信道攻击的一个分支，与功耗分析（SPA/DPA）、电磁分析（EMA）并列。其核心思想是：<strong>在芯片执行特定指令的瞬间，注入一个瞬时扰动，使该指令产生非预期的结果</strong>，从而破坏程序原本的安全校验逻辑。</p>
+<p>按注入手段划分，主要有四类：</p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────┐
+│                    故障注入技术分类                           │
+├──────────────┬────────────────┬──────────────┬──────────────┤
+│  电压故障     │  时钟故障       │  电磁故障     │  激光故障     │
+│  VCC Glitch  │  Clock Glitch  │  EMFI        │  LFI         │
+├──────────────┼────────────────┼──────────────┼──────────────┤
+│ 瞬时拉低/抬升 │ 注入毛刺时钟沿  │ 脉冲磁场耦合 │ 聚焦光子注入  │
+│ 供电电压      │ 扰乱时序        │ 扰乱寄存器    │ 电荷生成翻转  │
+├──────────────┼────────────────┼──────────────┼──────────────┤
+│ 成本最低      │ 成本较低        │ 中等成本      │ 成本最高      │
+│ 空间分辨率低  │ 空间分辨率低    │ 空间分辨率中  │ 空间分辨率高  │
+│ 易被电压传感  │ 易被频率传感    │ 穿透金属层难  │ 背面照射可绕  │
+│ 器检测        │ 器检测          │              │ 过正面屏蔽    │
+└──────────────┴────────────────┴──────────────┴──────────────┘
+</code></pre></div>
+
+<p>激光故障注入（LFI）是其中<strong>空间分辨率最高、最难被正面屏蔽层防御</strong>的手段，也是唯一能在亚微米级精确定位单个晶体管区域的注入方式，代价是设备昂贵、操作复杂。</p>
+<h3>2.2 激光故障注入的物理原理：光电效应</h3>
+<p>半导体晶体管本质上是光敏的。当激光光子打在硅片（silicon die）上的晶体管区域时，光子能量会激发半导体价带电子跃迁至导带，产生<strong>电子-空穴对（electron-hole pairs）</strong>——这是半导体层面的光电效应。</p>
+<div class="highlight"><pre><span></span><code>                    激光脉冲（红外，纳秒级）
+                         │
+                         ▼
+   ┌──────────────────────────────────────┐
+   │          硅基底 (Silicon Substrate)    │
+   │                                       │
+   │   价带电子  ──光子激发──►  导带电子     │
+   │      ●                    ○           │
+   │      │                    │           │
+   │      └──空穴(h+)  ◄──────┘            │
+   │                                       │
+   │   瞬时电荷载流子注入 → 晶体管状态翻转   │
+   │                                       │
+   │   [应关闭的管子短暂导通]                │
+   │   [应保持的寄存器值发生翻转]            │
+   └──────────────────────────────────────┘
+                         │
+                         ▼
+              指令执行结果被篡改
+        （条件跳转被跳过 / 比较结果翻转）
+</code></pre></div>
+
+<p>这种瞬时的电荷载流子注入会改变晶体管状态：本应保持关闭的管子可能短暂导通，本应保持稳定的寄存器位可能发生翻转。如果这一扰动恰好发生在执行<strong>安全关键指令</strong>（如条件比较、状态机跳转）的<strong>正确晶体管</strong>、<strong>正确时刻</strong>，就能让芯片以可控的方式"算错"——这就是故障注入的物理基础。</p>
+<p>现代安全芯片的晶体管尺寸在纳米量级，因此激光光斑必须聚焦到<strong>几微米</strong>级别，才能精确命中特定功能区域而不触发相邻的反制电路；时序精度需达到<strong>纳秒</strong>级；激光能量需精确校准——能量过低无效果，过高则永久烧毁电路。</p>
+<h3>2.3 故障注入对控制流的影响模型</h3>
+<p>从软件视角看，一次成功的故障注入通常产生以下三类效果之一：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">fault_models</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;激光故障注入在指令层面的三种典型效果模型&quot;&quot;&quot;</span>
+    <span class="c1"># 模型1: 指令跳过 (Instruction Skip) — 条件分支被整体跳过</span>
+    <span class="c1">#   例如: if (counter &gt;= MAX) lock();  →  lock() 永不执行</span>
+    <span class="n">model_1</span> <span class="o">=</span> <span class="s2">&quot;instruction_skip&quot;</span>
+    <span class="c1"># 模型2: 寄存器/内存值翻转 (Bit Flip) — 状态变量被翻转</span>
+    <span class="c1">#   例如: counter = 5  →  counter = 0  (位翻转导致清零)</span>
+    <span class="n">model_2</span> <span class="o">=</span> <span class="s2">&quot;register_bit_flip&quot;</span>
+    <span class="c1"># 模型3: PC 指针偏转 (Program Counter Hijack) — 跳转到非预期地址</span>
+    <span class="c1">#   例如: 跳过整个校验函数，直接进入 reset_pin()</span>
+    <span class="n">model_3</span> <span class="o">=</span> <span class="s2">&quot;pc_hijack&quot;</span>
+    <span class="k">return</span> <span class="p">[</span><span class="n">model_1</span><span class="p">,</span> <span class="n">model_2</span><span class="p">,</span> <span class="n">model_3</span><span class="p">]</span>
+</code></pre></div>
+
+<p>Tangem 攻击中，Donjon 利用的正是<strong>模型 1（指令跳过）/ 模型 2（状态翻转）</strong> 的组合：在固件执行"是否处于恢复态"的校验指令时注入故障，使该校验返回错误结果（假阳性），让卡片误以为处于合法恢复流程中。</p>
+<h2>三、Tangem 硬件钱包安全架构</h2>
+<h3>3.1 卡片硬件架构</h3>
+<p>Tangem 钱包外观为一张标准银行卡大小的智能卡，内部核心是一颗 Samsung S3D232A 安全元件。卡片通过 NFC 与手机 App 通信，私钥永远不出芯片。</p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────┐
+│                    Tangem 卡片物理结构                        │
+│  ┌───────────────────────────────────────────────────────┐  │
+│  │  PVC / 塑料卡体封装层                                  │  │
+│  │  ┌───────────────────────────────────────────────┐    │  │
+│  │  │  NFC 天线线圈                                  │    │  │
+│  │  │  ┌───────────────────────────────────────┐    │    │  │
+│  │  │  │  Samsung S3D232A 安全元件 (EAL6+)       │    │    │  │
+│  │  │  │  ┌─────────────────────────────────┐  │    │    │  │
+│  │  │  │  │  ▶ AES/SHA 密码协处理器          │  │    │    │  │
+│  │  │  │  │  ▶ 真随机数发生器 (TRNG)         │  │    │    │  │
+│  │  │  │  │  ▶ 受保护存储区 (私钥/PIN哈希)    │  │    │    │  │
+│  │  │  │  │  ▶ 固件 ROM (不可更新)           │  │    │    │  │
+│  │  │  │  │  ▶ 状态机/访问控制逻辑            │  │    │    │  │
+│  │  │  │  │  ▶ 金属屏蔽层 / 电压/光传感器     │  │    │    │  │
+│  │  │  │  └─────────────────────────────────┘  │    │    │  │
+│  │  │  └───────────────────────────────────────┘    │    │  │
+│  │  └───────────────────────────────────────────────┘    │  │
+│  └───────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>S3D232A 属于 Samsung 安全元件产品线，通过 Common Criteria EAL6+ 认证，具备电压/温度/频率/光照传感器、主动金属屏蔽层、内部存储加密等物理防护。EAL6+ 认证的对象是<strong>芯片本身及其硬件级防御机制</strong>，不包括设备厂商烧录其中的固件应用代码——这是一个常被误解的边界。</p>
+<h3>3.2 密码保护与恢复机制</h3>
+<p>Tangem 的安全模型依赖两个因素：<strong>持有卡片</strong> + <strong>知道密码</strong>。卡片以成套（linked set）形式销售，用户设置访问密码后，私钥受密码派生保护。其密码恢复流程设计如下：</p>
+<div class="highlight"><pre><span></span><code><span class="err">正常修改密码</span><span class="o">:</span><span class="w">                 </span><span class="err">恢复态重置密码</span><span class="w"> </span><span class="o">(</span><span class="err">忘记密码时</span><span class="o">):</span>
+<span class="err">┌──────────────┐</span><span class="w">              </span><span class="err">┌──────────────────────────┐</span>
+<span class="err">│</span><span class="w"> </span><span class="err">验证旧密码</span><span class="w">    </span><span class="err">│</span><span class="w">              </span><span class="err">│</span><span class="w"> </span><span class="err">将两张同套卡片贴近</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">          </span><span class="err">│</span><span class="w">              </span><span class="err">│</span><span class="w">   </span><span class="err">│</span><span class="w">                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">▼</span><span class="w">          </span><span class="err">│</span><span class="w">              </span><span class="err">│</span><span class="w">   </span><span class="err">▼</span><span class="w">                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">旧密码正确</span><span class="o">?</span><span class="w">   </span><span class="err">│</span><span class="w">              </span><span class="err">│</span><span class="w"> </span><span class="err">固件检查</span><span class="o">:</span><span class="w"> </span><span class="err">本卡是否处于</span><span class="w">   </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">│是</span><span class="w">        </span><span class="err">│</span><span class="w">              </span><span class="err">│</span><span class="w"> </span><span class="err">恢复态</span><span class="w"> </span><span class="o">(</span><span class="n">recovery</span><span class="w"> </span><span class="n">mode</span><span class="o">)?</span><span class="w">  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">   </span><span class="err">▼</span><span class="w">          </span><span class="err">│</span><span class="w">              </span><span class="err">│</span><span class="w">   </span><span class="err">│是</span><span class="w">                    </span><span class="err">│</span>
+<span class="err">│</span><span class="w"> </span><span class="err">接受新密码</span><span class="w">    </span><span class="err">│</span><span class="w">              </span><span class="err">│</span><span class="w">   </span><span class="err">▼</span><span class="w">                      </span><span class="err">│</span>
+<span class="err">└──────────────┘</span><span class="w">              </span><span class="err">│</span><span class="w"> </span><span class="n">SetPin</span><span class="w"> </span><span class="err">接受新密码</span><span class="w">        </span><span class="err">│</span>
+<span class="w">                              </span><span class="err">│</span><span class="w"> </span><span class="o">(</span><span class="err">不要求旧密码</span><span class="o">)</span><span class="w">           </span><span class="err">│</span>
+<span class="w">                              </span><span class="err">└──────────────────────────┘</span>
+</code></pre></div>
+
+<p>关键弱点在于恢复态校验逻辑：固件在处理 <code>SetPin</code> 指令时，会执行一次<strong>单一的状态检查</strong>——判断卡片当前是否处于合法恢复模式。若检查通过，则跳过旧密码验证，直接接受新密码。Donjon 的研究发现：</p>
+<ul>
+<li>该校验是<strong>单一检查点</strong>，缺乏冗余/交叉验证；</li>
+<li>即使用户在 App 中<strong>关闭了恢复功能</strong>，固件中同一段检查逻辑仍在每张卡片上执行；</li>
+<li>这意味着攻击面在所有卡片上恒常存在，无法通过用户配置消除。</li>
+</ul>
+<h2>四、攻击链拆解</h2>
+<p>整个攻击链可分为四个阶段：芯片去封装 → 裸晶映射与激光定位 → 故障注入 → 密码重置。</p>
+<h3>4.1 步骤一：芯片去封装（Decapping）</h3>
+<p>攻击首先需要物理暴露硅裸晶。卡片中的 S3D232A 被塑料封装包裹，必须去除：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 概念性伪代码：去封装流程（仅作原理说明，不可直接执行）</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">decapsulate_chip</span><span class="p">(</span><span class="n">card</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    化学去封装：发烟硝酸溶解塑料封装</span>
+<span class="sd">    机械去封装：精密铣削从背面去除封装材料</span>
+<span class="sd">    两种方式都会永久破坏卡片外观，不可逆</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">chip</span> <span class="o">=</span> <span class="n">extract_module_from_card</span><span class="p">(</span><span class="n">card</span><span class="p">)</span>          <span class="c1"># 从卡体取出 S3D232A 模块</span>
+    <span class="c1"># 发烟硝酸 (Fuming HNO3) 溶解环氧树脂，需通风橱与化学操作资质</span>
+    <span class="c1"># 或机械铣削：从芯片背面精密铣除封装</span>
+    <span class="n">exposed_die</span> <span class="o">=</span> <span class="n">chemical_decap</span><span class="p">(</span><span class="n">chip</span><span class="p">,</span> <span class="n">acid</span><span class="o">=</span><span class="s2">&quot;fuming_nitric_acid&quot;</span><span class="p">)</span>
+    <span class="n">die</span> <span class="o">=</span> <span class="n">clean</span><span class="p">(</span><span class="n">exposed_die</span><span class="p">)</span>                       <span class="c1"># 清洗残留酸液，露出硅裸晶</span>
+    <span class="k">return</span> <span class="n">die</span>  <span class="c1"># 裸晶已暴露，卡片永久损坏</span>
+</code></pre></div>
+
+<p>去封装是不可逆的——卡片外观会留下明显的切割/腐蚀痕迹，这正是该攻击无法"悄无声息"将卡片归还的原因。</p>
+<h3>4.2 步骤二：裸晶映射与激光定位</h3>
+<p>去封装后，需对裸晶进行功能映射，定位恢复态校验逻辑所在的晶体管区域。由于 S3D232A 没有公开裸晶照片，研究者需从外部完全黑盒地建立映射：</p>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────┐
+│              裸晶映射流程 (Black-box Die Mapping)             │
+│                                                              │
+│  发射光分析 (Photoemission Analysis)                          │
+│  ─────────────────────────────────                            │
+│  晶体管开关时会发射微弱红外光。在芯片执行特定指令时             │
+│  拍摄发射图像，可观察到哪些区域在该指令下活跃:                  │
+│                                                              │
+│      执行 SetPin 时的发射图:                                  │
+│      ┌────────────────────────┐                              │
+│      │  ░░░░░░░░░░░░░░░░░░░░  │                              │
+│      │  ░░░ [活跃区A] ░░░░░░  │  ← 候选区域: 访问控制逻辑     │
+│      │  ░░░░░░░░░░░░░░░░░░░░  │                              │
+│      │  ░░░░░░ [活跃区B] ░░░  │  ← 候选区域: 状态校验逻辑     │
+│      │  ░░░░░░░░░░░░░░░░░░░░  │                              │
+│      └────────────────────────┘                              │
+│                                                              │
+│  结合红外显微成像，建立功能区块 → 物理坐标的映射表             │
+│  识别出 recovery-state check 所在的候选晶体管区域             │
+└──────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3>4.3 步骤三：故障注入</h3>
+<p>定位到候选区域后，进入参数搜索阶段。LFI 攻击需要在三维参数空间中寻找正确组合：</p>
+<div class="highlight"><pre><span></span><code>参数空间:
+  (X, Y)    —— 激光光斑在裸晶上的物理坐标
+  T         —— 脉冲触发时刻相对指令执行的纳秒级偏移
+  E         —— 激光能量 (脉冲宽度 × 功率)
+
+搜索策略: 系统性扫描 → 观察芯片响应 → 收敛参数
+  ┌─────────────────────────────────────────────────┐
+  │  响应分类:                                       │
+  │   ① 无效果 → 调整坐标/时序                       │
+  │   ② 芯片崩溃 → 复位，调整能量降低                │
+  │   ③ 芯片永久损坏 → 换新样片，从零开始 (常见)      │
+  │   ④ ★校验返回假阳性 → 命中! 记录参数             │
+  └─────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>由于芯片背面相对正面屏蔽层更薄弱，Donjon 采用<strong>背面照射（backside injection）</strong>技术——红外激光从芯片背面穿透硅基底照射目标区域，绕过正面的金属屏蔽层。硅对红外波段相对透明，便于背面入射。</p>
+<p>故障注入的目标指令是固件中执行"是否处于恢复态"的条件判断：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 模拟密码验证流程中的故障注入点</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">verify_pin</span><span class="p">(</span><span class="n">user_pin</span><span class="p">,</span> <span class="n">stored_pin_hash</span><span class="p">,</span> <span class="n">attempt_counter</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    硬件钱包 PIN 验证流程模拟</span>
+<span class="sd">    故障注入目标: 跳过 attempt_counter 检查</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="c1"># 检查是否已超过最大尝试次数</span>
+    <span class="k">if</span> <span class="n">attempt_counter</span> <span class="o">&gt;=</span> <span class="n">MAX_ATTEMPTS</span><span class="p">:</span>  <span class="c1"># ← 激光故障注入目标指令</span>
+        <span class="n">card_lock</span><span class="p">()</span>
+        <span class="k">return</span> <span class="kc">False</span>
+
+    <span class="c1"># 计算输入 PIN 的哈希</span>
+    <span class="n">input_hash</span> <span class="o">=</span> <span class="n">sha256</span><span class="p">(</span><span class="n">user_pin</span><span class="o">.</span><span class="n">encode</span><span class="p">())</span><span class="o">.</span><span class="n">digest</span><span class="p">()</span>
+
+    <span class="c1"># 常数时间比较</span>
+    <span class="k">if</span> <span class="n">constant_time_compare</span><span class="p">(</span><span class="n">input_hash</span><span class="p">,</span> <span class="n">stored_pin_hash</span><span class="p">):</span>
+        <span class="n">reset_attempt_counter</span><span class="p">()</span>
+        <span class="k">return</span> <span class="kc">True</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">increment_attempt_counter</span><span class="p">()</span>
+        <span class="k">return</span> <span class="kc">False</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">set_pin_flow</span><span class="p">(</span><span class="n">new_pin</span><span class="p">,</span> <span class="n">is_recovery_mode</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    SetPin 指令处理流程 (简化模型)</span>
+<span class="sd">    这是 Tangem 攻击的真正目标: 恢复态校验</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="c1"># ★ 单一检查点: 本卡是否处于恢复态?</span>
+    <span class="k">if</span> <span class="n">is_recovery_mode</span><span class="p">:</span>            <span class="c1"># ← 激光故障注入在此注入</span>
+        <span class="c1"># 恢复态: 跳过旧密码验证, 直接接受新密码</span>
+        <span class="n">write_new_pin_hash</span><span class="p">(</span><span class="nb">hash</span><span class="p">(</span><span class="n">new_pin</span><span class="p">))</span>
+        <span class="k">return</span> <span class="kc">True</span>
+
+    <span class="c1"># 非恢复态: 要求验证旧密码</span>
+    <span class="k">if</span> <span class="n">verify_old_password</span><span class="p">():</span>
+        <span class="n">write_new_pin_hash</span><span class="p">(</span><span class="nb">hash</span><span class="p">(</span><span class="n">new_pin</span><span class="p">))</span>
+        <span class="k">return</span> <span class="kc">True</span>
+    <span class="k">return</span> <span class="kc">False</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">fault_injection_effect</span><span class="p">():</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    激光故障注入可能导致的效果:</span>
+<span class="sd">    1. 指令跳过: if(is_recovery_mode) 被跳过, 直接执行 write_new_pin_hash</span>
+<span class="sd">    2. 寄存器值翻转: is_recovery_mode 标志位被翻转为 True</span>
+<span class="sd">    3. PC指针偏转: 跳转到 write_new_pin_hash</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="k">pass</span>
+</code></pre></div>
+
+<h3>4.4 步骤四：密码重置</h3>
+<p>校验被绕过后，普通的 <code>SetPin</code> 指令会接受攻击者指定的新密码。密码重置完成后，攻击者已完全掌握卡片控制权，可对钱包绑定的资产签名转账。由于私钥从未离开 SE，攻击者实际是"获得了一张知道密码的新卡"，而非提取私钥。</p>
+<h2>五、技术细节深挖</h2>
+<h3>5.1 故障注入时机选择</h3>
+<p>LFI 的时序精度要求达到纳秒级，但固件指令的执行时刻对外部不可见。研究者通常借助<strong>侧信道辅助定位</strong>：</p>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────┐
+│  时序定位: 功耗/电磁侧信道辅助                                │
+│                                                              │
+│  功耗轨迹 (Power Trace):                                      │
+│  ▲                                                            │
+│  │     ┌─┐         ┌──┐        ┌─┐                          │
+│  │     │ │   ┌─┐   │  │   ┌─┐  │ │   ← 不同指令功耗特征不同   │
+│  │  ┌──┘ └───┘ └───┘  └───┘ └─┘ └──                         │
+│  │─────────────────────────────────────────────► t           │
+│  │           ▲                                                │
+│  │      recovery-state                                        │
+│  │      check 指令窗口                                         │
+│  │      (功耗特征可识别)                                       │
+│  │                                                            │
+│  │  在该窗口内触发激光脉冲 → 精确命中目标指令                  │
+└──────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>通过采集芯片执行 <code>SetPin</code> 流程时的功耗轨迹，识别出恢复态校验指令对应的功耗特征窗口，将激光脉冲触发时刻对准该窗口。结合芯片时钟同步信号，可将触发精度收敛到纳秒级。</p>
+<h3>5.2 激光参数</h3>
+<p>LFI 攻击的典型激光参数范围如下（基于公开研究的一般性参数，非 Tangem 攻击的精确泄密值）：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>典型范围</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>波长</td>
+<td>1064 nm / 808 nm（近红外）</td>
+<td>硅对红外相对透明，便于背面穿透；可见光易被正面金属层遮挡</td>
+</tr>
+<tr>
+<td>光斑直径</td>
+<td>1–5 μm</td>
+<td>需聚焦到微米级以命中单个功能区块</td>
+</tr>
+<tr>
+<td>脉冲宽度</td>
+<td>1–100 ns（纳秒级）</td>
+<td>与单条指令执行时间同量级</td>
+</tr>
+<tr>
+<td>激光功率</td>
+<td>mW–W 量级（脉冲峰值）</td>
+<td>需校准：过低无效果，过高烧毁</td>
+</tr>
+<tr>
+<td>触发精度</td>
+<td>亚纳秒级</td>
+<td>需与时钟/侧信道同步</td>
+</tr>
+<tr>
+<td>照射方式</td>
+<td>背面入射（backside）</td>
+<td>绕过正面金属屏蔽层</td>
+</tr>
+</tbody>
+</table>
+<p>整个实验台（激光源、精密 XY 平台/显微镜、示波器、定制攻击板、发射光分析装置）成本约 25 万美元，且需要半导体物理、故障注入理论、信号分析、芯片版图分析的复合型专家操作。</p>
+<h3>5.3 背面红外照射技术</h3>
+<p>正面照射（frontside）会受到芯片顶层金属互连层的遮挡——金属层对光不透明。背面照射通过从芯片基底侧入射，避开金属层：</p>
+<div class="highlight"><pre><span></span><code>        正面照射 (易被屏蔽)              背面照射 (绕过屏蔽)
+                                      激光 (红外)
+                                         │
+   激光                                   ▼
+    │            ┌──────────┐    ┌──────────┐
+    ▼            │ 金属互连层│    │  硅基底   │ ← 红外可穿透
+ ┌──────┐  被挡  │ ░░░░░░░░ │    │ (红外透明)│
+ │金属层│ ────► │ 晶体管层  │    │ 晶体管层  │ ← 命中目标
+ └──────┘       │  硅基底   │    │ 金属互连层│
+                └──────────┘    └──────────┘
+</code></pre></div>
+
+<p>背面照射需先将芯片背面基底减薄（thinning），使红外光能穿透至晶体管层，这是制备阶段的额外工序。</p>
+<h3>5.4 故障注入效果验证</h3>
+<p>注入后需验证故障是否产生了预期效果。验证逻辑：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">verify_fault_injection_success</span><span class="p">(</span><span class="n">card</span><span class="p">,</span> <span class="n">test_pin</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;验证故障注入是否成功绕过恢复态校验&quot;&quot;&quot;</span>
+    <span class="c1"># 注入故障后, 用 SetPin 设置新密码 (不提供旧密码, 不提供备份卡)</span>
+    <span class="n">result</span> <span class="o">=</span> <span class="n">card</span><span class="o">.</span><span class="n">send_apdu</span><span class="p">(</span><span class="n">cla</span><span class="o">=</span><span class="mh">0x00</span><span class="p">,</span> <span class="n">ins</span><span class="o">=</span><span class="n">SET_PIN</span><span class="p">,</span> <span class="n">data</span><span class="o">=</span><span class="n">test_pin</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">result</span><span class="o">.</span><span class="n">sw</span> <span class="o">==</span> <span class="n">SW_SUCCESS</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">True</span>  <span class="c1"># 非恢复态本应拒绝, 成功说明校验被绕过</span>
+    <span class="c1"># 进一步验证: 用新密码能否正常签名</span>
+    <span class="k">if</span> <span class="n">card</span><span class="o">.</span><span class="n">unlock</span><span class="p">(</span><span class="n">test_pin</span><span class="p">)</span> <span class="ow">and</span> <span class="n">card</span><span class="o">.</span><span class="n">sign</span><span class="p">(</span><span class="n">test_message</span><span class="p">)</span> <span class="ow">is</span> <span class="n">valid</span><span class="p">:</span>
+        <span class="k">return</span> <span class="kc">True</span>  <span class="c1"># 完全控制</span>
+    <span class="k">return</span> <span class="kc">False</span>
+</code></pre></div>
+
+<p>Donjon 报告：一旦参数锁定，攻击在每张测试卡片上都可成功，单次约 2 小时（含准备与执行）。</p>
+<h2>六、防御方案</h2>
+<p>LFI 攻击的防御需要硬件、软件、架构三层协同。核心原则：<strong>单一检查点是最致命的弱点，必须用冗余与纵深打破单点依赖。</strong></p>
+<h3>6.1 硬件级防御</h3>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────┐
+│                    硬件级防御手段                              │
+├──────────────────────────────────────────────────────────────┤
+│ 1. 光/激光传感器: 检测异常光照, 触发复位或密钥擦除             │
+│ 2. 主动金属屏蔽层 (Active Shield): 顶层金属网格, 破坏即告警    │
+│ 3. 电压/频率/温度传感器: 检测 Glitch 类故障注入               │
+│ 4. 随机化执行 (Randomized Execution):                          │
+│    - 随机插入空操作 (NOP) 打乱时序                            │
+│    - 随机化寄存器分配, 使固定坐标攻击失效                      │
+│ 5. 双轨/差分逻辑: 故障会使互补信号不一致而被检出               │
+└──────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>值得注意的是，Tangem 的 S3D232A 本身具备 EAL6+ 级的传感器与屏蔽，但<strong>背面照射绕过了正面屏蔽</strong>，说明硬件防护存在固有边界。</p>
+<h3>6.2 软件级防御</h3>
+<p>软件层是本次漏洞的真正所在。Donjon 给出的加固建议围绕"打破单一检查点"：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">hardened_set_pin</span><span class="p">(</span><span class="n">new_pin</span><span class="p">,</span> <span class="n">recovery_flag</span><span class="p">,</span> <span class="n">old_pin_hash</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    加固版 SetPin: 多重独立校验 + 控制流完整性</span>
+<span class="sd">    防御单点故障注入绕过</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="c1"># 防御1: 冗余校验 — 同一状态用独立方式多次判断</span>
+    <span class="n">recovery_check_1</span> <span class="o">=</span> <span class="n">read_recovery_flag_from_flash</span><span class="p">()</span>
+    <span class="n">recovery_check_2</span> <span class="o">=</span> <span class="n">recompute_recovery_state_from_blockchain_proof</span><span class="p">()</span>
+    <span class="n">recovery_check_3</span> <span class="o">=</span> <span class="n">verify_via_secondary_key_slot</span><span class="p">()</span>
+
+    <span class="c1"># 三取二 (majority vote), 单次故障注入无法同时翻转三处</span>
+    <span class="n">is_recovery</span> <span class="o">=</span> <span class="n">majority_vote</span><span class="p">(</span>
+        <span class="n">recovery_check_1</span><span class="p">,</span> <span class="n">recovery_check_2</span><span class="p">,</span> <span class="n">recovery_check_3</span>
+    <span class="p">)</span>
+
+    <span class="c1"># 防御2: 控制流完整性 (CFI) — 校验执行路径合法性</span>
+    <span class="n">expected_path</span> <span class="o">=</span> <span class="n">compute_expected_cfg_hash</span><span class="p">()</span>
+    <span class="n">actual_path</span> <span class="o">=</span> <span class="n">record_executed_cfg_hash</span><span class="p">()</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">constant_time_compare</span><span class="p">(</span><span class="n">expected_path</span><span class="p">,</span> <span class="n">actual_path</span><span class="p">):</span>
+        <span class="n">secure_wipe</span><span class="p">()</span>  <span class="c1"># 路径异常, 擦除密钥</span>
+        <span class="k">raise</span> <span class="n">FaultDetected</span>
+
+    <span class="c1"># 防御3: 状态变量内存加密 — 故障翻转的是密文, 解密后无效</span>
+    <span class="k">if</span> <span class="n">decrypt_and_verify</span><span class="p">(</span><span class="n">recovery_flag</span><span class="p">)</span> <span class="o">!=</span> <span class="n">is_recovery</span><span class="p">:</span>
+        <span class="n">secure_wipe</span><span class="p">()</span>
+        <span class="k">raise</span> <span class="n">FaultDetected</span>
+
+    <span class="c1"># 防御4: 即使恢复态为真, 密码变更仍需额外证明</span>
+    <span class="k">if</span> <span class="n">is_recovery</span><span class="p">:</span>
+        <span class="c1"># 要求密码变更始终受保护, 即使恢复功能&quot;已关闭&quot;</span>
+        <span class="k">if</span> <span class="n">recovery_feature_disabled</span><span class="p">():</span>
+            <span class="n">secure_wipe</span><span class="p">()</span>
+            <span class="k">raise</span> <span class="n">RecoveryDisabled</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">verify_backup_card_proof</span><span class="p">():</span>
+            <span class="n">secure_wipe</span><span class="p">()</span>
+            <span class="k">raise</span> <span class="n">MissingBackupProof</span>
+
+    <span class="c1"># 写入前对状态做循环冗余校验 (CRC)</span>
+    <span class="n">new_hash</span> <span class="o">=</span> <span class="n">sha256</span><span class="p">(</span><span class="n">new_pin</span><span class="p">)</span><span class="o">.</span><span class="n">digest</span><span class="p">()</span>
+    <span class="n">write_with_crc</span><span class="p">(</span><span class="n">protected_slot</span><span class="p">,</span> <span class="n">new_hash</span><span class="p">)</span>
+    <span class="k">return</span> <span class="kc">True</span>
+</code></pre></div>
+
+<p>软件级防御要点总结：</p>
+<table>
+<thead>
+<tr>
+<th>防御措施</th>
+<th>原理</th>
+<th>对抗的故障模型</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>多重独立校验（冗余）</td>
+<td>同一状态用互不相关的实现多次判断，取多数表决</td>
+<td>单次指令跳过/寄存器翻转</td>
+</tr>
+<tr>
+<td>控制流完整性（CFI）</td>
+<td>记录并校验实际执行路径与预期 CFG 一致</td>
+<td>PC 指针偏转</td>
+</tr>
+<tr>
+<td>内存加密</td>
+<td>敏感状态以密文存储，故障翻转密文后解密失效</td>
+<td>寄存器/内存位翻转</td>
+</tr>
+<tr>
+<td>随机化时序</td>
+<td>随机插入 NOP、打乱指令调度</td>
+<td>固定时刻的时序注入</td>
+</tr>
+<tr>
+<td>反馈式擦除</td>
+<td>检测到不一致立即安全擦除密钥</td>
+<td>所有故障模型（兜底）</td>
+</tr>
+</tbody>
+</table>
+<h3>6.3 架构级防御</h3>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────┐
+│                   架构级纵深防御                              │
+│                                                              │
+│  单芯片架构 (Tangem 现状):          双芯片/多层架构 (推荐):   │
+│  ┌──────────────┐                  ┌──────────────────────┐  │
+│  │  SE (固件)   │ ← 单点失效        │  MCU (应用层)         │  │
+│  │  校验+签名   │                  │   │ 校验层1            │  │
+│  │  全在一颗    │                  │  ┌──────────────┐    │  │
+│  └──────────────┘                  │  │ SE-1 (PIN)   │    │  │
+│                                    │  │  │ 校验层2    │    │  │
+│                                    │  └──────────────┘    │  │
+│                                    │  ┌──────────────┐    │  │
+│                                    │  │ SE-2 (签名)  │    │  │
+│                                    │  │  │ 校验层3    │    │  │
+│                                    │  └──────────────┘    │  │
+│                                    └──────────────────────┘  │
+│                                    攻击需同时突破多层独立校验  │
+└──────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>架构级要点：</p>
+<ol>
+<li><strong>双芯片/多 SE 架构</strong>：将 PIN 校验与签名授权分置于不同安全元件，敏感操作需多芯片协同确认。攻击者需同时对多颗芯片注入故障，难度指数级上升。Trezor Safe 7 在 TROPIC01 被攻破后资金未失，正是因其叠加了三层独立安全层。</li>
+<li><strong>可更新固件</strong>：保留经签名验证的安全固件升级通道。Tangem 的"不可更新"虽降低了远程篡改面，却使固件层漏洞永久化——这是安全权衡中常被忽视的代价。</li>
+<li><strong>安全元件选型</strong>：EAL6+ 是必要而非充分条件。选型时需审查芯片对背面 LFI、双轨逻辑、随机化执行的具体支持，而非仅看认证等级。</li>
+</ol>
+<h2>七、总结与启示</h2>
+<p>Tangem 激光攻击事件为硬件安全领域提供了几条清晰的技术启示：</p>
+<ol>
+<li>
+<p><strong>EAL6+ 认证不等于固件安全</strong>。认证评估的是芯片硬件及其内置防御，而非厂商叠加的应用固件逻辑。本次漏洞完全存在于固件的单一校验点，与芯片认证等级无关。消费市场与机构采购应避免将芯片认证等级等同于整机安全等级。</p>
+</li>
+<li>
+<p><strong>单一检查点是故障注入的天然靶点</strong>。任何"一次判断决定全局"的逻辑（恢复态校验、PIN 比较结果、访问控制位）都是故障注入的高价值目标。安全设计应遵循"冗余 + 独立 + 表决"原则，使单次故障无法穿透。</p>
+</li>
+<li>
+<p><strong>不可更新是一把双刃剑</strong>。Tangem 将固件不可更新包装为"抗远程篡改"的安全特性，但当固件层出现逻辑缺陷时，同一特性使漏洞永久不可修复。安全架构设计必须在"可更新性"与"抗篡改性"之间取得平衡——经签名验证的安全升级通道是更稳健的折中。</p>
+</li>
+<li>
+<p><strong>背面 LFI 是正面屏蔽的克星</strong>。传统金属屏蔽层针对正面光/探测攻击有效，但背面红外照射可穿透硅基底绕过。硬件防护需考虑背面减薄检测、全包覆屏蔽等手段。</p>
+</li>
+<li>
+<p><strong>攻击经济性是现实威胁的门槛</strong>。25 万美元的设备成本、不可逆的物理破坏、无法预知卡片价值的盲盒困境，使该攻击对普通用户"实际风险接近于零"。但对丢失/被盗且已知高价值的卡片，威胁真实存在——用户的物理保管仍是第一道防线。</p>
+</li>
+</ol>
+<p>从防御研究的角度，故障注入攻击的价值在于：它定义了"资金充足的对手能做到什么"的下限，迫使芯片厂商在后续硅片修订中改进反制，也迫使钱包厂商重新审视固件中的单点逻辑。每一次公开的攻击复现，都在推动硬件安全工程向前一步。</p>
+<hr />
+<h2>免责声明</h2>
+<p>本文仅用于网络安全技术研究、防御设计与学术讨论目的。文中所有攻击技术描述、代码示例与参数均为概念性说明，旨在帮助安全工程师理解威胁原理并设计相应防御，<strong>不构成可操作的攻击指南</strong>。激光故障注入攻击需要专业实验室设备、物理接触目标设备以及极高的专业技术门槛，且会对设备造成不可逆的物理破坏。读者<strong>不得</strong>将本文内容用于任何未经授权的安全测试、攻击或破坏活动。因不当使用本文信息所造成的任何后果，作者及发布平台不承担任何法律责任。如需进行硬件安全测试，请在获得设备所有者明确授权的前提下，于合规实验室环境中进行。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

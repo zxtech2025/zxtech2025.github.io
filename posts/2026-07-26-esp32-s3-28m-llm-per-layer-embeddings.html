@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>在 8 美元的 ESP32-S3 上跑 28.9M 参数大模型：Per-Layer Embeddings 与三级存储账 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>在 8 美元的 ESP32-S3 上跑 28.9M 参数大模型：Per-Layer Embeddings 与三级存储账</h1>
+<time>2026-07-26</time>
+<ul>
+<li>边缘计算</li>
+<li>TinyML</li>
+<li>ESP32</li>
+<li>模型量化</li>
+<li>嵌入式</li>
+</ul>
+<hr />
+<p>一个 28.9M 参数的语言模型跑在 ESP32-S3 上，端到端 9.5 tokens/s，全程不联网，屏幕上滚动的文字是芯片自己生成的。作者 slvDev 把项目开源在 github.com/slvDev/esp32-ai，模型权重、训练代码和量化脚本都可复现。</p>
+<p>这个数字一边说明架构做对了什么，一边也藏着一堆限制。我把 RESULTS.md 和 README 里的实测数据拆开看了一遍，下面按硬件、存储布局、带宽实测、消融四层来讲。</p>
+<h2>硬件底盘</h2>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>数值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>芯片</td>
+<td>ESP32-S3 N16R8</td>
+</tr>
+<tr>
+<td>SRAM</td>
+<td>512 KB</td>
+</tr>
+<tr>
+<td>PSRAM</td>
+<td>8 MB</td>
+</tr>
+<tr>
+<td>Flash</td>
+<td>16 MB</td>
+</tr>
+<tr>
+<td>模型体积</td>
+<td>14,912,332 字节（4-bit）</td>
+</tr>
+<tr>
+<td>速度</td>
+<td>9.5 tok/s 端到端，102.9 ms/模型步</td>
+</tr>
+<tr>
+<td>结构</td>
+<td>d_model=96，6 层，ple_dim=128，vocab 32768</td>
+</tr>
+</tbody>
+</table>
+<p>512KB SRAM 是这块芯片唯一"快"的内存。14.9MB 的模型显然塞不进去，所以问题不是"怎么把模型压到 512KB"，而是"怎么把参数拆到不同层级的内存里，让每一层只放它该放的东西"。</p>
+<h2>三级存储账</h2>
+<p>项目的核心思路是按访问频率分层，而不是一视同仁地量化：</p>
+<div class="highlight"><pre><span></span><code>SRAM  (快、小)   激活值 + norm 权重，每个 token 要碰很多次
+PSRAM (中等)     559K 稠密核心 + 3.1M 输出头，每个位置扫一遍
+FLASH (大、慢)   25M 参数查找表，每个 token 只取约 6 行，约 450 字节
+</code></pre></div>
+
+<p>28.9M 是"存储参数"的拆分：559K 稠密核心（4-bit 下 273KB，正好卡进 512KB SRAM）、3.1M 输出头、25M 查找表（12MB flash）。真正做推理计算的只有那 559K，剩下 25M 里绝大部分在整个生命周期都不会被读进内存，它躺在 flash 里，每个 token 按需取几行。</p>
+<p>"大部分参数是查表而不是计算"这个想法来自 Google 的 Gemma 3n 的 Per-Layer Embeddings（PLE）。项目做的事情是把 PLE 从手机或 GPU 的内存布局搬到单片机上。</p>
+<h2>把 tok/s 换算成内存带宽</h2>
+<p>架构讲完就该算账。作者在真机上用 Xtensa cycle counter 做了带宽基准：</p>
+<table>
+<thead>
+<tr>
+<th>测量项</th>
+<th>数值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PSRAM 顺序读</td>
+<td>60.7 MB/s</td>
+</tr>
+<tr>
+<td>内部 SRAM 顺序读</td>
+<td>240 MB/s</td>
+</tr>
+<tr>
+<td>Flash 512B 随机读</td>
+<td>20.3 μs</td>
+</tr>
+<tr>
+<td>每 token 查表成本（6 行随机读）</td>
+<td>约 0.12 ms</td>
+</tr>
+<tr>
+<td>每 token 输出头成本（1.5MB PSRAM 扫描）</td>
+<td>约 17.3 ms</td>
+</tr>
+<tr>
+<td>纯带宽上限</td>
+<td>约 58 tok/s</td>
+</tr>
+</tbody>
+</table>
+<p>这张表最有说服力的是倒数第二行。25M 参数的 flash 表只花掉每 token 内存时间的约 0.7%，几乎是白送；真正吃掉带宽的是输出头，而输出头是 baseline 也要付的成本。PLE 在几乎不增加推理开销的前提下，把参数容量翻了近 8 倍。</p>
+<p>作者自己标了 caveat：58 tok/s 是纯带宽上限，不是实测吞吐。第一版标量移植只有 0.57 tok/s，瓶颈根本不在带宽，而在 int4 解包和几百万次标量浮点运算。4-bit 省了内存，没省 CPU。</p>
+<h2>消融才是成色</h2>
+<p>参数从 3.7M 涨到 28.9M，困惑度只从 12.58 降到 11.41（+0.098 nats，约 9.3%）。绝对值不大，但关键是这些增益来自哪里：</p>
+<table>
+<thead>
+<tr>
+<th>方案</th>
+<th style="text-align: right;">核心</th>
+<th style="text-align: right;">总参数</th>
+<th style="text-align: right;">ppl</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>baseline</td>
+<td style="text-align: right;">559K</td>
+<td style="text-align: right;">3.7M</td>
+<td style="text-align: right;">12.58</td>
+</tr>
+<tr>
+<td>ple</td>
+<td style="text-align: right;">558K</td>
+<td style="text-align: right;">28.9M</td>
+<td style="text-align: right;">11.41</td>
+</tr>
+<tr>
+<td>fatembed（参数堆在底部）</td>
+<td style="text-align: right;">559K</td>
+<td style="text-align: right;">28.9M</td>
+<td style="text-align: right;">11.94</td>
+</tr>
+</tbody>
+</table>
+<p>同样 28.9M 参数，按层注入比堆在底部好 0.046 nats。也就是说"注入在哪"值大约 2 倍的参数量。</p>
+<p>更有意思的是反向对照。<code>ple_notable</code> 保留了 PLE 的全部每层适配器和投影，只拿掉查找表，结果在 vocab 4096 下比 baseline 还差（-0.017）。结论很硬：增益全部来自那张 flash 表，管线本身不产生收益。</p>
+<p>还有一条容易被忽略的：同样架构在 vocab 4096 下 PLE 只有 +0.025 nats，换到 vocab 32768 变成 +0.098，差了 4 倍。原因也直白，大词表既让表变得巨大，又让每次查表更稀疏，正好落在 PLE 设计的甜区。小词表那组消融是对照组，不是产品形态。</p>
+<h2>把它真的塞进 16MB flash 的账</h2>
+<p>模型导出后是 14,912,332 字节，装进一个自定义的 15,597,568 字节 flash 分区，还剩 685,236 字节；619KB 的应用程序放在另一个 1MB 分区里。这两个数字值得留意，分区表是手工调过的，默认的 OTA 布局塞不下这种尺寸的模型。</p>
+<p>25M 表的 4-bit 打包就是这笔账的另一半：12MB 摊在 6 层、32768 行、ple_dim=128 上，正好是 25M 参数。输出头则做了 int8 分级，权重和激活都走 int8，先在主机上验证困惑度几乎不动再上板。</p>
+<p>带宽表里那 17.3ms 就是输出的代价：每个 token 要把 1.5MB 的输出头从 PSRAM 完整扫一遍。这里没有技巧可用，因为输出头对每个位置都要算，不能像查表那样稀疏取样。所以 PLE 的收益边界很清楚：它能把容量塞进 flash，塞不进计算。</p>
+<h2>边界要说清楚</h2>
+<p>这个模型在 TinyStories 上训练，能写连贯的简短小故事，不能问答、不能听指令、不写代码、没有事实知识。能力上限由那 559K 的核心决定，存储技巧改变不了这一点。作者在文档里专门强调："28.9M 参数"指的是通过内存层级拆分驻留的参数，不是能力倍数。</p>
+<p>运行时布局也值得记一笔。tied embedding/output head 的 1.64MB 在启动时拷进 PSRAM，25M 表留在 flash 做 memory-mapped，scratch 和 KV cache 也在 PSRAM，全部分配完还剩 5,228KB。核心最终用 XIP 直接在 flash 上跑，实测够快，所以没占满 SRAM。这是一个明确的取舍点：核心本来能进 SRAM，实测发现 XIP 更快更省。</p>
+<h2>我的做法</h2>
+<p>如果你也想在单片机上试这条路，三条建议：</p>
+<ol>
+<li><strong>先量带宽，再谈架构</strong>。跑一遍 <code>firmware/benchmarks/bandwidth</code>，确认自己板子的 flash 随机读延迟和 PSRAM 读速。表格很漂亮，但 20.3μs 的随机读延迟会随表变宽线性放大。</li>
+<li><strong>用官方脚本，别手搓</strong>。<code>scripts/fetch_model.sh &lt;model&gt;</code> 会校验推理资产的 SHA-256 和字节数，并跟 release 的 <code>metadata.json</code> 交叉验证，任何一项不过就什么都不装；<code>scripts/deploy.sh &lt;model&gt;</code> 只从本地 <code>artifacts/&lt;model&gt;/</code> 编译烧录，不碰网络。两条命令分工明确，一个碰网络一个碰板子。</li>
+<li><strong>量化前先做金标准比对</strong>。这套 C 运行时在烧进板子之前，先跟 PyTorch 金标准对了全部 32768 个 logits（max abs diff 0.00001）。这个前置校验比在板子上 debug 便宜太多。</li>
+</ol>
+<p>参考坐标：DaveBben 的 esp32-llm 在 ESP32-S3 上跑 260K 参数，这个项目是它的约 110 倍，而且快内存预算更紧。训练数据 TinyStories 来自微软研究院（arXiv:2305.07759），最小 LM 训练参考是 Karpathy 的 llama2.c。</p>
+<p>一件值得记住的事：把"模型太大放不下"重新表述成"哪部分参数必须常驻，哪部分可以按需取样"，比单纯压缩模型更接近嵌入式推理的真实约束。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

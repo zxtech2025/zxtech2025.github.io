@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>一个不随机的随机数，蒸发一亿美元：ECDSA nonce 复用攻击全拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>一个不随机的随机数，蒸发一亿美元：ECDSA nonce 复用攻击全拆解</h1>
+<time>2026-08-13</time>
+<ul>
+<li>安全</li>
+<li>密码学</li>
+<li>ECDSA</li>
+<li>区块链</li>
+</ul>
+<hr />
+<p>安全社区这两天在传一件事：一个号称"冷存储"的钱包，1755 枚比特币一夜之间被转空，按当时市价折合约 1.1 亿美元。攻击者没有爆破私钥，没有攻破硬件钱包，也没有钓鱼。整条链上只有一个破绽：钱包在签名时用了一个<strong>不随机的随机数</strong>。</p>
+<p>这就是 ECDSA nonce 复用攻击。它比你想的更古老，也比你想象的更致命。我把它从头拆一遍，包括能直接复现的 PoC。</p>
+<h2>ECDSA 签名到底在算什么</h2>
+<p>比特币用的是 secp256k1 曲线，签名算法是 ECDSA。整个过程不复杂：</p>
+<ul>
+<li>私钥 <code>d</code>，公钥 <code>Q = d·G</code>（G 是曲线生成元，点乘）</li>
+<li>曲线阶是 <code>n</code>，一个 256 位的素数</li>
+<li>给消息签名时，先把消息哈希成 <code>z</code>（比特币里是 sighash，截断到 n 的位宽）</li>
+<li>生成一个随机数 <code>k</code>，范围 [1, n-1]，<strong>每次签名必须重新随机</strong></li>
+<li>计算 <code>R = k·G</code>，取 <code>r = R.x mod n</code></li>
+<li>计算 <code>s = k⁻¹(z + r·d) mod n</code></li>
+</ul>
+<p>签名就是 <code>(r, s)</code> 这一对数字。验证方拿公钥 Q 和消息哈希 z，验算 <code>s⁻¹·z·G + s⁻¹·r·Q</code> 是否落在 x 坐标等于 r 的点上。</p>
+<p>关键在于那个 <code>k</code>。它是签名的唯一随机成分，是私钥 <code>d</code> 的"护城河"——<code>s = k⁻¹(z + r·d)</code> 这个式子把 d 藏在 k 后面。只要 k 真的是随机的、只用一次，从 (r, s) 反推 d 在计算上不可行，这是椭圆曲线离散对数问题（ECDLP）的困难性保证的。</p>
+<p>但"只用一次"是硬约束。一旦违反，整个安全模型直接崩塌。</p>
+<h2>复用一个 nonce，等于交出私钥</h2>
+<p>假设钱包对两条消息签了名，因为随机数生成器坏了或者被复用，两次用了同一个 k。因为 <code>r = R.x</code> 只由 k 决定（R = k·G，G 固定），两次的 r 必然相同。</p>
+<p>签出两个 <code>(r, s1)</code> 和 <code>(r, s2)</code>，对应消息哈希 <code>z1</code>、<code>z2</code>：</p>
+<div class="highlight"><pre><span></span><code>s1 = k⁻¹(z1 + r·d) mod n
+s2 = k⁻¹(z2 + r·d) mod n
+</code></pre></div>
+
+<p>两个式子一减，d 这一项被消掉：</p>
+<div class="highlight"><pre><span></span><code>s1 - s2 = k⁻¹(z1 - z2) mod n
+</code></pre></div>
+
+<p>于是 nonce 直接被解出来：</p>
+<div class="highlight"><pre><span></span><code>k = (z1 - z2) · (s1 - s2)⁻¹ mod n
+</code></pre></div>
+
+<p>拿到 k 之后，私钥就是一步的事：</p>
+<div class="highlight"><pre><span></span><code>d = (s1·k - z1) · r⁻¹ mod n
+</code></pre></div>
+
+<p>注意这一步只用到了模逆（<code>pow(x, -1, n)</code>），<strong>不需要任何椭圆曲线运算</strong>。ECDLP 的困难性在这里完全失效，因为攻击者根本不需要解离散对数——数学里根本没有把 k 藏住。</p>
+<p>整个攻击只需要：两笔签名、共用的 r、各自的消息哈希。全部数据在区块链上是公开的，人人可查。</p>
+<h2>PoC：四行 Python 拿回私钥</h2>
+<p>下面是完整的恢复逻辑，纯标准库，能直接跑。假设我们从链上解析出了两笔签名的 (z, r, s)（z 是 sighash，比特币里对每条输入都要重新算）：</p>
+<div class="highlight"><pre><span></span><code><span class="n">n</span> <span class="o">=</span> <span class="mh">0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141</span>
+
+<span class="n">z1</span> <span class="o">=</span> <span class="mh">0x3dbd06704cf3ebbf244a4197556145b829dec0b787116935e55412e1f532859a</span>
+<span class="n">z2</span> <span class="o">=</span> <span class="mh">0xdcb1f7f66c15c9770803c10c37765b8ddc1fa0c25b5dff440a14dbf68d6729b0</span>
+<span class="n">r</span>  <span class="o">=</span> <span class="mh">0x09810cec0182ac09f33353cb36b7408495c19b44c46666de1fe85532a12e7df4</span>
+<span class="n">s1</span> <span class="o">=</span> <span class="mh">0x123b55122c545a923bd7fb5b7c8f6e1838ba766ca74abe16a8065e21bc6fa201</span>
+<span class="n">s2</span> <span class="o">=</span> <span class="mh">0x3188609075c15f4fdf016a72e9f3fd2100010817159c11b195382b352347b96c</span>
+
+<span class="n">k</span> <span class="o">=</span> <span class="p">(</span><span class="n">z1</span> <span class="o">-</span> <span class="n">z2</span><span class="p">)</span> <span class="o">*</span> <span class="nb">pow</span><span class="p">(</span><span class="n">s1</span> <span class="o">-</span> <span class="n">s2</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">n</span><span class="p">)</span> <span class="o">%</span> <span class="n">n</span>
+<span class="n">d</span> <span class="o">=</span> <span class="p">(</span><span class="n">s1</span> <span class="o">*</span> <span class="n">k</span> <span class="o">-</span> <span class="n">z1</span><span class="p">)</span> <span class="o">*</span> <span class="nb">pow</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">,</span> <span class="n">n</span><span class="p">)</span> <span class="o">%</span> <span class="n">n</span>
+<span class="nb">print</span><span class="p">(</span><span class="nb">hex</span><span class="p">(</span><span class="n">d</span><span class="p">))</span>
+</code></pre></div>
+
+<p>输出：</p>
+<div class="highlight"><pre><span></span><code><span class="mf">0</span><span class="n">x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef</span>
+</code></pre></div>
+
+<p>这组数字不是编的。我用纯 Python 实现了一遍 secp256k1 的点乘，故意用固定的 k 签了两条消息，再用上面这段恢复出了私钥 <code>0x1234...</code>，和受害者公钥 <code>04bb50e2d8...</code> 完全对得上。整条攻击链在你本机就能复现，连第三方库都不用装。</p>
+<p>实战里唯一的技术活，是"从交易里把 (z, r, s) 抠出来"。原始交易是十六进制的，<code>scriptSig</code> 末尾那段 DER 编码里藏着 r 和 s：两个字节分别是 <code>0x02</code> + 长度前缀 + 大整数（去掉可能的前导零填充）。抠出来的套路大致是这样：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># scriptSig 尾部 = 0x02 &lt;lenR&gt; &lt;r&gt; 0x02 &lt;lenS&gt; &lt;s&gt;，外加 sighash 标志字节</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">parse_der_sig</span><span class="p">(</span><span class="n">hexsig</span><span class="p">):</span>
+    <span class="n">b</span> <span class="o">=</span> <span class="nb">bytes</span><span class="o">.</span><span class="n">fromhex</span><span class="p">(</span><span class="n">hexsig</span><span class="p">)</span>
+    <span class="k">assert</span> <span class="n">b</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="mh">0x30</span>          <span class="c1"># DER sequence</span>
+    <span class="c1"># 跳过 sequence 头，定位两个 0x02 整数</span>
+    <span class="n">i</span> <span class="o">=</span> <span class="mi">2</span>
+    <span class="k">assert</span> <span class="n">b</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="mh">0x02</span><span class="p">;</span> <span class="n">lr</span> <span class="o">=</span> <span class="n">b</span><span class="p">[</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="p">];</span> <span class="n">r</span> <span class="o">=</span> <span class="nb">int</span><span class="o">.</span><span class="n">from_bytes</span><span class="p">(</span><span class="n">b</span><span class="p">[</span><span class="n">i</span><span class="o">+</span><span class="mi">2</span><span class="p">:</span><span class="n">i</span><span class="o">+</span><span class="mi">2</span><span class="o">+</span><span class="n">lr</span><span class="p">],</span> <span class="s1">&#39;big&#39;</span><span class="p">);</span> <span class="n">i</span> <span class="o">+=</span> <span class="mi">2</span> <span class="o">+</span> <span class="n">lr</span>
+    <span class="k">assert</span> <span class="n">b</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">==</span> <span class="mh">0x02</span><span class="p">;</span> <span class="n">ls</span> <span class="o">=</span> <span class="n">b</span><span class="p">[</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="p">];</span> <span class="n">s</span> <span class="o">=</span> <span class="nb">int</span><span class="o">.</span><span class="n">from_bytes</span><span class="p">(</span><span class="n">b</span><span class="p">[</span><span class="n">i</span><span class="o">+</span><span class="mi">2</span><span class="p">:</span><span class="n">i</span><span class="o">+</span><span class="mi">2</span><span class="o">+</span><span class="n">ls</span><span class="p">],</span> <span class="s1">&#39;big&#39;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">r</span><span class="p">,</span> <span class="n">s</span>
+</code></pre></div>
+
+<p>z 则是 sighash：按 BIP143 把交易版本、输入输出、锁定脚本、金额、<code>SIGHASH_ALL</code> 拼起来做一次 SHA256。对同一笔交易的不同输入，z 会因索引和金额不同而变化，这正是"同 k 不同 z"能成立的前提。这些步骤都是脏活累活，但没有一步是"难"的。</p>
+<h2>为什么新钱包没这个毛病</h2>
+<p>看到这里你可能会想：那现在的钱包还安全吗？答案是，好的实现已经把这个问题从根上消掉了，靠的是换掉"随机"这个前提。</p>
+<p><strong>Schnorr / EdDSA 天生免疫。</strong> Ed25519 和比特币 Taproot 用的 BIP340 Schnorr 签名，nonce 是从私钥和消息<strong>确定性推导</strong>出来的（Ed25519 里 <code>r = H(hash(私钥) || 消息)</code>），不是外部 RNG。同一私钥同一消息必然得到同一个 nonce，但不同消息的 nonce 必然不同。nonce 复用这个 bug 在 EdDSA 的构造里根本不存在——它不是"被修好了"，是设计上就没有这个变量。</p>
+<p><strong>这也是为什么 Schnorr 能做成聚合签名。</strong> 多个签名可以合并成一个，关键就是 nonce 确定、线性可加。ECDSA 的 s 公式里 k 要取逆，天然不能线性聚合，这也是 Taproot 从 ECDSA 迁到 Schnorr 的动机之一。</p>
+<p>所以"nonce 复用"这件事，本质上是 ECDSA 加"外部随机数"这个组合的历史包袱。你只要还在用 ECDSA + 手搓 RNG，就仍然暴露在这个攻击面下；换到 EdDSA/Schnorr，或者用 RFC 6979 的确定性 ECDSA，这个攻击面就整个消失了。</p>
+<h2>这条攻击链已经烧过三次大钱</h2>
+<p>nonce 复用不是新发现，它每隔几年就出来收割一轮。</p>
+<p><strong>2010 年，索尼 PS3。</strong> 最经典的一例。PS3 的软件签名用的是 ECDSA，但索尼在所有签名里复用了同一个 k（有说法是常数）。fail0verflow 团队在 27c3 大会上演示：只要两段被签名代码，就能恢复出索尼的签名私钥，进而给任意自制软件签名。PS3 的"可信启动"从此名存实亡，整条信任链被一把私钥撬开。</p>
+<p><strong>2013 年，Android SecureRandom 漏洞。</strong> 那段时间 Android 的 <code>SecureRandom</code> 实现没被正确播种，导致 <code>ecdsa</code> 签出来的 k 可预测、会重复。比特币钱包应用首当其冲，攻击者扫描链上签名，找到复用 r 的交易，批量洗劫。当时公开报道的损失在几十 BTC 量级，多个钱包应用中招。</p>
+<p><strong>2014 年，blockchain.info 网页钱包。</strong> 一个带病随机数生成器让这个当时用户量最大的网页钱包在签名时反复复用 nonce。攻击者写脚本盯链上数据，自动识别重复 r 并提币。</p>
+<p>共同点很一致：都不是算法被破解，是"随机"两个字被偷工减料了。私钥再强，k 一旦复用，就是白纸一张。</p>
+<h2>防御：让随机数"确定"</h2>
+<p>对策其实早就有了，而且就两行核心思路。</p>
+<p><strong>用 RFC 6979 确定性签名。</strong> 不依赖任何随机数生成器，k 直接从私钥和消息哈希确定性地推导出来：</p>
+<div class="highlight"><pre><span></span><code>k = HMAC-SHA256(d, z)   （RFC 6979 里还有更多轮次和位运算，这是核心思想）
+</code></pre></div>
+
+<p>同一个 d 和 z 永远得到同一个 k，但不同消息的 z 不同，k 自然不同。只要私钥 d 不泄露，k 就不可能重复。RNG 好不好、有没有被污染，全部无关。</p>
+<p><strong>用经过审计的库。</strong> Bitcoin Core 用的 libsecp256k1 内置了 RFC 6979 的 nonce 函数，还做了反侧信道处理。现代钱包、硬件钱包基本都走这条路径。真正容易出事的是自己手搓签名的项目：随便 <code>random.randint</code> 一个 k，或者拿 <code>Math.random()</code>、时间戳当种子，就等于埋了一颗定时炸弹。</p>
+<h2>我的做法</h2>
+<p>如果你要签名的不是玩具，这三条我建议直接落地：</p>
+<ol>
+<li>
+<p><strong>签名永远走 libsecp256k1 或等价实现</strong>，别自己算 s = k⁻¹(z + r·d)。nonce 生成这一步交给库，库做错了是它的事，你手搓错了是你的事。</p>
+</li>
+<li>
+<p><strong>上线前跑一次 nonce 复用自检</strong>。在测试环境用同一个私钥连续签一批消息，把 (r, s) 收集起来，检查有没有重复的 r：</p>
+</li>
+</ol>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">collections</span><span class="w"> </span><span class="kn">import</span> <span class="n">Counter</span>
+<span class="n">rs</span> <span class="o">=</span> <span class="p">[</span><span class="n">sig</span><span class="o">.</span><span class="n">r</span> <span class="k">for</span> <span class="n">sig</span> <span class="ow">in</span> <span class="n">test_sigs</span><span class="p">]</span>
+<span class="n">dup</span> <span class="o">=</span> <span class="p">[</span><span class="n">r</span> <span class="k">for</span> <span class="n">r</span><span class="p">,</span> <span class="n">c</span> <span class="ow">in</span> <span class="n">Counter</span><span class="p">(</span><span class="n">rs</span><span class="p">)</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">c</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">]</span>
+<span class="k">assert</span> <span class="ow">not</span> <span class="n">dup</span><span class="p">,</span> <span class="sa">f</span><span class="s2">&quot;nonce reused for r=</span><span class="si">{</span><span class="n">dup</span><span class="si">}</span><span class="s2">&quot;</span>
+</code></pre></div>
+
+<ol>
+<li><strong>把"检测重复 r"当成监控指标，不是一次性检查。</strong> 对区块链项目，可以扫自己的历史交易，任何 r 的重复出现都要触发告警。对非链上场景，在签名服务的日志里记录 r 的哈希，做离线比对。</li>
+</ol>
+<p>一句话收尾：这条攻击链的每一环都很简单，简单到让人轻视它，而轻视它的代价是 1.1 亿美元。签名的随机数，别省。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

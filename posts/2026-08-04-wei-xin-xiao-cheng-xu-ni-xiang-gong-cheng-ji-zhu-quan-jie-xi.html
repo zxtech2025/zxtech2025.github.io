@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>记一次微信小程序逆向：从 wxapkg 解包到签名算法提取的全链路技术解析 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>记一次微信小程序逆向：从 wxapkg 解包到签名算法提取的全链路技术解析</h1>
+<time>2026-08-04</time>
+<ul>
+<li>技术
+Slug: 微信小程序逆向工程技术全解析</li>
+</ul>
+<hr />
+<h2>目录</h2>
+<ul>
+<li><a href="#1-背景">1. 背景</a></li>
+<li><a href="#2-微信小程序架构概述">2. 微信小程序架构概述</a></li>
+<li><a href="#3-wxapkg-文件格式解析">3. wxapkg 文件格式解析</a></li>
+<li><a href="#4-解包后的代码恢复">4. 解包后的代码恢复</a></li>
+<li><a href="#5-关键点提取技术">5. 关键点提取技术</a></li>
+<li><a href="#6-逆向工具链">6. 逆向工具链</a></li>
+<li><a href="#7-防御方案">7. 防御方案</a></li>
+<li><a href="#8-总结">8. 总结</a></li>
+<li><a href="#免责声明">免责声明</a></li>
+</ul>
+<hr />
+<h2>1. 背景</h2>
+<p>微信小程序自 2017 年上线以来，已成长为日活超过 9 亿的轻量级应用生态。它以"无需安装、触手可及"的形态渗透到电商、金融、政务、出行等几乎所有垂直领域。与原生 App 不同，小程序的代码包以 <code>.wxapkg</code> 形式下发到客户端本地，这为安全研究人员提供了一条相对可达的逆向路径。</p>
+<p>小程序逆向在以下几个场景中具有现实意义：</p>
+<ul>
+<li><strong>安全研究</strong>：挖掘越权、信息泄露、支付逻辑等业务漏洞；</li>
+<li><strong>知识产权保护</strong>：评估自有小程序代码的防逆向强度，验证加固效果；</li>
+<li><strong>协议分析</strong>：还原私有 API 签名算法，用于自动化测试或合规审计；</li>
+<li><strong>恶意样本分析</strong>：识别伪装成小程序的钓鱼、欺诈应用。</li>
+</ul>
+<p>本文记录一次完整的小程序逆向过程，涵盖从 wxapkg 获取、解包、代码恢复、关键点提取到工具链选型的全链路，并在末尾给出对应的防御建议。所有操作均在授权环境下进行。</p>
+<hr />
+<h2>2. 微信小程序架构概述</h2>
+<h3>2.1 双线程模型</h3>
+<p>微信小程序采用<strong>双线程架构</strong>，逻辑层与视图层物理隔离，通过原生层（Native）的消息通道进行通信。这是它与传统 Web 页面最本质的区别。</p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────── 微信客户端 (Native) ───────────────────────────┐
+│  ┌──────────────────────┐         ┌──────────────────────┐               │
+│  │  逻辑层 (Service)     │         │   视图层 (View)       │               │
+│  │  JSCore / V8         │  JSBridge │  WebView (渲染)      │               │
+│  │  - App()/Page()      │◄─────────►│  - WXML → DOM       │               │
+│  │  - 业务逻辑 / wx.* API │  通信通道  │  - WXSS → 样式      │               │
+│  └──────────┬───────────┘         └──────────┬───────────┘               │
+│             └──────────────┬─────────────────┘                           │
+│                    ┌───────▼────────┐  消息序列化 / 域名白名单 / 接口签名  │
+│                    │ Native 中转层   │  完整性校验 / 沙箱隔离               │
+│                    └────────────────┘                                       │
+└──────────────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>双线程带来的安全特性：逻辑层运行在 JSCore 中，没有 DOM/BOM 对象，无法直接操作页面；视图层运行在 WebView 中，无法直接调用 <code>wx.*</code> 接口。两者通过 <code>setData</code> / 事件机制交互，这种隔离天然增加了 Hook 与注入的成本。</p>
+<h3>2.2 .wxapkg 打包格式</h3>
+<p>小程序代码最终编译打包为 <code>.wxapkg</code> 文件。一个完整小程序通常包含主包 <code>__APP__.wxapkg</code>（含 <code>app.js</code>/<code>app.json</code>/<code>app.wxss</code> 及公共页面）、按需加载的独立分包（如 <code>_-_-subPkg.wxapkg</code>），以及 Worker 线程代码包。</p>
+<h3>2.3 运行环境</h3>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>iOS</th>
+<th>Android</th>
+<th>Windows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>逻辑层</td>
+<td>JavaScriptCore</td>
+<td>V8 / XWeb</td>
+<td>V8</td>
+</tr>
+<tr>
+<td>视图层</td>
+<td>WKWebView</td>
+<td>X5 / 系统 WebView</td>
+<td>Chromium WebView</td>
+</tr>
+<tr>
+<td>原生桥</td>
+<td>ObjC 消息分发</td>
+<td>Java/JNI 桥</td>
+<td>C++ 桥</td>
+</tr>
+</tbody>
+</table>
+<h3>2.4 微信安全机制</h3>
+<p>微信在小程序生命周期中部署了多层防护：</p>
+<ol>
+<li><strong>代码混淆</strong>：发布时对 JS 进行变量名混淆、字符串数组化、控制流平坦化；</li>
+<li><strong>接口签名</strong>：部分 <code>wx.*</code> 接口（如支付、登录态）附带服务端校验签名，防止伪造；</li>
+<li><strong>域名白名单</strong>：<code>request</code>/<code>socket</code>/<code>uploadFile</code> 的目标域名必须在管理后台配置，且强制 HTTPS；</li>
+<li><strong>包完整性校验</strong>：客户端加载 wxapkg 前会校验包的完整性，防止本地篡改后被加载；</li>
+<li><strong>沙箱隔离</strong>：小程序运行在独立沙箱中，文件系统、存储相互隔离。</li>
+</ol>
+<p>理解这些机制是逆向的前提——它们决定了"能拿到什么"和"拿不到什么"。</p>
+<hr />
+<h2>3. wxapkg 文件格式解析</h2>
+<h3>3.1 文件结构</h3>
+<p>wxapkg 是一种自定义二进制打包格式，整体由 Header、Index Area、Data Area 三段构成，每个 File Entry 记录 <code>nameLen + name + offset + size</code>：</p>
+<div class="highlight"><pre><span></span><code>偏移   字段              长度      说明
+0x00   Magic             4 字节    &quot;V1MM&quot;(明文主包) / &quot;wxsg&quot;(加密包)
+0x04   Version           4 字节    通常为 0
+0x08   Index Length      4 字节    索引区长度
+0x0C   Data Length       4 字节    数据区长度          ← Header 共 16 字节
+──────────────────────────────────────────────────────
+0x10   File Count        4 字节    文件条目数量
+0x14   File Entry[0..n]  变长      每条: nameLen(4) + name + offset(4) + size(4)   ← Index Area
+──────────────────────────────────────────────────────
+       File Data[0..n]   size      实际文件内容(可能 zlib 压缩)                    ← Data Area
+</code></pre></div>
+
+<h3>3.2 解包脚本实现</h3>
+<p>下面是一个可用的 wxapkg 解包器，覆盖 Header 解析、索引区遍历、数据区提取与 zlib 解压：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">struct</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">zlib</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">WxapkgHeader</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;wxapkg 文件头解析&quot;&quot;&quot;</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">magic</span><span class="p">,</span> <span class="n">version</span><span class="p">,</span> <span class="n">index_len</span><span class="p">,</span> <span class="n">data_len</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">magic</span> <span class="o">=</span> <span class="n">magic</span>            <span class="c1"># 4字节魔数</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">version</span> <span class="o">=</span> <span class="n">version</span>        <span class="c1"># 版本号</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">index_len</span> <span class="o">=</span> <span class="n">index_len</span>    <span class="c1"># 索引区长度</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">data_len</span> <span class="o">=</span> <span class="n">data_len</span>      <span class="c1"># 数据区长度</span>
+
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_file</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">fp</span><span class="p">):</span>
+        <span class="n">fp</span><span class="o">.</span><span class="n">seek</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+        <span class="n">data</span> <span class="o">=</span> <span class="n">fp</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="mi">16</span><span class="p">)</span>
+        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">data</span><span class="p">)</span> <span class="o">&lt;</span> <span class="mi">16</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Invalid file: too short for header&quot;</span><span class="p">)</span>
+        <span class="n">magic</span><span class="p">,</span> <span class="n">version</span><span class="p">,</span> <span class="n">index_len</span><span class="p">,</span> <span class="n">data_len</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="s2">&quot;&lt;4sIII&quot;</span><span class="p">,</span> <span class="n">data</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">magic</span> <span class="ow">not</span> <span class="ow">in</span> <span class="p">[</span><span class="sa">b</span><span class="s2">&quot;V1MM&quot;</span><span class="p">,</span> <span class="sa">b</span><span class="s2">&quot;wxsg&quot;</span><span class="p">]:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;不是有效的 wxapkg 文件，魔数：</span><span class="si">{</span><span class="n">magic</span><span class="o">.</span><span class="n">hex</span><span class="p">()</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="n">magic</span><span class="p">,</span> <span class="n">version</span><span class="p">,</span> <span class="n">index_len</span><span class="p">,</span> <span class="n">data_len</span><span class="p">)</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">WxapkgFileEntry</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;wxapkg 文件条目&quot;&quot;&quot;</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">size</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">name</span> <span class="o">=</span> <span class="n">name</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">offset</span> <span class="o">=</span> <span class="n">offset</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">size</span> <span class="o">=</span> <span class="n">size</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">unpack_wxapkg</span><span class="p">(</span><span class="n">filepath</span><span class="p">,</span> <span class="n">output_dir</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;解包 wxapkg 文件&quot;&quot;&quot;</span>
+    <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">filepath</span><span class="p">,</span> <span class="s1">&#39;rb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">fp</span><span class="p">:</span>
+        <span class="n">header</span> <span class="o">=</span> <span class="n">WxapkgHeader</span><span class="o">.</span><span class="n">from_file</span><span class="p">(</span><span class="n">fp</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Magic: </span><span class="si">{</span><span class="n">header</span><span class="o">.</span><span class="n">magic</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Version: </span><span class="si">{</span><span class="n">header</span><span class="o">.</span><span class="n">version</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Index length: </span><span class="si">{</span><span class="n">header</span><span class="o">.</span><span class="n">index_len</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Data length: </span><span class="si">{</span><span class="n">header</span><span class="o">.</span><span class="n">data_len</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="c1"># 读取索引区</span>
+        <span class="n">file_count</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="s1">&#39;&gt;I&#39;</span><span class="p">,</span> <span class="n">fp</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="mi">4</span><span class="p">))[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;File count: </span><span class="si">{</span><span class="n">file_count</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+        <span class="n">entries</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">file_count</span><span class="p">):</span>
+            <span class="n">name_len</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="s1">&#39;&gt;I&#39;</span><span class="p">,</span> <span class="n">fp</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="mi">4</span><span class="p">))[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">name</span> <span class="o">=</span> <span class="n">fp</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="n">name_len</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="s1">&#39;utf-8&#39;</span><span class="p">)</span>
+            <span class="n">offset</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="s1">&#39;&gt;I&#39;</span><span class="p">,</span> <span class="n">fp</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="mi">4</span><span class="p">))[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">size</span> <span class="o">=</span> <span class="n">struct</span><span class="o">.</span><span class="n">unpack</span><span class="p">(</span><span class="s1">&#39;&gt;I&#39;</span><span class="p">,</span> <span class="n">fp</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="mi">4</span><span class="p">))[</span><span class="mi">0</span><span class="p">]</span>
+            <span class="n">entries</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">WxapkgFileEntry</span><span class="p">(</span><span class="n">name</span><span class="p">,</span> <span class="n">offset</span><span class="p">,</span> <span class="n">size</span><span class="p">))</span>
+
+        <span class="c1"># 读取数据区</span>
+        <span class="k">for</span> <span class="n">entry</span> <span class="ow">in</span> <span class="n">entries</span><span class="p">:</span>
+            <span class="n">fp</span><span class="o">.</span><span class="n">seek</span><span class="p">(</span><span class="n">entry</span><span class="o">.</span><span class="n">offset</span><span class="p">)</span>
+            <span class="n">data</span> <span class="o">=</span> <span class="n">fp</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="n">entry</span><span class="o">.</span><span class="n">size</span><span class="p">)</span>
+
+            <span class="c1"># 尝试解压</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">data</span> <span class="o">=</span> <span class="n">zlib</span><span class="o">.</span><span class="n">decompress</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+            <span class="k">except</span><span class="p">:</span>
+                <span class="k">pass</span>  <span class="c1"># 非压缩数据</span>
+
+            <span class="n">output_path</span> <span class="o">=</span> <span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">join</span><span class="p">(</span><span class="n">output_dir</span><span class="p">,</span> <span class="n">entry</span><span class="o">.</span><span class="n">name</span><span class="o">.</span><span class="n">lstrip</span><span class="p">(</span><span class="s1">&#39;/&#39;</span><span class="p">))</span>
+            <span class="n">os</span><span class="o">.</span><span class="n">makedirs</span><span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">dirname</span><span class="p">(</span><span class="n">output_path</span><span class="p">),</span> <span class="n">exist_ok</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="k">with</span> <span class="nb">open</span><span class="p">(</span><span class="n">output_path</span><span class="p">,</span> <span class="s1">&#39;wb&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">f</span><span class="p">:</span>
+                <span class="n">f</span><span class="o">.</span><span class="n">write</span><span class="p">(</span><span class="n">data</span><span class="p">)</span>
+            <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Extracted: </span><span class="si">{</span><span class="n">entry</span><span class="o">.</span><span class="n">name</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">entry</span><span class="o">.</span><span class="n">size</span><span class="si">}</span><span class="s2"> bytes)&quot;</span><span class="p">)</span>
+
+<span class="c1"># 使用示例</span>
+<span class="c1"># unpack_wxapkg(&#39;__APP__.wxapkg&#39;, &#39;./output/&#39;)</span>
+</code></pre></div>
+
+<p>需要注意的是，较新版本微信对主包做了整体加密（<code>wxsg</code> 魔数即加密包标志），此时直接 zlib 解压会失败。对于加密包，需要先用微信内置密钥进行解密（通常涉及对文件头 1024 字节的 AES/异或处理）后再走上述流程。社区工具 <code>unveilr</code> 已内置该解密逻辑。</p>
+<h3>3.3 获取 wxapkg 的途径</h3>
+<p>在 Android 设备上，小程序包缓存路径通常为：</p>
+<div class="highlight"><pre><span></span><code>/data/data/com.tencent.mm/MicroMsg/{用户哈希}/appbrand/pkg/
+</code></pre></div>
+
+<p>由于该目录需要 root 权限，实践中常用以下替代方案：</p>
+<ul>
+<li><strong>已 root 设备</strong>：直接 <code>adb pull</code> 拉取；</li>
+<li><strong>模拟器</strong>：使用自带 root 的 Android 模拟器，路径一致；</li>
+<li><strong>PC 微信</strong>：Windows 版微信缓存路径 <code>%APPDATA%\Tencent\WeChat\WeChat Files\Applet\</code>，部分版本可直接复制。</li>
+</ul>
+<hr />
+<h2>4. 解包后的代码恢复</h2>
+<p>解包后的目录结构通常如下：</p>
+<div class="highlight"><pre><span></span><code>output/
+├── app.js / app.json / app.wxss   # 入口逻辑(已混淆) / 全局配置 / 全局样式
+├── pages/index/{index.js,.wxml,.wxss,.json}   # 各页面四件套
+├── components/                    # 自定义组件
+└── miniprogram_npm/               # 构建后的 npm 依赖
+</code></pre></div>
+
+<h3>4.1 JS 代码反混淆</h3>
+<p>小程序发布时会经过微信混淆器处理，主要手段包括变量名替换（<code>getUserInfo</code> → <code>_0xab12</code>）、字符串数组化（字符串集中存入数组按索引引用）、控制流平坦化（顺序代码改写为 <code>switch-case</code> 状态机）、死代码注入（插入永不执行的分支干扰分析）。下面是一个基于 AST 的反混淆思路，使用 <code>@babel/parser</code> + <code>@babel/traverse</code> 还原字符串数组引用：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// deobfuscate.js —— 字符串数组还原 (典型模式: var _0x3a1f=[&#39;login&#39;,...]; function _0x4b2c(i){return _0x3a1f[i];})</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">parser</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">require</span><span class="p">(</span><span class="s1">&#39;@babel/parser&#39;</span><span class="p">);</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">traverse</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">require</span><span class="p">(</span><span class="s1">&#39;@babel/traverse&#39;</span><span class="p">).</span><span class="k">default</span><span class="p">;</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">generate</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">require</span><span class="p">(</span><span class="s1">&#39;@babel/generator&#39;</span><span class="p">).</span><span class="k">default</span><span class="p">;</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">t</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">require</span><span class="p">(</span><span class="s1">&#39;@babel/types&#39;</span><span class="p">);</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">fs</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">require</span><span class="p">(</span><span class="s1">&#39;fs&#39;</span><span class="p">);</span>
+
+<span class="kd">const</span><span class="w"> </span><span class="nx">ast</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">parser</span><span class="p">.</span><span class="nx">parse</span><span class="p">(</span><span class="nx">fs</span><span class="p">.</span><span class="nx">readFileSync</span><span class="p">(</span><span class="s1">&#39;app.js&#39;</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;utf-8&#39;</span><span class="p">));</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">stringArrayMap</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{};</span>
+<span class="kd">let</span><span class="w"> </span><span class="nx">arrayName</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span><span class="w"> </span><span class="nx">accessorName</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kc">null</span><span class="p">;</span>
+
+<span class="c1">// 1. 定位字符串数组及其访问函数</span>
+<span class="nx">traverse</span><span class="p">(</span><span class="nx">ast</span><span class="p">,</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="nx">VariableDeclarator</span><span class="p">(</span><span class="nx">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">t</span><span class="p">.</span><span class="nx">isArrayExpression</span><span class="p">(</span><span class="nx">path</span><span class="p">.</span><span class="nx">node</span><span class="p">.</span><span class="nx">init</span><span class="p">)</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nx">path</span><span class="p">.</span><span class="nx">node</span><span class="p">.</span><span class="nx">id</span><span class="p">.</span><span class="nx">name</span><span class="p">.</span><span class="nx">startsWith</span><span class="p">(</span><span class="s1">&#39;_0x&#39;</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nx">arrayName</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">path</span><span class="p">.</span><span class="nx">node</span><span class="p">.</span><span class="nx">id</span><span class="p">.</span><span class="nx">name</span><span class="p">;</span>
+<span class="w">      </span><span class="nx">path</span><span class="p">.</span><span class="nx">node</span><span class="p">.</span><span class="nx">init</span><span class="p">.</span><span class="nx">elements</span><span class="p">.</span><span class="nx">forEach</span><span class="p">((</span><span class="nx">el</span><span class="p">,</span><span class="w"> </span><span class="nx">i</span><span class="p">)</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">t</span><span class="p">.</span><span class="nx">isStringLiteral</span><span class="p">(</span><span class="nx">el</span><span class="p">))</span><span class="w"> </span><span class="nx">stringArrayMap</span><span class="p">[</span><span class="nx">i</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">el</span><span class="p">.</span><span class="nx">value</span><span class="p">;</span>
+<span class="w">      </span><span class="p">});</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nx">FunctionDeclaration</span><span class="p">(</span><span class="nx">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">generate</span><span class="p">(</span><span class="nx">path</span><span class="p">.</span><span class="nx">node</span><span class="p">).</span><span class="nx">code</span><span class="p">.</span><span class="nx">includes</span><span class="p">(</span><span class="nx">arrayName</span><span class="p">))</span><span class="w"> </span><span class="nx">accessorName</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">path</span><span class="p">.</span><span class="nx">node</span><span class="p">.</span><span class="nx">id</span><span class="p">.</span><span class="nx">name</span><span class="p">;</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">});</span>
+
+<span class="c1">// 2. 将 _0x4b2c(0x1) 形式的调用替换回原始字符串</span>
+<span class="nx">traverse</span><span class="p">(</span><span class="nx">ast</span><span class="p">,</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="nx">CallExpression</span><span class="p">(</span><span class="nx">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">path</span><span class="p">.</span><span class="nx">get</span><span class="p">(</span><span class="s1">&#39;callee&#39;</span><span class="p">).</span><span class="nx">isIdentifier</span><span class="p">({</span><span class="w"> </span><span class="nx">name</span><span class="o">:</span><span class="w"> </span><span class="nx">accessorName</span><span class="w"> </span><span class="p">}))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="kd">const</span><span class="w"> </span><span class="nx">arg</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">path</span><span class="p">.</span><span class="nx">node</span><span class="p">.</span><span class="nx">arguments</span><span class="p">[</span><span class="mf">0</span><span class="p">];</span>
+<span class="w">      </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">t</span><span class="p">.</span><span class="nx">isNumericLiteral</span><span class="p">(</span><span class="nx">arg</span><span class="p">)</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nx">stringArrayMap</span><span class="p">[</span><span class="nx">arg</span><span class="p">.</span><span class="nx">value</span><span class="p">]</span><span class="w"> </span><span class="o">!==</span><span class="w"> </span><span class="kc">undefined</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">path</span><span class="p">.</span><span class="nx">replaceWith</span><span class="p">(</span><span class="nx">t</span><span class="p">.</span><span class="nx">stringLiteral</span><span class="p">(</span><span class="nx">stringArrayMap</span><span class="p">[</span><span class="nx">arg</span><span class="p">.</span><span class="nx">value</span><span class="p">]));</span>
+<span class="w">      </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">});</span>
+
+<span class="nx">fs</span><span class="p">.</span><span class="nx">writeFileSync</span><span class="p">(</span><span class="s1">&#39;app.deob.js&#39;</span><span class="p">,</span><span class="w"> </span><span class="nx">generate</span><span class="p">(</span><span class="nx">ast</span><span class="p">,</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">comments</span><span class="o">:</span><span class="w"> </span><span class="kc">true</span><span class="w"> </span><span class="p">}).</span><span class="nx">code</span><span class="p">);</span>
+<span class="nx">console</span><span class="p">.</span><span class="nx">log</span><span class="p">(</span><span class="s1">&#39;反混淆完成 -&gt; app.deob.js&#39;</span><span class="p">);</span>
+</code></pre></div>
+
+<p>控制流平坦化的还原则更复杂，通常需要先识别调度变量（dispatcher），再按状态顺序重建基本块。对于深度混淆的代码，结合 <code>webcrack</code>、<code>deobfuscator</code> 等自动化工具可显著降低人工成本。</p>
+<h3>4.2 WXML/WXSS 还原</h3>
+<p>编译后的 WXML 会被转换成 JS 函数（<code>$gwx</code> 生成器），形如 <code>{ "node": { "tag": "view", "children": [...] } }</code> 的虚拟节点树。通过 <code>unveilr</code> 或 <code>wxappUnpacker</code> 可将其还原为原始 WXML：</p>
+<div class="highlight"><pre><span></span><code><span class="cm">&lt;!-- 还原后的 index.wxml --&gt;</span>
+<span class="nt">&lt;view</span><span class="w"> </span><span class="na">class=</span><span class="s">&quot;container&quot;</span><span class="nt">&gt;&lt;text&gt;</span>{{message}}<span class="nt">&lt;/text&gt;&lt;/view&gt;</span>
+</code></pre></div>
+
+<p>WXSS 编译后会被转成 JS 注入的 CSS，还原后得到标准样式表。</p>
+<h3>4.3 app.json 配置分析</h3>
+<p><code>app.json</code> 是小程序的全局配置，逆向时重点关注：</p>
+<div class="highlight"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;pages&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;pages/index/index&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;pages/login/login&quot;</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;subPackages&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;root&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;pkgA&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;pages&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;pages/detail/detail&quot;</span><span class="p">]</span><span class="w"> </span><span class="p">}</span>
+<span class="w">  </span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;networkTimeout&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;request&quot;</span><span class="p">:</span><span class="w"> </span><span class="mi">10000</span><span class="w"> </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;permission&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;scope.userLocation&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;desc&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;用于配送定位&quot;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;requiredBackgroundModes&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;audio&quot;</span><span class="p">],</span>
+<span class="w">  </span><span class="nt">&quot;__usePrivacyCheck__&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>从中可提取：页面路由（确定攻击面）、分包结构、申请的权限范围、后台能力。这些信息为后续的关键点提取提供导航。</p>
+<h3>4.4 依赖包分析</h3>
+<p>若小程序使用了 npm 包（开启了"构建 npm"），<code>miniprogram_npm/</code> 目录下会包含打包后的依赖。通过对比 <code>package.json</code> 与发布版本号，可识别是否存在已知漏洞依赖（如旧版 <code>lodash</code> 原型污染、<code>axios</code> SSRF 等），这是供应链审计的入口。</p>
+<hr />
+<h2>5. 关键点提取技术</h2>
+<p>逆向的最终目标通常不是阅读全部代码，而是定位少数关键点：API 接口、签名算法、加密密钥、核心业务逻辑。</p>
+<h3>5.1 API 接口提取</h3>
+<p>通过正则批量提取 <code>wx.request</code> 调用及其 URL：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">extract_api_calls</span><span class="p">(</span><span class="n">js_dir</span><span class="p">):</span>
+    <span class="n">pattern</span> <span class="o">=</span> <span class="n">re</span><span class="o">.</span><span class="n">compile</span><span class="p">(</span>
+        <span class="sa">r</span><span class="s1">&#39;wx\.request\s*\(\s*\{[^}]*?url\s*:\s*[</span><span class="se">\&#39;</span><span class="s1">&quot;]([^</span><span class="se">\&#39;</span><span class="s1">&quot;]+)[</span><span class="se">\&#39;</span><span class="s1">&quot;]&#39;</span><span class="p">,</span>
+        <span class="n">re</span><span class="o">.</span><span class="n">DOTALL</span>
+    <span class="p">)</span>
+    <span class="n">apis</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+    <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="n">Path</span><span class="p">(</span><span class="n">js_dir</span><span class="p">)</span><span class="o">.</span><span class="n">rglob</span><span class="p">(</span><span class="s1">&#39;*.js&#39;</span><span class="p">):</span>
+        <span class="n">code</span> <span class="o">=</span> <span class="n">f</span><span class="o">.</span><span class="n">read_text</span><span class="p">(</span><span class="n">encoding</span><span class="o">=</span><span class="s1">&#39;utf-8&#39;</span><span class="p">,</span> <span class="n">errors</span><span class="o">=</span><span class="s1">&#39;ignore&#39;</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">m</span> <span class="ow">in</span> <span class="n">pattern</span><span class="o">.</span><span class="n">finditer</span><span class="p">(</span><span class="n">code</span><span class="p">):</span>
+            <span class="n">apis</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="n">m</span><span class="o">.</span><span class="n">group</span><span class="p">(</span><span class="mi">1</span><span class="p">))</span>
+    <span class="k">return</span> <span class="nb">sorted</span><span class="p">(</span><span class="n">apis</span><span class="p">)</span>
+<span class="c1"># 输出示例: [&#39;https://api.target.com/v1/login&#39;, &#39;.../v1/order/create&#39;, &#39;https://pay.target.com/v1/sign&#39;]</span>
+</code></pre></div>
+
+<p>更准确的做法是用 AST 遍历 <code>CallExpression</code>，提取 <code>wx.request</code> 的配置对象字面量，可同时拿到 <code>method</code>、<code>header</code>、<code>data</code> 字段，构造出完整的请求模板。</p>
+<h3>5.2 签名算法定位</h3>
+<p>小程序常用的签名模式是在请求头或参数中附加 <code>sign</code> 字段，常见算法为 <code>MD5(参数 + 时间戳 + 密钥)</code>。定位思路：</p>
+<ol>
+<li><strong>关键词检索</strong>：搜索 <code>sign</code>、<code>signature</code>、<code>md5</code>、<code>hmac</code>、<code>crypto</code>；</li>
+<li><strong>Hook 加密函数</strong>：用 Frida Hook <code>CryptoJS.MD5</code>、<code>JSCore</code> 原生加密接口；</li>
+<li><strong>回溯调用链</strong>：从 <code>wx.request</code> 拦截器向上回溯，找到 <code>header.sign</code> 的赋值点。</li>
+</ol>
+<p>下面是一个定位签名生成函数的 Frida 脚本片段：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// frida -U -n WeChat -l hook_sign.js</span>
+<span class="nx">Java</span><span class="p">.</span><span class="nx">perform</span><span class="p">(</span><span class="kd">function</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kd">var</span><span class="w"> </span><span class="nx">CryptoJS</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">Java</span><span class="p">.</span><span class="nx">use</span><span class="p">(</span><span class="s1">&#39;com.tencent.mm.plugin.appbrand.jsapi.CryptoJS&#39;</span><span class="p">);</span>
+<span class="w">  </span><span class="nx">CryptoJS</span><span class="p">.</span><span class="nx">MD5</span><span class="p">.</span><span class="nx">implementation</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="p">(</span><span class="nx">input</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w">        </span><span class="c1">// Hook CryptoJS.MD5(若走 JS 层)</span>
+<span class="w">    </span><span class="nx">console</span><span class="p">.</span><span class="nx">log</span><span class="p">(</span><span class="s1">&#39;[MD5] in=&#39;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">input</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s1">&#39; out=&#39;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="k">this</span><span class="p">.</span><span class="nx">MD5</span><span class="p">(</span><span class="nx">input</span><span class="p">));</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="k">this</span><span class="p">.</span><span class="nx">MD5</span><span class="p">(</span><span class="nx">input</span><span class="p">);</span>
+<span class="w">  </span><span class="p">};</span>
+<span class="p">});</span>
+<span class="c1">// 签名在 JS 层时, 亦可 Hook JSCore 的 evaluateJavascript 拦截 sign 生成入参</span>
+<span class="nx">Interceptor</span><span class="p">.</span><span class="nx">attach</span><span class="p">(</span><span class="nx">Module</span><span class="p">.</span><span class="nx">findExportByName</span><span class="p">(</span><span class="kc">null</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;JSObjectMakeFunction&#39;</span><span class="p">),</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="nx">onEnter</span><span class="o">:</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="p">(</span><span class="nx">args</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* 记录函数创建 */</span><span class="w"> </span><span class="p">}</span>
+<span class="p">});</span>
+</code></pre></div>
+
+<p>定位到签名函数后，提取其算法伪代码：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 还原后的签名逻辑: 字典序拼接 + 时间戳 + 盐 → MD5</span>
+<span class="kd">function</span><span class="w"> </span><span class="nx">genSign</span><span class="p">(</span><span class="nx">params</span><span class="p">,</span><span class="w"> </span><span class="nx">timestamp</span><span class="p">,</span><span class="w"> </span><span class="nx">salt</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kd">var</span><span class="w"> </span><span class="nx">str</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Object</span><span class="p">.</span><span class="nx">keys</span><span class="p">(</span><span class="nx">params</span><span class="p">).</span><span class="nx">sort</span><span class="p">()</span>
+<span class="w">    </span><span class="p">.</span><span class="nx">map</span><span class="p">(</span><span class="nx">k</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="nx">k</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s1">&#39;=&#39;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">params</span><span class="p">[</span><span class="nx">k</span><span class="p">]).</span><span class="nx">join</span><span class="p">(</span><span class="s1">&#39;&amp;&#39;</span><span class="p">)</span><span class="w">        </span><span class="c1">// 1. 按 key 字典序拼接</span>
+<span class="w">    </span><span class="o">+</span><span class="w"> </span><span class="s1">&#39;&amp;timestamp=&#39;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">timestamp</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s1">&#39;&amp;salt=&#39;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">salt</span><span class="p">;</span><span class="w">   </span><span class="c1">// 2. 追加时间戳与盐</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="nx">md5</span><span class="p">(</span><span class="nx">str</span><span class="p">).</span><span class="nx">toUpperCase</span><span class="p">();</span><span class="w">                      </span><span class="c1">// 3. MD5 摘要</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>5.3 加密密钥提取</h3>
+<p>密钥常硬编码在 JS 中或通过 <code>wx.getStorage</code> 从本地读取。提取方法：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 密钥特征正则</span>
+<span class="n">patterns</span> <span class="o">=</span> <span class="p">[</span>
+    <span class="sa">r</span><span class="s1">&#39;(?:aes|aeskey|secret|appkey|app_secret)\s*[:=]\s*[</span><span class="se">\&#39;</span><span class="s1">&quot;]([A-Za-z0-9+/=]{16,64})[</span><span class="se">\&#39;</span><span class="s1">&quot;]&#39;</span><span class="p">,</span>
+    <span class="sa">r</span><span class="s1">&#39;[</span><span class="se">\&#39;</span><span class="s1">&quot;]([0-9a-fA-F]</span><span class="si">{32}</span><span class="s1">)[</span><span class="se">\&#39;</span><span class="s1">&quot;]&#39;</span><span class="p">,</span>  <span class="c1"># 32位hex (MD5/AES-128)</span>
+    <span class="sa">r</span><span class="s1">&#39;[</span><span class="se">\&#39;</span><span class="s1">&quot;]([A-Za-z0-9+/]</span><span class="si">{44}</span><span class="s1">=)[</span><span class="se">\&#39;</span><span class="s1">&quot;]&#39;</span><span class="p">,</span>  <span class="c1"># Base64 (AES-256)</span>
+<span class="p">]</span>
+</code></pre></div>
+
+<p>若密钥来自服务端动态下发，则需结合抓包与 Frida 追踪运行时内存。</p>
+<h3>5.4 业务逻辑分析</h3>
+<p>重点关注高风险逻辑：支付流程（订单创建、金额校验、回调验签）、权限控制（<code>wx.login</code> → <code>code2session</code> → 自建 token 鉴权链）、优惠券/积分（服务端是否校验业务约束）。典型漏洞模式：客户端自行计算订单金额并提交，服务端未做二次校验，导致支付金额篡改。</p>
+<h3>5.5 小程序云函数分析</h3>
+<p>使用云开发的小程序，部分逻辑运行在云函数（Node.js）中，客户端无法直接获取其源码，但可间接分析：搜索 <code>wx.cloud.callFunction({ name: 'xxx' })</code> 列出所有云函数名；Hook <code>callFunction</code> 抓取入参/出参；结合业务场景与返回数据结构推断内部逻辑；云函数常因未做调用方身份校验而存在未授权访问或水平越权。</p>
+<div class="highlight"><pre><span></span><code>客户端 ──callFunction({name:&#39;pay&#39;})──&gt; 云函数 ──校验?(常缺失)──&gt; 云数据库
+       &lt;──{code:0, data:{...}}──────── │       &lt;──订单数据────── │
+</code></pre></div>
+
+<hr />
+<h2>6. 逆向工具链</h2>
+<h3>6.1 工具链全景</h3>
+<div class="highlight"><pre><span></span><code>阶段      工具
+获取      root 设备 / 模拟器 / PC 微信缓存
+解包      unveilr (推荐) / wxappUnpacker / 自研脚本
+反混淆    webcrack / deobfuscator / Babel AST 自研
+调试      微信开发者工具 / Chrome DevTools 调试 WebView
+流量      Charles / Fiddler / mitmproxy (HTTPS 抓包)
+动态      Frida (Hook JSCore/Native) / Xposed
+辅助      VS Code + ESLint / Sourcemap 还原 / 正则工具
+</code></pre></div>
+
+<h3>6.2 各工具定位</h3>
+<table>
+<thead>
+<tr>
+<th>工具</th>
+<th>类型</th>
+<th>用途</th>
+<th>备注</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>unveilr</code></td>
+<td>解包</td>
+<td>解密 + 解包 + 还原 WXML/WXSS/JS</td>
+<td>Node 实现，支持加密包，社区活跃</td>
+</tr>
+<tr>
+<td><code>wxappUnpacker</code></td>
+<td>解包</td>
+<td>经典解包工具</td>
+<td>部分加密包已不适用</td>
+</tr>
+<tr>
+<td>微信开发者工具</td>
+<td>调试</td>
+<td>加载还原后代码、断点调试</td>
+<td>需绕过 AppID 校验</td>
+</tr>
+<tr>
+<td>Charles / Fiddler</td>
+<td>抓包</td>
+<td>HTTPS 中间人，分析请求</td>
+<td>需信任根证书</td>
+</tr>
+<tr>
+<td>Frida</td>
+<td>动态 Hook</td>
+<td>运行时拦截加密/签名函数</td>
+<td>跨平台，Android/iOS 通用</td>
+</tr>
+<tr>
+<td><code>webcrack</code></td>
+<td>反混淆</td>
+<td>自动化还原混淆 JS</td>
+<td>基于 Babel AST</td>
+</tr>
+<tr>
+<td>mitmproxy</td>
+<td>抓包</td>
+<td>脚本化流量分析</td>
+<td>适合自动化测试</td>
+</tr>
+</tbody>
+</table>
+<h3>6.3 调试与抓包配置</h3>
+<p>将还原后的代码导入微信开发者工具时，AppID 不匹配会阻断加载。绕过方式：新建空白项目并覆盖还原代码、开启"不校验合法域名"（详情 → 本地设置）、注释掉 <code>app.json</code> 中云开发配置，即可在本地断点调试逻辑层，实时观察 <code>wx.request</code> 的参数构造与签名生成。流量抓包方面，Android 7+ 默认不信任用户证书，可用低版本设备/模拟器、将证书安装到系统目录（需 root）或用 Frida 绕过 SSL Pinning。mitmproxy 启动代理：<code>mitmweb --listen-port 8888</code>，设备代理指向主机 IP:8888 后访问 <code>mitm.it</code> 安装证书。</p>
+<hr />
+<h2>7. 防御方案</h2>
+<p>逆向分析与防御是硬币的两面。从开发者视角，应从以下几个维度构建纵深防御。</p>
+<h3>7.1 代码加固</h3>
+<table>
+<thead>
+<tr>
+<th>手段</th>
+<th>实现方式</th>
+<th>效果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>商业混淆服务</td>
+<td>接入腾讯代码保护/第三方加固</td>
+<td>变量名、控制流深度混淆</td>
+</tr>
+<tr>
+<td>JS 加密</td>
+<td>关键函数运行时解密执行</td>
+<td>静态分析失效</td>
+</tr>
+<tr>
+<td>WASM 化</td>
+<td>核心算法用 C/Rust 编译为 WASM</td>
+<td>反编译成本大幅提升</td>
+</tr>
+<tr>
+<td>代码分包加密</td>
+<td>子包单独加密，按需解密</td>
+<td>减少一次性暴露面</td>
+</tr>
+</tbody>
+</table>
+<p>将核心签名算法迁移到 WASM 模块是当前性价比较高的方案，静态反汇编 WASM 的难度远高于 JS 反混淆。</p>
+<h3>7.2 接口签名与防重放</h3>
+<p>服务端必须独立校验签名，不信任客户端任何业务字段：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 服务端校验示例 (Node.js): HMAC-SHA256 + 时间窗口 + 常量时间比较</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">crypto</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">require</span><span class="p">(</span><span class="s1">&#39;crypto&#39;</span><span class="p">);</span>
+<span class="kd">function</span><span class="w"> </span><span class="nx">verifySign</span><span class="p">(</span><span class="nx">params</span><span class="p">,</span><span class="w"> </span><span class="nx">sign</span><span class="p">,</span><span class="w"> </span><span class="nx">secret</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kd">const</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">sign</span><span class="o">:</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="p">...</span><span class="nx">rest</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">params</span><span class="p">;</span><span class="w">                          </span><span class="c1">// 1. 剔除 sign 字段</span>
+<span class="w">  </span><span class="kd">const</span><span class="w"> </span><span class="nx">str</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Object</span><span class="p">.</span><span class="nx">keys</span><span class="p">(</span><span class="nx">rest</span><span class="p">).</span><span class="nx">sort</span><span class="p">()</span>
+<span class="w">    </span><span class="p">.</span><span class="nx">map</span><span class="p">(</span><span class="nx">k</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="sb">`</span><span class="si">${</span><span class="nx">k</span><span class="si">}</span><span class="sb">=</span><span class="si">${</span><span class="nx">rest</span><span class="p">[</span><span class="nx">k</span><span class="p">]</span><span class="si">}</span><span class="sb">`</span><span class="p">).</span><span class="nx">join</span><span class="p">(</span><span class="s1">&#39;&amp;&#39;</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="sb">`&amp;key=</span><span class="si">${</span><span class="nx">secret</span><span class="si">}</span><span class="sb">`</span><span class="p">;</span><span class="w">  </span><span class="c1">// 2. 字典序拼接</span>
+<span class="w">  </span><span class="kd">const</span><span class="w"> </span><span class="nx">expected</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">crypto</span><span class="p">.</span><span class="nx">createHmac</span><span class="p">(</span><span class="s1">&#39;sha256&#39;</span><span class="p">,</span><span class="w"> </span><span class="nx">secret</span><span class="p">).</span><span class="nx">update</span><span class="p">(</span><span class="nx">str</span><span class="p">).</span><span class="nx">digest</span><span class="p">(</span><span class="s1">&#39;hex&#39;</span><span class="p">);</span><span class="w"> </span><span class="c1">// 3. HMAC</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nb">Math</span><span class="p">.</span><span class="nx">abs</span><span class="p">(</span><span class="nb">Date</span><span class="p">.</span><span class="nx">now</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nb">Number</span><span class="p">(</span><span class="nx">params</span><span class="p">.</span><span class="nx">timestamp</span><span class="p">))</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mf">5</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">60</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1000</span><span class="p">)</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="kc">false</span><span class="p">;</span><span class="w"> </span><span class="c1">// 4. 5分钟窗口防重放</span>
+<span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="nx">crypto</span><span class="p">.</span><span class="nx">timingSafeEqual</span><span class="p">(</span><span class="nx">Buffer</span><span class="p">.</span><span class="kr">from</span><span class="p">(</span><span class="nx">sign</span><span class="p">),</span><span class="w"> </span><span class="nx">Buffer</span><span class="p">.</span><span class="kr">from</span><span class="p">(</span><span class="nx">expected</span><span class="p">));</span><span class="w"> </span><span class="c1">// 5. 防时序攻击</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>关键点：密钥永不下发客户端、使用 HMAC 而非裸 MD5、加入 nonce 防重放、常量时间比较防时序攻击。</p>
+<h3>7.3 敏感逻辑服务端化</h3>
+<p>客户端只负责"采集"和"展示"，所有"判断"和"计算"放到服务端：金额、数量、权限等级由服务端从数据库读取，不接受客户端传入；优惠券可用性、活动条件由服务端实时计算；支付回调以支付平台服务端通知为准，不信任客户端的"支付成功"状态。</p>
+<h3>7.4 小程序安全检测接入</h3>
+<p>发布前接入自动化安全检测平台（腾讯、阿里等厂商均提供 SaaS，可作为发布流水线一环），覆盖代码混淆强度评估、硬编码密钥/Token 扫描、域名白名单合规检查、越权与信息泄露漏洞扫描、依赖组件已知漏洞清单。</p>
+<h3>7.5 运行时防护</h3>
+<p>包括关键路径上的 wxapkg 完整性校验（发现篡改即熔断）、开发者工具/调试器附加检测（触发风控降级）、以及对异常批量 API 调用、高频签名请求的限流与告警。</p>
+<hr />
+<h2>8. 总结</h2>
+<p>本文完整记录了一次微信小程序逆向的全过程，核心脉络如下：</p>
+<div class="highlight"><pre><span></span><code>获取 wxapkg → 格式解析解包 → JS 反混淆/WXML 还原 → 配置与依赖分析
+                                                        │
+                                                        ▼
+                                              关键点提取 [API | 签名 | 密钥 | 业务逻辑]
+                                                        │
+        ┌───────────────────────────────────────────────┤
+        ▼                                               ▼
+   工具链协同 (unveilr/Frida/Charles/AST)         漏洞验证 (授权环境)
+</code></pre></div>
+
+<p>几点实践体会：解包已基本工程化，<code>unveilr</code> 等工具能覆盖绝大多数场景，加密包也已有成熟解密方案；反混淆是主要人力成本，深度混淆下纯静态分析几乎不可行，必须结合动态 Hook 与 AST 工具；签名算法是逆向的"终点"，拿到签名即可构造合法请求，后续漏洞挖掘转为传统 Web 安全范畴；云函数是新的盲区，客户端可见的只有入口名，逻辑推断依赖抓包与行为分析；防御的核心是服务端校验，客户端加固只是提高门槛，真正的安全边界必须在服务端建立。</p>
+<p>小程序的安全本质仍是"客户端不可信"原则的延伸。任何放在客户端的密钥、算法、判断逻辑，都应被视为可被还原的公开信息。将信任锚点收敛到服务端，才是抵御逆向的根本之道。</p>
+<hr />
+<h2>免责声明</h2>
+<p>本文所述技术内容仅用于安全研究、授权渗透测试与学术交流目的。读者应在获得目标系统所有者明确书面授权的前提下进行相关操作，不得用于任何非法用途。未经授权对他人小程序进行逆向、破解、数据爬取或接口调用，可能违反《中华人民共和国网络安全法》《中华人民共和国著作权法》《计算机软件保护条例》等法律法规，以及微信小程序平台服务协议，由此产生的一切法律责任由行为人自行承担。本文作者不对读者基于本文内容所实施的任何行为及其后果承担任何责任。请务必遵守所在国家/地区的法律法规，尊重软件开发者的知识产权与平台规则。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

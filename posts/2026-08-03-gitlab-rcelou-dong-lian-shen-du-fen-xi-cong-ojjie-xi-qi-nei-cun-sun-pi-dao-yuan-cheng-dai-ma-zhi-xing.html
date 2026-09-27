@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GitLab RCE 漏洞链深度分析：从 Oj 解析器内存损坏到远程代码执行 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>GitLab RCE 漏洞链深度分析：从 Oj 解析器内存损坏到远程代码执行</h1>
+<time>2026-08-03</time>
+<ul>
+<li>安全</li>
+<li>GitLab</li>
+<li>漏洞分析
+Slug: gitlab-rce漏洞链深度分析-从oj解析器内存损坏到远程代码执行</li>
+</ul>
+<hr />
+<h2>一条被低估的链</h2>
+<p>2026 年 7 月 24 日，Depthfirst 公开了一条 GitLab 远程代码执行链。两个在 Oj（GitLab 依赖的高性能 JSON 解析器）里潜伏了近五年的内存损坏缺陷，被串起来打穿了整个 Rails 进程。</p>
+<p>这条链最值得聊的点不是技术难度本身，而是它击穿了"Ruby 是内存安全语言"这个直觉。Oj 的核心是 C 扩展，里面有指针、定长缓冲区、手动生命周期管理。GitLab 通过 <code>Oj::Parser.usual.parse</code> 把用户提交的 notebook 文件喂进这个 C 解析器——然后攻击者只需要一个能推送代码的普通账户，就能触发内存损坏。</p>
+<p>受影响版本：GitLab CE/EE 15.2.0–18.10.7、18.11.0–18.11.4、19.0.0–19.0.1。修复版本 18.10.8 / 18.11.5 / 19.0.2。GitLab 把这次 Oj 升级归类为"Bug 修复"而非安全补丁——这意味着运维人员没有理由把它当紧急事件处理，这是该漏洞长期暴露的关键运营因素。</p>
+<h2>Oj 里的两个 bug</h2>
+<p>漏洞一是个越界写入。Oj 解析器用定长 1024 字节数组跟踪 JSON 嵌套深度：</p>
+<div class="highlight"><pre><span></span><code><span class="k">typedef</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">_ojParser</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">depth</span><span class="p">;</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">stack</span><span class="p">[</span><span class="mi">1024</span><span class="p">];</span><span class="w">   </span><span class="c1">// 定长嵌套栈</span>
+<span class="w">    </span><span class="kt">void</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="n">start</span><span class="p">)(</span><span class="k">struct</span><span class="w"> </span><span class="nc">_ojParser</span><span class="w"> </span><span class="o">*</span><span class="n">p</span><span class="p">);</span><span class="w">   </span><span class="c1">// 回调指针</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="p">}</span><span class="w"> </span><span class="o">*</span><span class="n">ojParser</span><span class="p">;</span>
+</code></pre></div>
+
+<p>打开数组时的处理没有深度检查：</p>
+<div class="highlight"><pre><span></span><code><span class="k">case</span><span class="w"> </span><span class="no">OPEN_ARRAY</span><span class="p">:</span>
+<span class="w">    </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">depth</span><span class="o">++</span><span class="p">;</span>
+<span class="w">    </span><span class="n">p</span><span class="o">-&gt;</span><span class="n">stack</span><span class="p">[</span><span class="n">p</span><span class="o">-&gt;</span><span class="n">depth</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ARRAY_FUN</span><span class="p">;</span><span class="w">   </span><span class="c1">// 超过 1024 层直接溢出</span>
+</code></pre></div>
+
+<p>攻击者构造超过 1024 层嵌套数组，<code>stack</code> 之后的字段被持续写入 <code>0x01</code>。配合 Oj 的"自延续"特性——每次写入的 <code>0x01</code> 在下一层被当作 Array 回调选择器读回——这个扫掠可以越过 padding 一路推进到 <code>buf.head</code> 指针，把它的低字节从 <code>0x80</code> 改为 <code>0x01</code>，向后回退 127 字节。</p>
+<p>漏洞二是堆指针泄露。一个超长对象键（65565 字节）的长度从 <code>size_t</code> 被截断为有符号 16 位整数，回绕为 29。Oj 为完整键分配了堆内存，但截断后的长度让返回路径从内联缓冲区读 29 字节，其中恰好包含活跃的堆指针。GitLab 渲染 diff 时把它作为输出的一部分返回给攻击者。</p>
+<h2>堆风水 + ASLR 探测 = RCE</h2>
+<p>两个单独的 bug 看起来都不严重——一个只能写 <code>0x01</code>，另一个只泄露少量内存。链化才是关键。整个利用分三步：</p>
+<p><strong>ASLR 绕过。</strong> 攻击者拿到堆指针后，不直接读内存，而是构造一个基于"执行反馈"的侧信道：把自循环指令地址写入 <code>p-&gt;start</code> 回调指针，观察解析器是挂起还是存活。挂起说明地址落在可执行映射内。在新实例上 5-10 分钟、成熟实例上 1-2 小时就能恢复 libc 基址。</p>
+<p><strong>堆风水。</strong> 写原语只能写 <code>0x01</code>，怎么把任意地址写进 <code>p-&gt;start</code>？利用链把被篡改的 <code>buf.head</code> 喂给 <code>realloc</code>，迫使其缓存一个伪造的内部指针。随后 Ruby Array 分配恰好回收同一块内存，Array 的元素内容覆盖了解析器的 <code>p-&gt;start</code> 指针。这是对 jemalloc 的 size class（3584 字节区域）和 slab 缓存语义的精确利用——没写 shellcode，靠分配器自己的行为完成了指针替换。</p>
+<p><strong>命令执行。</strong> NX/DEP 禁止堆上直接执行，所以攻击者不投 shellcode。<code>p-&gt;start</code> 被覆盖后，跳转到 libruby 内的两个跳板 gadget，最终落入 <code>system()</code>，命令字符串作为参数投递。整个利用在单个 <code>diffs_stream</code> 请求内完成，两个 notebook 按字典序排列，分别负责泄漏和触发。</p>
+<p>一句话总结这条链：普通认证用户推送含恶意 notebook 的提交 → 打开 diff → notebook 渲染器调用 <code>Oj::Parser.usual.parse</code> → 内存损坏改写回调指针 → 经 libruby 跳板进 <code>system()</code> → 以 <code>git</code> 用户执行命令。</p>
+<h2>缓解与修复</h2>
+<table>
+<thead>
+<tr>
+<th>缓解机制</th>
+<th>效果</th>
+<th>绕过方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>ASLR</td>
+<td>关键防线</td>
+<td>堆指针泄露 + 侧信道探测恢复基址</td>
+</tr>
+<tr>
+<td>Stack Canary</td>
+<td>完全无效</td>
+<td>不覆盖栈返回地址，攻击目标在堆上</td>
+</tr>
+<tr>
+<td>NX/DEP</td>
+<td>阻止直接 shellcode</td>
+<td>不投 shellcode，ROP 式跳转进 <code>system()</code></td>
+</tr>
+<tr>
+<td>PIE</td>
+<td>与 ASLR 协同</td>
+<td>同 ASLR 绕过路径</td>
+</tr>
+</tbody>
+</table>
+<p>Stack Canary 彻底失效这件事值得多想一层——它针对的是栈返回地址覆盖，而这个漏洞的写入目标在堆上的结构体内。对"结构体内部越界写 + 函数指针劫持"类缺陷，CFI（控制流完整性）才是对症的缓解。如果 libruby 启用 CFI，<code>p-&gt;start(p)</code> 的间接调用和跳板路径都可能被阻断。</p>
+<p>上游修复（Oj 3.17.2/3.17.3，ec368db）做了四件事：在 <code>open_array</code>/<code>open_object</code> 的 <code>depth++</code> 后加边界检查（超限直接 <code>parse_error</code>）；冻结输入字符串防止解析期间缓冲区被外部改写；把多处 <code>int len</code> 收窄统一改为 <code>size_t</code> 消除大长度回绕；加缩进上限 16 字符。</p>
+<h2>怎么防</h2>
+<p><strong>WAF 侧：</strong> 传统 WAF 很难拦截——恶意载荷藏在仓库文件内容里，走的是正常的 diff 流式接口。能做的是限制单文件大小，对 <code>.ipynb</code> 做 JSON 结构审计（嵌套深度 &gt;200 或单键 &gt;8192 字节就告警），对同一提交里包含多个字典序相邻 <code>.ipynb</code> 的情况提高风险评分。</p>
+<p><strong>HIDS 侧：</strong> <code>git</code> 用户派生 <code>sh</code>/<code>bash</code>/<code>curl</code>/<code>wget</code> 立即告警。监控 Rails secrets 和凭证文件的异常读取。网络层关注 Puma worker 向非预期内部服务的横向连接。</p>
+<p><strong>应急检查：</strong> <code>oj -v</code> 确认版本 ≥ 3.17.3。版本不满足且无法立即升级的，限制 <code>diffs_stream</code> 接口的访问频率，挂个监控盯着 Puma worker 异常重启和长时间 CPU 占用——那个 5 分钟到 2 小时的 ASLR 探测窗口，就是你的响应窗口。</p>
+<p>我个人对这条链最大的感受是：别信任"内存安全语言"这个标签。Ruby 是安全的，但它的 gem 堆里塞满了不安全的 C 扩展。Oj 不是特例——你跑 <code>gem list | wc -l</code> 看看你项目里有多少 gem，再想想每个 gem 的 <code>ext/</code> 目录里藏了多少指针运算。下次升级依赖的时候，至少看一眼 C 扩展变化的 changelog。</p>
+<hr />
+<h2>免责声明</h2>
+<p>本文仅供安全研究与防御建设参考。所有技术细节基于公开披露的研究资料与上游补丁还原。请勿将文中技术用于未经授权的测试或攻击；因不当使用造成的一切后果由使用者自行承担。受影响用户应尽快升级至 18.10.8 / 18.11.5 / 19.0.2。</p>
+<p><strong>参考资料：</strong> Depthfirst 公开报告 / Oj commit ec368db / GitLab 19.0.2 安全补丁 / CVE-2026-54903（Oj 整数溢出，同族内存安全缺陷）</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

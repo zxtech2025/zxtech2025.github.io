@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kerberos 票据伪造攻防：从金票到钻石票 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Kerberos 票据伪造攻防：从金票到钻石票</h1>
+<time>2026-08-05</time>
+<ul>
+<li>技术
+Slug: kerberos票据伪造攻防-从金票到钻石票</li>
+</ul>
+<hr />
+<h2>一、Kerberos 协议完整流程</h2>
+<p>Kerberos 是 Active Directory 默认的认证协议，核心思想是用一个可信第三方（KDC，密钥分发中心，通常由域控上的 <code>lsass.exe</code> 承载）向客户端签发票据，服务端不直接与 KDC 通信，仅凭票据内容即可完成授权判断。整个协议由三次交换组成。</p>
+<h3>1.1 三次交换</h3>
+<div class="highlight"><pre><span></span><code>        Client                         KDC (AS + TGS)                    Service
+          |                                  |                              |
+          |==== (1) AS-REQ (预认证) ========&gt;|                              |
+          |     [主体名 + 时间戳(用用户哈希加密)] |                              |
+          |&lt;== (1) AS-REP ===================|                              |
+          |     [TGT + 会话密钥]               |                              |
+          |     TGT 用 KRBTGT 账户密钥加密     |                              |
+          |                                  |                              |
+          |==== (2) TGS-REQ (TGT + 认证符) ==&gt;|                              |
+          |&lt;== (2) TGS-REP ===================|                              |
+          |     [服务票据 ST + 服务会话密钥]    |                              |
+          |     ST 用目标服务账户密钥加密        |                              |
+          |                                  |                              |
+          |==== (3) AP-REQ (ST + 认证符) =====|=============================&gt;|
+          |&lt;== (3) AP-REP (双向认证) =========|&lt;=============================|
+          |                                  |                              |
+</code></pre></div>
+
+<ul>
+<li><strong>AS 交换（AS-REQ / AS-REP）</strong>：客户端用自身密码哈希加密一个时间戳完成预认证，KDC 验证通过后返回 TGT（Ticket Granting Ticket）。TGT 用 <code>KRBTGT</code> 账户密钥加密，客户端无法解密其内容，只能原样持有并向 TGS 出示。</li>
+<li><strong>TGS 交换（TGS-REQ / TGS-REP）</strong>：客户端将 TGT 连同一个用会话密钥加密的认证符（Authenticator，含时间戳）发给 KDC 的 TGS 部分，换取访问特定服务的服务票据（ST）。ST 用目标服务账户的密钥加密，因此只有该服务能解密。</li>
+<li><strong>AP 交换（AP-REQ / AP-REP）</strong>：客户端向服务出示 ST 与认证符，服务用自身密钥解密 ST 校验合法性，可选返回 AP-REP 完成双向认证。</li>
+</ul>
+<p>关键票据属性：默认 TGT 有效期 <strong>10 小时</strong>，可续期至 <strong>7 天</strong>；服务票据有效期由策略决定，通常较短。所有票据中的 EncTicketPart（加密前的票据本体）包含授权数据——这正是 PAC 的载体。</p>
+<h3>1.2 密钥类型与加密降级风险</h3>
+<p>Kerberos 支持多种加密类型（etype），其中两种在 AD 环境中最常见，且安全性差异巨大：</p>
+<table>
+<thead>
+<tr>
+<th>加密类型</th>
+<th>etype</th>
+<th>密钥推导方式</th>
+<th>Salt</th>
+<th>安全性</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>RC4-HMAC</td>
+<td>23</td>
+<td>密钥 = NT 哈希（MD4）</td>
+<td>无 salt</td>
+<td>弱，离线爆破可行</td>
+</tr>
+<tr>
+<td>AES-256-CTS-HMAC-SHA1-96</td>
+<td>18</td>
+<td>PBKDF2-SHA1，4096 次迭代</td>
+<td>有 salt（域名+用户名）</td>
+<td>强，抗爆破</td>
+</tr>
+</tbody>
+</table>
+<p>RC4 的致命缺陷在于密钥即 NT 哈希，且无 salt 保护。攻击者通过 DCSync 拿到 krbtgt 的 NT 哈希后可直接用于伪造 RC4 金票；AES-256 则引入 salt 与高迭代次数，显著提高伪造门槛。这也是微软推动默认加密从 RC4 切换到 AES 的根本原因（详见 CVE-2022-37966）。</p>
+<hr />
+<h2>二、PAC（Privilege Attribute Certificate）详解</h2>
+<p>PAC 是微软对 Kerberos 的私有扩展（规范 MS-PAC），用于在票据内携带 Windows 授权数据。标准 Kerberos 票据只有身份标识，没有组与特权信息；AD 依赖 PAC 判断用户属于哪些组、拥有哪些权限。PAC 是票据伪造攻击的核心篡改目标。</p>
+<h3>2.1 PAC 缓冲区结构</h3>
+<div class="highlight"><pre><span></span><code><span class="nb">+</span><span class="c">======================================================</span><span class="nb">+</span>
+<span class="c">|                    PAC 结构                          |</span>
+<span class="nb">+------------------------------------------------------+</span>
+<span class="c">| LOGON_INFO          | 用户SID、组RID列表、域SID、     |</span>
+<span class="c">| (KERB_VALIDATION)   | ExtraSids、用户ID、账号标志     |</span>
+<span class="nb">+---------------------+--------------------------------+</span>
+<span class="c">| CLIENT_INFO         | 客户端账户名 </span><span class="nb">+</span><span class="c"> 签发时间戳       |</span>
+<span class="nb">+---------------------+--------------------------------+</span>
+<span class="c">| UPN_DNS_INFO        | UPN </span><span class="nb">+</span><span class="c"> DNS域名 (CVE</span><span class="nb">-</span><span class="c">2021</span><span class="nb">-</span><span class="c">42287  |</span>
+<span class="c">|                     | 后扩展为含 PAC_REQUESTOR)       |</span>
+<span class="nb">+---------------------+--------------------------------+</span>
+<span class="c">| SERVER_CHECKSUM     | 整个PAC的签名(HMAC</span><span class="nt">,</span><span class="c">KeyUsage=17)|</span>
+<span class="c">|                     | 签名Key = 服务账户密钥          |</span>
+<span class="nb">+---------------------+--------------------------------+</span>
+<span class="c">| KDC_CHECKSUM        | SERVER_CHECKSUM的签名           |</span>
+<span class="c">|                     | 签名Key = KRBTGT密钥            |</span>
+<span class="nb">+---------------------+--------------------------------+</span>
+<span class="c">| PAC_ATTRIBUTES_INFO | 票据请求标志 (CVE</span><span class="nb">-</span><span class="c">2021</span><span class="nb">-</span><span class="c">42287)   |</span>
+<span class="nb">+---------------------+--------------------------------+</span>
+<span class="c">| PAC_REQUESTOR       | 请求者SID (CVE</span><span class="nb">-</span><span class="c">2021</span><span class="nb">-</span><span class="c">42287)      |</span>
+<span class="nb">+</span><span class="c">======================================================</span><span class="nb">+</span>
+</code></pre></div>
+
+<p>七个必需缓冲区中，<code>LOGON_INFO</code> 携带实际授权数据（组 RID），而两个校验和缓冲区构成签名链：</p>
+<ul>
+<li><strong>SERVER_CHECKSUM</strong>：对整个 PAC（除签名字段本身）计算 HMAC，使用的密钥是<strong>目标服务账户密钥</strong>。</li>
+<li><strong>KDC_CHECKSUM</strong>：对 SERVER_CHECKSUM 的值再计算一次 HMAC，使用的密钥是 <strong>KRBTGT 密钥</strong>。</li>
+</ul>
+<p>两层签名的 KeyUsage 均为 <strong>17</strong>。这种设计的目的是：服务只能用自身密钥验证 SERVER_CHECKSUM，但无法伪造 KDC_CHECKSUM（因为不知道 krbtgt 密钥），从而保证 PAC 由 KDC 签发且未被篡改。</p>
+<h3>2.2 不同票据类型的签名密钥映射</h3>
+<p>这是理解四种票据伪造的关键：</p>
+<ul>
+<li><strong>Golden Ticket（TGT）</strong>：Server Key = KDC Key = <strong>KRBTGT 密钥</strong>。攻击者拥有 krbtgt 密钥即可同时伪造两个签名。</li>
+<li><strong>Silver Ticket（TGS 服务票据）</strong>：Server Key = KDC Key = <strong>目标服务账户密钥</strong>。攻击者只需服务账户哈希即可伪造完整签名链，无需 krbtgt。</li>
+</ul>
+<p>这一差异直接决定了银票不需要 krbtgt 密钥，但只能针对单一服务。</p>
+<hr />
+<h2>三、四种票据类型详解</h2>
+<h3>3.1 Golden Ticket（金票）— T1558.001</h3>
+<p>金票是最经典的票据伪造技术。攻击者通过 DCSync 等手段获取 <code>KRBTGT</code> 账户哈希后，完全离线伪造 TGT，将 PAC 中的组 SID 设为 Domain Admins（RID 512）等高权限组。</p>
+<div class="highlight"><pre><span></span><code>攻击者(持有krbtgt哈希)
+   |
+   | 1.离线构造EncTicketPart
+   |   - 填入任意用户名/SID
+   |   - PAC中添加Domain Admins(512)等高权限组
+   |   - 有效期设为10年
+   |
+   | 2.用krbtgt密钥加密EncTicketPart -&gt; 伪造TGT
+   |   用krbtgt密钥重签SERVER_CHECKSUM + KDC_CHECKSUM
+   |
+   | 3.PTT(票据传递)注入当前会话
+   |
+   v
+任意服务(收到TGT后向TGS换ST)
+   <span class="k">*</span> DC全程无AS-REQ记录,无票据签发日志
+   <span class="k">*</span> 完全绕过KDC
+</code></pre></div>
+
+<p><strong>OPSEC 特征</strong>：DC 上没有任何 AS-REQ/AS-REP 记录，票据有效期通常异常长（可达 10 年），PAC 与 AD 实际组成员关系不一致。</p>
+<p>mimikatz 命令（RC4）：</p>
+<div class="highlight"><pre><span></span><code>mimikatz<span class="w"> </span><span class="c1"># kerberos::golden /domain:corp.local /sid:S-1-5-21-xxx \</span>
+<span class="w">    </span>/rc4:&lt;krbtgt_ntlm_hash&gt;<span class="w"> </span>/user:Administrator<span class="w"> </span>/id:500<span class="w"> </span>/ptt
+</code></pre></div>
+
+<p>Rubeus 命令（AES-256）：</p>
+<div class="highlight"><pre><span></span><code>Rubeus.exe<span class="w"> </span>golden<span class="w"> </span>/krbkey:&lt;aes256_key&gt;<span class="w"> </span>/user:Administrator<span class="w"> </span>/domain:corp.local<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>/sid:S-1-5-21-xxx<span class="w"> </span>/aes256<span class="w"> </span>/ptt
+</code></pre></div>
+
+<h3>3.2 Silver Ticket（银票）— T1558.002</h3>
+<p>银票针对服务票据（TGS）。攻击者获取某个服务账户（如 <code>MSSQLSvc</code>、<code>CIFS</code>、<code>HTTP</code> 对应的计算机账户或服务账户）的哈希后，直接伪造该服务的 ST。由于 ST 用服务账户密钥加密，而服务本身信任票据内容，因此<strong>不需要与 DC 通信，也不在 DC 留下任何票据请求日志</strong>。</p>
+<div class="highlight"><pre><span></span><code>攻击者(持有服务账户哈希)
+   |
+   | 1.离线构造EncTicketPart(服务票据本体)
+   |   - 用服务账户哈希加密
+   |   - PAC完全伪造(高权限组)
+   |   - 用服务账户哈希签SERVER_CHECKSUM + KDC_CHECKSUM
+   |
+   | 2.直接向目标服务发起AP-REQ
+   |   (跳过AS交换与TGS交换)
+   |
+   v
+目标服务(用自身密钥解密ST,验证通过)
+   <span class="k">*</span> DC无任何记录
+   <span class="k">*</span> 仅对该特定服务有效
+</code></pre></div>
+
+<p>mimikatz 命令：</p>
+<div class="highlight"><pre><span></span><code>mimikatz<span class="w"> </span><span class="c1"># kerberos::golden /user:webuser /domain:corp.local \</span>
+<span class="w">    </span>/sid:S-1-5-21-xxx<span class="w"> </span>/target:sqlsrv.corp.local:1433<span class="w"> </span>/service:mssql<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>/rc4:&lt;service_account_ntlm&gt;<span class="w"> </span>/ptt
+</code></pre></div>
+
+<p>银票的局限是作用域单一（仅一个 SPN），但隐蔽性高——它在 DC 上是隐形的，只在目标服务侧留下访问痕迹。</p>
+<h3>3.3 Diamond Ticket（钻石票）</h3>
+<p>钻石票是金票的进化版，核心思路是<strong>基于合法 TGT 修改</strong>而非从零伪造。攻击者先通过正常 AS-REQ 获取一张合法 TGT，再用 krbtgt 密钥解密它，提取 PAC，向其中添加高权限组（Domain Admins RID 512）后重新签名、重新加密。</p>
+<div class="highlight"><pre><span></span><code>攻击者(持有krbtgt哈希 + 普通用户凭据)
+   |
+   | 1.正常AS-REQ -&gt; 获取合法TGT  (DC有AS-REQ/AS-REP记录!)
+   |
+   | 2.用krbtgt密钥解密TGT -&gt; 提取EncTicketPart + PAC
+   |
+   | 3.修改PAC: 添加Domain Admins(512)等高权限组
+   |
+   | 4.用krbtgt密钥重签SERVER_CHECKSUM + KDC_CHECKSUM
+   |
+   | 5.重新加密EncTicketPart -&gt; 新TGT
+   |
+   | 6.PTT注入
+   |
+   v
+对域内任意服务有效
+   <span class="k">*</span> DC上有&quot;合法&quot;的AS-REQ/AS-REP记录
+   <span class="k">*</span> 票据结构完全合法,保留原始签名格式
+</code></pre></div>
+
+<p><strong>与金票的核心区别</strong>：金票完全离线伪造，DC 无记录；钻石票基于一次真实的 AS-REQ 交换，DC 日志中存在看似正常的 TGT 请求记录。这使它在事件日志层面更难被发现。</p>
+<p>Rubeus 命令：</p>
+<div class="highlight"><pre><span></span><code>Rubeus.exe<span class="w"> </span>diamond<span class="w"> </span>/krbkey:&lt;aes256_key&gt;<span class="w"> </span>/user:normaluser<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>/password:Pass123<span class="w"> </span>/enctype:aes<span class="w"> </span>/domain:corp.local<span class="w"> </span>/dc:dc01.corp.local<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>/ticketuser:Administrator<span class="w"> </span>/ticketuserid:500<span class="w"> </span>/nowrap
+</code></pre></div>
+
+<p><strong>已知 PoC 局限（IoC）</strong>：当前公开实现将 PAC 组设为预定义的默认值组合 <code>(520, 512, 513, 519, 518)</code>。这组 RID 是一个稳定的特征码，防御方可直接据此检测——合法高权限用户的组成员关系通常不会精确等于这五个固定值。</p>
+<h3>3.4 Sapphire Ticket（蓝宝石票）</h3>
+<p>蓝宝石票是目前最隐蔽的变体。它不伪造 PAC，而是通过 S4U2Self + User-to-User（U2U）机制从 KDC <strong>获取一个真实高权限用户的合法 PAC</strong>，再将其替换进攻击者持有的 TGT 中。</p>
+<div class="highlight"><pre><span></span><code><span class="nx">攻击者</span><span class="p">(</span><span class="nx">持有krbtgt哈希</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">普通用户凭据</span><span class="p">)</span>
+<span class="w">   </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w"> </span><span class="mi">1</span><span class="p">.</span><span class="nx">正常AS</span><span class="o">-</span><span class="nx">REQ</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="nx">获取自己</span><span class="p">(</span><span class="nx">低权限</span><span class="p">)</span><span class="nx">的合法TGT</span>
+<span class="w">   </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w"> </span><span class="mi">2</span><span class="p">.</span><span class="nx">S4U2Self</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">U2U</span><span class="p">:</span>
+<span class="w">   </span><span class="o">|</span><span class="w">   </span><span class="nx">以</span><span class="s">&quot;domainadmin&quot;</span><span class="nx">为目标</span><span class="p">,</span><span class="nx">用自身TGT请求TGS</span>
+<span class="w">   </span><span class="o">|</span><span class="w">   </span><span class="nx">KDC返回domainadmin的合法服务票据</span><span class="p">(</span><span class="nx">含合法PAC</span><span class="p">!)</span>
+<span class="w">   </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w"> </span><span class="mi">3</span><span class="p">.</span><span class="nx">从domainadmin的服务票据中提取合法PAC</span>
+<span class="w">   </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w"> </span><span class="mi">4</span><span class="p">.</span><span class="nx">用krbtgt密钥解密自己的TGT</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="nx">提取EncTicketPart</span>
+<span class="w">   </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w"> </span><span class="mi">5</span><span class="p">.</span><span class="nx">用domainadmin的合法PAC替换原TGT的PAC</span>
+<span class="w">   </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w"> </span><span class="mi">6</span><span class="p">.</span><span class="nx">用krbtgt密钥重签</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">重新加密</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="nx">新TGT</span>
+<span class="w">   </span><span class="o">|</span>
+<span class="w">   </span><span class="o">|</span><span class="w"> </span><span class="mi">7</span><span class="p">.</span><span class="nx">PTT注入</span>
+<span class="w">   </span><span class="o">|</span>
+<span class="w">   </span><span class="nx">v</span>
+<span class="nx">PAC与AD实际组成员关系完全一致</span>
+<span class="w">   </span><span class="o">*</span><span class="w"> </span><span class="nx">最难检测的变体</span>
+</code></pre></div>
+
+<p><strong>优势</strong>：PAC 不是伪造的，而是 KDC 真实签发的，与 AD 中该高权限用户的实际组成员关系一致。钻石票的固定组 IoC 在这里不适用。</p>
+<p>Impacket 构造命令：</p>
+<div class="highlight"><pre><span></span><code>ticketer.py<span class="w"> </span>-request<span class="w"> </span>-impersonate<span class="w"> </span><span class="s1">&#39;domainadmin&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-domain<span class="w"> </span><span class="s1">&#39;corp.local&#39;</span><span class="w"> </span>-user<span class="w"> </span><span class="s1">&#39;normaluser&#39;</span><span class="w"> </span>-password<span class="w"> </span><span class="s1">&#39;Pass123&#39;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-nthash<span class="w"> </span>&lt;user_ntlm&gt;<span class="w"> </span>-aesKey<span class="w"> </span>&lt;aes256_key&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>-user-id<span class="w"> </span><span class="m">500</span><span class="w"> </span>-domain-sid<span class="w"> </span><span class="s1">&#39;S-1-5-21-xxx&#39;</span><span class="w"> </span><span class="s1">&#39;baduser&#39;</span>
+</code></pre></div>
+
+<hr />
+<h2>四、四种票据对比表</h2>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>Golden</th>
+<th>Silver</th>
+<th>Diamond</th>
+<th>Sapphire</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>伪造对象</td>
+<td>TGT</td>
+<td>TGS（服务票据）</td>
+<td>TGT（修改合法TGT）</td>
+<td>TGT（替换PAC）</td>
+</tr>
+<tr>
+<td>所需密钥</td>
+<td>krbtgt 哈希</td>
+<td>服务账户哈希</td>
+<td>krbtgt 哈希 + 用户凭据</td>
+<td>krbtgt 哈希 + 用户凭据</td>
+</tr>
+<tr>
+<td>是否与 DC 通信</td>
+<td>否</td>
+<td>否</td>
+<td>是（AS-REQ）</td>
+<td>是（AS-REQ + S4U2Self）</td>
+</tr>
+<tr>
+<td>DC 日志</td>
+<td>无记录</td>
+<td>无记录</td>
+<td>有 TGT 请求日志</td>
+<td>有 TGT 请求日志</td>
+</tr>
+<tr>
+<td>PAC 来源</td>
+<td>完全伪造</td>
+<td>完全伪造</td>
+<td>修改合法 PAC</td>
+<td>替换为合法 PAC</td>
+</tr>
+<tr>
+<td>PAC 与 AD 一致性</td>
+<td>不一致</td>
+<td>不一致</td>
+<td>不一致（默认组 IoC）</td>
+<td>一致（最难检测）</td>
+</tr>
+<tr>
+<td>作用域</td>
+<td>全域任意服务</td>
+<td>单一服务</td>
+<td>全域任意服务</td>
+<td>全域任意服务</td>
+</tr>
+<tr>
+<td>隐蔽性</td>
+<td>低</td>
+<td>中</td>
+<td>高</td>
+<td>极高</td>
+</tr>
+</tbody>
+</table>
+<p>从 Golden 到 Sapphire，攻击者付出的代价（所需凭据、所需与 DC 交互）递增，但隐蔽性也递增。这条演进线本质上是攻击者在与检测规则博弈：让伪造的票据越来越像合法票据。</p>
+<hr />
+<h2>五、检测方法</h2>
+<p>票据伪造检测的核心矛盾在于：金票和银票在 DC 上完全无日志，必须从服务端、关联异常与票据属性入手；而钻石票与蓝宝石票虽然有 AS-REQ 记录，但需要深入 PAC 层面比对才能识别。</p>
+<h3>5.1 关键 Windows 事件日志</h3>
+<table>
+<thead>
+<tr>
+<th>事件 ID</th>
+<th>含义</th>
+<th>异常信号</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>4768</td>
+<td>TGT 请求成功</td>
+<td>异常 IP/时间、RC4 加密类型（0x17）</td>
+</tr>
+<tr>
+<td>4769</td>
+<td>服务票据请求</td>
+<td>异常 SPN、RC4 降级、敏感账户</td>
+</tr>
+<tr>
+<td>4624</td>
+<td>登录成功</td>
+<td>Kerberos 登录出现在敏感服务器</td>
+</tr>
+<tr>
+<td>4672</td>
+<td>特殊权限分配</td>
+<td>特权用户从非 PAW 端点登录</td>
+</tr>
+<tr>
+<td>4771</td>
+<td>TGT 请求失败（预认证失败）</td>
+<td>暴力枚举、Kerberoasting 前兆</td>
+</tr>
+</tbody>
+</table>
+<h3>5.2 高信号检测模式</h3>
+<div class="highlight"><pre><span></span><code><span class="nb">+-------------------+</span><span class="c">     </span><span class="nb">+-------------------+</span><span class="c">     </span><span class="nb">+-------------------+</span>
+<span class="c">|  模式1: 4769无前置 |     | 模式2: 票据有效期  |     | 模式3: 不可能账户 |</span>
+<span class="c">|  4768 (金票离线)   |     | 异常(金票超长)     |     | 票据中账户AD不存在 |</span>
+<span class="nb">+-------------------+</span><span class="c">     </span><span class="nb">+-------------------+</span><span class="c">     </span><span class="nb">+-------------------+</span>
+<span class="c">          |                          |                          |</span>
+<span class="c">          v                          v                          v</span>
+<span class="nb">+-------------------+</span><span class="c">     </span><span class="nb">+-------------------+</span><span class="c">     </span><span class="nb">+-------------------+</span>
+<span class="c">| 模式4: 加密降级    |     | 模式5: 权限不匹配  |     | 模式6: 钻石票     |</span>
+<span class="c">| RC4突然出现        |     | PAC组与AD实际不符  |     | 固定组(520</span><span class="nt">,</span><span class="c">512</span><span class="nt">,</span><span class="c">   |</span>
+<span class="c">| (0x17 etype)      |     |                    |     | 513</span><span class="nt">,</span><span class="c">519</span><span class="nt">,</span><span class="c">518)IoC   |</span>
+<span class="nb">+-------------------+</span><span class="c">     </span><span class="nb">+-------------------+</span><span class="c">     </span><span class="nb">+-------------------+</span>
+</code></pre></div>
+
+<ol>
+<li><strong>"4769 无前置 4768" 关联</strong>：服务票据请求（4769）出现，但此前短时间内同账户无 TGT 请求（4768）记录。这是金票离线伪造的最强信号——DC 从未签发过对应 TGT，却出现了使用该票据的访问。</li>
+<li><strong>票据有效期异常</strong>：金票常设为 10 年等超长有效期，远超默认 10 小时 + 7 天续期上限。</li>
+<li><strong>不存在或"不可能"的账户</strong>：票据中的账户在 AD 中不存在，或已禁用/删除的账户仍产生 Kerberos 访问。</li>
+<li><strong>加密降级异常</strong>：环境已强制 AES，却突然出现 RC4（etype 0x17）流量。</li>
+<li><strong>权限不匹配</strong>：PAC 中的组与 AD 中该账户实际组成员关系不符。</li>
+<li><strong>钻石票固定组 IoC</strong>：PAC 组精确等于 <code>(520, 512, 513, 519, 518)</code>。</li>
+</ol>
+<h3>5.3 PowerShell 检测脚本：4768/4769 关联</h3>
+<p>以下脚本关联 TGT 请求（4768）与服务票据请求（4769），找出无对应 TGT 记录的可疑服务票据使用，用于初步筛查金票离线伪造：</p>
+<div class="highlight"><pre><span></span><code><span class="c"># Kerberos-GoldenTicket-Detect.ps1</span>
+<span class="c"># 检测模式1: 出现4769(服务票据请求)但无前置4768(TGT请求)的可疑访问</span>
+<span class="c"># 需在域控或集中日志服务器上运行,需管理员权限</span>
+
+<span class="k">param</span><span class="p">(</span>
+    <span class="no">[int]</span><span class="nv">$WindowMinutes</span> <span class="p">=</span> <span class="n">30</span><span class="p">,</span>        <span class="c"># 关联时间窗口(分钟)</span>
+    <span class="no">[int]</span><span class="nv">$ResultLimit</span>   <span class="p">=</span> <span class="n">50</span>         <span class="c"># 返回结果上限</span>
+<span class="p">)</span>
+
+<span class="nv">$Start</span> <span class="p">=</span> <span class="p">(</span><span class="nb">Get-Date</span><span class="p">).</span><span class="n">AddMinutes</span><span class="p">(-</span><span class="nv">$WindowMinutes</span><span class="p">)</span>
+<span class="nv">$FilterHash</span> <span class="p">=</span> <span class="p">@{</span>
+    <span class="n">LogName</span>   <span class="p">=</span> <span class="s1">&#39;Security&#39;</span>
+    <span class="n">StartTime</span> <span class="p">=</span> <span class="nv">$Start</span>
+<span class="p">}</span>
+
+<span class="c"># 收集4768(TGT签发)与4769(服务票据请求)事件</span>
+<span class="nv">$TgtEvents</span>  <span class="p">=</span> <span class="nb">Get-WinEvent</span> <span class="n">-FilterHashtable</span> <span class="p">(@{</span>
+    <span class="nv">$FilterHash</span><span class="p">;</span> <span class="n">Id</span> <span class="p">=</span> <span class="n">4768</span>
+<span class="p">})</span> <span class="n">-ErrorAction</span> <span class="n">SilentlyContinue</span>
+
+<span class="nv">$StEvents</span>   <span class="p">=</span> <span class="nb">Get-WinEvent</span> <span class="n">-FilterHashtable</span> <span class="p">(@{</span>
+    <span class="nv">$FilterHash</span><span class="p">;</span> <span class="n">Id</span> <span class="p">=</span> <span class="n">4769</span>
+<span class="p">})</span> <span class="n">-ErrorAction</span> <span class="n">SilentlyContinue</span>
+
+<span class="c"># 构建已签发TGT的账户集合(目标账户名)</span>
+<span class="nv">$TgtAccounts</span> <span class="p">=</span> <span class="p">@{}</span>
+<span class="k">foreach</span> <span class="p">(</span><span class="nv">$evt</span> <span class="k">in</span> <span class="nv">$TgtEvents</span><span class="p">)</span> <span class="p">{</span>
+    <span class="nv">$acct</span> <span class="p">=</span> <span class="p">(</span><span class="nv">$evt</span><span class="p">.</span><span class="n">Properties</span><span class="p">[</span><span class="n">0</span><span class="p">].</span><span class="n">Value</span><span class="p">).</span><span class="n">ToString</span><span class="p">()</span>
+    <span class="k">if</span> <span class="p">(</span><span class="o">-not</span> <span class="nv">$TgtAccounts</span><span class="p">.</span><span class="n">ContainsKey</span><span class="p">(</span><span class="nv">$acct</span><span class="p">))</span> <span class="p">{</span>
+        <span class="nv">$TgtAccounts</span><span class="p">[</span><span class="nv">$acct</span><span class="p">]</span> <span class="p">=</span> <span class="nv">$evt</span><span class="p">.</span><span class="n">TimeCreated</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c"># 遍历4769,找出无前置4768的可疑请求</span>
+<span class="nv">$Suspicious</span> <span class="p">=</span> <span class="k">foreach</span> <span class="p">(</span><span class="nv">$evt</span> <span class="k">in</span> <span class="nv">$StEvents</span><span class="p">)</span> <span class="p">{</span>
+    <span class="nv">$acct</span> <span class="p">=</span> <span class="p">(</span><span class="nv">$evt</span><span class="p">.</span><span class="n">Properties</span><span class="p">[</span><span class="n">0</span><span class="p">].</span><span class="n">Value</span><span class="p">).</span><span class="n">ToString</span><span class="p">()</span>
+    <span class="nv">$spn</span>  <span class="p">=</span> <span class="p">(</span><span class="nv">$evt</span><span class="p">.</span><span class="n">Properties</span><span class="p">[</span><span class="n">5</span><span class="p">].</span><span class="n">Value</span><span class="p">).</span><span class="n">ToString</span><span class="p">()</span>
+    <span class="nv">$encType</span> <span class="p">=</span> <span class="no">[Convert]</span><span class="p">::</span><span class="n">ToInt32</span><span class="p">(</span><span class="nv">$evt</span><span class="p">.</span><span class="n">Properties</span><span class="p">[</span><span class="n">8</span><span class="p">].</span><span class="n">Value</span><span class="p">)</span>
+    <span class="c"># RC4加密类型为0x17(23),AES为0x12(18)/0x11(17)</span>
+    <span class="nv">$isRc4</span> <span class="p">=</span> <span class="p">(</span><span class="nv">$encType</span> <span class="o">-eq</span> <span class="n">23</span><span class="p">)</span>
+
+    <span class="k">if</span> <span class="p">(</span><span class="o">-not</span> <span class="nv">$TgtAccounts</span><span class="p">.</span><span class="n">ContainsKey</span><span class="p">(</span><span class="nv">$acct</span><span class="p">))</span> <span class="p">{</span>
+        <span class="no">[PSCustomObject]</span><span class="p">@{</span>
+            <span class="n">TimeCreated</span>   <span class="p">=</span> <span class="nv">$evt</span><span class="p">.</span><span class="n">TimeCreated</span>
+            <span class="n">Account</span>       <span class="p">=</span> <span class="nv">$acct</span>
+            <span class="n">ServiceSPN</span>    <span class="p">=</span> <span class="nv">$spn</span>
+            <span class="n">ClientAddress</span> <span class="p">=</span> <span class="p">(</span><span class="nv">$evt</span><span class="p">.</span><span class="n">Properties</span><span class="p">[</span><span class="n">6</span><span class="p">].</span><span class="n">Value</span><span class="p">).</span><span class="n">ToString</span><span class="p">()</span>
+            <span class="n">EncType</span>       <span class="p">=</span> <span class="k">if</span> <span class="p">(</span><span class="nv">$isRc4</span><span class="p">)</span> <span class="p">{</span> <span class="s1">&#39;RC4-HMAC(降级!)&#39;</span> <span class="p">}</span> <span class="k">else</span> <span class="p">{</span> <span class="s2">&quot;0x</span><span class="p">$(</span><span class="nv">$encType</span><span class="p">.</span><span class="n">ToString</span><span class="p">(</span><span class="s1">&#39;x&#39;</span><span class="p">))</span><span class="s2">&quot;</span> <span class="p">}</span>
+            <span class="n">EventId</span>       <span class="p">=</span> <span class="n">4769</span>
+            <span class="n">Reason</span>        <span class="p">=</span> <span class="s1">&#39;无前置4768 TGT签发记录&#39;</span>
+        <span class="p">}</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">if</span> <span class="p">(</span><span class="nv">$Suspicious</span><span class="p">)</span> <span class="p">{</span>
+    <span class="nb">Write-Warning</span> <span class="s2">&quot;发现 </span><span class="p">$(</span><span class="nv">$Suspicious</span><span class="p">.</span><span class="n">Count</span><span class="p">)</span><span class="s2"> 条可疑服务票据请求(可能为金票离线伪造):&quot;</span>
+    <span class="nv">$Suspicious</span> <span class="p">|</span> <span class="nb">Select-Object</span> <span class="n">-First</span> <span class="nv">$ResultLimit</span> <span class="p">|</span>
+        <span class="nb">Format-Table</span> <span class="n">TimeCreated</span><span class="p">,</span> <span class="n">Account</span><span class="p">,</span> <span class="n">ServiceSPN</span><span class="p">,</span> <span class="n">ClientAddress</span><span class="p">,</span> <span class="n">EncType</span><span class="p">,</span> <span class="n">Reason</span> <span class="n">-AutoSize</span>
+<span class="p">}</span> <span class="k">else</span> <span class="p">{</span>
+    <span class="nb">Write-Output</span> <span class="s2">&quot;[</span><span class="p">$(</span><span class="nb">Get-Date</span><span class="p">)</span><span class="s2">] 时间窗口内未发现4769无前置4768的可疑记录。&quot;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>脚本说明：它将时间窗口内所有 4768 事件的目标账户建成哈希表，再遍历 4769 事件，凡账户未出现在 TGT 签发集合中的即视为可疑。同时标注 RC4 降级（etype 23）。实际生产中应结合 SIEM（Splunk/ELK）做全量关联，并排除机器账户、跨域信任等正常场景。</p>
+<h3>5.4 钻石票检测要点</h3>
+<p>钻石票的检测需深入 PAC 层面：</p>
+<ul>
+<li>比对票据 PAC 中的组 RID 与 AD 中该账户实际 <code>memberOf</code> 是否一致；重点关注组 RID 是否精确等于 <code>(520, 519, 512, 513, 518)</code> 这一已知 PoC 默认值组合。</li>
+<li>蓝宝石票因 PAC 来自真实高权限用户，上述方法失效，需结合行为分析（如低权限账户突然访问 Tier 0 资源）。</li>
+</ul>
+<hr />
+<h2>六、防御方案（按优先级排序）</h2>
+<div class="highlight"><pre><span></span><code>优先级  实施难度   控制措施                核心作用
+=================================================================
+ P1     低        KRBTGT密钥轮换          使泄露的旧哈希失效
+ P1     中        Credential Guard        凭据VBS隔离,防Mimikatz提取
+ P2     低        Protected Users组       禁用NTLM/DES/RC4,TGT 4h不可续
+ P2     低        AES强制执行             消除RC4降级攻击面
+ P2     高        分层管理模型            Tier0/1/2物理逻辑隔离
+ P3     中        gMSA                    服务账户240位随机密码+自动轮换
+ P3     低        SPN清理                 Domain Admins永不应有SPN
+ P3     低        蜜罐账户                检测Kerberoasting侦察
+ P3     中        PAC验证增强             Server2022+ FULL_PAC_SIGNATURE
+</code></pre></div>
+
+<h3>6.1 KRBTGT 密钥轮换（P1）</h3>
+<p>入侵后重置 krbtgt 密钥<strong>两次</strong>可使所有已签发的金票/钻石票失效（第一次重置后旧密钥仍可用于续期，第二次重置才彻底废弃旧密钥）。常规轮换周期建议至少 <strong>180 天</strong>。重置后，所有已签发的 TGT 失效，用户需重新认证。</p>
+<div class="highlight"><pre><span></span><code><span class="c"># 重置krbtgt账户密码(需Domain Admin + 在域控执行)</span>
+<span class="nb">Set-ADAccountPassword</span> <span class="n">-Identity</span> <span class="n">krbtgt</span> <span class="n">-Reset</span> <span class="p">`</span>
+    <span class="n">-NewPassword</span> <span class="p">(</span><span class="nb">ConvertTo-SecureString</span> <span class="n">-AsPlainText</span> <span class="n">-Force</span> <span class="p">`</span>
+    <span class="s2">&quot;</span><span class="p">$(</span><span class="nb">New-Guid</span><span class="p">)$(</span><span class="nb">Get-Random</span> <span class="n">-Maximum</span> <span class="n">99999</span><span class="p">)</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="c"># 注意: 重置后所有现有TGT失效, 建议在维护窗口执行, 至少重置两次</span>
+</code></pre></div>
+
+<h3>6.2 Credential Guard（P1）</h3>
+<p>Credential Guard 利用基于虚拟化的安全（VBS）将 LSA 机密隔离在一个独立的受保护进程（LSAIso）中。即使攻击者拿到 SYSTEM 权限，Mimikatz 也无法从 lsass.exe 内存中提取 NT 哈希与 Kerberos 票据，从源头切断票据伪造所需的凭据获取环节。</p>
+<h3>6.3 Protected Users 安全组（P2）</h3>
+<p>将高权限账户加入 <code>Protected Users</code> 全局组后，该账户的 Kerberos 行为被严格限制：</p>
+<ul>
+<li>禁止 NTLM、DES、RC4 认证。</li>
+<li>TGT 有效期缩短至 <strong>4 小时</strong>且<strong>不可续期</strong>。</li>
+<li>禁止使用摘要认证与 CredSSP 委派。</li>
+</ul>
+<p>这直接压缩了金票的可利用窗口，并消除 RC4 降级路径。</p>
+<h3>6.4 AES 强制执行（P2）</h3>
+<p>在域功能级别与账户属性层面强制 AES：</p>
+<div class="highlight"><pre><span></span><code><span class="c"># 为服务账户设置仅支持AES-256 + AES-128 (0x18 = 24 = 0x10|0x08)</span>
+<span class="nb">Set-ADUser</span> <span class="n">-Identity</span> <span class="n">svc_sql</span> <span class="o">-Replace</span> <span class="p">@{</span>
+    <span class="s1">&#39;msDS-SupportedEncryptionTypes&#39;</span> <span class="p">=</span> <span class="n">24</span>
+<span class="p">}</span>
+<span class="c"># 域级别: 确保域功能级别 &gt;= 2012 R2, 并通过组策略禁用&quot;允许旧版加密类型&quot;</span>
+</code></pre></div>
+
+<p>将 <code>msDS-SupportedEncryptionTypes</code> 设为 <code>0x18</code>（仅 AES-128 + AES-256），从协议层消除 RC4 降级可能。</p>
+<h3>6.5 分层管理模型（P2）</h3>
+<p>按 Tier 0（域控/ krbtgt / Domain Admins）、Tier 1（服务器）、Tier 2（工作站）实施物理与逻辑隔离：管理员账户不可跨层登录，Tier 0 管理员绝不登录 Tier 2 工作站。这样即使工作站被攻陷，也无法直接窃取 Tier 0 凭据，从而阻断票据伪造的凭据来源。</p>
+<h3>6.6 gMSA 与 SPN 治理（P3）</h3>
+<ul>
+<li><strong>gMSA</strong>：组托管服务账户使用 240 字符随机密码、30 天自动轮换、默认 AES，从源头消除服务账户弱口令与 Kerberoasting 风险。</li>
+<li><strong>SPN 清理</strong>：<code>Domain Admins</code> 成员<strong>永远不应注册 SPN</strong>。任何 DA 的 SPN 都意味着其哈希可被 Kerberoasting 离线爆破，进而直接用于银票或更深层攻击。</li>
+</ul>
+<div class="highlight"><pre><span></span><code><span class="c"># 检查Domain Admins中是否存在注册了SPN的账户(高危!)</span>
+<span class="nb">Get-ADGroupMember</span> <span class="n">-Identity</span> <span class="s2">&quot;Domain Admins&quot;</span> <span class="p">|</span> <span class="k">ForEach</span><span class="n">-Object</span> <span class="p">{</span>
+    <span class="nv">$u</span> <span class="p">=</span> <span class="nb">Get-ADUser</span> <span class="nv">$_</span><span class="p">.</span><span class="n">SamAccountName</span> <span class="n">-Properties</span> <span class="n">servicePrincipalName</span>
+    <span class="k">if</span> <span class="p">(</span><span class="nv">$u</span><span class="p">.</span><span class="n">servicePrincipalName</span><span class="p">)</span> <span class="p">{</span>
+        <span class="nb">Write-Warning</span> <span class="s2">&quot;高危: DA账户 </span><span class="p">$(</span><span class="nv">$u</span><span class="p">.</span><span class="n">SamAccountName</span><span class="p">)</span><span class="s2"> 注册了SPN: </span><span class="p">$(</span><span class="nv">$u</span><span class="p">.</span><span class="n">servicePrincipalName</span><span class="p">)</span><span class="s2">&quot;</span>
+    <span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h3>6.7 蜜罐账户与 PAC 验证增强（P3）</h3>
+<ul>
+<li><strong>蜜罐账户</strong>：部署无业务用途、注册 SPN 的虚假账户并监控其 4769 事件，用于早期发现 Kerberoasting 侦察。</li>
+<li><strong>PAC 验证增强</strong>：Windows Server 2022 及以上支持 <code>FULL_PAC_SIGNATURE</code>，强制 KDC 与服务对完整 PAC 进行签名验证，增加伪造 PAC 的难度。</li>
+</ul>
+<hr />
+<h2>七、工具对比</h2>
+<table>
+<thead>
+<tr>
+<th>功能</th>
+<th>mimikatz</th>
+<th>Rubeus</th>
+<th>Impacket</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Golden Ticket</td>
+<td>支持</td>
+<td>支持</td>
+<td>支持</td>
+</tr>
+<tr>
+<td>Silver Ticket</td>
+<td>支持</td>
+<td>支持</td>
+<td>支持</td>
+</tr>
+<tr>
+<td>Diamond Ticket</td>
+<td>不支持</td>
+<td>支持</td>
+<td>不支持</td>
+</tr>
+<tr>
+<td>Sapphire Ticket</td>
+<td>不支持</td>
+<td>不支持</td>
+<td>支持</td>
+</tr>
+<tr>
+<td>DCSync</td>
+<td>支持</td>
+<td>不支持</td>
+<td>支持</td>
+</tr>
+<tr>
+<td>LDAP 辅助</td>
+<td>不支持</td>
+<td>支持</td>
+<td>不支持</td>
+</tr>
+<tr>
+<td>平台</td>
+<td>Windows</td>
+<td>Windows</td>
+<td>跨平台（Python）</td>
+</tr>
+</tbody>
+</table>
+<p>选型要点：mimikatz 适合在已获取 SYSTEM 的 Windows 主机上做票据注入与凭据提取；Rubeus 在 C#/.NET 生态下集成更友好，是钻石票的主要实现；Impacket 凭借跨平台特性，是蓝宝石票与离线票据操作的首选，常用于从 Linux 跳板发起攻击。</p>
+<hr />
+<h2>八、关键 CVE 时间线</h2>
+<p>票据伪造攻防的演进与微软补丁紧密相关，以下 CVE 勾勒出协议加固的历史脉络：</p>
+<table>
+<thead>
+<tr>
+<th>时间</th>
+<th>CVE / 编号</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2014</td>
+<td><strong>MS14-068</strong></td>
+<td>允许普通用户伪造 PAC 提权至 Domain Admin，是 PAC 安全史上的里程碑漏洞</td>
+</tr>
+<tr>
+<td>2021</td>
+<td><strong>CVE-2021-42287</strong></td>
+<td>引入 <code>PAC_REQUESTOR</code> 与 <code>PAC_ATTRIBUTES_INFO</code> 缓冲区，KDC 可验证票据请求者身份，遏制匿名伪造</td>
+</tr>
+<tr>
+<td>2022</td>
+<td><strong>CVE-2022-37966</strong></td>
+<td>Kerberos 默认加密从 RC4 切换为 AES， krbtgt 密钥迁移至 AES-256，大幅提高金票伪造门槛</td>
+</tr>
+<tr>
+<td>2024</td>
+<td><strong>CVE-2024-29056</strong></td>
+<td>调整 PAC 验证逻辑，进一步收紧 PAC 签名校验</td>
+</tr>
+<tr>
+<td>2026 Q2（计划）</td>
+<td>RC4 默认禁用</td>
+<td>彻底关闭 RC4-HMAC etype 23，消除降级攻击面</td>
+</tr>
+</tbody>
+</table>
+<p>从 MS14-068 到 RC4 默认禁用，可以看到一条清晰的趋势：微软正逐步关闭 PAC 伪造与加密降级的所有旁路，迫使攻击者走向钻石票、蓝宝石票这类更复杂、更依赖合法交互的变体——而后者也更易被行为分析捕获。</p>
+<h2>结语</h2>
+<p>Kerberos 票据伪造攻防是一场围绕"信任边界"的持续博弈。金票与银票代表"离线伪造、不留痕迹"的经典范式，检测重心在服务端与关联异常；钻石票与蓝宝石票代表"伪装合法、混入正常流量"的新一代范式，迫使防御者深入 PAC 层面比对成员关系。攻防双方都在向 AES、合法交互、PAC 一致性方向收敛。对防御方而言没有单一银弹——唯有 KRBTGT 轮换、Credential Guard、分层管理、AES 强制与行为关联检测的组合纵深，才能压缩票据伪造的生存空间。</p>
+<h2>免责声明</h2>
+<p>本文仅供网络安全技术研究、教学与授权渗透测试参考。文中涉及的所有攻击技术、命令示例与检测脚本仅应用于<strong>已获得书面授权</strong>的测试环境或自有环境。未经授权对任何真实生产系统、第三方网络或他人资产实施上述攻击行为，均可能违反《中华人民共和国网络安全法》《刑法》第二百八十五条（非法侵入计算机信息系统罪）及相关法律法规，作者不承担任何由此引发的直接或间接法律责任。读者应在严格遵守适用法律与组织安全政策的前提下使用本文内容。文中涉及的商标、产品名称归各自所有者所有。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

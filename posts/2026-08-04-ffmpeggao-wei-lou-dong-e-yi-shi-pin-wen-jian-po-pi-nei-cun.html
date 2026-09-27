@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FFmpeg 高危漏洞：恶意视频文件即可破坏内存 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>FFmpeg 高危漏洞：恶意视频文件即可破坏内存</h1>
+<time>2026-08-04</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析</li>
+<li>多媒体</li>
+</ul>
+<hr />
+<h1>FFmpeg 高危漏洞：恶意视频文件即可破坏内存</h1>
+<h2>一、FFmpeg 的攻击面为什么这么大</h2>
+<p>FFmpeg 是几乎所有播放器、转码服务、视频处理管道的地基：VLC、Chrome 的 <code>&lt;video&gt;</code> 标签、OBS、抖音快手背后的转码集群，底层全是它。它的 C 代码量在百万行级别，支持的容器格式（demuxer）上百种、编解码器（codec）数百种、滤镜（filter）几百个。每一种格式都是一套独立的解析器，每一套解析器都处理来自不可信输入的结构化二进制数据——这就是一个巨大的攻击面。</p>
+<p>恶意视频的攻击路径通常是这样：受害者用播放器打开一个 MP4/AVI/MKV 文件，播放器的 demuxer 解析容器结构（box、chunk、索引），然后交给 decoder 解码音视频流。任何一个环节对畸形输入处理不当，就会触发越界读写、堆溢出、整数溢出，最终变成代码执行或拒绝服务。关键是：<strong>现代播放器默认开启硬解和自动播放，用户甚至不需要点击播放按钮</strong>，缩略图预览阶段就可能触发解析。</p>
+<h2>二、漏洞到底坏在哪：解析器的内存破坏模式</h2>
+<p>FFmpeg 的解析器漏洞集中在三类模式：</p>
+<p><strong>1. 堆缓冲区越界写（heap overflow）。</strong> 解码器在写输出帧时，长度计算依赖输入里的字段（如 sample size、block align），攻击者把字段改大或改小，绕过分配逻辑，写到堆块外面。经典场景：音频解码器按 <code>block_align</code> 计算缓冲区，恶意值导致写越界。堆溢出一旦发生，紧接着的堆布局被破坏，配合 UAF 就能改函数指针。</p>
+<p><strong>2. 越界读（OOB read）。</strong> 解析器读输入时索引越界，把相邻堆/栈内容读出来。越界读通常不能直接 RCE，但可以泄漏内存布局（绕过 ASLR），或者触发崩溃造成 DoS。很多 CVE 就是"越界读取导致拒绝服务"。</p>
+<p><strong>3. 整数溢出（integer overflow）。</strong> 长度字段相乘/相加时溢出，得到一个小值，分配了过小的缓冲区，后面写入时实际数据远超缓冲区。这是堆溢出的前身，经常和第一种叠加出现。</p>
+<p>具体到这次的公告，涉及媒体解析、解码、过滤、编码多个组件——意思是整条管线都有洞，不是单一解析器的问题。这也是 FFmpeg 漏洞的常态：它太庞大了，任何一个组件的边界检查疏漏都是入口。</p>
+<h2>三、恶意样本是怎么构造的</h2>
+<p>构造恶意视频不需要写代码，思路是：</p>
+<ol>
+<li><strong>拿合法样本改字节。</strong> 用 ffprobe 看结构，定位关键字段（moov box 的 sample table、stsz 的 sample size、音频的 block_align）。</li>
+<li><strong>模糊测试找崩溃。</strong> 安全研究员用 AFL++、honggfuzz 对 FFmpeg 跑 fuzz，每天能产生几十个崩溃样本。公开的 CVE 复现样本很多就是 fuzz 出来的畸形文件。</li>
+<li><strong>把畸形字段组合进合法容器。</strong> 比如 MP4 的 stsz box 里 sample size 写 0xFFFFFFFF，或者 AVI 的 chunk size 与文件实际大小不一致——解析器信任了这些字段值。</li>
+</ol>
+<p>一个具体的经典例子（历史 CVE）：某版本处理 AVI 时，<code>movi</code> chunk 的 size 字段被改成超大值，内部循环按 size 读取并拷贝到固定大小缓冲区，直接堆溢出。修复就是加 <code>av_clip</code> 边界钳制——这类"长度字段不信任"的修复遍布 FFmpeg 的 commit 历史。</p>
+<h2>四、从崩溃到利用的距离</h2>
+<p>恶意视频文件导致的内存破坏，利用难度分级：</p>
+<ul>
+<li><strong>纯 DoS</strong>：越界读、断言失败、空指针——播放器崩溃，转码任务失败。在云转码集群里，一个恶意文件可以让整个 worker 崩溃，如果 worker 没有隔离，就是服务可用性攻击。</li>
+<li><strong>信息泄漏</strong>：越界读配合输出回显（比如转码日志、错误信息里带出堆内容），泄漏 ASLR 基址。</li>
+<li><strong>代码执行</strong>：堆溢出 + UAF 改对象指针，经典组合是溢出改写 AVCodecContext 或 AVFrame 里的函数指针。历史上 FFmpeg 出过多个可 RCE 的洞，最知名的是 2016 年那个影响 4chan 的远程代码执行（改写了 <code>decode</code> 函数指针跳转到恶意代码）。</li>
+</ul>
+<p>播放器场景下利用面更大：Chrome 的 FFmpeg 跑在渲染进程 sandbox 里，RCE 之后还要配合沙箱逃逸；桌面播放器（VLC 等）没沙箱，RCE 即系统权限。</p>
+<h2>五、防御与检测</h2>
+<p>作为使用方，能做的事其实不少：</p>
+<p><strong>1. 及时升级。</strong> FFmpeg 的修复节奏很快，但下游（播放器、转码服务）打包往往滞后。查自己的版本：<code>ffmpeg -version</code>，对照 release notes 里的安全修复列表。</p>
+<p><strong>2. 用 fuzz 自己养样本。</strong> 对内网音视频上传入口，跑一轮 AFL++ 定向 fuzz，能提前发现 0day 级别的崩溃：</p>
+<div class="highlight"><pre><span></span><code>afl-fuzz<span class="w"> </span>-i<span class="w"> </span>seeds/<span class="w"> </span>-o<span class="w"> </span>out/<span class="w"> </span>--<span class="w"> </span>./ffmpeg<span class="w"> </span>-i<span class="w"> </span>@@<span class="w"> </span>-f<span class="w"> </span>null<span class="w"> </span>-
+</code></pre></div>
+
+<p><strong>3. 运行环境加固。</strong>
+- 转码服务用容器隔离，限制 CPU/内存，崩溃不拖垮宿主
+- 禁用不必要的解码器/容器支持（<code>--disable-everything --enable-...</code> 白名单编译，把攻击面砍到最小）
+- 生产环境关闭调试输出，避免堆内容经日志泄漏</p>
+<p><strong>4. 检测侧</strong>：文件上传入口做格式校验只防菜鸟——真正的畸形文件在格式层是合法的。更有效的是行为检测：转码进程的异常崩溃率、ASAN 编译的检测版二进制做灰度。</p>
+<p>我的做法是：任何对外提供音视频解析的服务，一律独立进程 + 资源限制 + 崩溃自动重启，绝不让解析逻辑跑在核心服务进程里。FFmpeg 这种级别的攻击面，默认当它是"不可信输入解析器"处理，而不是"内置组件"。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

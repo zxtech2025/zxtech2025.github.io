@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MTE 从 Pixel 11 上消失：硬件内存标记这两年抓到了什么 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>MTE 从 Pixel 11 上消失：硬件内存标记这两年抓到了什么</h1>
+<time>2026-08-30</time>
+<ul>
+<li>硬件安全</li>
+<li>Android</li>
+<li>内存安全</li>
+<li>GrapheneOS</li>
+</ul>
+<hr />
+<p>GrapheneOS 项目公开指出，<strong>Pixel 11 不再支持硬件内存标记（MTE）</strong>。这条消息在技术圈没什么水花，但我觉得它是这一季度最值得写的硬件安全变化之一——因为 MTE 不是个锦上添花的特性，它是这几年最有效的一类"能跑在生产环境的内存错误检测器"，而 GrapheneOS 已经用它抓出了一长串真实的上游内核 bug。</p>
+<h2>MTE 是什么</h2>
+<p>MTE（Memory Tagging Extension）是 ARM 在 Armv8.5 引入、在 Armv9 上成为标配的硬件特性。它干的事情用一句话说：<strong>给每块内存和每个指向它的指针都打上标签，访问时硬件校验标签是否匹配，不匹配就报错。</strong></p>
+<p>机制上有几个关键点：</p>
+<ul>
+<li>标签是 4 位，存在指针的高位字节里。ARM 定了"忽略高位字节"（top-byte-ignore）机制，让普通程序不关心这 4 位的存在。</li>
+<li>内存侧的标签按 16 字节粒度存在一块专门的影子内存里（每 16 字节内存对应 1 个标签字节）。</li>
+<li>分配内存时随机挑一个标签，同时写进内存的标签位和返回的指针。每次访问，硬件比较指针标签和内存标签。</li>
+</ul>
+<p>它能抓什么？<strong>用后释放（UAF）和越界读写</strong>这两类最常见、也最难查的内存错误。一个对象被 free 之后，重新分配的标签有很大概率跟原来的指针标签不同，于是这个"悬垂指针"的访问就会被硬件拦下来。越界访问同理——相邻内存块的标签通常不同。</p>
+<p>注意"很大概率"这个词。MTE 是<strong>概率性</strong>检测，不是完备的。它靠标签的随机性来提高命中率，但一个悬垂指针在理论上可能碰上相同标签而蒙混过关。这也是它比 ASan 这类"完备但极慢"的工具更适合生产环境的原因：完备性换成了可接受的开销。</p>
+<p>MTE 有三种模式：<code>synchronous</code>（同步，精确报错，开销最大）、<code>asynchronous</code>（异步，开销小，但报错信息不够精确）、<code>asymmetric</code>（内核同步、用户态异步的折中）。生产环境通常用异步或折中模式。</p>
+<h2>GrapheneOS 用它抓到了什么</h2>
+<p>GrapheneOS 把 MTE 用到了极致：用户态的 <code>hardened_malloc</code> 接上了 MTE，内核则启用了基于硬件标签的 KASAN（HW_TAGS），并且把 KASAN 的故障处理从"上报"改成了"直接 panic"，把它当成<strong>加固特性</strong>而不是调试特性来用。</p>
+<p>这个选择的结果是：任何一次被 MTE 捕获的内存错误，都会立刻让系统崩溃并留下日志，而不是默默放过。于是你会在 GrapheneOS 的更新日志里反复看到这类条目（下面这些来自其公开发布的版本变更记录）：</p>
+<ul>
+<li>内核（Pixel）：修掉 Broadcom Wi-Fi 驱动（bcm4383）里的<strong>上游 use-after-free</strong>，是 MTE 抓到的。</li>
+<li>内核（Pixel 10 系列）：修掉 <strong>DisplayPort 驱动里的越界数组读</strong>——成因是某些设备没有正确实现 DisplayPort 协议，驱动也没做好容错。</li>
+<li>内核（Pixel）：修掉 Samsung TEE DMA heap 驱动的崩溃，问题出在<strong>释放时指针的标签被剥离</strong>，MTE 因此报了错。</li>
+<li>内核：修掉 USB gadget UVC 驱动里的<strong>竞态导致的崩溃和 use-after-free</strong>，由 MTE 检出。</li>
+<li>ADB：修掉网络连接路径上的<strong>上游 use-after-free</strong>，被"始终启用的 MTE"抓出来。</li>
+<li>Bluetooth LE audio：修掉某类设备上触发<strong>use-after-free</strong>的上游 bug。</li>
+<li>HWC3 服务：修掉外接显示器连接时的<strong>上游 use-after-free</strong>，会引发软重启。</li>
+<li>USB gadget Ethernet 驱动：修掉上游的 <strong>double-free</strong>。</li>
+</ul>
+<p>这一串东西的共同点是：<strong>如果没有 MTE，它们都会以"偶发崩溃、原因不明"的形式存在很多年</strong>。驱动里的 UAF 和竞态本来就难复现，出现在特定硬件组合 + 特定时序下，用户只能反复抱怨"我的手机偶尔重启"。MTE 把这类问题从"玄学"变成了"有栈回溯的崩溃日志"。</p>
+<p>更值得一提的是 <code>hardened_malloc</code> 那边：GrapheneOS 的日志里还有处理"内存标记状态被并发读取"这类自身问题的记录——说明他们不只是使用者，还在补齐这套机制在真实负载下的边角。</p>
+<h2>失去 MTE 意味着什么</h2>
+<p>Pixel 11 不再支持 MTE，损失的不是一个跑分项，是一整条防线：</p>
+<ul>
+<li><strong>上游 bug 的发现渠道变窄。</strong> 上面那串 bug 之所以被发现，是因为有一台设备在生产模式下开着 MTE，用户的正常使用就成了免费的压力测试。没有 MTE，这些 bug 会重新隐身。</li>
+<li><strong>加固能力下降。</strong> MTE 不只是检测工具。在充分利用的配置下，它能让很多内存破坏漏洞从"可利用"退化成"直接崩溃"，把 RCE 的可利用性大幅降低。这是少数几个能真正抬高攻击门槛的硬件特性。</li>
+<li><strong>不可替代。</strong> 软件层的 <code>hardened_malloc</code>、ASan、影子内存这些手段，要么开销太大不能长期开，要么无法覆盖内核和厂商驱动。MTE 之所以重要，是因为它是硬件的、开销可接受的、且能覆盖整个系统的。</li>
+</ul>
+<p>需要说清楚的是：这次变动的具体原因、以及它是硬件层面的移除还是固件/配置层面的关闭，GrapheneOS 的公开说明没有展开，我也不替它推测。确定的信息是：<strong>在他们的设备支持矩阵里，Pixel 11 这条不再有 MTE</strong>。</p>
+<h2>我的做法</h2>
+<p>如果你是安全相关的开发者或研究者，这件事的启示是：</p>
+<ul>
+<li>把 MTE 当成一个<strong>开发期的常规开关</strong>，而不是"专项测试时才开的东西"。它在 Pixel 8 及以后的部分设备上可以持续开启，日常使用就是在帮上游找 bug。</li>
+<li>关注设备的<strong>安全特性支持矩阵</strong>，而不只看跑分和相机。厂商在宣传页上很少提"这一代砍掉了某个硬件安全特性"，得去项目方的文档里对比。</li>
+<li>自己写原生代码时，把 MTE 兼容性纳入验收。比如不要依赖指针高位的位做自定义标记——那会跟 MTE 抢 4 位标签。</li>
+</ul>
+<p>MTE 这两年在 GrapheneOS 手上抓出的那一长串内核 bug，本身就是最好的价值证明。它证明了"在生产设备上常开硬件内存标记"是可行的，也证明了这类特性一旦被撤掉，代价是隐性的、但长期的。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

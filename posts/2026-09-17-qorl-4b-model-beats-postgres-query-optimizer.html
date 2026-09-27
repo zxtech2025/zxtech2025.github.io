@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>用 4B 小模型替换 Postgres 查询优化器：81% 加速背后的两阶段训练 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>用 4B 小模型替换 Postgres 查询优化器：81% 加速背后的两阶段训练</h1>
+<time>2026-09-17</time>
+<ul>
+<li>数据库</li>
+<li>强化学习</li>
+<li>Postgres</li>
+<li>LLM工程</li>
+</ul>
+<hr />
+<p>Postgres 的查询优化器是个老问题了。Leis 等人在 2015 年问过"查询优化器到底有多好"，2025 年又问了第二遍。十年过去，结论没变多少：优化器依然在大量查询上选不出好计划。</p>
+<p>Rohan Bansal 做了个反直觉的尝试：不改进优化器算法，而是训练一个 4B 小模型去"指挥" Postgres。结果是一个几何平均 1.81x 加速、总延迟下降 44.7%。</p>
+<h2>问题：搜索空间是组合爆炸</h2>
+<p>优化器难在哪？看一个三表 JOIN：</p>
+<div class="highlight"><pre><span></span><code><span class="k">SELECT</span><span class="w"> </span><span class="k">count</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">title</span><span class="w"> </span><span class="n">t</span>
+<span class="w">  </span><span class="k">JOIN</span><span class="w"> </span><span class="n">movie_companies</span><span class="w"> </span><span class="n">mc</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">mc</span><span class="p">.</span><span class="n">movie_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">t</span><span class="p">.</span><span class="n">id</span>
+<span class="w">  </span><span class="k">JOIN</span><span class="w"> </span><span class="n">company_name</span><span class="w"> </span><span class="n">cn</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">cn</span><span class="p">.</span><span class="n">id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">mc</span><span class="p">.</span><span class="n">company_id</span>
+<span class="k">WHERE</span><span class="w"> </span><span class="n">cn</span><span class="p">.</span><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;Toho&#39;</span>
+</code></pre></div>
+
+<p>仅考虑最基本的四类决策：</p>
+<ul>
+<li><strong>连接树</strong>：哪两张表先连接</li>
+<li><strong>方向</strong>：每次 JOIN 的哪一侧作外表/内表</li>
+<li><strong>算法</strong>：hash / merge / nested loop 三选一</li>
+<li><strong>扫描方式</strong>：顺序读 / 索引 / index-only / bitmap</li>
+</ul>
+<p>一个三表查询就有 4,608 种执行方式，而这还只是下界（并行计划、更多扫描类型没算进去）。表数一多，搜索空间指数级膨胀，优化器必然要依赖基数估计（cardinality estimation）来剪枝。</p>
+<p>问题在于基数估计不可靠。它假设列之间独立，遇到相关性强的条件就估偏。估偏了，选出来的"最小行数"计划就不是最快计划。Leis 等人的结论：优化器的问题主要不在搜索算法，而在代价模型和基数估计的准确性。</p>
+<h2>思路：让模型输出 hint，而不是替换优化器</h2>
+<p>Bansal 没有重写优化器。他让模型输出 <strong>pg_hint_plan 风格的执行计划提示</strong>，交给 Postgres 实际执行并计时，用真实执行时间作为奖励信号。</p>
+<p>这个设计的关键在于：<strong>模型不需要知道代价，只需要知道哪个计划更快</strong>。代价模型本身不可信，那就绕开它，用真实执行作为 ground truth。</p>
+<p>单次 rollout 的形状是这样：</p>
+<div class="highlight"><pre><span></span><code><span class="o">/*+</span><span class="w"> </span><span class="n">HashJoin</span><span class="p">(</span><span class="n">mc</span><span class="w"> </span><span class="n">cn</span><span class="p">)</span><span class="w"> </span><span class="o">*/</span><span class="w">        </span>→<span class="w"> </span><span class="mi">96</span><span class="w"> </span><span class="n">ms</span><span class="w">   </span><span class="p">(</span>默认<span class="w"> </span><span class="mi">118</span><span class="w"> </span><span class="n">ms</span><span class="p">)</span><span class="w">  </span><span class="n">reward</span><span class="w"> </span><span class="o">+</span><span class="mf">0.21</span>
+<span class="o">/*+</span><span class="w"> </span><span class="n">Leading</span><span class="p">((</span><span class="n">cn</span><span class="w"> </span><span class="n">mc</span><span class="p">)</span><span class="w"> </span><span class="n">t</span><span class="p">)</span><span class="w"> </span><span class="o">*/</span><span class="w">     </span>→<span class="w"> </span><span class="mi">74</span><span class="w"> </span><span class="n">ms</span><span class="w">   </span><span class="p">(</span>默认<span class="w"> </span><span class="mi">118</span><span class="w"> </span><span class="n">ms</span><span class="p">)</span><span class="w">  </span><span class="n">reward</span><span class="w"> </span><span class="o">+</span><span class="mf">0.47</span>
+<span class="o">/*+</span><span class="w"> </span><span class="n">NestLoop</span><span class="p">(</span><span class="n">t</span><span class="w"> </span><span class="n">mc</span><span class="p">)</span><span class="w"> </span><span class="o">*/</span><span class="w">         </span>→<span class="w"> </span><span class="mi">163</span><span class="w"> </span><span class="n">ms</span><span class="w">  </span><span class="p">(</span>默认<span class="w"> </span><span class="mi">118</span><span class="w"> </span><span class="n">ms</span><span class="p">)</span><span class="w">  </span><span class="n">reward</span><span class="w"> </span><span class="o">-</span><span class="mf">0.32</span>
+<span class="o">/*+</span><span class="w"> </span><span class="n">IndexScan</span><span class="p">(</span><span class="n">t</span><span class="p">)</span><span class="w"> </span><span class="o">*/</span><span class="w">           </span>→<span class="w"> </span><span class="mi">131</span><span class="w"> </span><span class="n">ms</span><span class="w">  </span><span class="p">(</span>默认<span class="w"> </span><span class="mi">118</span><span class="w"> </span><span class="n">ms</span><span class="p">)</span><span class="w">  </span><span class="n">reward</span><span class="w"> </span><span class="o">-</span><span class="mf">0.10</span>
+</code></pre></div>
+
+<p>奖励是相对于默认计划的比值，正数代表加速。同一个查询跑 4 次 rollout，得到 4 个带奖励的样本，做相对优势估计（relative advantage）后回传更新模型权重。</p>
+<h2>训练：先蒸馏，再强化</h2>
+<p>模型选的是 Qwen 4B。直接上 RL 效果不好，4B 模型起初连 harness 的输出格式都理解不了。所以分两阶段：</p>
+<p><strong>阶段一：off-policy 蒸馏。</strong> 用更大的教师模型生成计划样本，做监督微调（SFT）。这一步的技术细节比听起来麻烦：</p>
+<ul>
+<li><strong>渲染与损失掩码</strong>：只有计划提示部分是模型该学的，查询文本和格式模板要 mask 掉，否则模型会把算力浪费在复述查询上</li>
+<li><strong>unrolling</strong>：把多轮 rollout 的样本展开成训练序列</li>
+</ul>
+<p><strong>阶段二：agentic RL。</strong> 蒸馏后的模型有了基础能力，再用真实执行反馈做强化学习。奖励是 per-rollout 的相对优势，不是绝对分数。这样同一批次内的好计划和坏计划能形成对比信号。</p>
+<p>LoRA 的规模值得一提：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>数值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>基座权重量化后</td>
+<td>4.66B 参数 / 9.32 GB</td>
+</tr>
+<tr>
+<td>LoRA 适配器</td>
+<td>42.5 MB</td>
+</tr>
+<tr>
+<td>可训练参数</td>
+<td>21.2M</td>
+</tr>
+</tbody>
+</table>
+<p>42.5MB 的适配器，训练出的是一个能读懂执行计划并给出有效提示的策略。</p>
+<h2>结果与评测方法</h2>
+<p>评测用两个基准：</p>
+<ul>
+<li><strong>JOB（Join Order Benchmark）</strong>：基于 IMDb 数据库，专门测多表连接顺序</li>
+<li><strong>CEB（Cardinality Estimation Benchmark）</strong>：约 13,600 条合成查询，16 个查询模板，同样基于 IMDb</li>
+</ul>
+<p>指标用<strong>几何平均加速比</strong>而非算术平均。原因很实在：算术平均会被极端值主导，一个查询加速 100x 能掩盖十个查询变慢。几何平均给每个查询等权重，2x 加速和 0.5x 减速正好抵消回 1x：</p>
+<p>$$\text{geo-mean} = \left(\prod_{i=1}^{N} \frac{T_{\text{default},i}}{T_{\text{candidate},i}}\right)^{1/N}$$</p>
+<p>比值大于 1 是加速。这个定义意味着一个查询从 5 分钟降到 2.5 分钟，和另一个从 25 秒涨到 50 秒，权重完全相同。对数据库场景来说这是对的取向：DBA 关心的是"整体工作负载是否变快"，不是"某一个查询快了多少"。</p>
+<p>最终成绩：</p>
+<ul>
+<li><strong>几何平均加速 1.81x</strong></li>
+<li><strong>总延迟下降 44.7%</strong></li>
+<li>测量方式：每查询 3 次尝试、best-of-15</li>
+</ul>
+<h2>训练循环的三个实际约束</h2>
+<p>这套方法要跑起来，有几个绕不过去的工程细节。</p>
+<p><strong>奖励信号必须是相对的。</strong> 如果直接用绝对执行时间当奖励，同一批次里的样本会因为查询本身的难易程度差异巨大而无法比较。一个天生就要跑 5 秒的查询和一个天生只要 20ms 的查询，执行时间差了几百倍，梯度会被长耗时查询主导。用 per-rollout 相对优势，等于把每个查询和"它自己的默认计划"对齐，消除了查询间的量纲差异。</p>
+<p><strong>off-policy 蒸馏里必须掩码损失。</strong> 教师模型输出的一段文本里，只有计划提示部分是学生该学的。查询语句、模板骨架、分隔符都是固定输入。如果不做 loss masking，模型会把容量花在复述查询上，而不是学"看到这种连接形态该用什么扫描方式"。文中专门有一节讲 rendering、loss masking 和 unrolling，这三件事构成了蒸馏管线的骨架。</p>
+<p><strong>教师模型的选择有讲究。</strong> 教师不能只强在"能写出计划"，还得强在"能写出多样化的计划"。如果教师总是给同一种风格的答案，学生学到的是单点解，进 RL 阶段后探索不动。文中分析了教师模型的选型过程，方向上偏向计划多样性而非单次最优。</p>
+<h2>一些值得注意的发现</h2>
+<p><strong>模型学到的是拓扑，不是记忆。</strong> 分析显示模型对查询"形状"（topology）敏感：相似的 JOIN 结构在不同表/列组合下会得到相似的计划选择。它没有背题，而是学到了"这种连接形态配这种扫描方式"的模式。论文里专门做了"query topology mapping"的分析，验证泛化性。</p>
+<p><strong>小模型被低估了。</strong> 作者的原话大意是：当 5T+ 参数的大模型在视线里时，很容易对 4B 模型不屑一顾，但不该如此。查询优化是个结构化决策问题，不需要万亿参数的世界知识，需要的是对执行计划空间的精确理解，这是可以训练出来的。</p>
+<p><strong>"骗过 agent"的反面。</strong> 文中有一节叫"To fool an agent"，讲的是如果奖励信号设计不当，模型会找到捷径（比如专挑容易加速的查询模板）。per-rollout 相对优势的设计某种程度上就是防这个。</p>
+<h2>我的判断</h2>
+<p>这个工作的价值不在"小模型打败 Postgres"这个标题。而是它揭示了一个通用的工程模式：<strong>当一个系统的内部代价模型不可信时，用真实反馈训练一个轻量策略来绕开它</strong>，往往比修复代价模型更划算。</p>
+<p>代价模型的准确性是个持续十年的研究难题，而 RL 微调一个 4B 模型只需要 42.5MB 的适配器和几天训练。这不是替代关系，是比较投入产出比之后的选择。</p>
+<p>可以预见的工程化方向：把这种模型接进连接池或查询中间件，对慢查询做在线计划纠正。风险也很明显：计划提示是个黑盒，出问题时 DBA 没法像读 EXPLAIN 那样读模型的决策逻辑。可解释性会是落地的主要阻力。</p>
+<p>参考：<a href="https://rohanbansal.com/qorl/">Training a 4B model to produce 81% faster query plans than Postgres</a></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

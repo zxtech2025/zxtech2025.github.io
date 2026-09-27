@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>用 Apple Virtualization.framework 启动一台虚拟 iPhone - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>用 Apple Virtualization.framework 启动一台虚拟 iPhone</h1>
+<time>2026-08-29</time>
+<ul>
+<li>iOS</li>
+<li>虚拟化</li>
+<li>Apple Silicon</li>
+<li>安全研究</li>
+</ul>
+<hr />
+<p>Lakr233 开源了一个叫 vphone-cli 的工具，能在 Apple Silicon 的 Mac 上启动一台虚拟 iPhone。它的 README 很直白：用 Apple 的 Virtualization.framework，复用 PCC 研究虚拟机的基建。</p>
+<p>这条值得记，因为它揭示了一个之前不那么显眼的能力：macOS 上那套给 Linux/ macOS 客户机用的虚拟化 API，其实也能承载 iOS。</p>
+<h2>它是怎么搭起来的</h2>
+<p>先看依赖清单，因为它几乎把整个流程都说清楚了：</p>
+<div class="highlight"><pre><span></span><code>brew<span class="w"> </span>install<span class="w"> </span>python@3.13<span class="w"> </span>aria2<span class="w"> </span>wget<span class="w"> </span>gnu-tar<span class="w"> </span>openssl@3<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>ldid-procursus<span class="w"> </span>sshpass<span class="w"> </span>keystone<span class="w"> </span>cmake<span class="w"> </span>libusb<span class="w"> </span>ipsw<span class="w"> </span>zstd
+</code></pre></div>
+
+<p>几个关键的：</p>
+<ul>
+<li><code>ipsw</code> 是用来下载和解析苹果固件（IPSW 文件）的工具。要起一台 iOS 客户机，你得先把固件拉下来、解出内核和根文件系统。</li>
+<li><code>ldid-procursus</code> 是给 Mach-O 二进制签权限（entitlements）的工具，特点是<strong>不需要开发者证书</strong>就能签。苹果私有权限（比如下面要说的 PV=3）没法用普通证书签发，所以需要它。</li>
+<li><code>sshpass</code> 说明工具会通过 SSH 自动连接客户机——启动之后要非交互地执行命令。</li>
+<li><code>keystone</code> 是汇编框架，<code>libusb</code> 是 USB 相关，<code>cmake</code>/<code>zstd</code> 属于常规构建依赖。</li>
+</ul>
+<p>构建只有三步：</p>
+<div class="highlight"><pre><span></span><code>git<span class="w"> </span>clone<span class="w"> </span>--recurse-submodules<span class="w"> </span>https://github.com/Lakr233/vphone-cli.git
+./scripts/setup_tools.sh
+./scripts/build.sh
+</code></pre></div>
+
+<p><code>setup_tools.sh</code> 装依赖、构建工具链子模块、建 Python venv；<code>build.sh</code> 编译并签名。</p>
+<h2>硬性前提：放松 SIP 与 AMFI</h2>
+<p>README 里有一条前置条件很关键：<strong>需要放宽 SIP/AMFI，以便给未签名二进制授予私有的 PV=3 权限</strong>。</p>
+<p>拆开看这三件事：</p>
+<p>SIP（System Integrity Protection）是 macOS 的系统完整性保护，会阻止对系统目录和保护路径的修改。AMFI（Apple Mobile File Integrity）是负责校验代码签名的内核机制——它决定一个二进制能不能带着某组 entitlements 运行。</p>
+<p>苹果的 Virtualization.framework 提供的公开 API，面向的是"跑 Linux/macOS 客户机"这类场景。要让它在客户机里跑 iOS，需要用到一层<strong>私有权限 PV=3</strong>。私有权限的特点是：没有官方证书链能签它，只能靠 <code>ldid</code> 这类工具直接写进二进制的 entitlements 段；而 AMFI 默认会拒绝这种没有合法签名的权限，所以必须把 SIP/AMFI 放松，让未签名但带私有权限的二进制能够加载。</p>
+<p>这一步是整套方案的门票，也是它最大的代价——<strong>你要先削弱宿主 Mac 的系统保护，才能跑起这个虚拟机</strong>。对一台"只用于 iOS 安全研究的机器"可以接受，对日常主力机就不是个好主意。</p>
+<h2>为什么要复用 PCC 的基建</h2>
+<p>README 提到它"使用 PCC 研究虚拟机的基建"，这是理解可行性的关键。</p>
+<p>PCC（Private Cloud Compute）是苹果那套跑在自研芯片上的隐私云计算节点。为了让外部研究者能审计 PCC 节点的行为，苹果提供了一个<strong>基于 Virtualization.framework 的研究虚拟机</strong>——本质上是一个"能在 Mac 上以受控方式跑苹果私有 guest 环境"的框架。</p>
+<p>vphone-cli 的思路就是：既然苹果自己用 Virtualization.framework 做了个能跑私有 guest 的基建，那顺着这条路，把 guest 换成 iOS 也是可行的。这属于典型的"官方工具的最小意外用法"——苹果开放 PCC 研究 VM 是为了透明性，而透明性必然要求把私有 guest 的启动路径暴露出来。</p>
+<h2>安全研究上的价值</h2>
+<p>一台不用越狱、不用物理设备、可以任意重置的 iOS 虚拟机，对做 iOS 安全的人意味着什么：</p>
+<ul>
+<li>快照与回滚。跑一个可疑样本之前打个快照，崩了或者被污染了直接回滚，不用重刷真机。</li>
+<li>无设备依赖。CI 里跑 iOS 侧的分析不需要一堆真机排排坐。</li>
+<li>可观测性。宿主是 macOS，你可以用标准的调试和分析工具观察客户机的行为，比在真机上方便得多。</li>
+<li>可重复。客户机状态完全由固件和配置决定，实验可复现。</li>
+</ul>
+<p>它的局限也明显：需要削弱宿主保护、依赖未公开的私有权限、且跟着苹果固件版本走（固件一升级，路径可能就变）。这是个研究工具，不是产品。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<h2>我的做法</h2>
+<p>这类"用官方虚拟化 API 跑非预期 guest"的项目，我会看两个信号：</p>
+<ul>
+<li><strong>它依赖哪些私有权限。</strong> 公开 API 做不到的事，一定要靠私有权限补。私有权限越多，方案的寿命越短。</li>
+<li><strong>它对宿主的保护做了什么让步。</strong> 关 SIP/AMFI 是重大让步。如果项目能在一个专用机器或独立用户空间里跑，风险可以接受；否则要掂量。</li>
+</ul>
+<p>vphone-cli 把这两点都写在 README 最前面，这个做法本身值得肯定——工具敢把代价摆在明面上，用的人才知道自己在签什么。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

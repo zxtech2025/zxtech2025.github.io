@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>当内存里没有 shellcode 可扫：VMLoader 无 shellcode 加载技术拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>当内存里没有 shellcode 可扫：VMLoader 无 shellcode 加载技术拆解</h1>
+<time>2026-09-25</time>
+<ul>
+<li>安全</li>
+<li>免杀</li>
+<li>虚拟机</li>
+<li>Shellcode</li>
+<li>EDR</li>
+</ul>
+<hr />
+<p>加载器的对抗史，说到底就是和内存扫描的对抗史。无论磁盘上做了多少层加密混淆，payload 最终都得变成可执行明文躺进内存。内存扫描工具，Moneta、PE-sieve，以及各家 EDR 的内存查杀模块，盯的就是这个"必然明文时刻"：在进程地址空间里找"可执行但来源可疑"的内存区域，再对区域内容做字节签名匹配。</p>
+<p>现有的对抗手段，加密休眠、权限翻转、模块镂空、反射式加载，都在回答同一个问题：怎么把一段 x64 机器码藏得更好。</p>
+<p>最近读到一个不同的设问：如果内存里自始至终就没有 x64 机器码，扫描器还能扫到什么？</p>
+<p>这个设问的答案是 VMLoader，一个基于自定义指令集虚拟机的加载框架。它把 payload 交叉编译成 RISC-V 64（RV64IM）机器码，用一个约四百行的解释器在宿主进程里逐条执行。整个过程，进程地址空间里不出现任何 x64 shellcode，也不出现任何带执行权限的私有内存。</p>
+<h2>内存扫描到底在扫什么</h2>
+<p>要讨论"对抗内存扫描"，得先说清楚扫描器在检测什么。归纳开源工具和厂商文档，检测面就三个维度。</p>
+<p>一是内存属性异常。带 PAGE_EXECUTE_READWRITE 属性的私有内存是最强信号，合法程序几乎不需要"可写且可执行"的内存。其次是"先写后执行"留下的痕迹：没有文件映像支撑的私有可执行页，以及起始地址落在这类区域里的线程。Moneta 对每一类都有独立告警。</p>
+<p>二是内容签名。针对已知 shellcode 的字节模式匹配。公开的 YARA 规则覆盖 Cobalt Strike Beacon、Metasploit 各阶段载荷、Sliver，几乎全以 x64 指令序列为匹配对象：特定函数序言、读 PEB 的惯用法（<code>mov rax, gs:[0x60]</code> 的字节模式）、解码循环的固定结构、API 哈希常量。Beacon 的公开检测规则，典型条目匹配的就是 <code>65 48 8B ?? ?? ?? 00 00</code> 这种 x64 特有的 gs 段读取序列。这个匹配字典是为 x64 指令集建的，当内存里的内容根本不是 x64 指令流时，这些规则在语法上就无从命中。</p>
+<p>三是行为遥测。API 调用序列、线程进程创建、注入事件、网络连接，数据来自用户态 inline hook、ETW、内核回调。注意，这一维不属于内存扫描。</p>
+<p>VMLoader 的目标明确限定在前两维：让 payload 在内存扫描维度上无可检测特征。行为维度需要 direct syscall、调用栈伪造、睡眠混淆这些正交技术，不在它的射程内。这个边界感很诚实，先讲清楚"我解决了什么、没解决什么"，比吹"虚拟机化即免杀"强。</p>
+<h2>三个组件</h2>
+<p>VMLoader 由三部分构成。</p>
+<p>payload：裸机 C++ 写的 RV64 程序，交叉编译成静态 ELF，不链任何运行库。loader：Windows x64 宿主程序，核心是一个 RV64IM 解释器加一组 ECALL 处理例程，把 payload 的"系统调用"转发给 WinAPI。embed_payload.py：构建期工具，把 ELF 拍平成平坦二进制，做 opcode 置换和加密，生成 C++ 字节数组供 loader 编译期内嵌。</p>
+<p>运行时加载链很直白：VirtualAlloc 分配普通读写内存，拷贝并解密 payload，按重定位表修正绝对地址，初始化解释器状态，进取指-译码-分发主循环。</p>
+<p>架构的关键性质一句话：payload 是被解释执行的数据，CPU 在整个生命周期里不执行其中任何一个字节。</p>
+<h2>解释器内核与 opcode 置换</h2>
+<p>VM 状态是 32 个 64 位寄存器（x0 硬连线为零）、PC、扁平内存视图、一张可替换的系统调用表。主循环只有三行：</p>
+<div class="highlight"><pre><span></span><code><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">vm</span><span class="o">-&gt;</span><span class="n">halted</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">instr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">rv_fetch</span><span class="p">(</span><span class="n">vm</span><span class="p">);</span>
+<span class="w">    </span><span class="n">g_dispatch</span><span class="p">[(</span><span class="n">instr</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="mi">2</span><span class="p">)</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0x1F</span><span class="p">](</span><span class="n">vm</span><span class="p">,</span><span class="w"> </span><span class="n">instr</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>rv_fetch 直接按宿主指针读 32 位指令字，guest 地址就是宿主地址，不做翻译。这是刻意取舍：要的不是沙箱隔离，是指令集层面的不可读性。去掉翻译层让解释器极小，也让 payload 能零开销读写自身内存和栈。指令实现覆盖 RV64IM 全集，load/store 用 memcpy 完成以避开未对齐访问的未定义行为，CSR 和 fence 按 NOP 处理，64 位乘法高半部分用 <code>__int128</code> 实现。</p>
+<p>有意思的是 opcode 置换。如果解释器按标准 RV64 编码分发，分析者认出手各个 handler 对应哪族指令，就能对 payload 做常规反汇编。所以指令的 opcode 字段（第 [6:2] 位，32 个槽位）在构建期被置换。loader 和嵌入脚本共享一张编译期 Fisher-Yates 置换表，由种子驱动：</p>
+<div class="highlight"><pre><span></span><code><span class="n">seed</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">seed</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">1664525u</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1013904223u</span><span class="p">;</span><span class="w">   </span><span class="c1">// LCG</span>
+<span class="kt">int</span><span class="w"> </span><span class="n">j</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="p">)((</span><span class="n">seed</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="mi">17</span><span class="p">)</span><span class="w"> </span><span class="o">%</span><span class="w"> </span><span class="p">(</span><span class="kt">uint32_t</span><span class="p">)(</span><span class="n">i</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">1</span><span class="p">));</span>
+</code></pre></div>
+
+<p>置换效果是双重的：payload 不但不是 x64 代码，甚至不是合法的 RISC-V 代码。标准 RV64 反汇编器对它输出的是一堆无意义指令，"这是 RISC-V"这个分析前提本身就不成立了。同时两侧种子不一致 payload 就完全跑不起来，种子顺带承担了构建期密钥的角色。</p>
+<h2>ECALL 桥与哈希化 API 解析</h2>
+<p>payload 和宿主之间只有四个约定，a7 寄存器带调用号：</p>
+<div class="highlight"><pre><span></span><code>ECALL_GET_PEB = 0    // () -&gt; void* peb
+ECALL_HOST_CALL = 1  // (void* fn, uintptr_t* args, int argc) -&gt; uintptr_t
+ECALL_RESOLVE = 2    // (uint32_t mod_hash, uint32_t sym_hash) -&gt; void*
+ECALL_EXIT = 3
+</code></pre></div>
+
+<p>注意 RESOLVE 的入参是哈希不是字符串。payload 侧是 constexpr 的 sdbm 变体，字面量参数编译期折叠成常量。所以 payload 二进制里不存在任何 DLL/API 名称明文，ECALL 边界上流动的只是两个 32 位常量。宿主侧遍历 PEB 模块链表，对模块名做大小写不敏感哈希比对，命中后扫导出表逐项比符号哈希。整个解析不经过 GetProcAddress、GetModuleHandle，loader 导入表里不出现敏感 API。</p>
+<p>HOST_CALL 用 F0–F8 函数指针强转转发，上限 8 个整型参数，不支持浮点和按值结构体。这是明确的 ABI 边界。演示 payload 弹计算器用的是 WinExec 而不是 CreateProcessA，后者 10 个参数，超了 8 的上限。</p>
+<h2>内存布局：RW 而不是 RWX</h2>
+<p>这一节是整套方案的核心。加载器分配内存用的是：</p>
+<div class="highlight"><pre><span></span><code><span class="n">VirtualAlloc</span><span class="p">(</span><span class="n">nullptr</span><span class="p">,</span><span class="w"> </span><span class="n">sz</span><span class="p">,</span><span class="w"> </span><span class="n">MEM_COMMIT</span><span class="w"> </span><span class="o">|</span><span class="w"> </span><span class="n">MEM_RESERVE</span><span class="p">,</span><span class="w"> </span><span class="n">PAGE_READWRITE</span><span class="p">);</span>
+</code></pre></div>
+
+<p>注释写得很直白：payload 是被解释的，CPU 从不执行它，所以普通 RW 就够了，扫描里永远不会出现 RWX 区域。传统 loader 回避不了 RWX，因为 payload 终归要被 CPU 执行；解释执行架构下 payload 对 CPU 只是数据，整个运行期进程地址空间只多一块普通读写内存。这不是"把 RWX 藏得更好"，是在结构上消除了产生这个信号的原因。</p>
+<p>payload 加密存储，算法是 32 位 LCG 密钥流逐字节异或，宿主和脚本两侧严格同构。这个机制的定位是混淆不是密码学安全：让磁盘字节和内存字节不同构，静态签名没法跨边界匹配。已知明文（RV64 指令低两位恒为 11）就能破 LCG 密钥流，作者自己承认这点。</p>
+<h2>无 exec 通道：删掉退路</h2>
+<p>最值得琢磨的是这条：ECALL 表里不存在"执行原生 shellcode"这个调用号。如果保留它，RV64 层就退化成搬运工，x64 shellcode 终归会在内存里重新出现，前面建立的所有性质全失效，扫描器只要等解密执行那一刻。所以设计在 ABI 层面删掉了这个能力：payload 的功能逻辑必须完全用 RV64 指令流表达，通过细粒度 HOST_CALL 调合法 WinAPI。内存里任意时刻都不存在一块连续的、有签名价值的 x64 机器码。</p>
+<p>通道不存在，滥用就不可能。这是设计约束，不是功能缺失。这句话我挺认同，它比"我们做了高强度加密"之类的说法扎实得多。</p>
+<h2>验证与边界</h2>
+<p>功能验证：Windows 用 MSVC 编译 loader，WSL 里交叉编译 payload，跑起来计算器作为子进程弹出。内存扫描验证：运行期间用 Moneta 全量扫描，无 RWX 区域、无无文件支撑的私有可执行页、无可疑线程起始地址。对照组用经典 VirtualAlloc(RWX) + 写入执行的 loader，扫描结果一堆高危告警。</p>
+<p>静态分析对照更有意思：磁盘上的 blob 是高熵随机字节，IDA 反汇编直接撞非法指令停掉；内存里置换后的 RV64 流能"反汇编"出零散指令，但寄存器编号、立即数、控制流全荒谬；只有去掉置换的 plain 版本才是干净完整的 RV64 指令流。</p>
+<p>局限也很坦诚。一是行为维度无效：HOST_CALL 最终调的还是被 EDR 挂钩的原始函数，API 序列、子进程创建、网络连接遥测完整可见，虚拟机改变调用的形态，改变不了调用的内容。二是 payload 必须用 RV64 重写，Beacon 这类成熟 implant 没法直接移植，guest 侧没调试器，排错靠二分和日志。三是解释执行带来一到两个数量级的性能损失，计算密集型 payload 不适用。</p>
+<h2>我的看法</h2>
+<p>这套东西的价值不在"免杀效果"，行为检测那关它自己都承认过不去。价值在思路：对抗内存扫描的终极形态不是把 shellcode 藏得更好，而是让这个概念本身消失。当 payload 全部逻辑以 guest 指令流存在、宿主进程不产生任何可执行私有内存时，内存签名和属性启发式面对的检测面是空集。</p>
+<p>从防御侧看，这条思路反过来也成立。如果哪天在目标进程里发现：一块普通 RW 内存区域里躺着高熵字节，且进程里冒出一个"没有文件映像却持续活跃"的线程在跑取指循环，那比找 RWX 区域更值得报警。现在的 EDR 大多还在盯 RWX 和 x64 签名，这套异构指令集解释执行的路子恰恰是它们盲区。</p>
+<p>对做安全研究的人来说，这篇最可学的不是代码，是它"先界定威胁模型再谈对抗"的写法：明确自己解决了维度 a/b、没解决维度 c，不吹不黑。真要落地，三个方向值得跟：syscall 层直通补行为短板、解释器形态多态化消除自身可签名性、payload 工具链生态降低开发成本。</p>
+<blockquote>
+<p>本文技术细节整理自公开安全研究《基于自定义指令集虚拟机的无 shellcode 加载技术：VMLoader 的设计与实现》（FreeBuf，2026-09-25）。</p>
+</blockquote>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的加载器架构、内存扫描对抗思路和代码示例均基于公开披露的安全研究，旨在帮助开发者和安全从业者理解内存扫描原理、提升检测与防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、入侵或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

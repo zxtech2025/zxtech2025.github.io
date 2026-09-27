@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>拆开 Intel 8087 的微码：一条 FSCALE 指令背后的 140 个微指令 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>拆开 Intel 8087 的微码：一条 FSCALE 指令背后的 140 个微指令</h1>
+<time>2026-09-13</time>
+<ul>
+<li>微码逆向</li>
+<li>Intel 8087</li>
+<li>浮点数</li>
+<li>硬件逆向</li>
+</ul>
+<hr />
+<p>FSCALE 是 8087 里最不起眼的指令之一：把浮点数按 2 的整数次幂缩放，比走完整浮点乘法快。它的数学含义就是"给指数加个整数"。</p>
+<p>Ken Shirriff 在 <a href="https://www.righto.com/2026/09/8087-microcode-reverse-engineering-fscale.html">Opcode Collective</a> 里把这条指令的微码翻了个底朝天，结论是它用了 <strong>140 多条微指令、三层子程序调用</strong>。他原本以为这是个简单到可以拿来练手的指令。</p>
+<h2>8087 的规模</h2>
+<p>要理解为什么一条简单指令会这么复杂，得先知道 8087 承载了什么。</p>
+<p>芯片 5mm × 6mm，中央那块大的就是微码 ROM，存着 <strong>1648 条微指令</strong>，控制整个芯片。左侧是微码引擎，负责步进、处理跳转和子程序调用。下半部分是数据通路，注意它是分裂的：<strong>16 位指数通路</strong> 加 <strong>64 位有效数字通路</strong>，两套独立硬件。</p>
+<p>数据通路里有几个关键部件：</p>
+<ul>
+<li><strong>指数 ROM</strong>：存各种常量</li>
+<li><strong>指数转换器</strong>（exponent converter）：检查指数、检测特殊值、在指数格式间转换。这是个专用电路，后面会看到它替微码干了很多活</li>
+<li><strong>移位器</strong>（shifter）：能把 64 位值左移或右移任意位数</li>
+<li><strong>加法器</strong>：8087 计算的核心，乘法、除法、开方都在循环里用它</li>
+<li><strong>B 寄存器 / sum 寄存器</strong>：加法器的输入和输出</li>
+<li><strong>八个栈寄存器 + 临时寄存器</strong></li>
+</ul>
+<p>内部数据一律是 80 位"临时实数"（temporary real）：1 位符号 + 15 位指数 + 64 位有效数字。指数带 16383 的偏移量，所以真实指数范围是 −16382 到 16383。</p>
+<p>每个栈寄存器还带一个对程序员不可见的 <strong>tag</strong>，取值是 valid / special / zero / empty。infinity、NaN、非规格化数统归为 special。这个 tag 是 FSCALE 微码里大量分支的来源。</p>
+<h2>微指令长什么样</h2>
+<p>理解微码前要先接受一个事实：这里有两层指令。程序员看到的是 <code>FSCALE</code> 这样的汇编指令，芯片内部执行的是 16 位宽的微指令。</p>
+<div class="highlight"><pre><span></span><code>前 3 位 = 类型 → 决定剩余 13 位的含义
+类型1: transfer  寄存器间数据搬运（源/目标字段 + 3 位特殊标志）
+类型2: shift     驱动桶形移位器左移/右移
+类型3: adder     控制加法器（也能做减法）
+misc:             栈指针操作、tag 修改、异常、子程序返回
+far jump/call:    跳到微地址列表中的固定目标
+local jump:       相对跳转到附近的微指令
+</code></pre></div>
+
+<p>条件字段支持多种条件跳转/调用/返回，最后一位用来取反条件。</p>
+<h2>FSCALE 的正常路径：22 条微指令</h2>
+<p><code>FSCALE</code> 的微码从十进制地址 <strong>748</strong> 开始。核心思路很简单：第一个参数在栈顶，第二个参数是要缩放的 2 的幂次；把第二个参数转成整数，加到第一个参数的指数上。</p>
+<p>正常路径的骨架（去掉特殊值分支）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">#0748  st(0) -&gt; tmpA          第一个参数从栈顶搬到 tmpA</span>
+<span class="c1">#0754  expconst 0x403e        选择常量 403e</span>
+<span class="c1">#0763  tmpB:exp -&gt; Breg       第二个参数的指数进 B 寄存器</span>
+<span class="c1">#0764  tmpB:sign,exp -&gt; expConv</span>
+<span class="c1">#0765  expConst -&gt; tmpC       常量 403e 进 tmpC</span>
+<span class="c1">#0766  adder: tmpC - Breg cin=1   403e - exp</span>
+<span class="c1">#0767  sumreg:frac -&gt; shiftcount  作为移位量</span>
+<span class="c1">#0768  shift tmpB:frac R count byte bit   执行移位</span>
+<span class="c1">#0769  shift R -&gt; Breg        B 寄存器现在存的是整数形式的缩放量</span>
+<span class="c1">#0771  adder: tmpA:exp + Breg cin=0       加指数</span>
+<span class="c1">#0772  sumreg:frac -&gt; expConv             交给指数转换器查溢出</span>
+<span class="c1">#0773  sumreg:frac -&gt; tmpA:exp</span>
+<span class="c1">#0775  tmpA -&gt; st(0)          结果写回栈顶</span>
+<span class="c1">#0776  RNI (Run Next Instruction)</span>
+</code></pre></div>
+
+<p>那个 <code>0x403e</code> 常量值得单独说。移位量是 63 减去指数。指数带 16383 偏移，所以实际要移的位数是 <code>63 - (exp - 16383)</code>，化简就是 <code>0x403e - exp</code>（因为 63 + 16383 = 16446 = 0x403E）。一条看起来简单的浮点转整数，在这里展开了四五条微指令：把 <code>0x403e</code> 加载进 tmpC、用加法器做减法、结果存进移位控制寄存器、驱动移位器、再把结果读进 B 寄存器。</p>
+<p>注意"激活部件"和"读取结果"是两个独立微指令——先 <code>shift ...</code>，再 <code>shift R -&gt; Breg</code>。</p>
+<p>即使在最顺的路径上，这也花了大约 22 条微指令。</p>
+<h2>SPECIAL_TMPS：处理空栈和特殊值</h2>
+<p>如果参数访问了空栈位置（下溢）或者是特殊值呢？交给一个叫 <code>SPECIAL_TMPS</code> 的子程序，起始地址 <strong>1484</strong>。</p>
+<p>这个子程序是通用件，基本算术运算、FSCALE、FTST、FPREM 全都调用它。它的控制流相当绕，因为必须给优先级排序——比如一个参数是空的、另一个是非规格化数，得先处理哪个。</p>
+<p>流程大意是：先把非规格化数（denorm）转成未规格化数（unnorm），然后检查空栈访问，再重新检查两个参数、遇到 NaN 就触发异常或中断。返回一个状态值表明参数类型。</p>
+<p>其中有一段很有意思：</p>
+<div class="highlight"><pre><span></span><code><span class="p">#</span><span class="mh">1517</span><span class="w">  </span><span class="nl">except:</span><span class="n">invalid</span>
+<span class="p">#</span><span class="mh">1518</span><span class="w">  </span><span class="nl">tmpB:</span><span class="n">frac</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">Breg</span><span class="w">       </span><span class="err">两个参数都是</span><span class="w"> </span><span class="n">NaN</span><span class="err">，找更大的那个</span>
+<span class="p">#</span><span class="mh">1519</span><span class="w">  </span><span class="nl">adder:</span><span class="w"> </span><span class="nl">tmpA:</span><span class="n">frac</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">Breg</span><span class="w"> </span><span class="n">cin</span><span class="o">=</span><span class="mh">1</span>
+<span class="p">#</span><span class="mh">1520</span><span class="w">  </span><span class="n">jmp</span><span class="w"> </span><span class="p">#</span><span class="mh">1522</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="n">adder</span><span class="w"> </span><span class="n">sign</span>
+<span class="p">#</span><span class="mh">1521</span><span class="w">  </span><span class="n">tmpB</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">tmpA</span><span class="w">            </span><span class="err">取较大的</span>
+</code></pre></div>
+
+<p><strong>如果两个参数都是 NaN，代码会比较它们并返回较大的那个。</strong> 这看起来很怪，但确实是有文档的行为。NaN 不是一个值，而是一个巨大的值族，设计者的意图是让程序员用不同的 NaN 标记不同位置的问题——比如给未初始化数组的每个位置放不同的 NaN，就能看出访问的是哪个下标。既然要区分，就得定义两个 NaN 运算的结果，Intel 选了"返回较大者"。</p>
+<p>还有一处硬件小技巧：<code>#1485</code> 的 <code>xchg tmp</code> 微指令并不真的搬运数据，而是<strong>翻转一个触发器，交换 tmpA 和 tmpB 的含义</strong>。如果触发器置位，对 tmpA 的引用就落到 tmpB 上。8080 的 XCHG（交换 DE 和 HL）和 Z80 的 EX/EXX 用的是同一招。</p>
+<h2>CREATE_DENORM 与三个舍入位</h2>
+<p>非规格化数是 8087 里一个有争议的特性。当指数据已经到最小值 −16382，还想表示更小的数，就打破"有效数字以 1 开头"的规则，把有效数字右移，指数写成特殊值 0标记为 denorm。范围能再往下扩 2⁶³ 倍，代价是精度变差、运算明显变慢。</p>
+<p><code>CREATE_DENORM</code> 子程序（地址 522）干这件事。但它的微码里有个看着多余的步骤：</p>
+<div class="highlight"><pre><span></span><code><span class="n">#0528</span><span class="w">  </span><span class="n">shift</span><span class="w"> </span><span class="nl">tmpA</span><span class="p">:</span><span class="n">frac</span><span class="w"> </span><span class="n">R</span><span class="w"> </span><span class="nf">count</span><span class="w"> </span><span class="n">byte</span><span class="w"> </span><span class="nc">bit</span><span class="w">    </span><span class="n">按指定量右移</span>
+<span class="n">#0529</span><span class="w">  </span><span class="n">shift</span><span class="w"> </span><span class="n">R</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">Breg</span><span class="w">                     </span><span class="n">结果进</span><span class="w"> </span><span class="n">Breg</span>
+<span class="n">#0530</span><span class="w">  </span><span class="n">shift</span><span class="w"> </span><span class="nl">tmpA</span><span class="p">:</span><span class="n">frac</span><span class="w"> </span><span class="n">L</span><span class="w"> </span><span class="o">~</span><span class="nf">count</span><span class="w"> </span><span class="n">byte</span><span class="w"> </span><span class="nc">bit</span><span class="w">   </span><span class="n">又移回去</span>
+<span class="n">#0531</span><span class="w">  </span><span class="n">NOP</span><span class="w">                                 </span><span class="n">等移位器</span>
+<span class="n">#0532</span><span class="w">  </span><span class="n">rounding</span><span class="p">(</span><span class="n">h</span><span class="p">)</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="n">Breg</span><span class="o">[</span><span class="n">grs</span><span class="o">]</span><span class="w">            </span><span class="n">三个舍入位存进</span><span class="w"> </span><span class="n">Breg</span>
+</code></pre></div>
+
+<p>右移完为什么又左移回去？<strong>目的是取出舍入位。</strong></p>
+<p>浮点舍入比看起来难。<code>1 + 0</code> 向上舍入得 1，但 <code>1 + 2⁻¹⁰⁰⁰⁰</code> 向上舍入应该比 1 略大——问题是在舍入前你不可能真的存几千个比特来做区分。</p>
+<p>8087 的解法是保留三位：<strong>guard、round、sticky</strong>。把有效数字右侧的比特串看作"尾巴"，guard 是尾部的最高位，round 是次高位，sticky 比较特殊——它是剩余所有位的 OR 结果，表示"后面还有没有 1"。这样 <code>1 + 2⁻¹⁰⁰⁰⁰</code> 的 sticky 位置位，<code>1 + 0</code> 不置位，两者就能舍入到不同结果。硬件上这是一个 64 位 NOR 门并行测试尾部比特。</p>
+<p><code>#0530</code> 的这次左移，就是把最终会被丢弃的尾部比特全保留下来，再去掉最终有效数字里的位。第 62 位变成 guard，第 61 位变成 round，剩下 64 位 OR 起来生成 sticky。其实这个模式的核心思想是：<strong>移位时丢失的比特不能真的丢</strong>，得先反向移一次把它们捞回来。</p>
+<h2>ADJUST_PRECISION 与一个未文档化的条件码</h2>
+<p>虽然 8087 支持三种长度的浮点数，所有计算都用 80 位临时实数完成，最后一步才转成目标精度。<code>ADJUST_PRECISION</code>（地址 299）负责这一步，大多数算术指令都会调用它。</p>
+<p>有意思的是微码和硬件的分工。四种舍入模式对一个有效数字只有两种可能的动作：截断，或者截断后加 1。这个判断被放进<strong>专用逻辑电路</strong>，去检查舍入位、舍入模式、符号。微码因此简化了，硬件变复杂了——这是典型的微码设计取舍。</p>
+<div class="highlight"><pre><span></span><code><span class="p">#</span><span class="mh">0299</span><span class="w">  </span><span class="n">jmp</span><span class="w"> </span><span class="p">#</span><span class="mh">0306</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="k">not</span><span class="w"> </span><span class="n">precision64</span>
+<span class="p">#</span><span class="mh">0300</span><span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="k">not</span><span class="w"> </span><span class="n">round</span><span class="w"> </span><span class="n">up</span><span class="p">,</span><span class="w"> </span><span class="n">update</span><span class="w"> </span><span class="n">CC1</span><span class="w">     </span><span class="err">←</span><span class="w"> </span><span class="err">注意这里</span>
+<span class="p">#</span><span class="mh">0301</span><span class="w">  </span><span class="nl">adder:</span><span class="w"> </span><span class="nl">sumreg:</span><span class="n">frac</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mh">0</span><span class="w"> </span><span class="n">cin</span><span class="o">=</span><span class="mh">1</span><span class="w">           </span><span class="err">进位加</span><span class="w"> </span><span class="mh">1</span><span class="w"> </span><span class="err">实现向上舍入</span>
+<span class="p">#</span><span class="mh">0302</span><span class="w">  </span><span class="k">return</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="k">not</span><span class="w"> </span><span class="n">sumreg</span><span class="p">[</span><span class="mh">64</span><span class="p">]</span>
+<span class="p">#</span><span class="mh">0303</span><span class="w">  </span><span class="n">Inf</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="nl">sumreg:</span><span class="n">frac</span><span class="p">,</span><span class="n">sign</span><span class="w">                </span><span class="err">溢出则返回</span><span class="w"> </span><span class="n">infinity</span>
+</code></pre></div>
+
+<p>看 <code>#0300</code> 那条。它是个带条件的返回，同时还<strong>更新 8087 对程序员可见的条件码寄存器 CC1</strong>，标记结果是向上还是向下舍入的。</p>
+<p>这就是 Shirriff 说的"隐藏特性"：8087 有额外电路专门检测这个条件并写进条件码锁存器，但<strong>8087 的文档完全没提这件事，Intel 直到 1987 年的 387SX 才补上文档</strong>。</p>
+<p>一条跳转指令顺手改了对程序员可见的寄存器状态，而且改的是没写进手册的状态——这种发现只能靠逐条读微码，从行为反推设计意图。</p>
+<h2>为什么一条指令会变成 140 条</h2>
+<p>把 FSCALE 的全部复杂度摊开看，它处理的不是"加个指数"，而是：</p>
+<ul>
+<li>参数是 0（缩放 0 得 0，即使缩放因子是 NaN）</li>
+<li>缩放因子是 0（任何数缩放 0 倍不变）</li>
+<li>参数是空栈 → 栈下溢异常</li>
+<li>参数是 NaN / infinity / denorm → 走 SPECIAL_TMPS</li>
+<li>两个 NaN 比大小</li>
+<li>缩放量是负数 → 走减法路径（<code>#0777: adder: tmpA:exp - Breg cin=1</code>）</li>
+<li>结果溢出 → 是返回 infinity 还是最大浮点数，取决于四种舍入模式</li>
+<li>结果下溢 → 是返回 denorm 还是 ±0</li>
+<li>infinity 模式是仿射还是投影（决定 infinity 带不带符号）</li>
+<li>中断被屏蔽还是未屏蔽——未屏蔽时要给中断处理器一个能放进指数域的、加上/减去 <code>0x6000</code> 偏移的指数</li>
+</ul>
+<p>再加上非规格化数的舍入、精度调整、CC1 更新。这些特性两两组合，就膨胀成了 140 条微指令和三层调用。</p>
+<p>William Kahan 主导的这套设计目标是数学上尽可能精确，代价就是复杂度。它最后变成了 IEEE 754 的基础，终结了各家浮点格式互不兼容的乱局。从 FSCALE 的微码里能看到这个目标的真实成本——<strong>每一条为正确性加上的规则，都要在微码里展开成显式的分支和子程序</strong>。</p>
+<p>这也解释了现代 CPU 为什么不会这么干。今天的浮点单元是流水线化的硬件，不是跑 rom 里的微码，特殊情况多走几个周期的惩罚靠深度流水和推测执行摊平。8087 那 1648 条微指令放在 1970 年代末，是"用有限晶体管换最大正确性"的可行解。</p>
+<h2>一点看法</h2>
+<p>这类微码逆向文章的价值不在于 8087 本身——那块芯片已经四十多年了。有价值的是一套方法论：把芯片开盖、拍高分辨率图、读 ROM、把微指令逐条翻译成可读的控制流，最后从代码模式反推出设计决策和未文档化行为。</p>
+<p>Shirriff 那个 <code>xchg tmp</code> 翻转触发器的小发现、CC1 未文档化的条件码更新，都是这么挖出来的。做固件逆向、bootrom 分析、或者任何"只有二进制没有源码"的场景，走的是同一条路：先建立指令/微指令的语义表，再让控制流自己暴露设计者的取舍。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SCTPhantom：一个潜伏18年的Linux内核SCTP漏洞，从UAF到容器逃逸的完整拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>SCTPhantom：一个潜伏18年的Linux内核SCTP漏洞，从UAF到容器逃逸的完整拆解</h1>
+<time>2026-08-10</time>
+<ul>
+<li>Linux内核</li>
+<li>漏洞分析</li>
+<li>SCTP</li>
+<li>UAF</li>
+<li>容器安全</li>
+<li>提权</li>
+</ul>
+<hr />
+<p>18年。Linux 2.6.25，2007年12月，commit <code>42e30bf3463c</code>。那个时候 iPhone 刚发布半年，Android 还没面世，内核社区往 SCTP 的 ASCONF 实现里加了一段 wildcard 处理逻辑。谁也没想到这段代码会在 2026 年被一台 AI 驱动的漏洞挖掘管线揪出来——CVE-2026-64564，CVSS 4.0 评分 8.5，本地提权 + 容器逃逸，影响从 5.14 到 7.2-rc2 的主流内核。</p>
+<p>发现方是腾讯朱雀实验室的 Corvus AI——一套持久化的多智能体内核漏洞研究管线。以下基于他们的完整技术报告，拆解漏洞原理、利用链和修复逻辑。</p>
+<h2>SCTP 与 ASCONF 背景</h2>
+<p>SCTP（Stream Control Transmission Protocol）是 RFC 4960 定义的消息导向传输协议，跟 TCP/UDP 最大的区别是多宿主（multihoming）——一个 association 可以绑定多个 IP 路径。内核用 <code>struct sctp_association</code> 表示 association，用 <code>struct sctp_transport</code> 表示每条路径，transport 挂在 <code>asoc-&gt;peer.transport_addr_list</code> 链表上。另外有两个关键缓存指针：</p>
+<div class="highlight"><pre><span></span><code>peer.primary_path ───→ transport A
+peer.active_path  ───→ transport A
+</code></pre></div>
+
+<p>这两个指针预期始终指向 association 拥有的活跃 transport。</p>
+<p>RFC 5061 给 SCTP 加了动态地址重配置（ASCONF），允许运行时增删路径、切换主路径。ASCONF chunk 结构是：一个 Address Parameter + 若干操作参数（ADD-IP、DEL-IP、SET-PRIMARY 等），按消息顺序处理。</p>
+<p>问题就出在这个顺序处理上。</p>
+<h2>身份不匹配：一个 DEL-IP 用了两个不同的"我是谁"</h2>
+<p>触发条件很精妙。攻击者构造一个 ASCONF chunk：</p>
+<div class="highlight"><pre><span></span><code>[ Address Parameter = L ]   ← 用来查找 transport
+[ DEL-IP L            ]   ← 验证删除权限时看的是 IPv4 包源地址 S
+[ DEL-IP 0.0.0.0      ]   ← wildcard，保留当前 transport 指针
+</code></pre></div>
+
+<p>如果你让 IPv4 包源地址 S ≠ Address Parameter L，DEL-IP L 的权限检查会通过（内核用 S 验证"你有权删除这条路径"），于是 <code>transport(L)</code> 被从 association 中移除并释放。随后 wildcard DEL-IP 把刚释放的 transport 指针保留为 "操作对象"。</p>
+<p>结果：<code>peer.primary_path</code> 和 <code>peer.active_path</code> 指向一个已经 RCU 释放的 <code>sctp_transport</code>。后续任何通过这两个指针访问的 socket 操作（比如 <code>getsockopt(SCTP_STATUS)</code>）都会触发 use-after-free。</p>
+<p>上游修复只有三行：</p>
+<div class="highlight"><pre><span></span><code><span class="n">peer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">sctp_assoc_lookup_paddr</span><span class="p">(</span><span class="n">asoc</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">addr</span><span class="p">);</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">peer</span><span class="p">)</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="n">SCTP_ERROR_DNS_FAILED</span><span class="p">;</span>
+<span class="o">+</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">peer</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">asconf</span><span class="o">-&gt;</span><span class="n">transport</span><span class="p">)</span>
+<span class="o">+</span><span class="w">     </span><span class="k">return</span><span class="w"> </span><span class="n">SCTP_ERROR_REQ_REFUSED</span><span class="p">;</span>
+<span class="n">sctp_assoc_rm_peer</span><span class="p">(</span><span class="n">asoc</span><span class="p">,</span><span class="w"> </span><span class="n">peer</span><span class="p">);</span>
+</code></pre></div>
+
+<p>拒绝删除 ASCONF chunk 自己选中的 transport。简单到让人想问"这难道不是一开始就该写的？"</p>
+<h2>利用链：六步从用户态到 root</h2>
+<p>Corvus AI 构造了一条完整的利用链，不需要 ROP，不需要 shellcode，纯数据导向。</p>
+<p><strong>第一步：稳定触发 UAF。</strong> 不是随便删一个 transport 就能用。如果删的是 ACTIVE primary，association 的定时器和引用计数会阻止 transport 真正释放。如果删的是 UNCONFIRMED secondary，transport 是释放了，但后续协议处理会销毁整个 association。甜点区是：一个 confirmed ACTIVE secondary——先通过 heartbeat 把它升到 ACTIVE，关掉所有路径的 heartbeat，再注入恶意 ASCONF。稳定触发后，把 ASCONF 包的源地址黑洞掉，防止 ASCONF-ACK 分配新 transport 抢占释放的 slot。</p>
+<p><strong>第二步：pg_vec 泄漏内核地址。</strong> <code>sctp_transport</code> 占 kmalloc-1024。用 TPACKET V1 发送环（128 block）分配一个 1024 字节的 pg_vec 数组，让它回收 UAF transport 的内存槽。此时 <code>getsockopt(SCTP_STATUS)</code> 把 pg_vec 里的页指针当成 transport 字段解读，<code>srtt</code> 和 <code>cwnd</code> 字段恰好拼出一个 64 位内核 direct-map 地址。同一个物理页在用户态有映射，在内核态也有地址——后续所有伪造对象都放在这个页里，通过泄漏的 direct-map 地址引用。</p>
+<p><strong>第三步：4 字节任意内核读。</strong> <code>SCTP_STATUS</code> 返回的 <code>assoc_id</code> 来自 <code>sctp_assoc2id(transport-&gt;asoc)</code>。控制 <code>transport-&gt;asoc</code> 指向目标地址减去 <code>offsetof(sctp_association, assoc_id)</code>，就能读出目标地址的 4 字节。</p>
+<p><strong>第四步：绕过 KASLR。</strong> 通过第三步读 CPU entry area 里 IDT 的 gate 0，重建 <code>asm_exc_divide_error</code> 的运行时地址，算出 KASLR slide。UMIP 阻止用户态 <code>sidt</code>，但内核读不受影响。</p>
+<p><strong>第五步：commit_creds()。</strong> 第二个 vulnerable association 用于安装完全受控的 transport 对象。msg_msg 分配走 <code>kmalloc-cg-1024</code>（GFP_KERNEL_ACCOUNT），SCTP transport 走 <code>kmalloc-1024</code>，不冲突。持久化的 SCTP authentication-key 分配在正确的 slab 里放入受控数据。构造的假对象图：</p>
+<div class="highlight"><pre><span></span><code><span class="n">stale</span><span class="w"> </span><span class="n">active_path</span>
+<span class="w">    </span><span class="err">│</span>
+<span class="w">    </span><span class="err">▼</span>
+<span class="p">[</span><span class="w"> </span><span class="n">reclaimed</span><span class="w"> </span><span class="n">transport</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">embedded</span><span class="w"> </span><span class="n">packet</span><span class="w"> </span><span class="p">]</span>
+<span class="w">    </span><span class="err">├──</span><span class="w"> </span><span class="n">packet</span><span class="o">-&gt;</span><span class="n">transport</span><span class="w"> </span><span class="err">──────→</span><span class="w"> </span><span class="p">[</span><span class="w"> </span><span class="n">fake</span><span class="w"> </span><span class="n">transport</span><span class="w"> </span><span class="p">]</span>
+<span class="w">    </span><span class="err">├──</span><span class="w"> </span><span class="n">asoc</span><span class="w"> </span><span class="err">────────────────────→</span><span class="w"> </span><span class="p">[</span><span class="w"> </span><span class="n">fake</span><span class="w"> </span><span class="n">association</span><span class="w"> </span><span class="p">]</span>
+<span class="w">    </span><span class="err">│</span><span class="w">                                   </span><span class="err">├──</span><span class="w"> </span><span class="n">base</span><span class="p">.</span><span class="n">sk</span><span class="w"> </span><span class="err">──→</span><span class="w"> </span><span class="p">[</span><span class="w"> </span><span class="n">fake</span><span class="w"> </span><span class="n">socket</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">cred</span><span class="w"> </span><span class="p">]</span>
+<span class="w">    </span><span class="err">│</span><span class="w">                                   </span><span class="err">└──</span><span class="w"> </span><span class="n">af_specific</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="p">[</span><span class="w"> </span><span class="n">fake</span><span class="w"> </span><span class="n">ops</span><span class="w"> </span><span class="p">]</span>
+<span class="w">    </span><span class="err">│</span><span class="w">                                           </span><span class="err">├──</span><span class="w"> </span><span class="n">get_dst</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">正常函数</span>
+<span class="w">    </span><span class="err">│</span><span class="w">                                           </span><span class="err">└──</span><span class="w"> </span><span class="n">get_saddr</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="n">commit_creds</span>
+<span class="w">    </span><span class="err">└──</span><span class="w"> </span><span class="n">dst</span><span class="w"> </span><span class="err">──────────────────────→</span><span class="w"> </span><span class="nb">NULL</span>
+</code></pre></div>
+
+<p>触发路径：<code>setsockopt(SO_LINGER) → close() → SCTP ABORT 生成 → 输出队列刷新 → sctp_transport_route() → af_specific-&gt;get_saddr(fake_sk) → commit_creds(controlled_cred)</code>。</p>
+<p>第六步验证：读 <code>/etc/shadow</code>、在 <code>/root</code> 下创建文件，确认全局 root。</p>
+<h2>容器逃逸：6/8 成功率，不需要特权</h2>
+<p>之前 PoC 需要 <code>net.sctp.addip_enable</code> 和 <code>net.sctp.addip_noauth_enable</code> 两个 sysctl，看似需要 <code>CAP_NET_ADMIN</code>。Corvus AI 后来发现 <code>SCTP_ASCONF_SUPPORTED</code> 和 <code>SCTP_AUTH_SUPPORTED</code> 可以在 socket 级别启用，带合法 AUTH chunk 的触发包就能工作。容器不需要 <code>CAP_NET_ADMIN</code>、不需要 <code>CAP_SYS_ADMIN</code>，默认 seccomp 策略下就能跑。</p>
+<p>容器逃逸的最后一步：<code>commit_creds</code> 回调替换为 <code>call_usermodehelper_exec()</code>，在初始命名空间里执行宿主机 root 操作。实测 8 次成功 6 次，失败的两次停在指针遍历不命中，没 panic。</p>
+<h2>修复和时间线</h2>
+<table>
+<thead>
+<tr>
+<th>时间</th>
+<th>事件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2007-12 / 2.6.25</td>
+<td>引入漏洞的 wildcard 逻辑合入</td>
+</tr>
+<tr>
+<td>2026-07-12</td>
+<td>Corvus AI 从软锁死推进到 post-RCU crash</td>
+</tr>
+<tr>
+<td>2026-07-12</td>
+<td>私密披露，附带 PoC 和补丁</td>
+</tr>
+<tr>
+<td>2026-07-15</td>
+<td>首个稳定的全局 root 利用链完成</td>
+</tr>
+<tr>
+<td>2026-07-15–23</td>
+<td>在 5.14/6.6/6.8/6.12 目标上验证</td>
+</tr>
+<tr>
+<td>2026-07-24</td>
+<td>修复进入 Linux networking tree</td>
+</tr>
+<tr>
+<td>2026-07-27</td>
+<td>容器逃逸验证通过</td>
+</tr>
+<tr>
+<td>2026-08-04</td>
+<td>CVE-2026-64564 公告</td>
+</tr>
+</tbody>
+</table>
+<p>修复已在 6.6.148、6.12.101、6.18.42、7.1.6 等稳定分支落地。主线 commit <code>9b2854f86f0b</code>。</p>
+<h2>一个内核开发者的视角</h2>
+<p>这个漏洞让我想了几个问题。</p>
+<p>第一，<strong>SCTP 本身的使用面有多广？</strong> 说实在的，大部分 Linux 服务器不会主动用 SCTP，但内核默认编译了 <code>sctp.ko</code>，容器环境里 <code>modprobe</code> 就可能加载。如果你跑的是容器平台（K8s node 上有 tenant 容器），攻击者不需要你"用"SCTP——他只需要能加载模块。</p>
+<p>第二，<strong>18 年的漏洞说明什么？</strong> 不是什么"内核代码质量差"——SCTP 的 ASCONF 实现其实写得挺规矩。问题在于协议状态机的边界条件复杂到人类审码很难穷举，而这次是 AI 驱动的多智能体管线把边界条件探索变成可重复的工程流程。Corvus AI 不是找了一个 bug，是建了一条流水线。</p>
+<p>第三，<strong>利用链的设计值得学。</strong> 没有 ROP、没有 shellcode，全凭数据导向——用 pg_vec 回收、direct-map 泄漏、IDT 读 KASLR、authentication-key 写受控对象。每一步都有验证和回退。这条链的工程化程度不亚于漏洞本身。</p>
+<p>如果你维护内核或容器平台：检查 <code>net.sctp.addip_enable</code> 和相关 sysctl，升级到对应稳定分支。如果你是做漏洞研究：Corvus AI 的公开报告本身就是一份很好的方法论参考。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<hr />
+<p><em>参考：Tencent Zhuque Lab — <a href="https://matrix.tencent.com/en/2026/08/06/sctphantom-CVE-2026-64564">SCTPhantom: An 18-Year-Old SCTP ASCONF Transport Use-After-Free</a></em></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

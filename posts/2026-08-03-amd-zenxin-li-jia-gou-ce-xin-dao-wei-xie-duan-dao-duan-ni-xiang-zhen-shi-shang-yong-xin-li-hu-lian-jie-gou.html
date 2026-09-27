@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AMD Zen 芯粒架构侧信道威胁：端到端逆向真实商用芯粒互连结构 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>AMD Zen 芯粒架构侧信道威胁：端到端逆向真实商用芯粒互连结构</h1>
+<time>2026-08-03</time>
+<ul>
+<li>技术
+Slug: amd-zen芯粒架构侧信道威胁-端到端逆向真实商用芯粒互连结构</li>
+</ul>
+<hr />
+<h2>一、概述</h2>
+<h3>1.1 AMD Zen 芯粒架构背景</h3>
+<p>自 Zen 2 架构起，AMD EPYC 与 Ryzen 处理器全面转向芯粒（Chiplet）设计：将原本集成在单一 monolithic die 上的计算核心与 I/O 子系统拆分为多个独立裸片（die），通过片上互连总线聚合。一颗典型的高端 EPYC 处理器由若干个 Core Complex Die（CCD）与一个 I/O Die（IOD）组成，CCD 之间不直接相连，所有跨芯粒通信都要经由 IOD 中的 Infinity Fabric 中转。</p>
+<p>芯粒设计的工程价值显而易见：用成熟制程生产 IOD、用先进制程生产 CCD，可以大幅提升良率与产能弹性；同时通过增减 CCD 数量即可在同一封装内扩展核心规模，覆盖从桌面到数据中心的全产品线。然而从安全视角看，这种"计算与 I/O 分离、多裸片经统一 fabric 互联"的拓扑，把原本在单片内由高速私有总线和共享末级缓存（LLC）承担的通信，转移到了一个可被软件间接观测的互连结构上，从而打开了一类全新的侧信道攻击面。</p>
+<h3>1.2 侧信道攻击的新攻击面</h3>
+<p>传统 x86 侧信道研究主要聚焦在单 die 内的微架构资源竞争：同一核心的超线程共享 L1/执行单元，同一 CCX 内的核心共享 L3，攻击者通过 Prime+Probe、Flush+Reload、Spectre/Meltdown 等手段观测缓存命中/缺失时序来推断受害者行为。在 monolithic 架构下，这些攻击的"信号"主要来自缓存层级。</p>
+<p>芯粒架构引入了位于缓存层级之上、但位于物理封装之内的<strong>互连结构时序</strong>这一新信号源：</p>
+<ul>
+<li><strong>跨 CCX 的 L3 边界</strong>：L3 仅在 CCX/CCD 内共享，跨 CCX 访问需要走 Infinity Fabric，命中本地 L3 与命中远端 CCD 的 L3 之间存在可观的周期级延迟差。</li>
+<li><strong>跨 CCD 的 fabric 仲裁时序</strong>：多个 CCD 共享 IOD 的 fabric 端口与内存控制器，fabric 的仲裁、队列与功耗状态转换会引入与负载相关的时序扰动。</li>
+<li><strong>NUMA 与一致性流量</strong>：跨 NUMA 节点（跨 CCD）的一致性消息（如 MOESI 的 probe/transfer）本身就是可被观测的时序事件。</li>
+</ul>
+<p>这意味着即便攻击者与受害者不共享任何缓存行、甚至不共享 L3，只要它们位于同一封装内的不同芯粒上，互连结构本身就会把受害者的访存模式"调制"到可测量的时序信号上。</p>
+<h3>1.3 研究意义</h3>
+<p>对芯粒互连结构进行端到端逆向，其意义有三：其一，帮助架构师在下一代设计中量化互连侧信道的信噪比，指导 fabric 仲裁策略与缓存分区的取舍；其二，帮助云厂商与机密计算（SEV/SEV-ES/SEV-SNP）部署者评估跨租户、跨虚拟机的现实泄露风险；其三，为防御方提供可检测的微架构指纹（如异常的跨 NUMA cache miss 模式），支撑侧信道攻击的运行时检测。本文余下部分将沿着"架构解析 → 侧信道原理 → 端到端逆向 → 风险与防御"的主线展开。</p>
+<h2>二、AMD Zen 芯粒架构解析</h2>
+<h3>2.1 芯粒设计哲学</h3>
+<p>从单芯片到芯粒的演进，本质上是把"面积/良率/可扩展性"的权衡从晶体管层级上移到裸片层级。monolithic 设计在核心数超过一定规模后，单 die 面积急剧膨胀，良率随面积呈指数下降；芯粒设计则将大 die 切成多个小 die，每个小 die 面积可控、良率高，且可用相同 CCD 复用到不同产品线。代价是必须引入一条高带宽、低延迟、且具备缓存一致性支持的片上互连，这就是 Infinity Fabric 的使命。</p>
+<p>芯粒互连的技术挑战集中在三点：<strong>带宽</strong>（多 CCD 并发访存对 fabric 与内存控制器的压力）、<strong>延迟</strong>（跨 die 跳数增加带来的往返时延）、<strong>一致性</strong>（跨 CCD 的缓存行状态必须由 fabric 维护全局一致）。这三点恰恰也是侧信道信号的来源——带宽争用产生排队时序，延迟差异暴露拓扑，一致性流量暴露访存地址。</p>
+<h3>2.2 CCD/CCX/IOD 架构</h3>
+<p>AMD Zen 系列的芯粒划分如下（以 Zen 2/Zen 3 EPYC 为代表，不同代际细节略有差异）：</p>
+<ul>
+<li><strong>CCX（Core Complex）</strong>：核心复用的最小单元。Zen 2 中一个 CCX 含 4 个 Zen 核心共享 16MB L3；Zen 3 中一个 CCX 含 8 个核心共享 32MB L3（将 L3 切片统一为单一共享域，这是 Zen 3 的关键改动）。L3 是 CCX 内的共享资源，也是传统 Flush+Reload/Prime+Probe 的主战场。</li>
+<li><strong>CCD（Core Complex Die）</strong>：一个物理裸片。Zen 2 中一个 CCD 含 1 个 CCX；Zen 3 中一个 CCD 含 1 个 CCX（8 核）。CCD 是封装内的可复用单元，多颗 CCD 通过 IOD 互联。</li>
+<li><strong>IOD（I/O Die）</strong>：承载内存控制器、PCIe root complex、Infinity Fabric 的汇聚节点、SMN（System Management Network）以及安全处理器（PSP）。所有跨 CCD 通信、所有 DDR 访问、所有外部 I/O 都经过 IOD。</li>
+</ul>
+<p>其结构关系如下图所示：</p>
+<div class="highlight"><pre><span></span><code><span class="c">                        </span><span class="nb">+---------------------------------------------------+</span>
+<span class="c">                        |                    Package                        |</span>
+<span class="c">   </span><span class="nb">+----------------+</span><span class="c">   |   </span><span class="nb">+-------------+</span><span class="c">        </span><span class="nb">+-------------+</span><span class="c">         |</span>
+<span class="c">   |   CCD 0        |   |   |   CCD 1     |   </span><span class="nt">...</span><span class="c">  |   CCD N     |         |</span>
+<span class="c">   | </span><span class="nb">+------------+</span><span class="c"> |   |   | </span><span class="nb">+---------+</span><span class="c"> |        | </span><span class="nb">+---------+</span><span class="c"> |         |</span>
+<span class="c">   | |   CCX      | |   |   | |  CCX    | |        | |  CCX    | |         |</span>
+<span class="c">   | | C0 C1 C2 C3| |   |   | |C0</span><span class="nt">..</span><span class="c">C7   | |        | |C0</span><span class="nt">..</span><span class="c">C7   | |         |</span>
+<span class="c">   | |  \  |  /   | |   |   |  \  |  /   |        |  \  |  /   |         |</span>
+<span class="c">   | |   L3 (shared)   |   |   |  L3 (shared)  |    |  L3 (shared)  |     |</span>
+<span class="c">   | </span><span class="nb">+------------+</span><span class="c"> |   |   | </span><span class="nb">+---------+</span><span class="c"> |        | </span><span class="nb">+---------+</span><span class="c"> |         |</span>
+<span class="c">   |        |       |   |   |      |      |        |      |      |         |</span>
+<span class="c">   </span><span class="nb">+--------</span><span class="c">|</span><span class="nb">-------+</span><span class="c">   |   </span><span class="nb">+------</span><span class="c">|</span><span class="nb">------+</span><span class="c">        </span><span class="nb">+------</span><span class="c">|</span><span class="nb">------+</span><span class="c">         |</span>
+<span class="c">            |  IF Link  |          |  IF Link             |  IF Link       |</span>
+<span class="c">            v           |          v                      v                |</span>
+<span class="c">   </span><span class="nb">+----------------------------------------------------------------+</span><span class="c">      |</span>
+<span class="c">   |                          I/O Die (IOD)                          |      |</span>
+<span class="c">   |  </span><span class="nb">+------------------+</span><span class="c">   </span><span class="nb">+-----------------+</span><span class="c">  </span><span class="nb">+---------------+</span><span class="c">  |      |</span>
+<span class="c">   |  | Infinity Fabric  |   | Memory Ctrl x8  |  | PCIe RC / xGMI|  |      |</span>
+<span class="c">   |  | (Scalable Data   |   | (DDR channels)  |  | (external IO) |  |      |</span>
+<span class="c">   |  |  Fabric </span><span class="nb">+</span><span class="c"> SCF)   |   </span><span class="nb">+-----------------+</span><span class="c">  </span><span class="nb">+---------------+</span><span class="c">  |      |</span>
+<span class="c">   |  </span><span class="nb">+------------------+</span><span class="c">                                           |      |</span>
+<span class="c">   |  </span><span class="nb">+------------------+</span><span class="c">   </span><span class="nb">+-----------------+</span><span class="c">                     |      |</span>
+<span class="c">   |  | SMN (System Mgmt |   | PSP (Platform   |                     |      |</span>
+<span class="c">   |  |  Network)        |   |  Security Proc) |                     |      |</span>
+<span class="c">   |  </span><span class="nb">+------------------+</span><span class="c">   </span><span class="nb">+-----------------+</span><span class="c">                     |      |</span>
+<span class="c">   </span><span class="nb">+----------------------------------------------------------------+</span><span class="c">      |</span>
+<span class="c">                        |                                                   |</span>
+<span class="c">                        </span><span class="nb">+---------------------------------------------------+</span>
+</code></pre></div>
+
+<p>关键观察：<strong>L3 的共享域止于 CCX/CCD</strong>。一旦访存请求跨出 CCD，它就必须穿越 Infinity Fabric 抵达 IOD，再由 IOD 路由到目标 CCD 或 DDR。这条穿越路径的延迟，正是跨芯粒时序侧信道的物理基础。</p>
+<h3>2.3 Infinity Fabric 互连</h3>
+<p>Infinity Fabric 在 AMD 文档中由两部分构成：<strong>Scalable Data Fabric（SDF）</strong>负责数据面，承载所有数据搬移；<strong>Scalable Control Fabric（SCF）</strong>负责控制面，承载中断、电源管理、一致性消息等。两者逻辑分离但物理共享链路。</p>
+<ul>
+<li><strong>协议栈</strong>：IFOP（Infinity Fabric On-Package）用于封装内 CCD-IOD 互连；IFIS（Infinity Fabric Inter-Socket）用于多 socket 间的 xGMI 链路。一致性由基于 MOESI 扩展协议的目录/探针机制维护，目录驻留在 IOD。</li>
+<li><strong>互连拓扑</strong>：CCD 与 IOD 之间为星型拓扑，IOD 是中心；多 CCD 间通信为两跳（CCD0 → IOD → CCD1），而非直连。</li>
+<li><strong>带宽与延迟特性</strong>：封装内 IFOP 链路典型双向带宽可达数百 GB/s 级别，但跨 CCD 往返延迟显著高于本地 L3 命中。实测中，本地 L3 命中约 40–50 周期，跨 CCD 远端 L3 命中可达 100+ 周期，DDR 访问则更高。这种量级差异在 <code>rdtsc</code>/APIC 定时器分辨率下完全可分辨。</li>
+</ul>
+<h2>三、侧信道攻击原理</h2>
+<h3>3.1 跨芯粒时序侧信道</h3>
+<p>跨芯粒时序侧信道建立在三个可观测的微架构现象之上。</p>
+<p><strong>（1）不同 CCX 间缓存共享机制。</strong> L3 仅在 CCX 内共享。当线程 A（CCX0）与线程 B（CCX1）访问同一物理地址时，该缓存行在两个 CCX 的 L3 中各有一份副本，状态由一致性协议维护。若 A 先写入，B 再读，B 的读请求会触发一次跨 CCD 的一致性探针/传输，延迟远高于 B 读本地 L3。</p>
+<p><strong>（2）缓存一致性协议中的时序差异。</strong> AMD 采用扩展 MOESI 协议（Modified/Owned/Exclusive/Shared/Invalid，并附加 AMD 专有状态）。当一行处于 M 态且位于远端 CCD 时，本地读必须等待远端"写回+传输"，这段等待时间是地址相关、状态相关的——攻击者可据此推断受害者是否曾修改某行。</p>
+<p><strong>（3）跨 CCD 通信延迟的可观测性。</strong> 由于 IOD 是所有跨 CCD 流量的必经瓶颈，受害者的访存强度会改变 fabric 队列占用，进而改变攻击者探测请求的往返延迟。这是一种"互连级 Prime+Probe"：攻击者不需要与受害者共享缓存，只需持续探测跨 CCD 的探测请求延迟，即可感知受害者的 fabric 负载模式。</p>
+<h3>3.2 SMN 寄存器逆向</h3>
+<p><strong>System Management Network（SMN）</strong> 是 AMD 平台内部用于访问各类管理/配置寄存器的统一编址空间。它不同于 PCI 配置空间，也不同于 MSR，而是通过 IOD/Data Fabric 暴露的一个间接访问窗口映射进来。SMN 空间内包含 Data Fabric（DF）寄存器、Northbridge 寄存器、内存控制器寄存器、PSP 相关寄存器等，是逆向芯粒互连拓扑与一致性参数的关键入口。</p>
+<p>SMN 的访问机制是：向 PCI 配置空间中的"SMN 地址寄存器"写入目标 SMN 地址，再从"SMN 数据寄存器"读出对应数据。在 AMD Zen 平台上，这两个寄存器位于 Data Fabric 设备（典型为 bus 0, device 0, function 0，即主机桥/DF 配置空间）的偏移 0x60 与 0x64：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// SMN 寄存器访问示例</span>
+<span class="c1">// 通过 PCI 配置空间间接访问 SMN 空间</span>
+<span class="c1">// 地址寄存器: DF 配置空间偏移 0x60</span>
+<span class="c1">// 数据寄存器: DF 配置空间偏移 0x64</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdint.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;sys/io.h&gt;</span>
+
+<span class="c1">// 假设 pci_{read,write}_config32 已封装底层 CF8/CFC 端口或 sysfs 访问</span>
+<span class="kt">void</span><span class="w"> </span><span class="nf">access_smn</span><span class="p">(</span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">address</span><span class="p">,</span><span class="w"> </span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">value</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 通过 PCI 配置空间访问 SMN</span>
+<span class="w">    </span><span class="n">pci_write_config32</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mh">0x60</span><span class="p">,</span><span class="w"> </span><span class="n">address</span><span class="p">);</span><span class="w">  </span><span class="c1">// SMN 地址寄存器</span>
+<span class="w">    </span><span class="n">pci_write_config32</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mh">0x64</span><span class="p">,</span><span class="w"> </span><span class="n">value</span><span class="p">);</span><span class="w">    </span><span class="c1">// SMN 数据寄存器</span>
+<span class="p">}</span>
+
+<span class="c1">// 读取 SMN 寄存器</span>
+<span class="kt">uint32_t</span><span class="w"> </span><span class="nf">read_smn</span><span class="p">(</span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">address</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">pci_write_config32</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mh">0x60</span><span class="p">,</span><span class="w"> </span><span class="n">address</span><span class="p">);</span><span class="w">  </span><span class="c1">// 锁定目标 SMN 地址</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">pci_read_config32</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mh">0x64</span><span class="p">);</span><span class="w">     </span><span class="c1">// 读回 SMN 数据</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>通过遍历 SMN 空间中 Data Fabric 的 DF::FabricRptCtrl、DF::SysFabricCntl、各 CCD/CCX 的 Component ID 与拓扑映射寄存器（具体偏移见 AMD PPR 中 SMN 地址表），研究者可以重建出"哪个 SMN ID 对应哪个 CCD、fabric 端口如何路由"的完整拓扑图。这是端到端逆向的第一手数据来源。</p>
+<p>需要强调：在多数生产 BIOS 中，对 SMN 的直接 PCI 配置写访问需要 root/CPL0 权限，且部分敏感 SMN 区域会触发 GNA/PSP 的访问过滤。但作为本地提权后的"深度侦察"阶段，SMN 逆向是完全可行的。</p>
+<h3>3.3 逆向方法论</h3>
+<p>除 SMN 外，端到端逆向还依赖以下三类无特权或低特权探测手段，它们可在用户态（CPL3）完成，组合起来足以重建芯粒互连结构：</p>
+<ul>
+<li><strong>MSR（Model Specific Register）探测</strong>：读取 <code>MSR_F15H_CU</code> 系列、<code>MSR_AMD64_*</code> 中的拓扑与功耗状态寄存器，可获知当前逻辑核所属的 CCX/CCD 编号、APIC ID 到芯粒的映射。配合 <code>CPUID</code> 的 leaf 0x1E/0x8000001E 可解析出 CoreId/ComputeUnitId/DieId。</li>
+<li><strong>性能计数器分析</strong>：编程 PMC（Performance Monitoring Counter），选择跨芯粒相关事件，如 <code>L3 miss</code>、<code>L3 request cross-CCX</code>、<code>Data Fabric request</code>、<code>remote cache hit</code>、<code>DRAM access</code> 等。通过对比本地命中与远端命中的计数差异，可量化每个地址访问的"穿越代价"。</li>
+<li><strong>APIC 定时器 / TSC 测量</strong>：以 <code>rdtscp</code>/<code>rdpmc</code> 配合 <code>cpuid</code> 序列化指令构建高分辨率时序探针。APIC 定时器可独立于 TSC 提供另一时间基准，用于交叉校验、滤除 TSC 抖动。测量"flush 后 reload 同一地址"在不同 CCX 上的延迟分布，即可定位 CCX 边界。</li>
+</ul>
+<p>逆向工程流程如下图所示：</p>
+<div class="highlight"><pre><span></span><code><span class="c">   </span><span class="nb">+-------------------+</span><span class="c">     </span><span class="nb">+--------------------+</span><span class="c">     </span><span class="nb">+-------------------+</span>
+<span class="c">   | 1</span><span class="nt">.</span><span class="c"> CPUID/MSR 解析  | </span><span class="nb">--</span><span class="nv">&gt;</span><span class="c"> | 2</span><span class="nt">.</span><span class="c"> SMN 空间扫描    | </span><span class="nb">--</span><span class="nv">&gt;</span><span class="c"> | 3</span><span class="nt">.</span><span class="c"> 拓扑重建       |</span>
+<span class="c">   | 获取核/CCX/CCD ID  |     | DF 寄存器/端口映射 |     | 芯粒互连图        |</span>
+<span class="c">   </span><span class="nb">+-------------------+</span><span class="c">     </span><span class="nb">+--------------------+</span><span class="c">     </span><span class="nb">+-------------------+</span>
+<span class="c">                                                          |</span>
+<span class="c">                                                          v</span>
+<span class="c">   </span><span class="nb">+-------------------+</span><span class="c">     </span><span class="nb">+--------------------+</span><span class="c">     </span><span class="nb">+-------------------+</span>
+<span class="c">   | 6</span><span class="nt">.</span><span class="c"> 构造侧信道 PoC | </span><span class="nv">&lt;</span><span class="nb">--</span><span class="c"> | 5</span><span class="nt">.</span><span class="c"> PMC 事件校验    | </span><span class="nv">&lt;</span><span class="nb">--</span><span class="c"> | 4</span><span class="nt">.</span><span class="c"> 延迟矩阵测量   |</span>
+<span class="c">   | Flush</span><span class="nb">+</span><span class="c">Reload/P</span><span class="nb">+</span><span class="c">P  |     | 远端命中计数分布   |     | 跨 CCX/CCD 时序   |</span>
+<span class="c">   </span><span class="nb">+-------------------+</span><span class="c">     </span><span class="nb">+--------------------+</span><span class="c">     </span><span class="nb">+-------------------+</span>
+</code></pre></div>
+
+<h2>四、端到端逆向分析</h2>
+<h3>4.1 第一步：识别芯粒互连拓扑</h3>
+<p>第一步目标是回答"哪些逻辑核属于同一 CCX、哪些属于同一 CCD、跨 CCD 边界在哪里"。</p>
+<p><strong>通过延迟测量推断 CCX/CCD 边界。</strong> 在所有核上跑一个固定探测内核：线程 0 在核 A 上 flush 并 reload 一个共享页内的地址，线程 1 在核 B 上预先访问同一地址；测量 reload 延迟。若 A、B 同 CCX，reload 走本地 L3，延迟低（约 40–50 周期）；若 A、B 跨 CCX 但同 CCD（Zen 2 下跨 CCX 即跨 CCD），延迟升高；若跨 CCD，延迟进一步升高并伴随 fabric 抖动。对所有核两两组合重复，得到一张 N×N 延迟矩阵，对其做层次聚类即可还原 CCX/CCD 分簇。</p>
+<p><strong>NUMA 节点映射。</strong> 通过 <code>lscpu</code>/SRAT 表可获知 NUMA 拓扑，但 SRAT 给出的是 CCD/内存控制器到 NUMA 节点的映射，并不直接暴露 CCX 边界。将 SRAT 的 NUMA 信息与上一步的延迟矩阵交叉，可校验"跨 NUMA == 跨 CCD"假设是否成立（在典型 EPYC 配置下通常成立）。</p>
+<h3>4.2 第二步：逆向 Infinity Fabric 参数</h3>
+<p>拓扑确定后，第二步聚焦 fabric 的带宽、仲裁与功耗状态参数。</p>
+<p><strong>带宽探测。</strong> 在攻击者线程上发起可控强度的跨 CCD 流量（如持续向远端 CCD 所属 NUMA 节点的内存做流式写），同时用受害者探测核测量一个固定访存的延迟。当攻击者流量逼近 fabric 某条 IFOP 链路的带宽上限时，受害者延迟出现非线性拐点，该拐点对应链路的有效带宽。逐链路重复，可还原每条 CCD-IOD 链路的带宽画像。</p>
+<p><strong>仲裁协议分析。</strong> 通过 PMC 中的 fabric 队列占用与延迟事件，观测多 CCD 并发时 IOD 端口的调度顺序。若发现某些 CCD 的流量被优先服务（静态优先级）或呈现轮转（公平调度），即可推断 IOD fabric 仲裁策略。仲裁策略直接决定侧信道信噪比——公平调度下跨租户串扰更均匀，静态优先级则可能造成跨 CCD 的"快慢道"。</p>
+<p><strong>功耗状态转换时序。</strong> IFOP 链路与内存控制器支持多个电源状态（PC0–PC6 类），空闲降频会产生进入/退出延迟。当受害者周期性访存触发 fabric 在 P-state 间切换时，攻击者可观测到延迟台阶，从而推断受害者的活跃周期。这是低信噪比但跨租户可用的"功耗状态侧信道"。</p>
+<h3>4.3 第三步：构造侧信道攻击</h3>
+<p>在拓扑与 fabric 参数已知后，第三步将上述观测转化为可泄露信息的侧信道原语。</p>
+<p><strong>Flush+Reload 跨 CCX 变体。</strong> 传统 Flush+Reload 要求攻击者与受害者共享同一物理页且共享 L3。在芯粒架构下，即使共享物理页，跨 CCX 的 L3 不共享，因此 flush 后 reload 无法直接命中受害者 CCX 的 L3。变体做法是：攻击者持续 flush 共享页中的"探针行"，受害者访问该行会在自己 CCX 的 L3 中产生副本并改变一致性状态；攻击者随后 reload，reload 请求经 fabric 发出跨 CCX 探针，若受害者刚访问过（行处于远端 M/S 态），fabric 返回需经一致性传输，延迟高于"无人访问"情形。该时序差虽小于同 CCX 命中差，但在统计上可分辨。</p>
+<p><strong>Prime+Probe 跨 CCD 变体。</strong> 攻击者不依赖共享页，而是用一组探针地址"填满"自己 CCX 的某个 L3 组，使受害者跨 CCD 访问产生的 evict 流量影响攻击者探针的命中率。更直接的跨 CCD 变体是放弃 L3 组竞争，转而测量 fabric 级争用：攻击者持续发起跨 CCD 探测流量"占满"fabric 端口带宽，受害者访存因 fabric 拥塞而变慢，攻击者通过自身探测延迟的变化反推受害者访存强度与地址集。这是一种"互连级 Prime+Probe"。</p>
+<p>下面给出跨 CCX 时序测量的概念性 PoC：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 跨 CCX 时序测量 PoC（概念性，省略线程绑定/同步细节）</span>
+<span class="c1">// 需配合 sched_setaffinity 把线程钉到不同 CCX 的核上</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdint.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;stdio.h&gt;</span>
+<span class="cp">#include</span><span class="w"> </span><span class="cpf">&lt;x86intrin.h&gt;</span>
+
+<span class="k">static</span><span class="w"> </span><span class="kr">inline</span><span class="w"> </span><span class="kt">uint64_t</span><span class="w"> </span><span class="nf">rdtsc_serialized</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">unsigned</span><span class="w"> </span><span class="n">aux</span><span class="p">;</span>
+<span class="w">    </span><span class="c1">// cpuid 序列化 + rdtscp，确保时序边界清晰</span>
+<span class="w">    </span><span class="k">asm</span><span class="w"> </span><span class="k">volatile</span><span class="p">(</span><span class="s">&quot;cpuid&quot;</span><span class="w"> </span><span class="o">:::</span><span class="w"> </span><span class="s">&quot;rax&quot;</span><span class="p">,</span><span class="s">&quot;rbx&quot;</span><span class="p">,</span><span class="s">&quot;rcx&quot;</span><span class="p">,</span><span class="s">&quot;rdx&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="k">asm</span><span class="w"> </span><span class="k">volatile</span><span class="p">(</span><span class="s">&quot;rdtscp&quot;</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="s">&quot;=a&quot;</span><span class="p">(</span><span class="n">aux</span><span class="p">),</span><span class="w"> </span><span class="s">&quot;=d&quot;</span><span class="p">(</span><span class="n">aux</span><span class="p">)</span><span class="w"> </span><span class="o">::</span><span class="w"> </span><span class="s">&quot;rcx&quot;</span><span class="p">);</span><span class="w"> </span><span class="c1">// 简化示意</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">__rdtsc</span><span class="p">();</span>
+<span class="p">}</span>
+
+<span class="c1">// 跨 CCX 时序测量 PoC</span>
+<span class="c1">// shared_addr 指向两个线程共享的页内某缓存行</span>
+<span class="kt">void</span><span class="w"> </span><span class="nf">measure_cross_ccx_timing</span><span class="p">(</span><span class="kt">void</span><span class="w"> </span><span class="o">*</span><span class="n">shared_addr</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 线程0在CCX 0上运行</span>
+<span class="w">    </span><span class="c1">// 线程1在CCX 1上运行</span>
+<span class="w">    </span><span class="c1">// 共享同一缓存行</span>
+
+<span class="w">    </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">start</span><span class="p">,</span><span class="w"> </span><span class="n">end</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// 线程1: 访问共享地址</span>
+<span class="w">    </span><span class="n">start</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">rdtsc_serialized</span><span class="p">();</span>
+<span class="w">    </span><span class="k">volatile</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="n">data</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">*</span><span class="p">(</span><span class="k">volatile</span><span class="w"> </span><span class="kt">char</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">shared_addr</span><span class="p">;</span>
+<span class="w">    </span><span class="n">end</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">rdtsc_serialized</span><span class="p">();</span>
+
+<span class="w">    </span><span class="c1">// 如果线程0刚访问过该地址（同CCX），延迟低（本地L3命中）</span>
+<span class="w">    </span><span class="c1">// 如果线程0在不同CCX上访问过，延迟高（跨fabric一致性传输）</span>
+<span class="w">    </span><span class="c1">// 通过时序差异推断对方是否访问了特定地址</span>
+<span class="w">    </span><span class="n">printf</span><span class="p">(</span><span class="s">&quot;Access latency: %lu cycles</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">end</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">start</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="c1">// 完整攻击循环（伪代码框架）</span>
+<span class="c1">// for (trial = 0; trial &lt; N; trial++) {</span>
+<span class="c1">//     attacker_flush(shared_addr);        // clflush 探针行</span>
+<span class="c1">//     sync_barrier();                     // 与受害者时序对齐</span>
+<span class="c1">//     victim_window();                    // 受害者可能访问 shared_addr</span>
+<span class="c1">//     sync_barrier();</span>
+<span class="c1">//     latency = measure_cross_ccx_timing(shared_addr);</span>
+<span class="c1">//     record(latency);                    // 高延迟 -&gt; 受害者访问过</span>
+<span class="c1">// }</span>
+</code></pre></div>
+
+<p>实际部署中需处理三类噪声：TSC 抖动、操作系统调度抢占、SMT 兄弟核干扰。常用对策是大量重复试验取分布、用 <code>isolcpus</code>/<code>chrt</code> 提升优先级、关闭超线程或避开 SMT 兄弟核。统计上，跨 CCX 命中与未命中两类延迟分布的可分性（可用 KL 散度或 AUC 衡量）决定信道容量。</p>
+<h2>五、现实风险评估</h2>
+<h3>5.1 攻击场景</h3>
+<p><strong>跨虚拟机密钥泄露。</strong> 在公有云中，同一物理机上的两个虚拟机可能被调度到不同 CCX/CCD。若它们共享只读页（如共享库 libc、共享驱动页），攻击者 VM 可用跨 CCX Flush+Reload 变体监测受害者 VM 对共享库特定函数的访问时序，进而推断其密码学原语调用模式。已有研究在 RSA、AES、EdDSA 等算法上以此类时序侧信道还原密钥位。</p>
+<p><strong>云环境中的跨租户攻击。</strong> 跨 CCD 的 fabric 级 Prime+Probe 不要求共享页，威胁面更广：只要攻击者与受害者同处一封装，攻击者即可用探测流量"监听"fabric 拥塞，推断受害者的工作负载类型甚至访存地址集。这类攻击对多租户 GPU/CPU 混部、对延迟敏感的金融工作负载尤为危险。</p>
+<p><strong>对 SEV/SEV-SNP 安全飞地的影响。</strong> AMD SEV 系列对虚拟机内存做加密（SEV）、对寄存器做加密保护（SEV-ES）、对内存完整性做反向页表保护（SEV-SNP），其设计目标是抵御恶意 hypervisor。但 SEV 加密的是内存数据，并不加密<strong>微架构时序</strong>。上述跨芯粒时序侧信道在 SEV 加持下依然成立——加密内存的访问仍会经过 fabric 并产生可测时序。因此 SEV-SNP 提供的机密性保证<strong>不覆盖</strong>微架构侧信道，跨租户侧信道仍是 SEV 部署的现实威胁，这也是 AMD 在 SEV-SNP 白皮书中明确指出的残余攻击面。</p>
+<h3>5.2 缓解措施现状</h3>
+<p><strong>AMD 的官方缓解建议。</strong> AMD 在其侧信道缓解指南中将此类跨芯粒时序攻击归入"微架构数据采样/时序"类别，建议对高敏感工作负载采用核心隔离、避免跨租户共享物理核与共享缓存域，并在 SEV-SNP 上启用受限执行模式。</p>
+<p><strong>BIOS/微码更新。</strong> 部分缓解可通过微码与 BIOS 选项实现：关闭跨 CCX 的某些预取器、调整 fabric 仲裁为更激进的公平模式以降低可分辨性、在敏感核上禁用降频以减少功耗状态侧信道。但微码缓解通常以性能损失为代价，且无法根除时序差异这一物理事实。</p>
+<p><strong>操作系统层面的缓解。</strong> 操作系统可通过 NUMA 感知调度把同租户虚拟机约束在同一 CCD/CCX 内、通过 CAT（Cache Allocation Technology）分区 L3、通过核心调度（core scheduling）避免超线程兄弟核跨租户复用。这些是当前最实用的工程缓解，但仍无法阻挡跨 CCD fabric 级攻击。</p>
+<h2>六、检测与防御</h2>
+<h3>6.1 侧信道攻击检测</h3>
+<p><strong>性能计数器异常检测。</strong> 跨芯粒侧信道攻击在 PMC 上有可辨识的指纹：异常高频的 <code>clflush</code>、跨 CCX 远端命中计数飙升、fabric 端口占用率与受害者负载强相关、L3 miss 模式呈周期性窄峰。部署基于 PMC 的运行时监控（如以 eBPF/Perf 采样），对上述指标做统计过程控制，可在攻击进行时触发告警。</p>
+<p><strong>cache miss 模式分析。</strong> 正常应用的 cache miss 在时间-地址维度上呈现平滑分布；侧信道探测往往产生对特定缓存组的密集、周期性 miss。通过对 L3 miss 的事件流做地址组聚类与周期性检测（自相关/FFT），可识别 Prime+Probe 类探测行为。跨 CCD 攻击还会在 fabric 级 PMC 上留下与受害者负载高度相关的互相关峰，这是同 CCX 攻击所没有的特征。</p>
+<h3>6.2 防御建议</h3>
+<p><strong>缓存分区（CAT）。</strong> 对 L3 按 CCX 内的 CLOSID/CBM 做硬分区，使不同安全域占用互不重叠的 L3 路，消除同 CCX 内的 Prime+Probe 信道。注意 CAT 只覆盖 L3，不覆盖 fabric，因此需与下述调度策略联合使用。</p>
+<p><strong>核心调度策略。</strong> 将同一安全域（同一租户/同一密钥域）的所有线程约束在同一 CCD 内，避免跨 CCD 通信，从根本上消除跨芯粒时序差异。对机密计算工作负载，建议独占整个 CCD（CCD 级隔离），而非仅核心级隔离。</p>
+<p><strong>敏感代码隔离执行。</strong> 对密码学等高敏感代码，采用"独占核 + 屏蔽中断 + 禁用 SMT + 钉在同一 CCX"的强化执行环境，并在执行前后清空相关 L3 组与 fabric 探测窗口，缩小可观测窗口。</p>
+<p><strong>架构层面的长期方向。</strong> 在 fabric 设计上引入恒定时间仲裁（constant-time arbitration）、对跨 CCD 一致性传输做时序归一化、在 IOD 中加入侧信道感知的流量整形（traffic shaping），是从根源上压低互连侧信道信噪比的路径。这些需要架构师在性能与安全间做权衡，也是下一代芯粒互连设计值得投入的研究方向。</p>
+<h2>七、免责声明</h2>
+<p>本文所述技术内容仅用于学术研究与防御性安全评估目的，旨在帮助架构工程师、云安全团队与机密计算部署者理解 AMD Zen 芯粒架构下的侧信道攻击面，并据此设计与部署缓解措施。文中所有逆向方法均基于 AMD 公开发布的处理器编程参考（PPR）与学术界已发表的侧信道研究框架，未涉及任何未公开漏洞细节或绕过现有保护机制的利用代码。</p>
+<p>文中代码片段为概念性 PoC，省略了实际利用所需的权限提升、时序同步与噪声处理细节，无法直接用于对真实系统发起攻击，亦不构成对任何特定 AMD 产品漏洞的披露。读者不得将本文内容用于未授权的系统测试、数据窃取或任何违反所在地区法律法规与目标系统授权范围的行为。因不当使用本文信息所造成的任何后果，作者不承担任何责任。AMD 及其商标、产品名称的著作权与商标权归原权利人所有，本文引用仅为技术分析之目的。</p>
+<p>在执行任何与本文相关的安全测试前，请确保已获得目标系统的明确书面授权，并遵守所在司法管辖区的相关法律（包括但不限于计算机犯罪法、数据保护法与出口管制法规）。对于机密计算与云环境的安全评估，建议在受控实验环境中进行，并优先采用官方提供的缓解建议与基准测试套件验证缓解效果。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

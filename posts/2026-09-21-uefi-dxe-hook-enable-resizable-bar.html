@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>给十年前的主板补上 Resizable BAR：一个 UEFI DXE 驱动如何劫持 PCI 枚举 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>给十年前的主板补上 Resizable BAR：一个 UEFI DXE 驱动如何劫持 PCI 枚举</h1>
+<time>2026-09-21</time>
+<ul>
+<li>UEFI</li>
+<li>固件</li>
+<li>PCIe</li>
+<li>逆向</li>
+<li>硬件</li>
+</ul>
+<hr />
+<p>厂商说你的主板不支持 Resizable BAR，所以你在 BIOS 里翻遍每一个菜单也找不到那个开关。但 Resizable BAR 这件事，本质上只是 PCIe 规范里的一个扩展能力位加上一段可写的配置空间寄存器——<strong>做不做，是固件愿不愿意做，不是硬件能不能做</strong>。xCuri0 的 ReBarUEFI 用不到 300 行 C 代码证明了这一点：往 UEFI 固件的 DXE 卷里塞一个驱动，把 PCI 总线枚举过程中的一个协议函数换掉，老主板就能开 Resizable BAR。</p>
+<p>这篇文章拆的是这段代码怎么工作。不是"刷 BIOS 教程"，是固件层的一次函数劫持。</p>
+<h2>一、先搞清楚 BAR 为什么需要"resizable"</h2>
+<p>PCI 设备在配置空间里有 6 个 BAR（Base Address Register）。以显卡为例，BAR0 是一段 MMIO 窗口，驱动往里读写就是在跟显存对话。传统 PCIe 的 BAR 大小由固件在枚举阶段<strong>一次性分配并锁死</strong>，显卡想改也改不了。</p>
+<p>问题在于现代游戏和大模型推理的数据量。一个 8GB 显存的卡，如果 BAR 只映射 256MB，驱动就得靠窗口"翻页"访问显存——CPU 写一次显存要经过多次分页搬运。Resizable BAR 允许把这个窗口涨到 8GB 甚至更大，实现"CPU 直写全量显存"。</p>
+<p>Intel 从 10 代酷睿、AMD 从锐龙 5000 系列开始官方支持，<strong>更早的平台固件根本没实现这段逻辑</strong>。ReBarUEFI 要补的就是这段逻辑。</p>
+<h2>二、劫持点：PciHostBridgeResourceAllocationProtocol</h2>
+<p>UEFI 启动分 SEC / PEI / DXE / BDS 等阶段。PCI 枚举发生在 DXE 阶段的 <code>PciBusDxe</code> 模块里，它遍历总线、给每个设备的 BAR 分配地址空间。分配之前，它会调用一个协议函数做预处理：</p>
+<div class="highlight"><pre><span></span><code><span class="n">EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PROTOCOL</span><span class="w"> </span><span class="o">*</span><span class="n">pciResAlloc</span><span class="p">;</span>
+<span class="c1">// 该协议的成员</span>
+<span class="n">pciResAlloc</span><span class="o">-&gt;</span><span class="n">PreprocessController</span><span class="p">(...)</span>
+</code></pre></div>
+
+<p>ReBarUEFI 干的事很直接——<strong>把这个函数指针换成自己的</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 保存原始函数指针</span>
+<span class="n">o_PreprocessController</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">pciResAlloc</span><span class="o">-&gt;</span><span class="n">PreprocessController</span><span class="p">;</span>
+<span class="c1">// 替换成我们的实现</span>
+<span class="n">pciResAlloc</span><span class="o">-&gt;</span><span class="n">PreprocessController</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">PreprocessControllerOverride</span><span class="p">;</span>
+</code></pre></div>
+
+<p>驱动先通过 <code>LocateHandleBuffer</code> 按协议 GUID 找到句柄，再用 <code>OpenProtocol</code> 取到协议实例，然后改写成员。这是 UEFI 里最经典的一类 hook——没有内核态的 inline hook，就是<strong>协议表里的一个函数指针赋值</strong>。</p>
+<p>替换后的实现先调原始函数，保证原有枚举逻辑不受影响，再叠加自己的动作：</p>
+<div class="highlight"><pre><span></span><code><span class="n">EFI_STATUS</span><span class="w"> </span><span class="n">EFIAPI</span><span class="w"> </span><span class="n">PreprocessControllerOverride</span><span class="p">(</span>
+<span class="w">  </span><span class="n">IN</span><span class="w"> </span><span class="n">EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PROTOCOL</span><span class="w"> </span><span class="o">*</span><span class="n">This</span><span class="p">,</span>
+<span class="w">  </span><span class="n">IN</span><span class="w"> </span><span class="n">EFI_HANDLE</span><span class="w"> </span><span class="n">RootBridgeHandle</span><span class="p">,</span>
+<span class="w">  </span><span class="n">IN</span><span class="w"> </span><span class="n">EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_PCI_ADDRESS</span><span class="w"> </span><span class="n">PciAddress</span><span class="p">,</span>
+<span class="w">  </span><span class="n">IN</span><span class="w"> </span><span class="n">EFI_PCI_CONTROLLER_RESOURCE_ALLOCATION_PHASE</span><span class="w"> </span><span class="n">Phase</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="c1">// 先执行固件原本的逻辑</span>
+<span class="w">    </span><span class="n">EFI_STATUS</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">o_PreprocessController</span><span class="p">(</span><span class="n">This</span><span class="p">,</span><span class="w"> </span><span class="n">RootBridgeHandle</span><span class="p">,</span><span class="w"> </span><span class="n">PciAddress</span><span class="p">,</span><span class="w"> </span><span class="n">Phase</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// EDK2 的 PciBusDxe 会对 Resizable BAR 做两次处理，这里保持一致</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">Phase</span><span class="w"> </span><span class="o">&lt;=</span><span class="w"> </span><span class="n">EfiPciBeforeResourceCollection</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">reBarSetupDevice</span><span class="p">(</span><span class="n">RootBridgeHandle</span><span class="p">,</span><span class="w"> </span><span class="n">PciAddress</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">status</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>Phase &lt;= EfiPciBeforeResourceCollection</code> 这个判断有讲究。EDK2 上游的 <code>PciBusDxe</code> 内部处理 Resizable BAR 时会走两遍，作者让 hook 也遵循同样的时序，避免和上层逻辑打架。注释里写得很明白：<em>"EDK2 PciBusDxe setups Resizable BAR twice so we will do same"</em>。</p>
+<h2>三、往哪个寄存器写</h2>
+<p>找到设备后，先读 Vendor/Device ID 过滤掉空槽位（<code>0xFFFF</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="n">pciReadConfigWord</span><span class="p">(</span><span class="n">pciAddress</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">vid</span><span class="p">);</span>
+<span class="n">pciReadConfigWord</span><span class="p">(</span><span class="n">pciAddress</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">did</span><span class="p">);</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">vid</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mh">0xFFFF</span><span class="p">)</span>
+<span class="w">    </span><span class="k">return</span><span class="p">;</span>
+</code></pre></div>
+
+<p>然后沿 PCIe 扩展能力链（Extended Capability）找 Resizable BAR 能力结构，capability ID 是 <code>PCI_EXT_CAP_ID_REBAR</code>(=15)。扩展能力从配置空间偏移 <code>0x100</code> 开始，每个能力头用 32 位描述，<strong>低 16 位是 ID、高 12 位是到下一个能力的偏移</strong>，遍历上限是 <code>(0x1000 - 0x100) / 8</code> 次：</p>
+<div class="highlight"><pre><span></span><code><span class="n">UINT16</span><span class="w"> </span><span class="nf">pciFindExtCapability</span><span class="p">(</span><span class="n">UINTN</span><span class="w"> </span><span class="n">pciAddress</span><span class="p">,</span><span class="w"> </span><span class="n">INTN</span><span class="w"> </span><span class="n">cap</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">UINT16</span><span class="w"> </span><span class="n">pos</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">PCI_CFG_SPACE_SIZE</span><span class="p">;</span><span class="w">   </span><span class="c1">// 0x100</span>
+<span class="w">    </span><span class="n">ttl</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">PCI_CFG_SPACE_EXP_SIZE</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">PCI_CFG_SPACE_SIZE</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span><span class="w">  </span><span class="c1">// 最小 8 字节一个能力</span>
+
+<span class="w">    </span><span class="n">pciReadConfigDword</span><span class="p">(</span><span class="n">pciAddress</span><span class="p">,</span><span class="w"> </span><span class="n">pos</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">header</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// 全是 0（无能力）或全是 F（设备缺失）都直接返回</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">header</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="n">PCI_POSSIBLE_ERROR</span><span class="p">(</span><span class="n">header</span><span class="p">))</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="n">ttl</span><span class="o">--</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">PCI_EXT_CAP_ID</span><span class="p">(</span><span class="n">header</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">cap</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">pos</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+<span class="w">            </span><span class="k">return</span><span class="w"> </span><span class="n">pos</span><span class="p">;</span>
+<span class="w">        </span><span class="n">pos</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">PCI_EXT_CAP_NEXT</span><span class="p">(</span><span class="n">header</span><span class="p">);</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">pos</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">PCI_CFG_SPACE_SIZE</span><span class="p">)</span>
+<span class="w">            </span><span class="k">break</span><span class="p">;</span><span class="w">      </span><span class="c1">// 越界即停，防御畸形固件</span>
+<span class="w">        </span><span class="n">pciReadConfigDword</span><span class="p">(</span><span class="n">pciAddress</span><span class="p">,</span><span class="w"> </span><span class="n">pos</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">header</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>这段几乎是从 Linux 内核的 <code>pci_find_ext_capability()</code> 移植过来的——<strong>内核驱动里验证过十几年的遍历逻辑，直接搬进固件用</strong>，作者在注释里也承认了这点（"adapted from linux pci_find_ext_capability"）。</p>
+<p>找到能力结构后，分两步：读能力寄存器拿到<strong>支持的 BAR 尺寸位图</strong>，再往控制寄存器写入选定的尺寸。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 读支持尺寸：cap 的高位是位图，bit N 置位表示支持 2^N</span>
+<span class="n">pciReadConfigDword</span><span class="p">(</span><span class="n">pciAddress</span><span class="p">,</span><span class="w"> </span><span class="n">pos</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">PCI_REBAR_CAP</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">cap</span><span class="p">);</span>
+<span class="n">cap</span><span class="w"> </span><span class="o">&amp;=</span><span class="w"> </span><span class="n">PCI_REBAR_CAP_SIZES</span><span class="p">;</span>
+<span class="k">return</span><span class="w"> </span><span class="n">cap</span><span class="w"> </span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="mi">4</span><span class="p">;</span><span class="w">    </span><span class="c1">// 位图对齐到 bit0</span>
+
+<span class="c1">// 写选定尺寸：先清掉原有的 BAR_SIZE 字段，再写入新值</span>
+<span class="n">pciReadConfigDword</span><span class="p">(</span><span class="n">pciAddress</span><span class="p">,</span><span class="w"> </span><span class="n">pos</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">PCI_REBAR_CTRL</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">ctrl</span><span class="p">);</span>
+<span class="n">ctrl</span><span class="w"> </span><span class="o">&amp;=</span><span class="w"> </span><span class="p">(</span><span class="n">UINT32</span><span class="p">)</span><span class="o">~</span><span class="n">PCI_REBAR_CTRL_BAR_SIZE</span><span class="p">;</span>
+<span class="n">ctrl</span><span class="w"> </span><span class="o">|=</span><span class="w"> </span><span class="p">(</span><span class="n">UINT32</span><span class="p">)</span><span class="n">size</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="n">PCI_REBAR_CTRL_BAR_SHIFT</span><span class="p">;</span>
+<span class="n">pciWriteConfigDword</span><span class="p">(</span><span class="n">pciAddress</span><span class="p">,</span><span class="w"> </span><span class="n">pos</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">PCI_REBAR_CTRL</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">ctrl</span><span class="p">);</span>
+</code></pre></div>
+
+<p>设置尺寸时用 <code>fls</code>（find last set bit）从用户指定的上限往下试，命中第一个被支持的尺寸就停：</p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">UINT8</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MIN</span><span class="p">((</span><span class="n">UINT8</span><span class="p">)</span><span class="n">fls</span><span class="p">(</span><span class="n">rBarS</span><span class="p">),</span><span class="w"> </span><span class="n">reBarState</span><span class="p">);</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">n</span><span class="o">--</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">rBarS</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="p">(</span><span class="mi">1</span><span class="w"> </span><span class="o">&lt;&lt;</span><span class="w"> </span><span class="n">n</span><span class="p">))</span><span class="w"> </span><span class="p">{</span><span class="w">     </span><span class="c1">// 该尺寸被设备支持？</span>
+<span class="w">        </span><span class="n">pciRebarSetSize</span><span class="p">(</span><span class="n">pciAddress</span><span class="p">,</span><span class="w"> </span><span class="n">epos</span><span class="p">,</span><span class="w"> </span><span class="n">bar</span><span class="p">,</span><span class="w"> </span><span class="n">n</span><span class="p">);</span>
+<span class="w">        </span><span class="k">break</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>fls</code> 在 MSVC 下用 <code>_BitScanReverse64</code>，在 GCC 下直接内联 <code>bsrl</code> 指令——UEFI 驱动能写内联汇编，是因为它跑在 ring 0 等价的特权环境里。</p>
+<h2>四、两个真实世界的坑</h2>
+<p><strong>坑一：厂商固件写错的能力值。</strong> 蓝宝石 RX 5600 XT Pulse 的 BAR0 能力 dword 是错的，返回 <code>0x7000</code>。代码里硬编码了这个 quirk：</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">vid</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">PCI_VENDOR_ID_ATI</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">did</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mh">0x731f</span><span class="w"> </span><span class="o">&amp;&amp;</span>
+<span class="w">    </span><span class="n">bar</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">cap</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mh">0x7000</span><span class="p">)</span>
+<span class="w">    </span><span class="n">cap</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x3f000</span><span class="p">;</span><span class="w">      </span><span class="c1">// 修正为正确的尺寸位图</span>
+</code></pre></div>
+
+<p>设备 ID、BAR 索引、错误值三条件同时命中才修正——这是<strong>针对具体型号打补丁</strong>，不是通用逻辑。</p>
+<p><strong>坑二：设错尺寸直接开不了机。</strong> 如果写入了设备/主板不支持的 BAR 尺寸，PCI 枚举会失败，机器连 BIOS 都进不去。作者的逃生方案是检测 CMOS 重置：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 读当前时间，如果年份早于构建年份，说明 CMOS 被清过 → 自动禁用</span>
+<span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">gRT</span><span class="o">-&gt;</span><span class="n">GetTime</span><span class="p">(</span><span class="o">&amp;</span><span class="n">time</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">);</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">time</span><span class="p">.</span><span class="n">Year</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">BUILD_YEAR</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w">       </span><span class="c1">// BUILD_YEAR = 2023</span>
+<span class="w">    </span><span class="n">reBarState</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="w">    </span><span class="n">gRT</span><span class="o">-&gt;</span><span class="n">SetVariable</span><span class="p">(</span><span class="sa">L</span><span class="s">&quot;ReBarState&quot;</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">reBarStateGuid</span><span class="p">,</span><span class="w"> </span><span class="n">attributes</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">reBarState</span><span class="p">);</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">EFI_SUCCESS</span><span class="p">;</span><span class="w">             </span><span class="c1">// 不 hook，安全退出</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>CMOS 被清会导致 RTC 归零到 1970 或厂商默认值，年份自然小于编译年份。<strong>用"时间倒退"当重置的信号</strong>，这个判定简单粗暴但有效——代价是如果你故意把系统时间调回 2023 年之前，Resizable BAR 就会自己关掉。</p>
+<p>配置通过一个 NVRAM 变量传递，GUID 是固定的 <code>a3c5b77a-c88f-4a93-bf1c-4a92-a32c65ce</code>，值语义是 <strong>2 的幂次上限</strong>（<code>32</code> 表示不限，<code>0</code> 表示禁用）：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 0: disabled</span>
+<span class="c1">// &gt;0: maximum BAR size (2^x). UINT8_MAX for unlimited</span>
+<span class="n">gRT</span><span class="o">-&gt;</span><span class="n">GetVariable</span><span class="p">(</span><span class="sa">L</span><span class="s">&quot;ReBarState&quot;</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">reBarStateGuid</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">attributes</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">bufferSize</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">reBarState</span><span class="p">);</span>
+</code></pre></div>
+
+<p>读变量时故意只给 1 字节缓冲区，<strong>如果实际值更长会返回 <code>EFI_BUFFER_TOO_SMALL</code></strong>，此时直接把 <code>reBarState</code> 归零。这是个防御性设计：防止有人往变量里塞超长数据引发越界。</p>
+<h2>五、怎么确认它真的生效了</h2>
+<p>驱动跑起来只是第一步，得能验证。作者提供了 <code>ReBarState</code> 这个用户态工具——Windows 下直接从 Release 取，Linux 下用 CMake 自己编。它做两件事：读当前哪些设备支持 Resizable BAR，以及往 NVRAM 变量里写入目标尺寸。</p>
+<p>手工验证的话，最直接的是看 PCI 配置空间。Linux 下：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 确认显卡有 Resizable BAR 扩展能力（cap ID 15 = 0x0f）</span>
+sudo<span class="w"> </span>lspci<span class="w"> </span>-vvv<span class="w"> </span>-s<span class="w"> </span><span class="m">01</span>:00.0<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-A4<span class="w"> </span><span class="s2">&quot;Resizable BAR&quot;</span>
+
+<span class="c1"># 输出形如：</span>
+<span class="c1">#   Capabilities: [resizable bar]</span>
+<span class="c1">#     BAR 1 size: 256M (8M, 16M, 64M, 256M, 1G, 8G...)</span>
+<span class="c1">#     BAR 1 size: 8G (8M, 16M, 64M, 256M, 1G, 8G)  ← 当前生效值</span>
+</code></pre></div>
+
+<p>括号里是设备<strong>支持的全部尺寸</strong>，括号前是<strong>当前生效值</strong>。生效值等于最大值，说明设置成功。</p>
+<p>再看 MMIO 窗口够不够大——这是最容易被忽略的失败原因：</p>
+<div class="highlight"><pre><span></span><code>sudo<span class="w"> </span>dmesg<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-i<span class="w"> </span><span class="s2">&quot;pci.*mmio\|BAR.*assigned&quot;</span>
+<span class="c1"># 关注显卡 BAR0 的起始地址和长度</span>
+sudo<span class="w"> </span>lspci<span class="w"> </span>-vvv<span class="w"> </span>-s<span class="w"> </span><span class="m">01</span>:00.0<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-A2<span class="w"> </span><span class="s2">&quot;Region 1&quot;</span>
+</code></pre></div>
+
+<p>如果 BAR 尺寸比 MMIO 窗口还大，枚举必然失败。这也是为什么必须配合 UEFIPatch 扩 MMIO 空间。</p>
+<p>Windows 下最省事的是 GPU-Z：它直接把 Resizable BAR 状态标在界面上，<strong>"Enabled" / "Disabled" 一眼可见</strong>，还能看到最大 BAR 尺寸。配合 CPU-Z 一起截图，是社区里最常用的验证组合。</p>
+<h2>六、为什么还要打 UEFIPatch 补丁</h2>
+<p>光有驱动不够。老固件里的 <code>PciBusDxe</code> 常常有硬编码的限制，<code>UEFIPatch</code> 目录下的一堆补丁就是处理这些：</p>
+<ul>
+<li>移除 <code>&lt; 4GB</code> 的 BAR 尺寸限制</li>
+<li>移除 <code>&lt; 16GB</code> / <code>&lt; 64GB</code> 限制</li>
+<li>阻止 64 位 BAR 被降级成 32 位</li>
+<li>扩大 MMIO 空间（Skylake/Kaby Lake 从 16-32GB 扩到 39 位 512GB 全量；Haswell/Broadwell 从 8-16GB 扩到 512GB；Sandy/Ivy Bridge 扩到 36 位 64GB）</li>
+</ul>
+<p>MMIO 空间不足是硬约束：<strong>你给显卡开了 8GB BAR，但整个系统可用的 MMIO 窗口只有 4GB，枚举就会失败</strong>。所以扩大 MMIO 空间和设置 BAR 尺寸是一套动作的两半。</p>
+<p>Sandy/Ivy Bridge 平台还需要改 DSDT——因为 <code>_CRS</code> 方法里写死的地址范围会阻止扩展。这些补丁用 Ghidra 逆向厂商固件后确定偏移，属于<strong>逐平台手工适配</strong>，没有通用解。</p>
+<h2>七、一个开发者的视角</h2>
+<p>这个项目的价值不在"让老显卡快 12%"，而在于它演示了<strong>固件层的可编程性</strong>：</p>
+<ol>
+<li><strong>DXE 阶段就是用户态。</strong> 协议表里的函数指针可以随便改，没有签名校验阻断。这个驱动在 Secure Boot 打开的情况下也能加载——注释里明确说 <em>"Most firmware will accept unsigned/patched modules with Secure Boot on"</em>。UEFI Secure Boot 验的是<strong>引导链</strong>（PE 镜像签名），不是每个 DXE 驱动都强制验签，厂商实现差异极大。</li>
+<li><strong>Linux 内核是固件开发的教科书。</strong> 扩展能力遍历、BAR 尺寸位图、PCI 寄存器布局——这些在 <code>drivers/pci/</code> 里都有经过实战检验的实现，移植成本远低于从零写。</li>
+<li><strong>风险确实存在。</strong> 刷错固件会变砖，设错 BAR 尺寸会开不了机。作者给了 CMOS 逃生机制，但<strong>刷固件前先确认主板有 Dual BIOS 或能拆下 SPI Flash 用编程器</strong>，是基本前提。</li>
+</ol>
+<p>我自己的看法：这类项目最值得学的不是"如何刷 BIOS"，而是<strong>当你发现一个能力"厂商说不支持"，先去查规范，再看固件有没有实现它</strong>。多数时候，"不支持"是产品线的市场区分手段，不是硅片的物理限制。ReBarUEFI 把这层窗户纸捅破的方式很干净——<strong>不修改硬件，只替换枚举时的一个函数指针</strong>。</p>
+<h2>参考</h2>
+<ul>
+<li>ReBarUEFI 项目源码：<code>github.com/xCuri0/ReBarUEFI</code>（MIT 协议，核心为 <code>ReBarDxe/ReBar.c</code>）</li>
+<li>PCI Express Base Specification：Resizable BAR Capability（扩展能力 ID 15）</li>
+<li>Linux 内核 <code>drivers/pci/pci.c</code>：<code>pci_find_ext_capability()</code> 实现</li>
+<li>EDK2 <code>PciBusDxe</code>：<code>PciHostBridgeResourceAllocationProtocol</code> 定义</li>
+</ul>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>浏览器主线程很贵：16.6 毫秒里能塞多少活 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>浏览器主线程很贵：16.6 毫秒里能塞多少活</h1>
+<time>2026-09-02</time>
+<ul>
+<li>前端</li>
+<li>性能优化</li>
+<li>浏览器</li>
+<li>JavaScript</li>
+</ul>
+<hr />
+<p>kciter 写了篇《The browser's main thread is expensive》。这个话题不新，但这篇有个优点：它把"主线程"当成一种<strong>有明确预算的稀缺资源</strong>来讲，而不是"慢就优化"。</p>
+<h2>主线程到底在干什么</h2>
+<p>浏览器的主线程负责串行执行这一串工作：解析和构建 DOM、计算 CSSOM、样式重算（style recalc）、布局（layout/reflow）、绘制（paint），以及跑 JavaScript。除此之外，它还要处理用户的输入事件。</p>
+<p>关键在于"串行"。这些工作不是分别跑在不同的核上互相并行——它们排在同一条队列里，一个做完才轮到下一个。所以你在主线程上花掉的每一毫秒，都是渲染和输入响应<strong>用不到的</strong>毫秒。</p>
+<p>预算从哪来？最常见的显示器是 60Hz，也就是每秒 60 帧，每帧约 <strong>16.6 毫秒</strong>。在这 16.6ms 里，浏览器要完成上面那串工作，才能保证不掉帧。你的 JS 如果占了 12ms，留给样式和布局的就只剩 4ms——大概率不够，于是掉帧。</p>
+<h2>一个反直觉的细节：预算从"帧开始"算</h2>
+<p>文章里有一段我印象最深的代码思路：做时间分片（time slicing）时，<strong>不要按"我已经跑了 5ms"来切，要按"距离这一帧开始已经过了 5ms"来切</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 只在距本帧开始 5ms 内继续干活</span>
+<span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="nx">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="nx">items</span><span class="p">.</span><span class="nx">length</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="p">(</span><span class="nx">performance</span><span class="p">.</span><span class="nx">now</span><span class="p">()</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nx">frameStart</span><span class="p">)</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">5</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="nx">process</span><span class="p">(</span><span class="nx">items</span><span class="p">[</span><span class="nx">i</span><span class="o">++</span><span class="p">]);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>差别在哪？如果按"我跑了 5ms 就停"，多个独立的任务各自都觉得自己只跑了 5ms，加起来可能把一整帧挤爆。而按"距帧开始 5ms"来算，所有任务共享同一个预算锚点——你跑掉的时间会被别人看到，自然就互相谦让了。</p>
+<p>这个技巧解决的是"多个动画/任务共享一帧"时的资源竞争。它把时间预算从"各自的私有量"变成"共享量"，光是这一点就能解释很多"单个组件很快、合起来就卡"的现象。</p>
+<h2>三条路线：用得更少、别用它、干掉它</h2>
+<p>文章把策略分成三档，我觉得这个分类比按 API 分类更有用。</p>
+<p><strong>第一档：把主线程资源用一个更聪明的方式花掉。</strong></p>
+<ul>
+<li><strong>拆分（Splitting）</strong>：把一个大任务切成几个小块，块之间让出主线程，让渲染有机会插进来。上面那段 5ms 分片就是它的实现。</li>
+<li><strong>批处理（Batching）</strong>：短时间内的多次更新合并成一次。典型是虚拟列表——一屏只渲染可见项，滚动时增量更新，而不是一次性渲染 10000 行。</li>
+<li><strong>定优先级（Prioritizing）</strong>：输入响应和动画优先，后台计算靠后。<code>scheduler.postTask</code> 这类接口允许给任务标优先级。</li>
+<li><strong>延后（Deferring）</strong>：不急的活推迟到空闲时段。文章里举的输入场景很典型：打字时每次按键都重算会卡，改成<strong>防抖 300ms</strong>（停手之后再算一次），输入立刻变得顺滑。它给的对比是"一次算完" vs "每帧 5ms" vs "300ms 防抖"——同一个功能，三种策略下的手感差别很大。</li>
+</ul>
+<p><strong>第二档：根本不用主线程。</strong></p>
+<ul>
+<li><strong>交给合成器（Moving work to the compositor）</strong>：<code>transform</code> 和 <code>opacity</code> 的动画可以在合成器线程上跑，不占主线程。这就是为什么"用 <code>transform</code> 做动画比用 <code>left/top</code> 快"——后者会触发布局，前者不会。</li>
+<li><strong>交给 Worker（Sending work to a worker）</strong>：把纯计算搬到 Web Worker。注意"纯计算"是重点——Worker 拿不到 DOM，凡是需要读写 DOM 的活都搬不走。能用 <code>OffscreenCanvas</code> 的渲染工作也可以搬。</li>
+</ul>
+<p><strong>第三档：把它删掉。</strong></p>
+<ul>
+<li><strong>消除工作本身（Eliminating the work itself）</strong>：这是收益最高也最容易被忽略的一档。少画一层、少嵌套一个容器、少一次无意义的样式重算，比任何"优化执行"都有效。<code>content-visibility: auto</code> 让屏幕外的内容跳过渲染，本质也是消除工作。</li>
+</ul>
+<h2>为什么"长任务"是分界线</h2>
+<p>主线程上超过 <strong>50ms</strong> 的任务被称为长任务（long task），因为它已经不可能在一帧内完成，必然影响响应性。这个 50ms 是个经验阈值，但它对应的是一个很实在的体验指标：用户点击之后，如果 100ms 内没有可见反馈，人就会觉得"卡了"。</p>
+<p>所以排查性能问题时的第一步，往往不是"哪个函数慢"，而是"主线程上有没有长任务"。有的话，先把它拆到 50ms 以下，再谈别的优化。切分本身可能只花几行代码，收益却常常超过后面所有的微优化。</p>
+<h2>我的做法</h2>
+<p>在真实项目里，我现在按这个顺序处理主线程问题：</p>
+<ol>
+<li>用 DevTools 的 Performance 面板看有没有长任务，有就先拆。这一步收益最大，代价最小。</li>
+<li>动画一律用 <code>transform</code> / <code>opacity</code>，需要动画的属性先想"能不能换成这两个"。</li>
+<li>输入相关的高频事件（输入、滚动、resize）默认加防抖或节流。默认加，不要等出问题再加。</li>
+<li>列表默认虚拟化。超过几百项就上虚拟列表，不要赌用户不滚。</li>
+<li>最后才看"优化某个函数"。前三步做完，多数卡顿已经消失了。</li>
+</ol>
+<p>主线程的贵，贵在它是<strong>共享的</strong>。你写的每一段 JS 都在跟渲染、跟输入响应抢同一条 16.6ms 的通道。意识到这一点，优化的方向会清楚很多。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

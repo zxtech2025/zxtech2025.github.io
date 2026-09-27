@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>一张矿卡撬动 A100：GPU 安全设计的系统性缺陷 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>一张矿卡撬动 A100：GPU 安全设计的系统性缺陷</h1>
+<time>2026-08-05</time>
+<ul>
+<li>技术
+Slug: 矿卡撬动a100-gpu安全设计系统性缺陷深度分析</li>
+</ul>
+<hr />
+<h2>一、背景：同源不同命的 GA100</h2>
+<p>NVIDIA CMP 170HX 矿卡与 A100 数据中心 GPU 使用同一颗 GA100 芯片。出厂时通过固件与 OTP 熔丝施加软件层面的算力限制，使矿卡 FP32 算力被锁死在 A100 的 1/32。</p>
+<p>然而研究论文《A Canary in the Crypto Mine》证明：<strong>这三个安全限制（SM 速率、显存可见容量、PCIe 速率）均可从已 root 但非特权的主机端软件破解</strong>，且无需 NVIDIA 签名密钥、无需调试熔丝、无需物理访问硬件。攻击者只需一张矿卡和一台 root 过的主机，就能在软件层面完成原本需要芯片级权限的操作。这一发现揭示的不是单一漏洞，而是 GPU 安全设计的系统性缺陷。</p>
+<h2>二、矿卡与数据中心 GPU 的硬件差异</h2>
+<h3>2.1 规格对照</h3>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>CMP 170HX（出厂状态）</th>
+<th>A100（解锁状态）</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FP32 算力</td>
+<td>~3 TFLOPS（SM 锁为 1/32）</td>
+<td>94 TFLOPS</td>
+</tr>
+<tr>
+<td>FP64 算力</td>
+<td>~0.2 TFLOPS</td>
+<td>12 TFLOPS</td>
+</tr>
+<tr>
+<td>显存可见容量</td>
+<td>10GB（物理焊接 80GB HBM）</td>
+<td>80GB</td>
+</tr>
+<tr>
+<td>PCIe 速率</td>
+<td>Gen1</td>
+<td>Gen2</td>
+</tr>
+<tr>
+<td>Device ID</td>
+<td>0x20C2 / 0x2082</td>
+<td>0x20B0 / 0x20F1</td>
+</tr>
+</tbody>
+</table>
+<p>关键点在于：<strong>物理层面两块卡几乎完全一致</strong>。80GB HBM 真实焊接在矿卡 PCB 上，固件层只暴露 10GB；SM 计算单元物理完好却被限速；PCIe 控制器支持 Gen2 却被降级到 Gen1。所有限制都是"软"的。</p>
+<h3>2.2 唯一的物理硬边界</h3>
+<div class="highlight"><pre><span></span><code>   CMP 170HX PCB（俯视简化）
+   ┌──────────────────────────────────┐
+   │   GA100 Die                       │
+   │   ┌────────────┐                  │
+   │   │ 80GB HBM2e │  ← 物理焊接，完整 │
+   │   └────────────┘                  │
+   │   PCIe x16 Slot Edge              │
+   │   ┌──────────────┐                │
+   │   │ |||||||||||| │  ← 12根lane的  │
+   │   │ |||||||||||| │    交流耦合电容 │
+   │   └──────────────┘    未焊接！     │
+   │      ×× ×× ×× ×× ×× ××           │
+   │      缺失的24颗100nF电容           │
+   └──────────────────────────────────┘
+</code></pre></div>
+
+<p>唯一的物理硬边界是：<strong>12 根 PCIe lane 的交流耦合电容（AC coupling capacitor）未焊接</strong>。要让 PCIe 跑满 Gen2，理论上需补焊 24 颗 100nF 电容。但这是物理层面的优化项，并非安全限制核心——核心的安全限制全部通过固件与熔丝实现，而这恰恰是攻击突破口。</p>
+<h2>三、NVIDIA GPU 安全架构</h2>
+<p>GA100 的安全体系围绕 Falcon 安全处理器构建。</p>
+<h3>3.1 Falcon 安全处理器与三种安全模式</h3>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────┐
+│                  Falcon 安全处理器                        │
+│   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐   │
+│   │ Non-Secure  │   │ Light Secure│   │ Heavy Secure│   │
+│   │    (NS)     │   │    (LS)     │   │    (HS)     │   │
+│   ├─────────────┤   ├─────────────┤   ├─────────────┤   │
+│   │ 功能受限     │   │ 介于NS与HS  │   │ 微处理器成为 │   │
+│   │ 普通固件运行 │   │ 签名验证例程│   │ &quot;黑盒&quot;，只能 │   │
+│   │             │   │ 驻留于此    │   │ 加载签名微码 │   │
+│   │             │   │             │   │ 进入LEVEL2   │   │
+│   └─────────────┘   └─────────────┘   └─────────────┘   │
+│         ↑                  ↑                  ↑         │
+│         └──────────────────┴──────────────────┘         │
+│                    特权层级递增 →                         │
+└─────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>三种模式的核心区别：</p>
+<ol>
+<li><strong>Non-Secure (NS)</strong>：功能受限，普通固件运行于此，无法访问受保护寄存器。</li>
+<li><strong>Heavy Secure (HS)</strong>：微处理器成为"黑盒"，只能通过加载 NVIDIA 签名的微码进入，运行在 LEVEL2 最高特权级。HS 模式下 Falcon 的指令/数据内存对外部读取锁死，是整个信任栈的执行核心。</li>
+<li><strong>Light Secure (LS)</strong>：介于 NS 和 HS 之间，签名验证例程驻留于此——这正是攻击的切入点。</li>
+</ol>
+<h3>3.2 信任栈三层架构</h3>
+<div class="highlight"><pre><span></span><code>        ▲ 特权递增方向
+        │
+  ┌─────┴──────────────────────────────────────────┐
+  │  最上层：常规内存安全                            │
+  │  签名校验 · 栈保护(canary) · 缓冲区边界         │
+  │  ← 防止运行时内存破坏                            │
+  ├────────────────────────────────────────────────┤
+  │  中间层：HS 模式固件                            │
+  │  读取 OTP 熔丝 · 执行算力/显存限制策略          │
+  │  ← 信任根的执行体                                │
+  ├────────────────────────────────────────────────┤
+  │  最底层：OTP 熔丝（一次性可编程）               │
+  │  Device ID · 安全配置 · 算力分级标记            │
+  │  ← 不可篡改的硬件信任根                          │
+  └────────────────────────────────────────────────┘
+</code></pre></div>
+
+<p>OTP 熔丝在最底层，记录 Device ID 与安全配置，理论上不可篡改。HS 固件负责读取熔丝并执行限制策略。最上层是常规内存安全机制，包括签名校验与栈保护。论文的突破在于：<strong>最上层的内存安全机制存在缺陷，攻击者借此获得 HS 执行权限，进而绕过中间层策略，甚至改写最底层熔丝值的"覆盖寄存器"</strong>。</p>
+<h3>3.3 Secure Boot 流程</h3>
+<div class="highlight"><pre><span></span><code>   上电
+     │ 读取下一级固件镜像
+     ▼
+┌─────────────────────────────────────┐
+│  BROM (Boot ROM，固化在芯片内)       │
+└──────┬──────────────────────────────┘
+       │ Davies-Meyer 哈希（非 RSA-3072，哈希链式结构）
+       ▼
+┌─────────────────────────────────────┐
+│  AES-KDF 派生密钥                    │
+│  csecret（芯片唯一密钥）+ AES 解密   │
+│  验证固件完整性                       │
+└──────┬──────────────────────────────┘
+       │ 验证通过
+       ▼
+┌─────────────────────────────────────┐
+│  加载并执行已验证固件 → 进入 LS/HS   │
+└─────────────────────────────────────┘
+</code></pre></div>
+
+<p>值得注意：Secure Boot 使用 <strong>Davies-Meyer 哈希 + AES-KDF with csecret</strong> 进行验证，而非业界常见的 RSA-3072 签名方案。csecret 是每颗芯片唯一的密钥，这使得固件验证与具体硬件绑定。</p>
+<h3>3.4 ACR/WPR 机制与 PCIe BAR0 + PLM</h3>
+<p><strong>ACR/WPR（Access-Control Region / Write-Protected Region）</strong>：通过 ACR bootstrap 配合 FBHUB ACL（Access Control List），实现 GPU 内部内存区域隔离。不同区域的读写权限由硬件级 ACL 强制执行。</p>
+<p><strong>PCIe BAR0 + PLM（Privilege Level Mask）</strong>：主机通过 PCIe BAR0 窗口访问 GPU 寄存器。每个寄存器关联一个 PL（Privilege Level），主机写入时硬件检查 PLM——PL0 写入受保护寄存器会被硬件直接拒绝。</p>
+<div class="highlight"><pre><span></span><code>   主机 CPU                        GPU
+   ┌────────┐    PCIe BAR0      ┌──────────────────────┐
+   │ Root   │ ──────────────►   │  寄存器空间           │
+   │ Driver │   MMIO write      │  PLM 硬件检查：        │
+   └────────┘                   │   PL0 写入 ──► ✗ 拒绝 │
+                                │   PL1 写入 ──► ✓ 允许 │
+                                └──────────────────────┘
+</code></pre></div>
+
+<p>这套机制本应保证：即使主机是 root，也无法直接改写熔丝覆盖寄存器。但漏洞四将证明，HS 权限可以重写 PLM，从而让主机 root 拿到 PL0 写权限。</p>
+<h2>四、四个关键漏洞</h2>
+<h3>4.1 漏洞一：栈保护参考字位置不当</h3>
+<p>Falcon 固件的栈保护实现存在经典缺陷：<code>__stack_chk_guard</code>（canary 参考值）被放在数据段尾部，紧邻一个可溢出的签名缓冲区。</p>
+<div class="highlight"><pre><span></span><code><span class="w">   </span><span class="n">Falcon</span><span class="w"> </span><span class="n">DMEM</span><span class="err">（</span><span class="n">数据内存</span><span class="err">）</span><span class="n">布局</span>
+<span class="w">   </span><span class="err">┌──────────────────────────────┐</span><span class="w"> </span><span class="n">高地址</span>
+<span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="p">...</span><span class="w"> </span><span class="n">其他数据</span><span class="w"> </span><span class="p">...</span><span class="w">             </span><span class="err">│</span>
+<span class="w">   </span><span class="err">├──────────────────────────────┤</span>
+<span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="n">签名缓冲区</span><span class="w"> </span><span class="n">sig_buf</span><span class="o">[</span><span class="n">N</span><span class="o">]</span><span class="w">        </span><span class="err">│</span><span class="w"> </span><span class="err">←</span><span class="w"> </span><span class="n">可溢出</span><span class="err">！</span>
+<span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="o">[</span><span class="n">........可写........</span><span class="o">]</span><span class="w">      </span><span class="err">│</span>
+<span class="w">   </span><span class="err">├──────────────────────────────┤</span>
+<span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="n">__stack_chk_guard</span><span class="w"> </span><span class="p">(</span><span class="n">canary</span><span class="p">)</span><span class="w">   </span><span class="err">│</span><span class="w"> </span><span class="err">←</span><span class="w"> </span><span class="n">紧邻溢出源</span>
+<span class="w">   </span><span class="err">├──────────────────────────────┤</span>
+<span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="p">...</span><span class="w"> </span><span class="n">栈区</span><span class="w"> </span><span class="p">...</span><span class="w">                 </span><span class="err">│</span>
+<span class="w">   </span><span class="err">│</span><span class="w">  </span><span class="o">[</span><span class="n">返回地址</span><span class="o">][</span><span class="n">canary副本</span><span class="o">][</span><span class="n">局部</span><span class="o">]</span><span class="w"> </span><span class="err">│</span><span class="w"> </span><span class="err">←</span><span class="w"> </span><span class="n">栈帧</span>
+<span class="w">   </span><span class="err">└──────────────────────────────┘</span><span class="w"> </span><span class="n">低地址</span>
+</code></pre></div>
+
+<p>问题根源：<strong>数据内存平坦可写，无 MPU 只读映射、无 RELRO、无 guard page</strong>。<code>__stack_chk_guard</code> 与可溢出缓冲区处于同一可写段，没有任何硬件级隔离。</p>
+<p>攻击原理：线性溢出用一个统一值 <code>V</code> 填充，依次覆盖三个位置：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 伪代码：Falcon LS 模式签名验证例程（存在缺陷）</span>
+<span class="kt">int</span><span class="w"> </span><span class="nf">verify_signature</span><span class="p">(</span><span class="n">dma_addr_t</span><span class="w"> </span><span class="n">host_sig</span><span class="p">,</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">len</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">char</span><span class="w"> </span><span class="n">sig_buf</span><span class="p">[</span><span class="n">BUF_SIZE</span><span class="p">];</span>
+<span class="w">    </span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">canary</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">__stack_chk_guard</span><span class="p">;</span><span class="w">  </span><span class="c1">// 从数据段尾部读取</span>
+
+<span class="w">    </span><span class="c1">// 无界 DMA 拷贝：len 来自主机可控字段</span>
+<span class="w">    </span><span class="n">dma_copy</span><span class="p">(</span><span class="n">sig_buf</span><span class="p">,</span><span class="w"> </span><span class="n">host_sig</span><span class="p">,</span><span class="w"> </span><span class="n">len</span><span class="p">);</span><span class="w">     </span><span class="c1">// ← 溢出发生点</span>
+
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">ok</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">crypto_verify</span><span class="p">(</span><span class="n">sig_buf</span><span class="p">,</span><span class="w"> </span><span class="n">len</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">canary</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="n">__stack_chk_guard</span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w">    </span><span class="c1">// 栈保护检查</span>
+<span class="w">        </span><span class="n">abort</span><span class="p">();</span><span class="w">                          </span><span class="c1">// ← 永远不会触发！</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="n">ok</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>当溢出用 <code>V</code> 填充时：<code>sig_buf</code> 被填满为 <code>V</code>、<code>__stack_chk_guard</code>（参考值）被覆盖为 <code>V</code>、栈上 canary 副本被覆盖为 <code>V</code>、返回地址被覆盖为 <code>V</code>。校验时 <code>canary(V) == __stack_chk_guard(V)</code> → <strong>校验通过</strong>。栈保护形同虚设，同时返回地址被控制。</p>
+<h3>4.2 漏洞二：DMA 在静态分析中的盲区</h3>
+<p>无界 DMA 拷贝是漏洞一的触发条件，但它本身之所以能潜伏，是因为<strong>静态分析工具无法识别 DMA 操作为内存拷贝</strong>。</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// DMA 拷贝在代码层面的真实形态——只是几条寄存器写</span>
+<span class="kt">void</span><span class="w"> </span><span class="nf">dma_copy</span><span class="p">(</span><span class="kt">void</span><span class="w"> </span><span class="o">*</span><span class="n">dst</span><span class="p">,</span><span class="w"> </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">src_pa</span><span class="p">,</span><span class="w"> </span><span class="kt">size_t</span><span class="w"> </span><span class="n">len</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="o">*</span><span class="p">(</span><span class="k">volatile</span><span class="w"> </span><span class="kt">uint32_t</span><span class="o">*</span><span class="p">)(</span><span class="n">DMA_BASE</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">DMA_DST</span><span class="p">)</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">uint32_t</span><span class="p">)(</span><span class="kt">uintptr_t</span><span class="p">)</span><span class="n">dst</span><span class="p">;</span>
+<span class="w">    </span><span class="o">*</span><span class="p">(</span><span class="k">volatile</span><span class="w"> </span><span class="kt">uint32_t</span><span class="o">*</span><span class="p">)(</span><span class="n">DMA_BASE</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">DMA_SRC</span><span class="p">)</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">uint32_t</span><span class="p">)</span><span class="n">src_pa</span><span class="p">;</span>
+<span class="w">    </span><span class="o">*</span><span class="p">(</span><span class="k">volatile</span><span class="w"> </span><span class="kt">uint32_t</span><span class="o">*</span><span class="p">)(</span><span class="n">DMA_BASE</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">DMA_LEN</span><span class="p">)</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">uint32_t</span><span class="p">)</span><span class="n">len</span><span class="p">;</span><span class="w">  </span><span class="c1">// ← 攻击者可控</span>
+<span class="w">    </span><span class="o">*</span><span class="p">(</span><span class="k">volatile</span><span class="w"> </span><span class="kt">uint32_t</span><span class="o">*</span><span class="p">)(</span><span class="n">DMA_BASE</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">DMA_CTRL</span><span class="p">)</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="n">DMA_START</span><span class="p">;</span>
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="p">(</span><span class="o">*</span><span class="p">(</span><span class="k">volatile</span><span class="w"> </span><span class="kt">uint32_t</span><span class="o">*</span><span class="p">)(</span><span class="n">DMA_BASE</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">DMA_STATUS</span><span class="p">)</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="n">DMA_DONE</span><span class="p">));</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>对静态分析器而言，这只是几次 MMIO 写入，无法推断出"这是一次会跨越缓冲区边界的 memcpy"。<code>len</code> 来自主机可控字段，无任何边界检查。这暴露一个工程盲区：<strong>CI 流水线中的静态分析工具默认不识别 DMA sink 的数据流语义</strong>，使"寄存器写伪装成的内存拷贝"成为隐形攻击面。</p>
+<h3>4.3 漏洞三：确定性环境让盲打可靠</h3>
+<p>HS 模式下 Falcon 的指令/数据内存对外部读取锁死——攻击者无法直接 dump HS 内存来定位偏移。这本应是一道防线，但 GPU 固件运行环境的高度确定性使其失效。HS Falcon 固件的环境特征为：无并发（单线程）、无中断干扰、无 OS 调度、无动态内存分配、每次启动内存布局完全一致。</p>
+<div class="highlight"><pre><span></span><code>   传统盲打攻击（高失败率）                GPU HS 盲打（高成功率）
+   ┌──────────────────────┐             ┌──────────────────────┐
+   │ ASLR随机化基址        │             │ 固定基址，无ASLR      │
+   │ 多线程并发竞争        │             │ 单线程无并发          │
+   │ 中断随时打断          │             │ 无中断                │
+   │ 堆布局不确定          │             │ 无动态分配，布局固定  │
+   │ canary每次随机        │             │ canary可被一并覆盖    │
+   │ → 需信息泄露          │             │ → 离线还原即可        │
+   └──────────────────────┘             └──────────────────────┘
+</code></pre></div>
+
+<p>攻击者编写一个<strong>周期精确的 Falcon 仿真器</strong>，离线还原溢出时刻的精确内存布局。由于环境完全确定，仿真结果与真实硬件完全一致。再用均匀填充值 <code>V</code> 覆盖，使所有被覆盖的槽位统一为同一值——既绕过 canary 校验，又精确控制返回地址（PC）。</p>
+<h3>4.4 漏洞四：常开岛实现永久解锁</h3>
+<p>前三个漏洞组合后，第四个漏洞将"一次性利用"升级为"永久解锁"。攻击链完整流程如下：</p>
+<div class="highlight"><pre><span></span><code><span class="err">┌─────────────────────────────────────────────────────────────────┐</span>
+<span class="err">│</span><span class="w">                    </span><span class="err">完整攻击链流程</span><span class="w">                                 </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">①</span><span class="w"> </span><span class="err">加载厂商已签名</span><span class="w"> </span><span class="n">bootloader</span><span class="w">                                     </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">│</span><span class="w">  </span><span class="err">签名校验正常通过（合法签名）</span><span class="w">                               </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">▼</span><span class="w">                                                            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">②</span><span class="w"> </span><span class="err">利用无界</span><span class="w"> </span><span class="n">DMA</span><span class="w"> </span><span class="err">溢出，在</span><span class="w"> </span><span class="n">HS</span><span class="w"> </span><span class="err">模式下控制</span><span class="w"> </span><span class="n">PC</span><span class="w">                        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">│</span><span class="w">  </span><span class="err">漏洞一</span><span class="o">+</span><span class="err">二</span><span class="o">+</span><span class="err">三组合：溢出</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">覆盖</span><span class="n">canary</span><span class="o">+</span><span class="err">返回地址</span><span class="w"> </span><span class="err">→</span><span class="w"> </span><span class="err">劫持控制流</span><span class="w">  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">▼</span><span class="w">                                                            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">③</span><span class="w"> </span><span class="err">拿到</span><span class="w"> </span><span class="n">HS</span><span class="w"> </span><span class="err">权限后，重写</span><span class="w"> </span><span class="n">PLM</span><span class="w">                                      </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">│</span><span class="w">  </span><span class="err">开放熔丝覆盖寄存器</span><span class="p">(</span><span class="n">fuse</span><span class="w"> </span><span class="n">override</span><span class="p">)</span><span class="err">的</span><span class="w"> </span><span class="n">PL0</span><span class="w"> </span><span class="err">写权限</span><span class="w">            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">▼</span><span class="w">                                                            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">④</span><span class="w"> </span><span class="err">主机用</span><span class="w"> </span><span class="n">BAR0</span><span class="w"> </span><span class="err">写寄存器修改配置</span><span class="w">                                  </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">│</span><span class="w">  </span><span class="n">SM</span><span class="w"> </span><span class="err">速率</span><span class="w"> </span><span class="err">·</span><span class="w"> </span><span class="err">显存配置</span><span class="w"> </span><span class="err">·</span><span class="w"> </span><span class="n">PCIe</span><span class="w"> </span><span class="err">速度</span><span class="w"> </span><span class="err">·</span><span class="w"> </span><span class="n">Device</span><span class="w"> </span><span class="n">ID</span><span class="w">               </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">▼</span><span class="w">                                                            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">⑤</span><span class="w"> </span><span class="err">覆盖值存入常开电源域</span><span class="w"> </span><span class="p">(</span><span class="n">always</span><span class="o">-</span><span class="n">on</span><span class="w"> </span><span class="n">domain</span><span class="p">)</span><span class="w">                       </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">│</span><span class="w">  </span><span class="err">功能级复位</span><span class="p">(</span><span class="n">functional</span><span class="w"> </span><span class="n">reset</span><span class="p">)</span><span class="err">清不掉</span><span class="w">                        </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">│</span><span class="w">  </span><span class="err">重装驱动清不掉</span><span class="w">                                             </span><span class="err">│</span>
+<span class="err">│</span><span class="w">     </span><span class="err">▼</span><span class="w">                                                            </span><span class="err">│</span>
+<span class="err">│</span><span class="w">  </span><span class="err">✓</span><span class="w"> </span><span class="err">永久解锁：矿卡变</span><span class="w"> </span><span class="n">A100</span><span class="w"> </span><span class="err">级算力</span><span class="w">                                  </span><span class="err">│</span>
+<span class="err">└─────────────────────────────────────────────────────────────────┘</span>
+</code></pre></div>
+
+<p>最致命的是第 ⑤ 步：覆盖值被写入 <strong>always-on 电源域</strong>（常开岛）。功能级复位（functional reset）无法清除，重新加载驱动无法清除，只有完全断电（让常开域失电）才能恢复出厂限制。在数据中心场景下显卡通常持续供电，使"永久解锁"名副其实。</p>
+<h2>五、VBIOS 结构分析</h2>
+<p>CMP 170HX 的 VBIOS 内存布局如下：</p>
+<div class="highlight"><pre><span></span><code><span class="w">   </span><span class="n">VBIOS</span><span class="w"> </span><span class="err">内存布局（</span><span class="mh">256</span><span class="n">KB</span><span class="w"> </span><span class="n">Flash</span><span class="err">）</span>
+<span class="w">   </span><span class="mh">0</span><span class="n">x00000</span><span class="w"> </span><span class="err">┌──────────────────────────────────────┐</span>
+<span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="n">NVGI</span><span class="w"> </span><span class="n">header</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">RFRD</span><span class="w"> </span><span class="n">manifest</span><span class="w">         </span><span class="err">│</span><span class="w"> </span><span class="err">明文</span>
+<span class="w">   </span><span class="mh">0</span><span class="n">x02200</span><span class="w"> </span><span class="err">├──────────────────────────────────────┤</span>
+<span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="n">PciAt</span><span class="w"> </span><span class="n">region</span><span class="w">                        </span><span class="err">│</span>
+<span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="n">BIT</span><span class="w"> </span><span class="n">tokens</span><span class="w"> </span><span class="err">·</span><span class="w"> </span><span class="n">PERF_PTRS</span><span class="w">              </span><span class="err">│</span>
+<span class="w">   </span><span class="mh">0</span><span class="n">x05E00</span><span class="w"> </span><span class="err">├──────────────────────────────────────┤</span>
+<span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="n">FwSec</span><span class="w"> </span><span class="n">headers</span><span class="w">                       </span><span class="err">│</span><span class="w"> </span><span class="err">固件安全头</span>
+<span class="w">   </span><span class="mh">0</span><span class="n">x0C800</span><span class="w"> </span><span class="err">├──────────────────────────────────────┤</span>
+<span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="n">Compressed</span><span class="w"> </span><span class="n">Falcon</span><span class="w"> </span><span class="n">code</span><span class="w">              </span><span class="err">│</span><span class="w"> </span><span class="mh">87</span><span class="o">%</span><span class="err">与</span><span class="n">A100共享</span><span class="err">！</span>
+<span class="w">   </span><span class="mh">0</span><span class="n">x14A00</span><span class="w"> </span><span class="err">├──────────────────────────────────────┤</span>
+<span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="n">ECB</span><span class="w"> </span><span class="err">加密固件</span><span class="w"> </span><span class="n">A</span><span class="w"> </span><span class="p">(</span><span class="n">AES</span><span class="o">-</span><span class="mh">128</span><span class="o">-</span><span class="n">ECB</span><span class="p">)</span><span class="w">        </span><span class="err">│</span>
+<span class="w">   </span><span class="mh">0</span><span class="n">x20700</span><span class="w"> </span><span class="err">├──────────────────────────────────────┤</span>
+<span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="n">ECB</span><span class="w"> </span><span class="err">加密固件</span><span class="w"> </span><span class="n">B</span><span class="w"> </span><span class="p">(</span><span class="n">AES</span><span class="o">-</span><span class="mh">128</span><span class="o">-</span><span class="n">ECB</span><span class="p">)</span><span class="w">        </span><span class="err">│</span>
+<span class="w">   </span><span class="mh">0</span><span class="n">x41200</span><span class="w"> </span><span class="err">├──────────────────────────────────────┤</span>
+<span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="n">Strap</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">training</span><span class="w"> </span><span class="n">tables</span><span class="w">             </span><span class="err">│</span>
+<span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="n">CFG1</span><span class="w"> </span><span class="p">@</span><span class="w"> </span><span class="mh">0</span><span class="n">x41D53</span><span class="w">  </span><span class="err">←</span><span class="w"> </span><span class="err">关键字节！</span><span class="w">        </span><span class="err">│</span>
+<span class="w">   </span><span class="mh">0</span><span class="n">x43A00</span><span class="w"> </span><span class="err">├──────────────────────────────────────┤</span>
+<span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="err">未签名尾部</span><span class="w">                           </span><span class="err">│</span>
+<span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="err">功耗限制</span><span class="w"> </span><span class="err">·</span><span class="w"> </span><span class="n">CTRL_OPT</span><span class="w"> </span><span class="n">fuse</span><span class="w"> </span><span class="err">表</span><span class="w">         </span><span class="err">│</span><span class="w"> </span><span class="err">←</span><span class="w"> </span><span class="err">无完整性校验</span>
+<span class="w">   </span><span class="mh">0</span><span class="n">xFE000</span><span class="w"> </span><span class="err">├──────────────────────────────────────┤</span>
+<span class="w">           </span><span class="err">│</span><span class="w">  </span><span class="n">License</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">HULK</span><span class="w"> </span><span class="n">cert</span><span class="w"> </span><span class="n">region</span><span class="w">          </span><span class="err">│</span>
+<span class="w">   </span><span class="mh">0</span><span class="n">xFFFFF</span><span class="w"> </span><span class="err">└──────────────────────────────────────┘</span>
+</code></pre></div>
+
+<h3>5.1 关键发现：一字节翻转实现内存解锁</h3>
+<p>在 CFG1 配置区 <code>0x41D53</code> 处，MAC（内存访问控制）配置字节从 <code>0x44</code> 翻转为 <code>0x66</code> 即可实现内存解锁。这是一个单字节修改，却能改变整个显存可见性策略。</p>
+<div class="highlight"><pre><span></span><code>   修改前 (0x44):  显存可见 = 10GB       修改后 (0x66):  显存可见 = 80GB
+   ┌──────────┐                         ┌──────────────────────┐
+   │ 10GB可见  │                         │       80GB全可见       │
+   ├──────────┤                         │                      │
+   │ 70GB屏蔽  │                         │                      │
+   └──────────┘                         └──────────────────────┘
+</code></pre></div>
+
+<h3>5.2 ECB 加密的脆弱性</h3>
+<p>固件 A/B 使用 <strong>AES-128-ECB</strong> 模式加密。ECB 模式的已知缺陷是：相同明文块加密后产生相同密文块，无法隐藏明文模式。研究者通过密文块模式比对，发现 CMP 170HX 的 Falcon 代码有 <strong>87% 与 A100 共享</strong>——侧面证实两块卡本就是同一份固件的不同配置分支。</p>
+<h3>5.3 未签名尾部的隐患</h3>
+<p><code>0x43A00-0x47700</code> 的尾部区域（含功耗限制、CTRL_OPT fuse 表）<strong>无完整性签名校验</strong>，攻击者可在不破坏签名链的前提下直接修改功耗与配置参数。</p>
+<h2>六、解锁结果</h2>
+<p>CMP 170HX 完成全链攻击后，实现从矿卡到数据中心级算力的跨越：</p>
+<div class="highlight"><pre><span></span><code>   算力解锁对比（对数刻度示意）
+   FP32:    3 TFLOPS  ████████                          →  94 TFLOPS  ████████████████████████████████  (31×)
+   FP64:    0.2 TFLOPS █                                 →  12 TFLOPS ████████████████████████          (60×)
+   Tensor:  基准       █████                             →  ~15×      ████████████████████████████████  (15×)
+   显存:    10GB       █████                             →  80GB      ████████████████████████████████  (8×)
+   PCIe:    Gen1       ██                                →  Gen2      ████                               (2×)
+</code></pre></div>
+
+<p>一张矿卡的售价远低于 A100，而破解成本仅需 root 主机与公开研究方法。这种性价比倒挂直接冲击了 NVIDIA 的产品分级商业模式。</p>
+<h2>七、GPU 侧信道攻击面</h2>
+<p>除固件破解（"白盒"改写配置）外，GPU 还面临广泛的"灰盒/黑盒"侧信道攻击面，无需改写固件即可窃取模型与数据：</p>
+<div class="highlight"><pre><span></span><code>┌─────────────────────────────────────────────────────────────┐
+│                  GPU 侧信道攻击面全景                         │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
+│  │ 电源分析(CPA) │  │ 电磁辐射(EM) │  │ 时序攻击     │       │
+│  │ 功耗轨迹提取 │  │ BarraCUDA    │  │ Leaky DNN    │       │
+│  │ 模型参数     │  │ CEMA恢复CNN  │  │ 上下文切换   │       │
+│  │              │  │ 卷积层权重   │  │ 时序提取架构 │       │
+│  └──────────────┘  └──────┬───────┘  └──────────────┘       │
+│                    ┌──────┴───────┐  ┌──────────────┐       │
+│                    │ Kraken       │  │ MERCURY      │       │
+│                    │ 远场EM攻击   │  │ 远程侧信道   │       │
+│                    │ 100cm外穿透  │  │ 攻击NVIDIA   │       │
+│                    │ 玻璃障碍     │  │ DLA          │       │
+│                    └──────────────┘  └──────────────┘       │
+└─────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<ol>
+<li>
+<p><strong>电源分析（CPA，Correlation Power Analysis）</strong>：从 GPU 功耗轨迹中相关性提取模型参数，属于经典侧信道方法在 GPU 上的迁移。</p>
+</li>
+<li>
+<p><strong>电磁辐射——BarraCUDA</strong>：通过 CEMA（Correlation ElectroMagnetic Analysis）从 GPU 电磁辐射中恢复 CNN 卷积层权重。BarraCUDA 是针对 NVIDIA GPU 的电磁侧信道框架。</p>
+</li>
+<li>
+<p><strong>Kraken</strong>：远场电磁攻击，可在 <strong>100cm 外穿透玻璃障碍</strong>捕获 GPU 运行时的电磁特征。这极大拓展了攻击的物理距离假设——攻击者无需物理接触设备。</p>
+</li>
+<li>
+<p><strong>时序攻击——Leaky DNN</strong>：利用 GPU 上下文切换的时序差异，提取神经网络架构信息（层数、通道数等），属于时序侧信道。</p>
+</li>
+<li>
+<p><strong>MERCURY</strong>：远程侧信道攻击 NVIDIA DLA（Deep Learning Accelerator），通过网络可观测的资源争用推断模型结构。</p>
+</li>
+</ol>
+<p>这些侧信道与固件破解形成互补：固件破解改写配置"解锁算力"，侧信道则"窃取机密"。二者结合构成对 GPU 机密计算的双重威胁。</p>
+<h2>八、对机密计算的影响</h2>
+<p>H100 与 Blackwell 架构引入了 <strong>Confidential Computing（机密计算）</strong>，承诺在 GPU 内为租户数据提供硬件级隔离与加密保护。其信任根正是 <strong>HS 固件</strong>——所有内存加密密钥的派生与访问控制都依赖 HS 模式的完整性。</p>
+<div class="highlight"><pre><span></span><code>   H100/Blackwell 机密计算信任链（被论文动摇）
+   租户数据加密密钥
+        │ 派生自
+        ▼
+   HS 固件（信任根）  ← 论文证明：一个内存安全漏洞即可让主机侧获得 HS 执行权限
+        │ 依赖
+        ▼
+   Falcon 安全处理器 + Secure Boot
+        │
+        ▼
+   OTP 熔丝（硬件信任根）
+   断裂点：HS 固件可被攻陷 → 信任根失效 → 整条信任链坍塌
+</code></pre></div>
+
+<p>论文的核心警示在于：<strong>一个内存安全漏洞就能让主机侧获得 HS 执行权限</strong>。若攻击者能在 HS 模式下执行任意代码，内存加密密钥可被读取、租户隔离边界可被突破、"机密计算"的保密性承诺失去保障。这对云厂商的多租户 GPU 服务构成根本性挑战：只要底层 GPU 固件存在同类缺陷，跨租户数据隔离就建立在沙地之上。</p>
+<h2>九、防御方案</h2>
+<h3>9.1 链接脚本加固</h3>
+<p>将 <code>__stack_chk_guard</code> 从数据段尾部移出，单独放入一个独立段，初始化后用 MPU 设为只读：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 链接脚本片段（Falcon 固件 .ld）</span>
+<span class="n">SECTIONS</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="p">.</span><span class="n">data</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="o">*</span><span class="p">(.</span><span class="n">data</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="cm">/* 栈保护参考字单独成段 */</span>
+<span class="w">    </span><span class="p">.</span><span class="n">stack_guard</span><span class="w"> </span><span class="p">(</span><span class="n">NOLOAD</span><span class="p">)</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">__stack_chk_guard_start</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">.;</span>
+<span class="w">        </span><span class="n">KEEP</span><span class="p">(</span><span class="o">*</span><span class="p">(.</span><span class="n">stack_guard</span><span class="p">))</span>
+<span class="w">        </span><span class="n">__stack_chk_guard_end</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">.;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="p">.</span><span class="n">bss</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">*</span><span class="p">(.</span><span class="n">bss</span><span class="p">)</span><span class="w"> </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="c1">// 启动代码：初始化后用 MPU 将 .stack_guard 段设为只读</span>
+<span class="kt">void</span><span class="w"> </span><span class="n">init_stack_guard</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">uint32_t</span><span class="w"> </span><span class="o">*</span><span class="n">guard</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="kt">uint32_t</span><span class="w"> </span><span class="o">*</span><span class="p">)</span><span class="n">__stack_chk_guard_start</span><span class="p">;</span>
+<span class="w">    </span><span class="o">*</span><span class="n">guard</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">generate_random_canary</span><span class="p">();</span><span class="w">   </span><span class="c1">// 随机化（非确定性）</span>
+
+<span class="w">    </span><span class="c1">// MPU 配置：将 guard 段标记为只读</span>
+<span class="w">    </span><span class="n">mpu_set_region</span><span class="p">(</span><span class="n">__stack_chk_guard_start</span><span class="p">,</span>
+<span class="w">                   </span><span class="n">__stack_chk_guard_end</span><span class="p">,</span>
+<span class="w">                   </span><span class="n">MPU_ATTR_READ_ONLY</span><span class="p">);</span><span class="w">   </span><span class="c1">// ← 此后任何写入触发硬件异常</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>这直接修复漏洞一：即使缓冲区溢出，也无法覆盖只读的 guard 值。</p>
+<h3>9.2 DMA-aware 安全分析</h3>
+<p>要求固件供应商提供<strong>对所有 DMA sink 的边界检查审计</strong>，并在 CI 流水线中集成 DMA-aware 静态分析：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 伪代码：DMA-aware 静态分析规则（CI 流水线）</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">audit_dma_sinks</span><span class="p">(</span><span class="n">firmware_ir</span><span class="p">):</span>
+    <span class="n">vulnerabilities</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="k">for</span> <span class="n">func</span> <span class="ow">in</span> <span class="n">firmware_ir</span><span class="o">.</span><span class="n">functions</span><span class="p">:</span>
+        <span class="k">for</span> <span class="n">dma_call</span> <span class="ow">in</span> <span class="n">find_dma_writes</span><span class="p">(</span><span class="n">func</span><span class="p">):</span>
+            <span class="c1"># 检查 DMA 长度参数是否有边界检查</span>
+            <span class="n">len_var</span> <span class="o">=</span> <span class="n">dma_call</span><span class="o">.</span><span class="n">length_operand</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="n">has_bounds_check</span><span class="p">(</span><span class="n">func</span><span class="p">,</span> <span class="n">len_var</span><span class="p">,</span> <span class="n">dma_call</span><span class="o">.</span><span class="n">dst_buffer</span><span class="p">):</span>
+                <span class="n">vulnerabilities</span><span class="o">.</span><span class="n">append</span><span class="p">({</span>
+                    <span class="s1">&#39;func&#39;</span><span class="p">:</span> <span class="n">func</span><span class="o">.</span><span class="n">name</span><span class="p">,</span>
+                    <span class="s1">&#39;sink&#39;</span><span class="p">:</span> <span class="n">dma_call</span><span class="o">.</span><span class="n">dst_buffer</span><span class="p">,</span>
+                    <span class="s1">&#39;issue&#39;</span><span class="p">:</span> <span class="s1">&#39;DMA length 未做边界检查&#39;</span><span class="p">,</span>
+                    <span class="s1">&#39;severity&#39;</span><span class="p">:</span> <span class="s1">&#39;CRITICAL&#39;</span>
+                <span class="p">})</span>
+    <span class="k">return</span> <span class="n">vulnerabilities</span>
+</code></pre></div>
+
+<p>关键在于让分析器理解"寄存器写序列 = DMA 数据拷贝"的语义，对每个 DMA sink 强制要求显式边界检查。</p>
+<h3>9.3 注入非确定性</h3>
+<p>针对漏洞三（确定性环境使盲打可靠），防御思路是<strong>打破确定性</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 启动时随机化栈基址与 guard 页偏移</span>
+<span class="kt">void</span><span class="w"> </span><span class="nf">randomize_memory_layout</span><span class="p">(</span><span class="kt">void</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// 1. 栈基址随机偏移</span>
+<span class="w">    </span><span class="kt">uintptr_t</span><span class="w"> </span><span class="n">stack_base</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">DEFAULT_STACK_BASE</span><span class="p">;</span>
+<span class="w">    </span><span class="n">stack_base</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="n">get_hw_random</span><span class="p">()</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0xFF0</span><span class="p">;</span><span class="w">  </span><span class="c1">// 随机偏移</span>
+<span class="w">    </span><span class="n">set_stack_pointer</span><span class="p">(</span><span class="n">stack_base</span><span class="p">);</span>
+
+<span class="w">    </span><span class="c1">// 2. 在栈与缓冲区间插入随机 guard 页</span>
+<span class="w">    </span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">pad</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">get_hw_random</span><span class="p">()</span><span class="w"> </span><span class="o">&amp;</span><span class="w"> </span><span class="mh">0x7</span><span class="p">;</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">pad</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">map_guard_page</span><span class="p">(</span><span class="n">alloc_page</span><span class="p">());</span><span class="w">       </span><span class="c1">// 不可访问页</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="c1">// 3. canary 随机化（每次启动不同）</span>
+<span class="w">    </span><span class="n">__stack_chk_guard</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">get_hw_random</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>随机化栈基址、随机偏移 guard 页、每次启动随机化 canary，使离线仿真器无法预测真实硬件的内存布局，盲打成功率大幅下降。</p>
+<h3>9.4 Rust 固件重写</h3>
+<p>最彻底的方案是用内存安全语言（如 Rust）重写 HS Falcon 固件。Rust 的所有权与借用检查在编译期消除缓冲区溢出、悬垂指针等内存安全缺陷：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// Rust 版本的签名验证例程（编译期保证内存安全）</span>
+<span class="k">fn</span><span class="w"> </span><span class="nf">verify_signature</span><span class="p">(</span><span class="n">host_sig</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="p">[</span><span class="kt">u8</span><span class="p">])</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="kt">bool</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">sig_buf</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span><span class="mi">0</span><span class="k">u8</span><span class="p">;</span><span class="w"> </span><span class="n">BUF_SIZE</span><span class="p">];</span><span class="w">          </span><span class="c1">// 固定大小，编译期已知</span>
+
+<span class="w">    </span><span class="c1">// DMA 拷贝：编译器强制边界检查</span>
+<span class="w">    </span><span class="c1">// 若 host_sig.len() &gt; BUF_SIZE，编译期/运行期拒绝</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">copy_len</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">host_sig</span><span class="p">.</span><span class="n">len</span><span class="p">().</span><span class="n">min</span><span class="p">(</span><span class="n">BUF_SIZE</span><span class="p">);</span>
+<span class="w">    </span><span class="n">sig_buf</span><span class="p">[</span><span class="o">..</span><span class="n">copy_len</span><span class="p">].</span><span class="n">copy_from_slice</span><span class="p">(</span><span class="o">&amp;</span><span class="n">host_sig</span><span class="p">[</span><span class="o">..</span><span class="n">copy_len</span><span class="p">]);</span>
+
+<span class="w">    </span><span class="n">crypto_verify</span><span class="p">(</span><span class="o">&amp;</span><span class="n">sig_buf</span><span class="p">[</span><span class="o">..</span><span class="n">copy_len</span><span class="p">])</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>Rust 固件从根本上消除了漏洞一、二赖以存在的内存不安全原语。综合来看，上述防御构成纵深体系：架构层注入非确定性并加固 canary 位置，工程层用 Rust 消除内存缺陷，流水线层用 DMA-aware CI 阻断缺陷进入生产。</p>
+<h2>十、总结</h2>
+<p>《A Canary in the Crypto Mine》揭示的不是某一个孤立漏洞，而是 GPU 安全设计的<strong>系统性缺陷</strong>：</p>
+<ol>
+<li><strong>信任栈层级耦合但隔离不足</strong>：最上层的内存安全缺陷能级联击穿中间层策略与底层熔丝保护，三层架构本应相互独立却因实现缺陷相互牵连。</li>
+<li><strong>确定性环境是安全的敌人</strong>：HS 模式锁死了外部读取，但运行环境的完全确定性反而让离线仿真与盲打成为可能。</li>
+<li><strong>常开域使临时利用永久化</strong>：always-on 电源域将一次性的权限提升固化为永久解锁，违背了"复位即恢复"的安全假设。</li>
+<li><strong>静态分析存在语义盲区</strong>：DMA 操作的寄存器写伪装让传统分析工具失明，工程实践需要 DMA-aware 的新范式。</li>
+<li><strong>机密计算信任根脆弱</strong>：H100/Blackwell 的机密计算将全部信任押注于 HS 固件完整性，而论文证明这一根基本可被单一内存漏洞动摇。</li>
+</ol>
+<p>"矿卡撬动 A100"的本质是：当产品分级（矿卡 vs 数据中心卡）完全依赖软件与固件限制，而底层安全架构又存在系统性缺陷时，商业分级就会在安全研究面前不堪一击。这对整个 GPU 行业的安全设计提出了深刻课题——<strong>硬件产品分级的安全边界，必须建立在硬件级强隔离之上，而非固件级的"君子协定"</strong>。</p>
+<hr />
+<h2>免责声明</h2>
+<p>本文所有技术内容均来源于公开发表的学术研究论文《A Canary in the Crypto Mine》及相关公开技术资料，仅用于安全研究、防御设计与技术教育目的。</p>
+<ol>
+<li><strong>合法性声明</strong>：本文不提供任何可直接用于破解、修改或绕过 NVIDIA GPU 安全限制的完整利用代码、工具或操作步骤。文中所涉技术细节均为已公开研究的高度概括与原理性描述。</li>
+<li><strong>不可用于违法用途</strong>：读者不得将本文内容用于任何未经授权的硬件修改、固件破解、产品分级绕过或其他违反法律法规、NVIDIA 最终用户许可协议（EULA）及知识产权法规的行为。任何此类行为由行为人自行承担全部法律责任。</li>
+<li><strong>准确性声明</strong>：本文基于公开研究资料撰写，作者不对技术细节的绝对准确性作任何担保。NVIDIA 可能已在后续产品或驱动更新中修复相关缺陷，具体技术现状以官方信息为准。</li>
+<li><strong>研究免责</strong>：本文提及的 BarraCUDA、Kraken、Leaky DNN、MERCURY 等侧信道研究均为独立学术成果，本文仅作综述引用，不代表这些工具可用于实际攻击部署。</li>
+<li><strong>责任限制</strong>：在适用法律允许的最大范围内，本文作者及发布平台不对读者基于本文内容采取的任何行为及其后果承担任何直接或间接责任。</li>
+</ol>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

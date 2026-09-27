@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NVIDIA Vera 白皮书拆解——一颗好 CPU 被营销写成玄幻小说 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>NVIDIA Vera 白皮书拆解——一颗好 CPU 被营销写成玄幻小说</h1>
+<time>2026-08-06</time>
+<ul>
+<li>CPU架构</li>
+<li>NVIDIA</li>
+<li>硬件分析</li>
+<li>Arm</li>
+<li>服务器</li>
+</ul>
+<hr />
+<p>NVIDIA 在 7 月 21 日发布了 Vera 处理器的技术白皮书。Vera 是 NVIDIA 第一款基于自研 Olympus 核心的服务器 CPU——88 核单 die、Arm v9.2、value prediction、graph prefetcher、164MB 系统级缓存、1.2 TB/s 内存带宽。</p>
+<p>硬件本身很能打。Phoronix 的独立测试显示 Vera 比 EPYC 9575F 高 10%，比 Xeon 6980P 高 55%，比上一代 Grace 高 63%。这是目前公开测试中最强的 Arm 服务器 CPU。</p>
+<p>问题出在白皮书上。NVIDIA 花了大量篇幅试图把工程上的取舍包装成对 x86 的降维打击，中间塞了不少经不起推敲的叙事。Chips and Cheese 发了一篇长文逐条拆解，我读完后的感受：NVIDIA 做了一颗好芯片，但营销部门把它包装成了"信 Vera 者得永生，x86 已是过去式"。</p>
+<p>下面逐条拆开看。</p>
+<h2>Olympus 核心：硬件是真的好</h2>
+<p>先说好的部分。Olympus 的架构设计确实有东西：</p>
+<ul>
+<li><strong>前端</strong>：每周期解码 10 条指令，每周期可处理两条 taken branch</li>
+<li><strong>预测</strong>：neural branch predictor + value prediction + memory renaming</li>
+<li><strong>执行</strong>：6 条 128-bit SVE 流水线 + 4 load + 2 store</li>
+<li><strong>缓存</strong>：96KB L1 数据缓存，2MB 私有 L2，约 10 周期延迟</li>
+<li><strong>SoC</strong>：88 核共享 164MB 系统级缓存，3.4 TB/s 一致性互联</li>
+</ul>
+<p>Value prediction 是 Olympus 最独特的特性。它的核心思路是：如果 CPU 能预测某个长延迟操作的结果，依赖指令就不用排队等，直接往前跑。AMD 在 Zen 1/2 上做过有限的浮点 value prediction，但 Olympus 的实现更接近 Apple 的方案——覆盖范围更广。</p>
+<p>Graph prefetcher 是另一个亮点。它能识别 producer-consumer 模式，自动追踪指针链做预取。Intel 从 2022 年起在 Granite Rapids 上有类似的 Data-Dependent Prefetcher，但实现比较受限。NVIDIA 的版本可能处理更复杂的依赖链。注意，这两个都不是 NVIDIA 发明的概念，但 Olympus 把它们落地到了服务器场景里。</p>
+<p>内存子系统同样大方：8 个 SOCAMM2 LPDDR5X 模块，总带宽 1.2 TB/s，满配功耗仅约 50W。作为对比，传统 EPYC 和 Xeon 的 DIMM 方案容量更大、更换方便，但要付出板面积和功耗代价。</p>
+<p>总结：Olympus 从微架构到 SoC 设计都是冲着高性能去的。这是 NVIDIA 在服务器 CPU 领域第一次拿出真正有竞争力的东西。</p>
+<h2>SMT 示意图：把 x86 画成一个红绿灯</h2>
+<p>白皮书 Figure 5 对比了"传统 SMT (x86)"和 NVIDIA 的 Spatial Multithreading。x86 这边，分支预测、译码、执行、访存各阶段被画成在两个线程间交替"时间片"轮转。配文说 Vera 通过静态划分资源避免了这种"机会主义的分时复用"。</p>
+<p>问题在于，这个图对 SMT 工作原理的描述是错误的。</p>
+<p>现实中的 SMT（无论是 x86 还是其他 ISA）不是时间片轮转。取指、译码、分配阶段是每周期动态选择线程，而执行和访存阶段是线程无关的——同一周期可以同时服务两个线程的微操作。静态划分和每周期动态选择的平均吞吐量是一样的，但当某个线程停顿（cache miss、分支预测失败），动态选择能把空闲资源交给另一个线程用。静态划分做不到这一点。</p>
+<p>NVIDIA 自己也没说 Spatial Multithreading 吞吐更高。白皮书强调的是"确定性、隔离、服务质量"，这在 NVIDIA 的目标市场（企业/AI 推理节点）可能是合理的取舍。但那个把传统 SMT 画成"两车道红绿灯交替放行"的示意图，暗示的是一个不存在的吞吐优势。</p>
+<p>Chips and Cheese 文章里的点很好：静态划分下，一个计算密集的线程可能用不到核心一半的执行资源，因为另一半被保留给了另一个线程——即使那个线程当前是 idle 的。</p>
+<p>SMT 性能还涉及大量细节：重排序缓冲区、寄存器文件、内存排序队列是复制、静态划分、watermark 还是竞争共享？Olympus 选了静态划分，从双线程切回单线程会有过渡延迟——软件要清楚开第二个线程在 Olympus 上不是免费的。但白皮书既不讨论这些取舍，也不给 SMT 性能数据，只扔了一张误导性的图。</p>
+<h2>NUMA 拓扑：可选项变"原罪"</h2>
+<p>白皮书说双路 x86 系统可能暴露"多达 32 个 NUMA 域"，而 Vera 只给一个。语言上给人的感觉是 x86 天生复杂，Vera 天生干净。</p>
+<p>但你只要翻一下 AMD 的调优指南就知道，NUMA 节点数是可配的——NPS4、NPS2、NPS1、NPS0，甚至可以把每个 LLC 域单独暴露为 NUMA 节点。"32 NUMA 节点"是把所有 locality 旋钮拧到最细粒度的极端配置，不是一个 x86 用户必然面对的现实。</p>
+<p>Vera 选了一个更简单的呈现方式：每 socket 一个 NUMA 域。这对调度器和内存放置确实友好。但 Vera 本身仍然有 88 个核、分布式缓存和 home node、围绕大 die 的内存控制器、基于包的 coherency fabric——这些物理距离不会因为 OS 看到一个 NUMA 域就消失。一个平坦的软件拓扑能把这些距离变得更一致，但不能让它们不存在。</p>
+<p>白皮书用"core-to-core 延迟最多降低 50%"来支撑这个论点，但不提供核心编号、最小/中位/最大延迟、分布和测量方法。这个数字是 NVIDIA 拿到的最好结果，不代表典型行为。</p>
+<h2>SPEC 改名叫"Agentic Benchmark"</h2>
+<p>这部分是整本白皮书最离谱的操作。</p>
+<p>NVIDIA 选了四个 SPEC CPU 2026 整数子项——CPython、GCC、LLVM、Cppcheck——然后把它们叫做"agentic benchmarks"。</p>
+<p>这四个程序是：一个 Python 解释器、两个优化编译器、一个 C/C++ 静态分析器。它们确实是正经的 CPU 负载，测试的是大指令足迹、分支密集代码、分配和依赖链。Agent 当然可能会调用类似的程序。</p>
+<p>但它们不是 agent。没有模型在吐 token，没有 agent runtime 在选择工具，没有沙箱在启动、阻塞 I/O、检索上下文、评估答案、把观察结果喂回策略。这些负载可能是 agentic pipeline 中"跑代码"那部分的有用代理，但把它们直接叫"agentic benchmarks"相当于把手表配件叫"智能腕戴设备"。</p>
+<p>再看数据呈现。Figure 15 显示四个子项每物理核 1.7x 到 1.8x 的优势。翻到配置页，两张卡的总 SPECrate 2026 Integer Base：Vera 双路 925 分，EPYC 9755 双路 898 分——系统级吞吐量领先 3.0%。</p>
+<p>两个数字都对。Vera 双路 176 物理核，EPYC 双路 256 物理核。按核均摊 Vera 确实快 50%，四个精选子项达到 70-80%。但把所有子项（包括 Vera 不擅长那些）加回总量，领先就缩到 3%。NVIDIA 当然有权利强调自己的强项，但把一个 3% 的系统级优势包装成"agentic 场景 1.8x"，这就是话术了。</p>
+<h2>IPC 对比：不可比的计数器</h2>
+<p>白皮书的 IPC 分析引用四个计数器组——branch predictions per cycle 领先 2.3x、taken branches per cycle 领先 3.5x、instruction fetch operations 领先 2.4x、backend operations 领先 4.3x。</p>
+<p>问题一：没有 PMU 事件名称和定义，没有原始计数，没有采样间隔，没有时钟频率。无法复现，无法审计。</p>
+<p>问题二：Arm 指令和 x86 指令不是同一个工作量单位。一条 x86 指令可能被拆成多个微操作，另一条 Arm 指令在退役时只算一条。CPU A 的"backend operation"和 CPU B 的"backend operation"可能根本不是一个东西。</p>
+<p>问题三：同一个任务，两个二进制可能用相同时间完成，但 IPC 完全不同。一个退休了更多"指令"但每条指令做了更少的工作。IPC 描述的是核心运行某段代码的行为特征，不是通用工作量标尺。</p>
+<p>更具体地说：更高的 branch predictions per cycle 可能是因为 Arm 二进制有更多的分支，或者 NVIDIA 的事件计入了 speculative prediction 而 EPYC 的对应事件没有。更高的 backend operations per cycle 可能只是微架构拆分粒度不同。要真正隔离出 value prediction 或 graph prefetcher 的贡献，需要开关对比实验——至少需要事件定义和 miss rate delta。白皮书没有提供这些。</p>
+<h2>内存带宽：最硬的数据和最小的结论</h2>
+<p>内存部分是白皮书最有说服力也最误导的地方。</p>
+<p>NVIDIA 的 loaded-latency 图显示 Vera 冲到 ~1.1 TB/s，EPYC 9755 停在 ~400 GB/s，差距近 3 倍。每核带宽 12.7 GB/s vs 3.1 GB/s，差距 4.1 倍。</p>
+<p>Chips and Cheese 在自己的 Turin 平台上测到了 ~570 GB/s。用这个数字重算：Vera 总带宽领先 1.9 倍（不是 3 倍），每核领先 2.8 倍（不是 4.1 倍）。如果换 AMD 自己定位的 AI 头节点 SKU EPYC 9575F，每核带宽差距缩到约 40%。</p>
+<p>关键数据：Turin 的理论峰值是 12 通道 DDR5-6400 = 614 GB/s。C&amp;C 测到 570 GB/s，利用率 93%。Vera 的理论峰值是 8 通道 LPDDR5X-9600 = 1.2 TB/s。NVIDIA 测到 1.1 TB/s，利用率 92%。</p>
+<p>两个处理器把理论带宽转化为实际带宽的效率几乎一样。Vera 赢在接口本身提供的峰值带宽是 Turin 的两倍、核数更少竞用更低——不是因为 chiplet 设计在"浪费"带宽。</p>
+<p>还有一个时间线上的尴尬：NVIDIA 7 月 21 日发白皮书，AMD 7 月 23 日发布第六代 EPYC（Venice）。96 核的 EPYC 9686F 提供 16 通道 DDR5-8000 或 MRDIMM-12800，顶配 1,638 GB/s——超过 Vera 的 1,200 GB/s。当然 Venice 还没上市，但说明这个"绝对带宽优势"的有效期可能很短。</p>
+<h2>1.8x RL 训练提升 = 一排小方块</h2>
+<p>白皮书 Figure 24 标题"Vera drives 1.8x for RL training"，配图是一排填满的小方块。</p>
+<p>没有模型名称，没有环境描述，没有 CPU/GPU 分配，没有框架，没有 batch size，没有功耗数据，没有重复次数，没有误差棒。我们甚至不知道这些小方块代表样本、步骤还是 NVIDIA 总部某个会议室地砖的排列。</p>
+<p>这不是一个差的 benchmark。这根本不是一个 benchmark。</p>
+<h2>结论：好硬件，烂白皮书</h2>
+<p>读完 45 页后，我对 Vera 的看法比对 Vera 白皮书的看法要好得多。</p>
+<p>Olympus 是一颗认真的核心：10-wide 定长解码器、大容量私有缓存、value prediction、激进的分支处理、图感知预取、88 核单 die——每一项都指向高性能设计。1.2 TB/s 的内存带宽对内存密集型服务器负载是实打实的优势。早期独立测试也证明这颗芯片至少兑现了白皮书写下的一部分承诺。</p>
+<p>但白皮书的论证是另一回事：把 x86 SMT 画成时间片轮转、把 NUMA 可选项说成默认负担、把 SPEC CPU 改名叫 agentic benchmark、用精选子项 1.8x 盖过总量 3%、用未定义计数器做跨 ISA IPC 对比、把内存接口优势归因到单 die 设计、把一排小方块当性能数据展示。</p>
+<p>这些操作不会让 Vera 变慢。它们只是让 NVIDIA 的论据比 NVIDIA 营销的语调小了一截。说人话就是：你明明做了一颗好 U，不需要从营销部门借性能。</p>
+<p>从开发者视角看，Vera 最值得关注的点是：</p>
+<ol>
+<li><strong>Arm 服务器生态正在形成真正的性能竞争力</strong>——不是"能跑"级别的，是"在某些场景下领先"级别的</li>
+<li><strong>LPDDR5X 在服务器上不再是妥协方案</strong>——8 通道 1.2 TB/s 功耗仅 50W，这对内存带宽敏感型负载（图数据库、ClickHouse、RL 训练的环境步进）是巨大吸引力</li>
+<li><strong>Value prediction 从学术论文走进了服务器硅片</strong>——这个技术路线如果成熟，对分支密集、依赖链长的负载会有质的提升</li>
+</ol>
+<p>NVIDIA 应该尽快把 Vera 硬件送到独立评测者手上，放开频率、功耗、工作负载限制。如果 Vera 真的像架构设计暗示的那么强，那些测试会比把 x86 SMT 画成两车道红绿灯有说服力得多。</p>
+<hr />
+<p><em>参考来源：<a href="https://chipsandcheese.com/p/nvidias-vera-whitepaper-has-a-thread">Chips and Cheese - NVIDIA's Vera Whitepaper Has a Thread Loose</a> / <a href="https://resources.nvidia.com/en-us-vera-cpu">NVIDIA Vera Whitepaper</a> / Phoronix Vera benchmarks</em></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

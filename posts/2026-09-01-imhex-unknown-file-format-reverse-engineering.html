@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>用 ImHex 逆向一个未知文件格式：从存档到完整 Pattern - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>用 ImHex 逆向一个未知文件格式：从存档到完整 Pattern</h1>
+<time>2026-09-01</time>
+<ul>
+<li>逆向工程</li>
+<li>二进制格式</li>
+<li>ImHex</li>
+</ul>
+<hr />
+<p>ImHex 的作者 WerWolv 写了篇《Reverse Engineering Unknown File Formats with ImHex》，用一个游戏存档（FEZ，2012 年的游戏）做例子，把"拿到一个二进制文件，最后写出结构化解析"的完整过程走了一遍。</p>
+<p>这类文章不多见。多数格式逆向教程停在"用十六进制编辑器看字节，猜一猜"，而这篇的重点是<strong>怎么从代码里拿到确定信息</strong>，再把它变成可复用的格式描述。</p>
+<h2>流程：反编译 → 找文件 → 找函数 → 写 Pattern</h2>
+<p>文章的目录把方法说得很清楚：</p>
+<ol>
+<li>反编译游戏</li>
+<li>找对文件</li>
+<li>找对函数</li>
+<li>写 ImHex Pattern</li>
+</ol>
+<p>顺序很重要。很多人反过来：先拿到文件就埋头看字节。但字节层面能告诉你的信息很少——你只能看到一堆十六进制，猜不出哪个字段是什么。真正确定的信息在<strong>读写这个文件的代码</strong>里。</p>
+<p>FEZ 是 C#（Unity）写的，反编译之后能看到清楚地写出存档的类和方法。这就是逆向未知格式最省力的入口：<strong>找序列化代码，而不是猜字节</strong>。</p>
+<h2>从代码里读出的具体线索</h2>
+<p>文章里给出的代码片段非常有代表性：</p>
+<div class="highlight"><pre><span></span><code><span class="kt">byte</span><span class="p">[]</span><span class="w"> </span><span class="n">buffer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="kt">byte</span><span class="p">[</span><span class="mi">40960</span><span class="w"> </span><span class="cm">/*0xA000*/</span><span class="p">];</span>
+<span class="k">using</span><span class="w"> </span><span class="p">(</span><span class="n">MemoryStream</span><span class="w"> </span><span class="n">output</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">MemoryStream</span><span class="p">(</span><span class="n">buffer</span><span class="p">))</span>
+<span class="k">using</span><span class="w"> </span><span class="p">(</span><span class="n">BinaryWriter</span><span class="w"> </span><span class="n">writer</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">BinaryWriter</span><span class="p">((</span><span class="n">Stream</span><span class="p">)</span><span class="n">output</span><span class="p">))</span>
+<span class="p">{</span>
+<span class="w">    </span><span class="n">writer</span><span class="p">.</span><span class="n">Write</span><span class="p">(...);</span><span class="w">   </span><span class="c1">// 按顺序写各个字段</span>
+<span class="w">    </span><span class="p">...</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>（还有对应的读取侧，会检查 <code>Length &gt; 40960L</code> 并抛出 <code>"Save file greater than the imposed limit!"</code>。）</p>
+<p>从这几行能提取出好几条硬信息：</p>
+<ul>
+<li><strong>文件有固定的最大尺寸 40960 字节（0xA000）</strong>。这说明格式里可能存在固定长度的数组或填充区。你看到文件尾部有大段零，不是"没用的数据"，是格式规定的定长区域。</li>
+<li><strong>字段顺序 = Write 调用的顺序</strong>。序列化代码里 <code>writer.Write</code> 的先后，直接对应文件里字段的排列。这是最重要的一条——它把"猜测字段边界"变成了"照着代码抄顺序"。</li>
+<li><strong><code>BinaryWriter</code> 是 .NET 的小端写器</strong>，所以数值字段默认是小端序。这一条能省掉大量试错。</li>
+<li><strong>异常里的字符串是格式约束的直接陈述</strong>，这类用户可见的错误信息经常比注释还可靠。</li>
+</ul>
+<p>把这几条合起来，你其实已经拿到了格式的骨架：一个定长缓冲区，里面按固定顺序排着一串特定类型的字段。</p>
+<h2>ImHex Pattern 语言：把格式写成代码</h2>
+<p>找到了结构，接下来要把它表达成 ImHex 能用的东西。ImHex 的 Pattern 语言是一套用来描述二进制布局的声明式语言，核心能力：</p>
+<ul>
+<li><code>struct</code> 定义结构体，字段按声明顺序对应文件里的字节。</li>
+<li>类型系统带固定宽度整数（<code>u8</code>、<code>u16</code>、<code>u32</code>、<code>u64</code>）、<code>float</code>、<code>char</code> 数组、定长 <code>byte[n]</code>。</li>
+<li>用 <code>@</code> 放置操作符把结构体锚定到文件里的某个偏移。文章里就是 <code>struct FezSaveFile</code> 放在文件开头。</li>
+<li>支持 <code>enum</code>、<code>list</code>（变长数组，长度可以引用前面读到的字段）、<code>string</code>（长度或终止符变体）、以及 <code>typedef</code> 定义子类型（subtype）复用。</li>
+<li>每个字段可以带 <code>[[color(...)]]</code>、注释、条件（<code>if</code>）等属性，读出来之后在视图里高亮。</li>
+</ul>
+<p>用它写格式的好处跟"写 schemas 解析 JSON"是一样的：<strong>格式变成了一份可执行、可版本化的文档</strong>。你不需要每次打开文件都重新数偏移，Pattern 一加载，字段名、类型、值全都标出来；改格式就改 Pattern，别人拿到 Pattern 也能立刻看懂。</p>
+<p>文章的分节顺序（Humble Beginnings → Save Data → Objects and Strings → Lists → Enums → More Subtypes）基本就是循序渐进写 Pattern 的过程：先定个空壳 struct，把第一个字段读出来，再一段段往里加，每加一段都在视图里核对解析结果是否合理。</p>
+<h2>几个能直接用的经验</h2>
+<ul>
+<li><strong>先反编译，再动十六进制编辑器。</strong> 读写函数是唯一能给你"确定答案"的地方。没有源码就找有符号的二进制、找格式相关的字符串常量。</li>
+<li><strong>定长缓冲区是礼物。</strong> 看到 <code>new byte[N]</code> 这样的分配，基本等于告诉你格式里有 N 字节的固定区域，边界可以直接画出来。</li>
+<li><strong>用异常的文本反推约束。</strong> "greater than the imposed limit" 这类话直接给了你字段的取值范围。</li>
+<li><strong>Pattern 边写边验。</strong> 每加一个字段就看解析出来的值像不像话（枚举落在合理范围、长度跟文件大小自洽、字符串能打印）。解析出乱码通常意味着前面某个字段宽度错了，越早发现越省事。</li>
+<li><strong>把 checksum 单独处理。</strong> 存档格式通常带校验和，先用 Pattern 把其余部分读对，再单独逆校验算法。</li>
+</ul>
+<h2>我的做法</h2>
+<p>遇到未知二进制格式，我的流程现在固定成：</p>
+<ol>
+<li>先 <code>strings</code> 一遍，找可疑的字段名、版本号、错误信息——这些往往直接暴露结构线索。</li>
+<li>找读写代码（源码优先，其次是符号化的二进制），把 <code>Write</code>/<code>Read</code> 的顺序抄下来当字段表。</li>
+<li>写一个最小 ImHex Pattern，只放前几个字段，验证。</li>
+<li>逐步补全，每步都核对；把 checksum 留到最后。</li>
+<li>把最终的 Pattern 存进仓库——下次要解析这个格式，直接用，不用重来。</li>
+</ol>
+<p>格式逆向的价值在于"一次性投入、长期复用"。Pattern 写完之后，这个格式对你就从"一团字节"变成了"有名字的数据结构"。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

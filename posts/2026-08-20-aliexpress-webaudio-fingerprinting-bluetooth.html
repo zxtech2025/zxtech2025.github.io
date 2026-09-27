@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>一次"听不见"的音频指纹：AliExpress 如何静默占住你的蓝牙耳机 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>一次"听不见"的音频指纹：AliExpress 如何静默占住你的蓝牙耳机</h1>
+<time>2026-08-20</time>
+<ul>
+<li>浏览器指纹</li>
+<li>WebAudio</li>
+<li>隐私</li>
+<li>安全</li>
+<li>蓝牙</li>
+</ul>
+<hr />
+<p>事情要从一副蓝牙耳机说起。</p>
+<p>我的耳机支持 multipoint，可以同时连 PC 和手机。平时 PC 优先出声，手机在 PC 空闲时接管播放。这套机制一直很稳，直到我打开 AliExpress 首页。</p>
+<p>打开页面几秒钟后，手机音乐戛然而止；关掉标签页立刻恢复。静音标签页、静音 Firefox、静音 Windows 全都无效，页面上也看不到任何视频、音乐或媒体元素。这个现象可疑到值得追查。</p>
+<h2>排查：包装 AudioContext 构造函数</h2>
+<p>第一反应是自动播放的商品视频或广告。我逐一排查了常规嫌疑对象：</p>
+<ul>
+<li><code>&lt;audio&gt;</code> / <code>&lt;video&gt;</code> 元素：没有</li>
+<li><code>HTMLMediaElement.play()</code> 调用：没有</li>
+<li>活跃的 Media Session 元数据：没有</li>
+<li><code>navigator.mediaSession.playbackState</code>：一直是 <code>none</code></li>
+<li>内嵌 iframe 里的媒体：没有</li>
+</ul>
+<p>线索是问题并非立即出现，而是页面空闲几秒后才开始。我改用 Web Audio API 的思路去观察，在页面加载前先埋点，包装两个关键 API：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">const</span><span class="w"> </span><span class="nx">OriginalAudioContext</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">window</span><span class="p">.</span><span class="nx">AudioContext</span><span class="p">;</span>
+<span class="nb">window</span><span class="p">.</span><span class="nx">AudioContext</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kd">class</span><span class="w"> </span><span class="k">extends</span><span class="w"> </span><span class="nx">OriginalAudioContext</span><span class="w"> </span><span class="p">{</span>
+<span class="w">  </span><span class="kr">constructor</span><span class="p">(...</span><span class="nx">args</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">super</span><span class="p">(...</span><span class="nx">args</span><span class="p">);</span>
+<span class="w">    </span><span class="nx">console</span><span class="p">.</span><span class="nx">log</span><span class="p">(</span><span class="s2">&quot;AudioContext created&quot;</span><span class="p">,</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nx">state</span><span class="o">:</span><span class="w"> </span><span class="k">this</span><span class="p">.</span><span class="nx">state</span><span class="p">,</span>
+<span class="w">      </span><span class="nx">stack</span><span class="o">:</span><span class="w"> </span><span class="ow">new</span><span class="w"> </span><span class="ne">Error</span><span class="p">().</span><span class="nx">stack</span>
+<span class="w">    </span><span class="p">});</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">};</span>
+<span class="c1">// 同时包装 AudioNode.prototype.connect()，</span>
+<span class="c1">// 看有没有节点连到 AudioContext.destination</span>
+</code></pre></div>
+
+<p>这下抓到了：AliExpress 首页在空闲状态创建了<strong>两个</strong> AudioContext，都进入 <code>running</code> 状态，都往 <code>AudioContext.destination</code> 上接了节点。而此刻页面上依旧是零个 <code>&lt;audio&gt;</code>/<code>&lt;video&gt;</code>、零次 <code>play()</code>、零条 Media Session，也听不到任何声音。</p>
+<p>构造函数堆栈指向两个脚本：</p>
+<div class="highlight"><pre><span></span><code>https://assets.aliexpress-media.com/g/AWSC/uab/1.140.0/collina.js
+https://assets.aliexpress-media.com/g/AWSC/fireyejs/1.231.67/fireyejs.js
+</code></pre></div>
+
+<p>两个脚本都挂在 <code>AWSC</code> 目录下，是阿里巴巴浏览器安全与反滥用（anti-abuse）体系的一部分，代码重度混淆。</p>
+<h2>隐藏的音频图：锯齿波 → 分析器 → 零增益</h2>
+<p>对混淆代码逆向后，两个脚本搭建的 WebAudio 图结构一致：</p>
+<div class="highlight"><pre><span></span><code>SawtoothOscillator（锯齿波振荡器）
+  → AnalyserNode（分析器）
+  → ScriptProcessorNode（脚本处理）
+  → GainNode（增益设为 0）
+  → AudioContext.destination
+</code></pre></div>
+
+<p>振荡器产生一个已知波形，分析器测量它经过浏览器音频实现之后的结果，脚本读取频率数据。增益设为 0，用户听不到声音；但整张图仍然连到了系统音频输出端。连上 destination 会让浏览器<strong>主动调度这张图做实时音频处理</strong>，即便最终音量是 0。</p>
+<p>这跟自动播放视频有本质区别：没有 media 元素，浏览器标签页的静音控制就无从下手。对页面来说，它在执行实时音频处理；对我的耳机来说，这条音频通路被"占住"了，multipoint 自然无法干净地切回手机。</p>
+<h2>为什么"静音"仍然占着音频通道</h2>
+<p>这里有个容易被忽略的机制：WebAudio 的 <code>GainNode</code> 增益为 0，不等于图没在跑。</p>
+<p>只要某个节点连接到了 <code>destination</code>，浏览器就会为这条链建立音频渲染调度。对底层来说，这意味着输出设备被打开、音频回调周期性地被驱动——对蓝牙 A2DP 而言，PC 这一侧的音频 sink 持续处于激活态。multipoint 耳机遵循"谁在出声（或谁的音频通路活跃）谁优先"的规则，于是 PC 牢牢抓住优先权，手机那头自然被顶掉。</p>
+<p>标签页静音之所以失效，是因为它作用于 media 元素的音量/静音标志，而这里根本没有 media 元素。<code>mediaSession.playbackState</code> 是 <code>none</code>，因为图不是通过 media 元素播放的。这是一条绕开了浏览器所有可见媒体控制的"隐形音频通道"。</p>
+<h2>不止音频：一份完整的指纹清单</h2>
+<p>WebAudio 测试只是这套脚本的一小部分。翻看 bundle，还能找到大量测量代码，覆盖：</p>
+<ul>
+<li>Canvas 渲染与 <code>toDataURL()</code></li>
+<li>WebGL 渲染器信息、扩展、shader 精度</li>
+<li>音频振荡器与分析器输出</li>
+<li>屏幕与视口尺寸、devicePixelRatio</li>
+<li><code>hardwareConcurrency</code> 与设备内存</li>
+<li>已安装浏览器插件</li>
+<li>支持的音视频格式</li>
+<li>WebRTC 行为</li>
+<li>浏览器性能计时</li>
+<li>鼠标、触摸、焦点、滚动事件</li>
+<li>设备运动与方向传感器</li>
+<li>一系列与浏览器自动化（爬虫/Selenium 痕迹）相关的属性</li>
+</ul>
+<p>结果会被序列化、加密，通过 <code>fetch()</code> 或 <code>sendBeacon()</code> 发往阿里的遥测服务。</p>
+<p>音频指纹的原理是：同样的生成信号，在不同浏览器版本、操作系统、音频库、硬件上会得到<strong>略有差异</strong>的输出。单靠音频指纹未必能唯一定位一台设备，但把它和 Canvas、WebGL、硬件、时序、交互数据拼起来，区分度就非常高了。</p>
+<h2>动机：反欺诈与隐私的天平</h2>
+<p>从商业角度看，AliExpress 有充分理由区分真实用户和自动化客户端：账号接管、虚假账号、爬虫、自动下单、支付欺诈、刷评、滥用优惠券和新客补贴。Cookie 不可靠——可以被清除、复制、替换；而由十几个独立测量维度拼成的指纹，很难被一致性地伪造。交互数据还能辅助判断操作者是人还是脚本。</p>
+<p>问题不在目的，而在实现方式。它在<strong>未触发任何敏感操作前</strong>就在普通购物首页跑起来，采集范围广、代码刻意不可读、且没有任何可见提示表明页面启动了一条实时音频处理链。更糟的是它产生了真实的硬件副作用——一条静默指纹测试能干扰蓝牙 multipoint 切换，而浏览器的静音控制对此无能为力。</p>
+<h2>防御：两条 uBlock Origin 过滤规则</h2>
+<p>实测屏蔽这两个脚本族后，AliExpress 首页照常渲染，捕获中不再出现 AudioContext 或 destination 连接。在 Firefox 的 uBlock Origin 仪表盘里，进"自定义静态过滤规则"加上：</p>
+<div class="highlight"><pre><span></span><code>! AliExpress AWSC fingerprinting scripts
+||assets.aliexpress-media.com/g/AWSC/uab/*/collina.js$script,domain=aliexpress.com
+||assets.aliexpress-media.com/g/AWSC/fireyejs/*/fireyejs.js$script,domain=aliexpress.com
+</code></pre></div>
+
+<p>点"应用更改"后<strong>务必关掉已有的 AliExpress 标签页再重新打开</strong>——屏蔽脚本并不会终止它已经创建的音频上下文。</p>
+<p>这两条规则刻意收窄：只屏蔽观察到的两个脚本族，且仅在 <code>aliexpress.com</code> 域名下生效。因为它们连着反欺诈系统，屏蔽后登录或支付时可能出现更多 CAPTCHA；如果合法登录被拒，可以临时停用规则。目前首页和普通商品浏览不受影响。</p>
+<p>如果你也想验证别的站点有没有类似行为，可以在 DevTools 控制台先跑上面的 <code>AudioContext</code> 包装代码，再打开目标页面看日志；<code>state: "running"</code> 且堆栈里出现可疑脚本，基本就是同一类东西。</p>
+<h2>一个开发者的视角</h2>
+<p>这件事最让我不舒服的，不是被采集数据，而是它让我<strong>无法掌控自己的音频通路</strong>。一个前端安全模块，通过一条零增益的音频图，就能改变我外部硬件的行为，而我唯一的线索是"手机音乐莫名停了"。这暴露的是浏览器给网页的权限边界和给用户的可见性之间的裂缝。</p>
+<p>我自己的处理方式就两条：</p>
+<ol>
+<li><strong>默认拦</strong>：把上面两条规则常驻在 uBlock 里。反欺诈可以理解，但静默占用音频通路不能接受。</li>
+<li><strong>留个心眼</strong>：蓝牙耳机突然被"抢走"、手机播放异常中断时，先看看是不是有个看似安静的前台页面在搞小动作。包装 <code>AudioContext</code> 那几行代码，随时能帮你把隐形音频图揪出来。</li>
+</ol>
+<p>隐私和反欺诈从来不是非此即彼，但实现必须透明、克制。一个能让耳机"卡住"的静默指纹，无论如何都越界了。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
