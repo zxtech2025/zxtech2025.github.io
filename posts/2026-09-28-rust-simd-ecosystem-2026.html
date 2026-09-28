@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rust SIMD 生态 2026 年度纵览：从 autovectorization 到 AVX-512 的性能陷阱 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Rust SIMD 生态 2026 年度纵览：从 autovectorization 到 AVX-512 的性能陷阱</h1>
+<time>2026-09-28</time>
+<ul>
+<li>Rust</li>
+<li>SIMD</li>
+<li>性能优化</li>
+<li>编译器</li>
+<li>底层</li>
+</ul>
+<hr />
+<p>Sergey "Shnatsel" Davidoff 刚发布了年度调查《The state of SIMD in Rust in 2026》。他去年写完调查后就一头扎进去参与贡献，现在已经是 Fearless SIMD 的 maintainer 了。为了避免利益冲突，他把草稿发给 std::simd、wide、pulp、macerator 的作者们审阅，但保留了编辑权。</p>
+<p>这份调查值得认真读的原因是：它不只是列一遍有哪些 crate，而是把整个技术栈从「编译器能不能向量化」一直扒到「Intel 的 AVX-512 在哪些 CPU 上反而更慢」。下面是我读完之后的梳理，加上一些我自己踩过的坑。</p>
+<h2>三条路线，以及它们的真实成本</h2>
+<p>用上 SIMD 只有三种方式，作者把它们排了个序：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 1. 让编译器自己向量化</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">sum</span><span class="p">:</span><span class="w"> </span><span class="kt">i32</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">slice</span><span class="p">.</span><span class="n">iter</span><span class="p">().</span><span class="n">sum</span><span class="p">();</span>
+
+<span class="c1">// 2. 可移植的 SIMD 抽象</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">c</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">i32x4</span><span class="p">::</span><span class="n">splat</span><span class="p">(</span><span class="mi">3</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">i32x4</span><span class="p">::</span><span class="n">from_array</span><span class="p">([</span><span class="mi">1</span><span class="p">,</span><span class="mi">2</span><span class="p">,</span><span class="mi">3</span><span class="p">,</span><span class="mi">4</span><span class="p">]);</span>
+
+<span class="c1">// 3. 平台专属 intrinsic，且必须处理多版本分发</span>
+<span class="cp">#[cfg(all(target_arch = </span><span class="s">&quot;x86_64&quot;</span><span class="cp">, target_feature = </span><span class="s">&quot;sse2&quot;</span><span class="cp">))]</span>
+<span class="n">_mm_add_epi32</span><span class="p">(</span><span class="n">__m128i</span><span class="p">,</span><span class="w"> </span><span class="n">__m128i</span><span class="p">)</span>
+<span class="cp">#[cfg(all(target_arch = </span><span class="s">&quot;aarch64&quot;</span><span class="cp">, target_feature = </span><span class="s">&quot;neon&quot;</span><span class="cp">))]</span>
+<span class="n">vaddq_u32</span><span class="p">(</span><span class="n">int32x4_t</span><span class="p">,</span><span class="w"> </span><span class="n">int32x4_t</span><span class="p">)</span>
+</code></pre></div>
+
+<p>自动向量化最省事，没有依赖，能覆盖编译器支持的所有指令集。但它的不可靠程度也很真实：函数越大越复杂，编译器放弃向量化的概率越高；性能还会随编译器版本上下横跳。</p>
+<p>这里有个容易忽略的细节：Rust 1.98 才稳定了 <code>algebraic_add()</code> 这类代数运算。在此之前，浮点求和根本无法自动向量化，因为改变运算顺序会改变可观测结果，编译器不被允许这么做。<code>algebraic_*</code> 相当于一个不那么危险的 <code>-ffast-math</code>，但你还是得手动改写代码才可能被向量化。</p>
+<h2>x86 的分发问题，以及 15% 的现实</h2>
+<p>x86_64 默认只保证 SSE2，所以你要么接受这个基线，要么处理多版本分发。</p>
+<p>作者提到 <code>multiversion</code> crate 有个没写进文档的坑：给函数加 <code>#[multiversion(targets = "simd")]</code> 之后，调用它会有十几条指令的开销。如果这个函数本身很小，开销就直接吞掉收益。他的经验法则是：函数里有循环就加 <code>#[multiversion]</code>，只处理几个值就加 <code>#[inline(always)]</code>，前提是调用链上游某处有 <code>#[multiversion]</code>。</p>
+<p>但真正扎心的是这一段：AVX2 早在 2013 年就有 CPU 支持了，可 <strong>最近一款不支持 AVX2 的 Intel CPU 是 2021 年发布的</strong>。结果是 2026 年的 Firefox 硬件调查里，<strong>15% 的 x86 CPU 依然没有 AVX2</strong>。你还得为这批机器维护 SSE4.2 代码路径——那是 2008 年的指令集。</p>
+<p>如果你只在自己服务器或云上跑，那就直接断言硬件够新：</p>
+<div class="highlight"><pre><span></span><code><span class="nv">RUSTFLAGS</span><span class="o">=</span><span class="s1">&#39;-C target-cpu=x86-64-v3&#39;</span><span class="w"> </span>cargo<span class="w"> </span>build<span class="w"> </span>--release
+</code></pre></div>
+
+<p>代价是遇到不支持的 CPU 会直接崩或行为异常，所以对外分发的二进制不能这么干。</p>
+<p>值得注意的是，这个问题只存在于 x86。ARM 从 64 位开始就强制要求 NEON，WebAssembly 则让你编两份二进制再用 JS 探测。</p>
+<h2>crate 横评：一张表说清选择</h2>
+<p>作者对生产可用的可移植 SIMD 抽象做了特性矩阵，这张表的可读性比任何 benchmark 都高：</p>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>std::simd</th>
+<th>fearless_simd</th>
+<th>wide</th>
+<th>pulp</th>
+<th>macerator</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>多版本分发</td>
+<td>✅</td>
+<td>✅</td>
+<td>❌</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>定宽向量</td>
+<td>✅</td>
+<td>✅</td>
+<td>✅</td>
+<td>☑️</td>
+<td>❌</td>
+</tr>
+<tr>
+<td>硬件宽向量</td>
+<td>部分</td>
+<td>✅</td>
+<td>手动</td>
+<td>✅</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>对元素类型泛型</td>
+<td>✅</td>
+<td>✅</td>
+<td>❌</td>
+<td>❌</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>对向量宽度泛型</td>
+<td>✅</td>
+<td>✅</td>
+<td>❌</td>
+<td>☑️</td>
+<td>✅</td>
+</tr>
+<tr>
+<td>安全调用 intrinsic</td>
+<td>部分</td>
+<td>✅</td>
+<td>☑️</td>
+<td>✅</td>
+<td>❌</td>
+</tr>
+<tr>
+<td>三角函数</td>
+<td>部分</td>
+<td>❌</td>
+<td>☑️</td>
+<td>❌</td>
+<td>❌</td>
+</tr>
+</tbody>
+</table>
+<p>（✅ 完整支持，☑️ 有但有限制，❌ 不支持）</p>
+<p>指令集覆盖方面，AVX-512 各家都支持，但实现深度差别很大，值得单独看几个关键点。</p>
+<p><strong>std::simd</strong> 的定位是「必须进标准库的积木块」，其余交给生态。最大问题是 nightly-only，而且还在不定期做破坏性 API 变更。它直接坐在 LLVM 之上，能覆盖任何 LLVM 能覆盖的平台，包括那些只有大型银行或者 LoongArch 才用的 CPU。但反过来，如果 LLVM 内部没有恰好对应的操作，<code>std::simd</code> 没有 plan B，最终就是<strong>一条 SIMD 指令都不发</strong>。作者说这种情况「令人不安地频繁」。它的 <code>reduce_sum()</code> 在性能和精度上都是最差的，浮点上的非平凡函数建议别用。</p>
+<p><strong>fearless_simd</strong> 是作者现在维护的那个，也是唯一所有格子全绿的。卖点有几个：底层 unsafe 代码比其他 crate 少几个数量级；<code>#[simd]</code> 标注上去就完事，连很小的函数也能正确分发；分发策略由<strong>编译最终二进制的那个使用者</strong>控制，不用改库源码。代价是样板代码：</p>
+<div class="highlight"><pre><span></span><code><span class="cp">#[simd]</span>
+<span class="k">fn</span><span class="w"> </span><span class="nf">my_func</span><span class="o">&lt;</span><span class="n">S</span><span class="p">:</span><span class="w"> </span><span class="nc">Simd</span><span class="o">&gt;</span><span class="p">(</span><span class="n">simd</span><span class="p">:</span><span class="w"> </span><span class="nc">S</span><span class="p">,</span><span class="w"> </span><span class="n">a</span><span class="p">:</span><span class="w"> </span><span class="nc">A</span><span class="p">,</span><span class="w"> </span><span class="n">b</span><span class="p">:</span><span class="w"> </span><span class="nc">B</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>wide</strong> 平台覆盖好、操作全、已经 v1.0，甚至有三角函数（虽然精度明确不保证）。但它在架构上<strong>和分发机制不兼容</strong>，不跑 x86 或者总是带 <code>-C target-cpu=</code> 固定目标还行，否则性能受限。唯一的绕法是 <code>cargo multivers</code>，但那玩意只对长跑程序有效，短命程序的启动开销比 SIMD 收益还大。</p>
+<p><strong>pulp</strong> 是给 faer 线性代数库做的，所以 API 偏向原生宽度向量，实现的操作也偏数学（连 swizzle 都没有）。定宽向量理论上能用，但完全没有文档、非常别扭，作者在研究过程中还顺手修了一个 soundness bug。</p>
+<p><strong>macerator</strong> 是 pulp 的近亲，给 burn 做 CPU 后端。相对 pulp 加了对元素类型泛型，但砍掉了安全 intrinsic 访问和大部分文档。它是除 std::simd 之外唯一对 <code>f16</code> 有可移植操作的库。crates.io 上除了 burn 没人用它。</p>
+<h2>intrinsic 的永恒拉锯战</h2>
+<p>这一节是我觉得整篇文章最有价值的部分。作者直说：intrinsic 本该清晰地映射到具体 CPU 指令，简单又重要，你期待它工作得很好，<strong>但它不。Rust 不行，C++ 不行，C 也不行。</strong></p>
+<p>根本矛盾在于「给我这条确切指令」和编译器优化之间的冲突。把 intrinsic 当纯黑盒，别处就低效。</p>
+<p>他举了个在 ARM 上真实踩到的 bug：<code>u32x4::from([1,2,3,4])</code> 很慢。这只是在加载一个常量，而且 <code>u32x4</code> 的内存布局和 <code>[u32; 4]</code> 完全一样，本该就是一次 load。结果底层的 <code>vld1_u32_x4</code> intrinsic 在编译器里是黑盒实现，LLVM 只能看到一个作用于栈上值的黑盒操作，生成的汇编变成：先把常量装进寄存器，再扔回栈上，然后通过黑盒的 <code>vld1_u32_x4</code> 再装回寄存器。修法是把这个 intrinsic 降级成普通 load 的兼容包装。</p>
+<p>但把所有 intrinsic 都变成编译器操作的包装并不现实。它本质上是硬件操作，只是还没人为它写优化 pass。而且如果想让编译器理解这些操作（或者对略有差异的硬件指令做抽象），就需要拆成多个基本块；然后你又得靠优化器把它们重新组合回单条指令，而无关的优化模式很容易打乱这个匹配。结果就是：<strong>简单测试用例上能跑通的优化，真实代码里会崩。</strong></p>
+<p>再叠上指令选择 bug。作者遇到 LLVM 看到一个常量索引的 512 位 shuffle 操作，觉得「我知道，我能优化这个」，结果它的「优化」用的是 SSE4.2 时代的操作，比直接执行 shuffle 指令慢得多（已在 LLVM 23 修复）。他甚至维护了一份自己找到的编译器 bug 清单。Rust 相关的报上去修了，但影响 Rust、C++、C 的 LLVM bug 还有一堆没修。这不是 LLVM 独有的问题，GCC 类似，MSVC 明显比两个开源编译器更差。</p>
+<p>附带一个冷知识：Intel 忘了把某些 AVX-512 指令放进他们可搜索的 Intrinsics Guide，导致大多数编译器没实现，现在从高层语言根本够不到这些指令。</p>
+<p>那用内联汇编绕过去？可以，但内联汇编块是个货真价实的黑盒，所有优化问题加倍奉还，进出汇编块本身还有开销。写一个大函数还行，就想用一两条指令并不划算。</p>
+<h2>硬件真相：AVX-512 在部分 CPU 上是净亏损</h2>
+<p>这是标题里说的性能陷阱。作者写完 5 个不同指令集的 SIMD 代码之后，对硬件有一肚子意见。</p>
+<p><strong>AVX2 是最常见也最坑的指令集。</strong> 作者的说法很传神：每当他实现一个直白的 SIMD 操作，AVX-512 和 NEON 有一半时候有原生支持，而 AVX2 需要复杂又慢的模拟。原因是它压根不是真正的 256 位 ISA，更像是<strong>两个 128 位执行单元塞在一起</strong>。</p>
+<p>然后 AVX-512 的问题更微妙。在早期支持 AVX-512 的 Intel CPU 上，<strong>即使只在一个核上跑，也会拉低所有核的频率</strong>，整个芯片的其他部分都得陪着降频。讽刺的是 AVX-512 只出现在高核心数的高端 CPU 上，而这种场景下频率外溢的伤害恰恰最大。你以为通吃全部核心能摊平，但更可能是撞上内存带宽瓶颈，CPU 在干什么已经不重要了。</p>
+<p>这个降频行为直到 2019 年的 Ice Lake 才被修复，这也正是 fearless_simd 只在 Ice Lake 及以后（以及从来没有降频问题的 AMD）启用 AVX-512 的原因。</p>
+<p>AMD 的设计从另一个角度证明了 Intel 有多失误：Zen 4 根本没有硬件 512 位运算单元，把大多数 512 位操作映射到 256 位执行单元上，benchmark 里照样吊打 Intel 的原生 512 位硬件。Zen 5 上了原生 512 位之后就彻底没悬念了。</p>
+<p>scatter/gather 指令则是 AMD 的锅：Zen 上它们没有硬件原生实现，比发一堆小 load 还慢。而 <strong>LLVM 自动向量化时有时会为 AVX-512 生成 scatter/gather，在 Intel 上拖慢 1.75 倍，在 AMD 上拖慢 4 倍</strong>。作者都不确定 LLVM 图什么。</p>
+<p>浮点还有个坑：对非常接近零的值做数学运算，性能会暴跌。AMD 大约慢 2 倍，<strong>Intel 上你会吃到 30 倍的减速</strong>。</p>
+<p>现实分布数据来自 Steam 硬件调查：<strong>23.9% 的系统有 AVX-512</strong>（偏高端和游戏机，Firefox 图形调查里那 15% 只有 SSE4.2 的机器在这里只占 2%）。桌面端倒是不用担心那些「坏掉的 AVX-512」，所以把 Ice Lake 设成 AVX-512 的门槛实际上不亏，Skylake 服务器会退到 AVX2，正好避开降频。</p>
+<p><strong>ARM 这边，AVX2 做错的事 64 位 NEON 全做对了。</strong> 只有 128 位向量，你以为它对应 SSE4.2，实际更接近 AVX2：寄存器空间和 AVX2 一样（实践中这才是瓶颈），而且不需要你显式处理两个 128 位执行单元，大核通过指令级并行透明地并行执行 128 位操作，省电的小核则逐个执行。作者在 SIMD base64 解码上的实测：<strong>同一算法在 NEON 上比 AVX2 快 1.5 到 2 倍</strong>，但比 AVX-512 还是慢 2 倍。而且它是单一编程模型，64 位 ARM 上强制存在，完全不需要分发。</p>
+<p>NEON 唯一的槽点是 ARM 芯片有大核小核两套执行特性完全不同的核心，一个在大核上快的指令序列在小核上就慢，无法针对具体 CPU 挑最优实现，只能权衡。</p>
+<p>SVE 基本可以忽略，SVE2 现在是强制要求，但在高端服务器芯片上也只按 128 位宽实现，等于一个多了几步的别扭 NEON。</p>
+<p><strong>RISC-V 向量（RVV）在 2026 年完全不用管</strong>，因为支持向量的 RISC-V 硬件本身就不重要，性能价格比极差。而且就算有好硬件，spec 的写法让某些关键指令对编译器根本不可用。</p>
+<h2>编译器的功能愿望清单</h2>
+<p>作者列了几个对 Rust 最要紧的东西，按重要性排序：</p>
+<p><code>min_generic_const_args</code> 让数组能和硬件宽 SIMD 向量配合使用。目前只能拿超大数组、<code>generic-array</code> crate 或者宏来凑合，都不完整或者很丑。</p>
+<p>Struct Target Features RFC 会让 fearless_simd / pulp / macerator 不再需要在函数上加 <code>#[simd]</code>。样板代码少了是其次，<strong>关键是你不会再因为忘了加注解而悄悄掉性能</strong>。</p>
+<p>还需要一种让迭代器不和多版本分发冲突的办法，Struct Target Features RFC 也能解决这个。</p>
+<p>标准库层面，他希望有类似 crater 的机制来验证 intrinsic 的改动，以及 <code>std::simd</code> 进 stable，那样生态 crate 能删掉大部分代码，顺便白拿所有冷门平台的支持。</p>
+<h2>我自己的取法</h2>
+<p>看完这篇，我把自己项目里的策略调整成这样：</p>
+<p><strong>别默认上 intrinsic。</strong> 先写紧凑的循环，用 <code>as_chunks()</code> 而不是裸切片迭代，然后看汇编确认编译器到底有没有向量化。只有确认它做不到，才考虑动手。</p>
+<p><strong>crate 选 fearless_simd 或 wide，取决于你是否需要对外分发。</strong> 需要分发且想省心就 fearless_simd，全绿的格子不是白拿的。只给固定硬件编译，wide 的 v1.0 成熟度和三角函数覆盖更舒服。</p>
+<p><strong>x86 上永远测两个目标。</strong> SSE2 基线跑一遍，<code>-C target-cpu=x86-64-v3</code> 再跑一遍。那 15% 的差距你只有在真机上才看得到。</p>
+<p><strong>别信 AVX-512 在所有 CPU 上都更快。</strong> 如果目标是 Skylake 服务器，启用 AVX-512 很可能是在给自己降频，用 Ice Lake 作为门槛这个做法值得照抄。</p>
+<p><strong>内存带宽才是最终天花板。</strong> 当计算密集到一定程度，AVX-512 的优势会被内存吃光。如果你的 kernel 已经在带宽边界上，继续堆向量宽度是浪费时间，该去看数据布局。</p>
+<p>这篇调查最让我意外的不是哪个 crate 好用，而是<strong>编译器对 intrinsic 的优化至今仍是一团乱麻</strong>。我们把 SIMD 当成性能银弹，但底下二十年攒出来的指令集碎片、降频行为、指令选择 bug，决定了同一段代码在不同机器上能差出 4 倍。写 SIMD 的合理心态大概是：把它当成需要实测的硬件适配工作，而不是一次写完到处都快的抽象。</p>
+<p>原文：https://shnatsel.github.io/state-of-simd-rust-2026/</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
