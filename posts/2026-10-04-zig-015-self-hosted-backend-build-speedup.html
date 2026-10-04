@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Zig 0.15 编译提速实战：自研 x86_64 后端如何把 Ghostty 的构建时间砍掉四分之一 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Zig 0.15 编译提速实战：自研 x86_64 后端如何把 Ghostty 的构建时间砍掉四分之一</h1>
+<time>2026-10-04</time>
+<ul>
+<li>Zig</li>
+<li>编译器</li>
+<li>构建系统</li>
+<li>工程实践</li>
+<li>性能优化</li>
+</ul>
+<hr />
+<h1>Zig 0.15 编译提速实战：自研 x86_64 后端如何把 Ghostty 的构建时间砍掉四分之一</h1>
+<p>Zig 社区有句话被反复引用："编译器太慢了，所以我们才有 bug。"这句话背后的逻辑很朴素——编译慢，开发者就会下意识地少编译、少测试,把验证推迟到 CI 甚至推迟到线上。所以 Zig 多年来把"更快的编译"当作一等目标,干了几件在别人看来很疯的事:抛弃 LLVM、自己写代码生成后端、自己写链接器、一步步逼近增量编译。</p>
+<p>这些投入在 Zig 0.15.1 终于开始显形。Mitchell Hashimoto 用他的 Ghostty 终端模拟器做了一组真实场景的对比,数据相当能说明问题。</p>
+<h2>四组真实构建数据</h2>
+<p>所有测量都在同一台 x86_64 Linux 机器上完成,对比 Zig 0.14 与 0.15。</p>
+<p><strong>构建脚本自身的编译</strong>(<code>zig build --help</code> 触发的 <code>build.zig</code> 编译):</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>Zig 0.14</th>
+<th>Zig 0.15</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>build.zig 编译</td>
+<td>7.167s</td>
+<td><strong>1.702s</strong></td>
+</tr>
+</tbody>
+</table>
+<p>一个写得好的构建脚本很少需要重建自己,但每个未缓存的源码构建都要先付这笔成本。对"从源码编译一次"的用户来说,这直接决定了拿到可用二进制的等待时间。4 倍多的差距。</p>
+<p><strong>完整未缓存构建 Ghostty 可执行文件</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>Zig 0.14</th>
+<th>Zig 0.15</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>全量未缓存</td>
+<td>41s</td>
+<td>32s</td>
+</tr>
+</tbody>
+</table>
+<p>注意这里包含了构建脚本自身的编译时间。扣掉那 5 秒后,其余部分约快 2 秒。关键是,<strong>这次构建仍然大部分走 LLVM</strong>。Ghostty 目前还无法完全用自研 x86_64 后端完成构建和链接,因为后端本身还有 bug。也就是说,这里的提升纯粹来自 Zig 编译器自身的通用优化,LLVM 还在链路里。等 Ghostty 能完全切到自研后端,Mitchell 预计这个数字会掉到 25 秒以下,不到 0.14 的一半。</p>
+<p><strong>增量构建 Ghostty 可执行文件</strong>(改一行终端模拟核心代码,比如在转义序列解析器里加一次日志调用):</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>Zig 0.14</th>
+<th>Zig 0.15</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>增量(改一行)</td>
+<td>19s</td>
+<td>16s</td>
+</tr>
+</tbody>
+</table>
+<p>构建脚本和依赖图已完全缓存,只重建必要的部分。但增量编译在 Zig 里还没完全可用,所以仍然重编了相当多的代码,而且依然在用 LLVM。仅把 LLVM 从链路里拿掉,预计能降到 12 秒左右。</p>
+<p><strong>增量构建 libghostty-vt</strong>(只重建这个库):</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>Zig 0.14</th>
+<th>Zig 0.15</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>改一行的增量</td>
+<td>2.884s</td>
+<td><strong>0.975s</strong></td>
+</tr>
+</tbody>
+</table>
+<p>这组最值得看,因为 libghostty-vt 已经能完全跑在自研 x86_64 后端上,<strong>LLVM 完全不在链路里</strong>。近 3 倍的提速。同样,由于增量编译尚未完全可用,它仍在重建整个库模块。Mitchell 预计增量编译落地后,这个数字会掉到毫秒级。</p>
+<p>对一个非平凡的库来说,亚秒级构建体验是质变。Mitchell 的原话是:升级到 0.15.1 才几天,工作流就有天壤之别。以前构建/测试之间会切出去看眼邮件,现在快到他可以一直待在终端里保持心流。</p>
+<h2>为什么能快:自研后端 + 线程化代码生成</h2>
+<p>要理解这些数字,得看 Zig 在 0.15 里做了什么。</p>
+<p><strong>自研 x86_64 后端在 Debug 模式下默认启用</strong>。根据官方发布说明,大多数情况下编译时间相比 LLVM 有约 <strong>5 倍</strong>的下降。而且这不只是快——自研 x86 后端已经通过了比 LLVM 后端更大的行为测试子集(<strong>1984/2008 vs 1977/2008</strong>),换句话说,它提供了更完整、更正确的语言实现。官方还在追踪 60 多个上游 LLVM bug,自研后端让编译器不再受这些问题波及。</p>
+<p>当然自研后端也有自己的短板:它生成的机器码目前比 LLVM 慢。如果受影响,可以在 Debug 构建里传 <code>-fllvm</code>,或在 <code>std.Build.Step.Compile</code> 上设 <code>.use_llvm = true</code> 回退。Zig 核心团队自己编译 Zig 编译器时已经几乎只用自研 x86 后端——编译时间从 1-2 分钟降到几秒。</p>
+<p><strong>线程化代码生成(Threaded Codegen)</strong> 是另一个关键。相比 0.14.0,它在使用自研后端时带来又一波性能提升,墙钟时间改善从"不明显"到"超过 50%"不等,取决于具体编译的代码。一个真实数据点:用自研 x86_64 后端构建 Zig 编译器本身,在某个系统上因这项改动快了 <strong>27%</strong>。</p>
+<p><strong>链接器</strong>这轮只做了 bug 修复和维护,没有大改动。但官方路线图写得很清楚:增强链接器实现,消除对 LLD 的依赖,并支持增量编译。</p>
+<h3>自研后端和 LLVM 到底差在哪</h3>
+<p>传统上,Zig 把 AST 降级成 LLVM IR,交给 LLVM 做优化和机器码生成。这条链路成熟、优化强,但代价也明显:每一层都带着自己的中间表示和构建开销,而且 Zig 的语义得先"翻译"成 LLVM 能理解的样子,翻译过程本身就是信息损失和额外交互。</p>
+<p>自研后端直接把 Zig 的中间表示降到机器码,跳过 LLVM 那一整套 IR 构造、优化 pass 和它对上下文的假设。这解释了为什么它能快 5 倍,也解释了为什么它生成的机器码暂时还比 LLVM 慢,毕竟 LLVM 十几年积累的优化器不是白给的。Zig 团队的选择是:先把<strong>开发循环</strong>这条最频繁的路径做快,机器码质量的问题用更多工程迭代去追,反正 Debug 构建本来就不追求极致优化。</p>
+<p>这套设计从第一天就是为增量编译准备的。线程化代码生成把不同的编译单元并行处理,墙钟时间最多再降一半;而增量编译要做到"只重编改动的部分",前提就是后端能对单个函数/模块独立生成代码、独立链接。这正是自研后端相对 LLVM 的架构优势,LLVM 的模块级假设更难支持这种细粒度重建。</p>
+<p>这一点从 Zig 的长期取舍里能看出来:<strong>它宁愿用一个暂时慢一点、但结构可控的自家后端,也不愿长期被上游 IR 的抽象层次绑住。</strong></p>
+<h2>路线图:LLVM 降级为可选依赖</h2>
+<p>把以上线索串起来,就是 Zig 的长期计划——<strong>把 LLVM 变成可选依赖,与编译器实现解耦</strong>。</p>
+<p>这个目标如果达成,意味着:编译时间大幅下降、Debug 构建获得良好的增量编译支持,甚至能探索 LLVM 无法有效 lowering 的语言特性。这不是一次版本更新的小优化,而是编译器架构层面的路线切换。</p>
+<p>下一个焦点是 <strong>aarch64</strong>。自研 x86 后端稳定到能默认启用后,Jacob 把目光投向了 aarch64——现代 Apple 硬件都基于这个架构,需求很实际。这个进行中的后端从 x86 的经验里学到了不少,采用了一些新设计方向。官方说法是:预期它既比自研 x86_64 后端更快,生成的机器码质量也更好,终极目标是代码生成能力能与 LLVM 竞争。</p>
+<h2>增量编译:目前的状态与预期</h2>
+<p>Zig 0.15 在增量编译上继续推进:它只重建发生变化的代码。这轮修了不少 bug,尤其是文件导入变化相关的问题。用法上:</p>
+<div class="highlight"><pre><span></span><code>zig<span class="w"> </span>build<span class="w"> </span>--watch<span class="w"> </span>-fincremental
+</code></pre></div>
+
+<p>官方特别提到,如果你以前因为 macOS 上的某个 bug 而回避 <code>--watch</code>,现在可以放心用了。下一个发布周期会继续朝"默认启用增量编译"推进。</p>
+<p>需要泼盆冷水:增量编译目前还是<strong>实验性</strong>的,需要显式加 <code>-fincremental</code>。Debug 构建的完整增量支持还不完善——这正是上面几组数据里,即便库已经跑在自研后端上、改一行代码仍然要重建整个模块的原因。等它真正落地,本文里这些数字会显得"慢得可笑"。</p>
+<h2>一个开发者的视角</h2>
+<p>这组数据最打动我的地方,不是某个绝对值,而是<strong>方向的一致性</strong>。Zig 没有走"把 LLVM 换个姿势调用"的捷径,而是花了好几年重写后端、链接器,一步步把上游依赖变成可选项。短期看这很亏——自研后端生成的机器码还比 LLVM 慢,还会有自己的 bug。但长期看,编译速度、语言特性的实现自由度、对上游 bug 的免疫力,都握在自己手里了。</p>
+<p>如果你在做系统级项目,几个可落地的做法:</p>
+<ol>
+<li><strong>先测自己项目的构建瓶颈在哪</strong>。用 <code>zig build --help</code> 单独测构建脚本的编译时间。如果它占了几秒,说明你的 <code>build.zig</code> 或者依赖图有优化空间。</li>
+<li><strong>Debug 构建试试自研后端的实际收益</strong>。默认已经启用了,如果你的项目恰好踩到后端 bug,<code>-fllvm</code> 能一键回退,不用担心被卡死。</li>
+<li><strong>保持对 <code>-fincremental</code> 的关注</strong>。现在别用在生产构建上,但在本地开发循环里值得试,尤其改动集中在单个库时,亚秒级重建的心流价值是实打实的。</li>
+</ol>
+<p>第 2 点如果要在 <code>build.zig</code> 里显式控制,大致是这样:</p>
+<div class="highlight"><pre><span></span><code><span class="kr">const</span><span class="w"> </span><span class="n">exe</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">b</span><span class="p">.</span><span class="n">addExecutable</span><span class="p">(.{</span>
+<span class="w">    </span><span class="p">.</span><span class="n">name</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;myapp&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="p">.</span><span class="n">root_source_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">b</span><span class="p">.</span><span class="n">path</span><span class="p">(</span><span class="s">&quot;src/main.zig&quot;</span><span class="p">),</span>
+<span class="w">    </span><span class="p">.</span><span class="n">target</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">target</span><span class="p">,</span>
+<span class="w">    </span><span class="p">.</span><span class="n">optimize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">optimize</span><span class="p">,</span>
+<span class="p">});</span>
+<span class="c1">// 想强制走 LLVM(比如后端有 bug 时回退):</span>
+<span class="c1">// exe.use_llvm = true;</span>
+<span class="c1">// 想手动开增量编译(目前仍实验性):</span>
+<span class="c1">// exe.use_incremental = true;</span>
+<span class="n">b</span><span class="p">.</span><span class="n">installArtifact</span><span class="p">(</span><span class="n">exe</span><span class="p">);</span>
+</code></pre></div>
+
+<p>命令行侧对应的开关是 <code>-fllvm</code> 和 <code>-fincremental</code>,配合 <code>--watch</code> 使用。</p>
+<p>编译器把构建时间压到毫秒级,改变的不只是数字,是开发者"敢不敢多编译一次"的直觉。而那个直觉,最终决定了 bug 是在本地被抓到,还是在线上被用户遇到。</p>
+<p>参考来源:
+- Mitchell Hashimoto, <a href="https://mitchellh.com/writing/zig-builds-getting-faster">Zig Builds Are Getting Faster</a>
+- Zig 0.15.1 <a href="https://ziglang.org/download/0.15.1/release-notes.html">Release Notes</a></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
