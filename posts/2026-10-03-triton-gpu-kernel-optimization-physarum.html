@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>从 55 次到 17 次内核启动：用 Triton 手写 GPU 内核优化黏菌模拟的完整实录 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>从 55 次到 17 次内核启动：用 Triton 手写 GPU 内核优化黏菌模拟的完整实录</h1>
+<time>2026-10-03</time>
+<ul>
+<li>GPU</li>
+<li>Triton</li>
+<li>性能优化</li>
+<li>并行计算</li>
+<li>开发工具</li>
+</ul>
+<hr />
+<p>一个发生在微软研究院的实习项目，把 GPU 优化讲成了一篇能直接抄作业的实录：作者用 PyTorch 写了个黏菌（Physarum）生长模拟，跑起来挺好看，但慢得没道理。于是他打开 profiler，把每一步拆到底层，再用 Triton 手写内核重写热点路径。最后内核启动次数从 55 次降到 17 次，首步初始化开销从 244ms 掉到 2ms 量级。这篇文章把其中的方法论完整拆开——不只是"我用了 Triton"，而是"我怎么知道该用 Triton"。</p>
+<h2>先搞清楚在算什么</h2>
+<p>Physarum 是一种黏菌，它的生长行为可以用两层网格近似建模：一层是 agent 场（每个 agent 有位置、朝向、三个传感器），另一层是信息素（pheromone）场。agent 朝信息素浓度高的方向移动，移动时留下信息素痕迹；信息素每步做一次扩散（3×3 均值滤波）和衰减。</p>
+<p>单步迭代拆成五个阶段，这个划分很关键，后面所有优化都围绕它：</p>
+<ol>
+<li><strong>感知（sense）</strong>：每个 agent 朝前、左前、右前三个方向采样信息素浓度；</li>
+<li><strong>转向（motor）</strong>：朝浓度最高的方向转一个固定角度；</li>
+<li><strong>沉积（deposition）</strong>：在新位置写入信息素；</li>
+<li><strong>扩散（diffuse）</strong>：对整场做 3×3 均值滤波；</li>
+<li><strong>衰减（decay）</strong>：全场乘以 (1 - decay_rate)。</li>
+</ol>
+<p>实验环境：NVIDIA RTX A6000，Triton 3.4.0，Torch 2.8.0。作者先按复杂度做了消融实验，确认程序对步数是线性的、对网格尺寸是二次的、对 agent 数量是常数——这些结论不用跑也知道。</p>
+<h2>profiler 才是真正的起点</h2>
+<p>作者说得很直白：按复杂度做的时间日志"没什么用"。你早就知道程序是线性的、二次的、常数的，看完曲线还是不知道往哪优化。</p>
+<p>真正有用的是<strong>按操作拆分的耗时</strong>。GPU 上不同指令的执行速度差别很大：位运算、rsqrt（倒数平方根）、FMA（融合乘加）这些操作走的是硬件快路径，如果能把热点改写成这些指令，性能是"白捡"的。</p>
+<p>一个意外发现：网格尺寸的耗时曲线只是<strong>"差不多"二次</strong>，实际拟合是 y = 1.241e-4 · x^1.459 + 0.260，指数 1.459 而不是 2。作者猜测是初始化时有个固定开销把拟合拉偏了，但<strong>没有逐操作日志就无法证实</strong>。这个疑点最后被 profiler 解开了。</p>
+<p>PyTorch 自带 profiler，不用手动给每个操作套 <code>time.time()</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">from</span><span class="w"> </span><span class="nn">torch.profiler</span><span class="w"> </span><span class="kn">import</span> <span class="n">profile</span><span class="p">,</span> <span class="n">record_function</span><span class="p">,</span> <span class="n">ProfilerActivity</span>
+
+<span class="k">with</span> <span class="n">profile</span><span class="p">(</span>
+    <span class="n">activities</span><span class="o">=</span><span class="p">[</span><span class="n">ProfilerActivity</span><span class="o">.</span><span class="n">CPU</span><span class="p">,</span> <span class="n">ProfilerActivity</span><span class="o">.</span><span class="n">CUDA</span><span class="p">],</span>
+    <span class="n">record_shapes</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">profile_memory</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">with_stack</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">on_trace_ready</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">profiler</span><span class="o">.</span><span class="n">tensorboard_trace_handler</span><span class="p">(</span><span class="s1">&#39;./profiling&#39;</span><span class="p">)</span>
+<span class="p">)</span> <span class="k">as</span> <span class="n">prof</span><span class="p">:</span>
+    <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">steps</span><span class="p">):</span>
+        <span class="k">with</span> <span class="n">record_function</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;simulation_step_</span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">):</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+        <span class="n">prof</span><span class="o">.</span><span class="n">step</span><span class="p">()</span>
+</code></pre></div>
+
+<p>配合 <code>record_function</code> 给 <code>step</code> 内部各阶段打标签（<code>step_sensing</code>、<code>step_steering</code>、<code>step_deposition</code>、<code>step_diffusion</code>），导出的 trace 上传到 Perfetto 就能逐段看。</p>
+<h2>读懂 trace：CPU 只是发号施令的</h2>
+<p>trace 的读法有几个关键点，作者讲得很清楚：</p>
+<ul>
+<li><code>python XXXX</code> 是 CPU 进程，下面挂的是它启动的线程；</li>
+<li><code>python 0</code> 是 GPU 进程（PID 用 0 占位），里面的 <strong>stream</strong> 对应 GPU 的执行上下文，一句话记：<strong>threads : CPU :: streams : GPU</strong>；</li>
+<li>时间轴 Y 轴是调用栈，X 轴是时间；</li>
+<li>CPU 侧的 <code>cudaLaunchKernel</code> 只是把操作<strong>入队（enqueue）</strong>到 CUDA stream 就返回了，是异步的，不等实际执行完。</li>
+</ul>
+<p>那个棕色连线就是 CPU 入队和 GPU 实际执行之间的对应关系。<strong>这条异步特性直接决定了后面 benchmark 的写法</strong>（见文末）。</p>
+<h2>初始化开销：244ms 之谜</h2>
+<p>trace 里最扎眼的一点：开头一段比后面长得多。第一次调用 <code>step</code> 花了约 <strong>244ms</strong>，第二次只要约 <strong>2ms</strong>，差了两个数量级。</p>
+<p>原因有两层：</p>
+<ol>
+<li><strong>PyTorch 懒加载</strong>内核和库，第一次调用才加载并缓存（profiler 不会记录 PyTorch 算子之外的 C++/CUDA 工作，所以初始化 cuBLAS/cuDNN 上下文这些动作不会显式上报）；</li>
+<li>CUDA 本身要分配显存缓冲、加载模块、按需 JIT 编译。</li>
+</ol>
+<p>这也解释了为什么 10 次采样里 GPU stream 只有 9 个相似块：第一个块被初始化噪声吃掉了。它同时反证了前面那个"二次不完美"的猜测，<strong>首步的固定开销确实在污染拟合</strong>。把每个分区的耗时标出来之后，优化该往哪使劲就一目了然了。</p>
+<h2>Triton 是什么，为什么能更快</h2>
+<p>Triton 是给 CUDA 编程用的 DSL（领域特定语言），定位夹在 PyTorch 和裸 CUDA 之间——比 PyTorch 暴露更多控制权，又不用手写 CUDA C。</p>
+<p><code>@triton.jit</code> 是它的即时编译钩子。第一次调用时，Triton 追踪函数体，针对具体的启动参数（<code>BLOCK_SIZE</code>、张量步长、dtype）做特化，生成 GPU 能执行的 PTX；之后的调用直接走编译好的缓存，Python 控制流只留在边缘，热路径纯设备速度。</p>
+<p>先拿一个热身例子——行内 softmax。PyTorch 的 <code>F.softmax</code> 是通用实现：支持任意轴、任意 dtype、任意形状，代价是做额外的边界检查、开临时缓冲、多次启动内核。当矩阵很"瘦"（比如 attention score 只有 64–128 列）时，max、sub、exp、sum、div 会各启动一个内核。Triton 能把整条流水线融成一次 pass：</p>
+<div class="highlight"><pre><span></span><code><span class="nd">@triton</span><span class="o">.</span><span class="n">jit</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">row_softmax_kernel</span><span class="p">(</span><span class="n">input_ptr</span><span class="p">,</span> <span class="n">output_ptr</span><span class="p">,</span> <span class="n">stride_in</span><span class="p">,</span> <span class="n">stride_out</span><span class="p">,</span>
+                       <span class="n">n_cols</span><span class="p">,</span> <span class="n">BLOCK_SIZE</span><span class="p">:</span> <span class="n">tl</span><span class="o">.</span><span class="n">constexpr</span><span class="p">):</span>
+    <span class="n">row_id</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">program_id</span><span class="p">(</span><span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+    <span class="n">row_in_ptr</span> <span class="o">=</span> <span class="n">input_ptr</span> <span class="o">+</span> <span class="n">row_id</span> <span class="o">*</span> <span class="n">stride_in</span>
+    <span class="n">row_out_ptr</span> <span class="o">=</span> <span class="n">output_ptr</span> <span class="o">+</span> <span class="n">row_id</span> <span class="o">*</span> <span class="n">stride_out</span>
+    <span class="n">offs</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">BLOCK_SIZE</span><span class="p">)</span>
+    <span class="n">mask</span> <span class="o">=</span> <span class="n">offs</span> <span class="o">&lt;</span> <span class="n">n_cols</span>
+    <span class="n">row_vals</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="n">row_in_ptr</span> <span class="o">+</span> <span class="n">offs</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">mask</span><span class="p">,</span> <span class="n">other</span><span class="o">=-</span><span class="nb">float</span><span class="p">(</span><span class="s2">&quot;inf&quot;</span><span class="p">))</span>
+    <span class="n">row_max</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">row_vals</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+    <span class="n">shift</span> <span class="o">=</span> <span class="n">row_vals</span> <span class="o">-</span> <span class="n">row_max</span>
+    <span class="n">numerators</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">shift</span><span class="p">)</span>
+    <span class="n">denom</span> <span class="o">=</span> <span class="n">tl</span><span class="o">.</span><span class="n">sum</span><span class="p">(</span><span class="n">numerators</span><span class="p">,</span> <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+    <span class="n">tl</span><span class="o">.</span><span class="n">store</span><span class="p">(</span><span class="n">row_out_ptr</span> <span class="o">+</span> <span class="n">offs</span><span class="p">,</span> <span class="n">numerators</span> <span class="o">/</span> <span class="n">denom</span><span class="p">,</span> <span class="n">mask</span><span class="o">=</span><span class="n">mask</span><span class="p">)</span>
+</code></pre></div>
+
+<p>核心收益：中间值留在寄存器里，不写回全局内存；启动几何可以按自己的数据定制。对训练场景还有个二阶好处——省下的显存能塞更大的 batch size，反过来又加速训练。</p>
+<h2>把黏菌模拟拆成两个内核</h2>
+<p>Triton 的心智模型是<strong>矩形工作块（tile）</strong>，不是单个标量。每条 kernel 启动由 <code>program_id</code> 索引这些块，所有读写都要自己算指针。三条约束：</p>
+<ul>
+<li><strong>启动形状静态</strong>：<code>BLOCK_SIZE</code> 是编译期常量，挑的时候要够并行又不能让寄存器溢出；</li>
+<li><strong>内存运算显式</strong>：指针算术归你管，未对齐访问直接变成带宽浪费；</li>
+<li><strong>向量友好指令</strong>：<code>tl.sin</code>、<code>tl.cos</code>、<code>tl.where</code> 这些都是 CUDA 快数学的镜像，能写成向量运算就能融合。</li>
+</ul>
+<p>模拟里五个阶段，前两个是定制向量运算，最适合做 kernel：<strong>感知+转向融合</strong>、<strong>信息素沉积</strong>。</p>
+<p><strong>内核 1——感知与转向融合。</strong> 每个 agent 采样三个方向、比较、转向、移动，全部在寄存器里完成：位置和朝向只读一次，三条传感器射线并行求值，胜出的角度立刻喂给位置更新。关键在于<strong>不用把中间张量绕道全局内存</strong>——这就是它比链式 PyTorch 算子更快的原因（内核启动更少、内存同步更少、采样缓存的局部性更好）。</p>
+<p><strong>内核 2——原子沉积。</strong> 用 <code>tl.atomic_add</code> 把成千上万次沉积塞进一次启动：</p>
+<div class="highlight"><pre><span></span><code><span class="n">field_idx</span> <span class="o">=</span> <span class="n">iy</span> <span class="o">*</span> <span class="n">W</span> <span class="o">+</span> <span class="n">ix</span>
+<span class="n">tl</span><span class="o">.</span><span class="n">atomic_add</span><span class="p">(</span><span class="n">field_ptr</span> <span class="o">+</span> <span class="n">field_idx</span><span class="p">,</span>
+              <span class="n">tl</span><span class="o">.</span><span class="n">where</span><span class="p">(</span><span class="n">mask</span><span class="p">,</span> <span class="n">deposit_amount</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">),</span> <span class="n">mask</span><span class="o">=</span><span class="n">mask</span><span class="p">)</span>
+</code></pre></div>
+
+<p><code>atomic_add</code> 保证两个 agent 撞到同一格时的正确性，而且只碰一次展平后的场，于是瓶颈只剩内存带宽。</p>
+<h2>55 → 17：数字不会骗人</h2>
+<p>作者把两种实现并排摆在 trace 上：</p>
+<ul>
+<li><strong>原 PyTorch 流</strong>：<code>step</code> 里每一行都是一个独立张量算子，每个算子启动一个新 CUDA 内核，还要物化像 <code>torch.stack</code> 出来的传感器采样这种临时张量，阶段之间把位置回写全局内存；</li>
+<li><strong>Triton 重写</strong>：整个 agent 更新融成一次启动，中间值留寄存器，最终位置/角度只写一次；沉积变成紧凑的原子加循环，零 Python 分支；扩散仍是 <code>conv2d</code>，区别只在于进入它的场已经是缓存友好的布局。</li>
+</ul>
+<p>结果：<strong>单步模拟 17 次 <code>cudaLaunchKernel</code>，对比原来的 55 次</strong>。</p>
+<h2>一个容易翻车的 benchmark 细节</h2>
+<p>先看这段代码：</p>
+<div class="highlight"><pre><span></span><code><span class="n">start_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span>
+<span class="n">simulation</span><span class="o">.</span><span class="n">run</span><span class="p">()</span>
+<span class="n">torch</span><span class="o">.</span><span class="n">cuda</span><span class="o">.</span><span class="n">synchronize</span><span class="p">()</span>
+<span class="n">simulation_time</span> <span class="o">=</span> <span class="n">time</span><span class="o">.</span><span class="n">time</span><span class="p">()</span> <span class="o">-</span> <span class="n">start_time</span>
+</code></pre></div>
+
+<p><code>torch.cuda.synchronize()</code> 这一行不能省。前面 trace 已经证明：CPU 侧操作是<strong>异步</strong>的，<code>cudaLaunchKernel</code> 入队就返回，不等 GPU 执行完。不 synchronize 就计时，你测到的是"入队耗时"，不是"完成耗时"，结论会离谱到没法用。这是 GPU 性能测试里最常见的坑之一。</p>
+<h2>彩蛋：这套模拟能不能当伪随机算法用？</h2>
+<p>文章的最后一个转折有点意思。作者之前对地形/洞穴生成用到的（伪）随机算法感兴趣，Physarum 生长天然适合做这个——把输出离散化就能得到好看的裂隙。但怎么量化它的"随机性"？</p>
+<p>他从布尔函数分析里借来了 <strong>average sensitivity</strong> 的概念。布尔函数的敏感度定义为：翻转输入中单个比特、结果改变的数量。</p>
+<div class="highlight"><pre><span></span><code><span class="n">s</span><span class="p">(</span><span class="n">f</span><span class="p">,</span><span class="w"> </span><span class="n">x</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">|</span><span class="err">{</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="err">∈</span><span class="w"> </span><span class="o">[</span><span class="n">n</span><span class="o">]</span><span class="w"> </span><span class="err">:</span><span class="w"> </span><span class="n">f</span><span class="p">(</span><span class="n">x</span><span class="p">)</span><span class="w"> </span><span class="err">≠</span><span class="w"> </span><span class="n">f</span><span class="p">(</span><span class="n">x</span><span class="w"> </span><span class="err">⊕</span><span class="w"> </span><span class="n">e_i</span><span class="p">)</span><span class="w"> </span><span class="err">}</span><span class="o">|</span>
+</code></pre></div>
+
+<p>对超立方体求期望就是全局平均敏感度。但 Physarum 的状态是连续的，不是布尔函数。作者意识到：<strong>敏感度在布尔函数里的角色，其实就是连续函数对输入的导数</strong>。于是推广方向导数：</p>
+<div class="highlight"><pre><span></span><code>s_i(f, x) = lim_{ε→0} ‖f(x) − f(x + ε·e_i)‖ / ε
+</code></pre></div>
+
+<p>对可微函数，这就是 <strong>Jacobian 矩阵列向量的范数</strong>。再往时间维度上推：每一步的扰动都要乘一个 Jacobian，扰动按 Jacobian 乘积演化：</p>
+<div class="highlight"><pre><span></span><code>Δx_t ≈ (∏_{k=0}^{t−1} J_F(x_k)) Δx_0
+</code></pre></div>
+
+<p>这个乘积是放大还是收缩，由 <strong>Lyapunov 指数</strong>决定——衡量两条初始相隔很近的轨迹发散得多快：</p>
+<div class="highlight"><pre><span></span><code>λ_max = lim_{t→∞} (1/t) · log(‖Δx_t‖ / ‖Δx_0‖)
+</code></pre></div>
+
+<p>λ_max &gt; 0 就意味着"初始条件的微小变化会让输出大变"，正是伪随机算法想要的敏感特性。</p>
+<p>为了证明这一点，作者用一个 2 元线性玩具模型收尾：把状态坍缩成信息素强度 p 和 agent 活跃度 y，更新写成矩阵 A 乘向量，其中 α 是沉积率、β 是衰减率、γ 是 agent 对信息素的响应、κ 是 agent 阻尼。扰动按 A^t 演化，最大的特征值决定命运。算出 λ_max = log ρ(A)，展开后得到一个很干净的判据：</p>
+<div class="highlight"><pre><span></span><code>αγ &gt; βκ
+</code></pre></div>
+
+<p>正反馈回路（agent 沉积信息素 × 信息素刺激 agent）必须压过阻尼乘积（衰减 × 迟滞），扰动才会指数级放大。作者自己也说这段写得仓促、"有些地方超出能力范围了"，但作为把整套随机性直觉量化下来的尝试，思路是站得住的。</p>
+<h2>我的一点看法</h2>
+<p>这篇文章最值得抄的不是 Triton 语法，而是那套<strong>从 profile 到优化的纪律</strong>：</p>
+<ol>
+<li><strong>别信复杂度分析，信 profiler</strong>。作者一开始就知道程序是 O(n)、O(n²)、O(1)，但真正找到 244ms 初始化开销、发现 1.459 次方这个异常指数的，是 trace 不是公式；</li>
+<li><strong>先分区打标签，再谈优化</strong>。<code>record_function</code> 把 <code>step</code> 切成五段，哪段占时间一目了然。没有这个前置动作，优化就是瞎猜；</li>
+<li><strong>融合的价值在"少写一次全局内存"</strong>。从 55 到 17 的内核启动数下降只是表象，本质是中间张量不再绕道显存。判断一个算子该不该用 Triton 重写，就问：它能不能把多个 pass 融成一个、把中间值留在寄存器里；</li>
+<li><strong>测 GPU 时间一定 synchronize</strong>。这个坑我在自己的推理服务压测里也踩过，异步入队会让你误以为一切飞快。</li>
+</ol>
+<p>如果你的项目里有"一跑就慢但不知道慢在哪"的 GPU 热点，先上 PyTorch Profiler + Perfetto 看一眼异步入队和初始化开销，再决定要不要动 Triton。多数时候你会先发现一堆可以省掉的中间张量。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>

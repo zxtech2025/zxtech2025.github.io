@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>当 AI 成为 curl 的漏洞猎人：22 个 bugfix 背后的 AI-SAST 工具链拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>当 AI 成为 curl 的漏洞猎人：22 个 bugfix 背后的 AI-SAST 工具链拆解</h1>
+<time>2026-10-02</time>
+<ul>
+<li>安全</li>
+<li>静态分析</li>
+<li>AI工程</li>
+<li>开源</li>
+<li>代码审计</li>
+</ul>
+<hr />
+<p>2025 年 9 月，Daniel Stenberg 在 Mastodon 上发了一条不起眼的动态：他用一组"AI 辅助工具"在 curl 代码库里挖出了一批潜在问题，已经合入了 22 个 bugfix，手上还有两倍于此的 issue 待处理。这条动态在 Hacker News 上冲到 547 分、190 条评论。评论区第一反应是："真没想到关于 curl 和 AI 的新闻，居然能是正面的。"</p>
+<p>这话有背景。过去一年半，开源维护者被 AI 生成的低质量安全报告淹没了。Stenberg 自己就公开抱怨过 HackerOne 上的 AI 垃圾报告，说他们已经到达"被 DDoS"的阈值，凡是被判定为 AI slop 的报告一律立刻封禁上报者。所以当同一个人转头说"AI 工具帮我找到了真 bug"时，值得认真拆一下：他用的到底是什么，为什么这次成了，以及这条路别人能不能复制。</p>
+<h2>先看证据：61 个 SARIF 相关的 PR</h2>
+<p>空口无凭，先看代码。在 curl 仓库里搜索关闭的 PR，<code>sarif</code> 关键字能命中 61 条。这些 PR 的正文里，很大一部分只有一句话：</p>
+<blockquote>
+<p>Reported in Joshua's sarif data</p>
+</blockquote>
+<p>被修复的问题分布很广，随手挑几个：</p>
+<ul>
+<li><strong>#18735 — telnet 模块未正确处理部分写</strong>（"13.1 telnet code does not handle partial writes properly"，+6/-0）</li>
+<li><strong>#18740 — libssh 在 SFTP 状态机里未确认 SSH_AGAIN</strong>（+12/-0）</li>
+<li><strong>#18620 — gtls 在 trace 输出中可能使用未初始化变量</strong>（+1/-1）</li>
+<li><strong>#18714 — socks_gssapi 中多余的 gss_recv_token 释放</strong></li>
+<li><strong>#18730 — quiche 在 ingress 处理失败时未返回正确错误码</strong></li>
+<li><strong>#18739 — libssh 的 myssh_block2waitfor 语义澄清</strong></li>
+</ul>
+<p>这些 bug 的共同特征值得注意：<strong>它们绝大多数不是内存破坏类漏洞</strong>，而是"部分写没处理全""错误码没透传""该确认的异步状态没确认""变量在某条路径上没初始化"这种逻辑正确性问题。diff 都很小，大多十几行以内。</p>
+<p>这正是 AI 辅助静态分析的甜区。堆溢出、UAF 这类有明确模式的内存安全问题，传统 fuzzer（oss-fuzz）和编译器 sanitizer 已经扫了很多年，低垂的果实被摘得差不多了。而"telnet 写了一半怎么办""SFTP 状态机收到 SSH_AGAIN 之后该不该退回去"这类问题依赖对协议语义的理解，传统 SAST 规则写不出来，人工 review 又容易在几千行代码里漏掉。LLM 恰好能读出"这里看起来该处理 AGAIN，但代码直接往下走了"。</p>
+<h2>工具链：AI 不是主角，是过滤器</h2>
+<p>真正值得警惕的一点是评论区的技术质疑。有人翻了其中一个产品（Corgea）的白皮书后发现，AI 在流水线里的位置被过度宣传了：</p>
+<blockquote>
+<p>BLAST 通过其 AI 引擎，基于应用上下文过滤掉无关发现。</p>
+</blockquote>
+<p>翻译成人话：<strong>传统分析器先扫出大量候选，AI 负责降噪。</strong> 同一份评论里还提到 ZeroPath 用了类似的措辞。也就是说，这条链路更接近这个结构：</p>
+<ol>
+<li><strong>传统 SAST / 数据流分析器</strong>跑出候选告警（对应报告里的 "sarif data"，SARIF 就是静态分析结果交换格式）</li>
+<li><strong>AI 引擎做上下文过滤</strong>，把大量误报砍掉，剩下高置信度的候选</li>
+<li><strong>人类（Stenberg）逐条验证</strong>，确认后提 PR 修复</li>
+</ol>
+<p>所以更准确的标题不是"AI 找到了 22 个 bug"，而是"AI 降噪让传统 SAST 的产出变得可用"。评论区里一句话概括得很到位："这是个工具系统，不是自动驾驶。"</p>
+<p>这个分工其实解释了为什么过去 AI 报告是垃圾而现在有用。早期做法是直接让 GPT/Claude"看看这段代码有没有漏洞"，模型在没有数据流上下文的情况下凭模式猜，产出的全是幻觉，这也是 curl 被 AI 报告淹没的原因。现在的做法是把 LLM 放在它擅长的位置：<strong>给定一个具体的告警点 + 周边源码上下文，判断"这里是不是真的有问题"</strong>。判别比生成容易得多，幻觉率自然下来。</p>
+<h2>为什么这次能成：判别任务 vs 生成任务</h2>
+<p>这里有个可以推广的方法论。LLM 在安全审计里做不好的事和做得好的事，边界很清楚：</p>
+<table>
+<thead>
+<tr>
+<th>任务类型</th>
+<th>例子</th>
+<th>LLM 表现</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>开放式发现</td>
+<td>"找出这个文件里的漏洞"</td>
+<td>差，全是幻觉</td>
+<td>无约束的生成，模式匹配当推理</td>
+</tr>
+<tr>
+<td>上下文判别</td>
+<td>"SAST 说这行有风险，对么"</td>
+<td>好</td>
+<td>有明确锚点和上下文，是判别任务</td>
+</tr>
+<tr>
+<td>协议语义核查</td>
+<td>"SSH_AGAIN 之后该做什么"</td>
+<td>中上</td>
+<td>依赖预训练里的协议知识</td>
+</tr>
+<tr>
+<td>证明漏洞可利用</td>
+<td>"构造 PoC 打穿它"</td>
+<td>差</td>
+<td>需要环境反馈，模型没有运行时</td>
+</tr>
+</tbody>
+</table>
+<p>HN 评论区里一位做内存安全 R&amp;D 的工程师印证了这一点：在他们主攻的低层安全（内存安全）领域，<strong>"验证和调试已经比漏洞发现本身更重要"，因为幻觉会污染发现阶段</strong>。他们的做法是干脆用多智能体 + 校验器架构，把"发现"和"证明"拆成两个阶段。</p>
+<p>另一位评论者的实践也很典型：他让 Claude 在 20 万行的 C 库上找 bug，结果模型只是把文件切块、grep 特定模式，最后返回的全是他自己写的 FIXME 注释，用他的原话"一个 bash 脚本也能干这个"。差别就在于他给的是开放式任务，而 Stenberg 用的工具给的是"这条 SAST 告警是不是真的"这种闭式判别任务。</p>
+<h2>把 AI 洞察固化成确定性工具</h2>
+<p>评论区里有一条我认为最值得抄的做法，来自一位做 CI/工具链的开发者：</p>
+<blockquote>
+<p>不要让 AI 去制造 bug，而是让 AI 去找问题，然后让它<strong>生成确定性的工具</strong>，用工具以可重复、可理解、可审计的方式去捕获问题。让 AI 写短小易懂的脚本提交进仓库，带文件名、行号、零/非零退出码。把 AI 洞察转成检测工具这一步，才能把结果从概率性的变成确定性的。</p>
+</blockquote>
+<p>这段话点出了 AI-SAST 落地的关键工程约束：<strong>LLM 是非确定性的</strong>。你今天问一次得到的是一批结果，明天问同一个问题可能得到另一批。如果检测逻辑只活在模型里，你没法版本化、没法在 CI 里回归、没法审计"这个 bug 曾经被检出过"。</p>
+<p>正确姿势是把一次性发现沉淀成规则：AI 帮你定位了"telnet 部分写没处理"这类问题后，写一个针对性的检查脚本或 SARIF 规则进仓库，让它在每次提交时自动跑。模型负责发现模式，脚本负责守住模式。</p>
+<h2>一个开发者的视角</h2>
+<p>结合 curl 这个案例，如果要在自己的代码库里试这条路，我会这么做：</p>
+<p><strong>第一，先有传统分析器，再加 AI。</strong> 直接上 LLM 白盒审计是最差的开局。先把 CodeQL、Semgrep、clang-tidy 或者语言原生的分析器接进 CI，让它们产出 SARIF。这一步的产出虽然噪声大，但它是 AI 过滤的输入燃料。</p>
+<p><strong>第二，给 AI 明确的判别任务，别给开放式任务。</strong> 把 SAST 的单条告警 + 该函数完整源码 + 调用点一起喂给模型，问"这条告警是真问题吗，给出理由和修复建议"。不要问"这个文件有漏洞吗"。</p>
+<p><strong>第三，人类验证环节不能省。</strong> Stenberg 是 curl 的作者，他知道哪些"看起来像 bug"的行为其实是兼容性依赖。HN 上有条评论说得很对：有些代码看起来是 bug，但某个关键基础设施依赖那个行为，AI 不知道，除非你告诉它。这个环节决定最终质量，也决定 AI 报告是资产还是负债。</p>
+<p><strong>第四，把确认的发现固化成规则。</strong> 每修完一个 bug，顺手写一条能复现它的检测规则或测试。让这次发现变成永久的回归护栏，而不是一次性运气。</p>
+<p>curl 这个案例的价值不在于"AI 会找漏洞了"，它证明了另一点：<strong>当 AI 被放在判别位置、被传统工具约束、被人类把关时，它能填上 SAST 长期填不上的那道缝，也就是语义级逻辑缺陷。</strong> 这个组合的位置找对了，产出就是实的；找错了，就是一封"Dear maintainer, I found a critical vulnerability"的垃圾邮件。</p>
+<p>顺带一提，评论区还有人调侃"怎么还没人来教 Stenberg 用 Rust 重写"，看来那波人也知道那套话术不好使了。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
