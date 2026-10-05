@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>一次 40ms 的 Go GC 停顿：当 swap 把运行时元数据换出物理内存 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>一次 40ms 的 Go GC 停顿：当 swap 把运行时元数据换出物理内存</h1>
+<time>2026-10-05</time>
+<ul>
+<li>Go</li>
+<li>垃圾回收</li>
+<li>性能调优</li>
+<li>内核</li>
+<li>bpftrace</li>
+</ul>
+<hr />
+<p>一个跑了三年的 Go 服务，P99 延迟长期稳在个位数毫秒。某天开始偶发 40ms 的尖刺，频率不高，半小时 312 次 stop-the-world 里只有几次超过 20ms。监控上看不出任何异常：CPU 没有打满，GC 周期数正常，堆大小平稳。</p>
+<p>问题最后落在两个词上：<strong>swap</strong> 和 <strong>GC 元数据</strong>。</p>
+<h2>复现：一个刻意设计的实验</h2>
+<p>Fernando Simões 把这个场景完整地做成了可复现的实验仓库（<a href="https://github.com/frnsimoes/go-gc-swap-cost">go-gc-swap-cost</a>）。核心设定是模拟一个真实的消息处理服务：一个 Go 进程负责调用 <code>io.ReadAll</code>、<code>proto.Unmarshal</code>、<code>scan</code>，持续分配又释放成片的堆对象。</p>
+<p>实验环境是一台 Hetzner 机器，内核 6.8，开启了 MGLRU（Multi-Gen LRU，多代 LRU 页面回收）。跑在一个 cgroup 里，参数按生产配置给：</p>
+<table>
+<thead>
+<tr>
+<th>参数</th>
+<th>值</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>memory.max</code></td>
+<td>900m</td>
+<td>容器内存上限</td>
+</tr>
+<tr>
+<td><code>--memory-swap</code></td>
+<td>1400m</td>
+<td>上限 + swap，等于 900m 时禁用 swap</td>
+</tr>
+<tr>
+<td><code>CPUS</code></td>
+<td>2</td>
+<td>变成 <code>GOMAXPROCS</code></td>
+</tr>
+<tr>
+<td><code>IDLE</code></td>
+<td>400 MiB</td>
+<td>邻居进程占住的内存</td>
+</tr>
+<tr>
+<td><code>GOGC</code></td>
+<td>100</td>
+<td>Go 默认值</td>
+</tr>
+</tbody>
+</table>
+<p>容器里跑两个进程。一个是「邻居」，只做一件事：持有 400 MiB 内存，每 15 秒把它整个读一遍。另一个是真正要观测的 spike 进程。这样做是为了制造有压力但不满的内存环境：足以让内核开始挑页面换出，又不至于直接 OOM。</p>
+<p>很关键的一点：二进制必须从 bind mount 拷到 <code>/tmp</code> 再跑，因为 bpftrace 的 uprobe 没法挂载到 virtiofs（Docker Desktop）上的文件。这种细节不做实验根本想不到。</p>
+<h2>元数据为什么会在 swap 里</h2>
+<p>Go 的垃圾回收器有一部分数据结构不在堆上。它们由运行时自己分配，<strong>不会被释放，只会被复用</strong>，典型的比如 <code>mspan</code> 相关的 bitmap、mark bit arena。这些页面在 GC 的每个周期里都会被读取。</p>
+<p>问题就出在这个「复用」上。内核做页面回收时按页面年龄排序，把最近最少访问的页面送去 swap。邻居进程每 15 秒把 400 MiB 全读一遍，相当于持续给这些页面「刷新鲜度」；而 Go 运行时那些 GC 元数据页，两次 GC 之间的访问间隔是秒级的，年龄很快就超过了邻居的内存。于是内核把 GC 元数据换了出去。</p>
+<p>下一次 GC 触发，运行时去读那些页面，撞上 page fault，而且不是 minor fault，是需要从块设备读回来的 major fault。更糟的是，这段读取发生在 <strong>stop-the-world 阶段</strong>。</p>
+<p>作者用 bpftrace 直接挂了 <code>runtime.stopTheWorldWithSema</code> 和 <code>runtime.startTheWorldWithSema</code> 两个 uprobe，中间统计 page fault：</p>
+<div class="highlight"><pre><span></span><code><span class="nl">uprobe</span><span class="p">:</span><span class="nl">BIN</span><span class="p">:</span><span class="n">runtime</span><span class="p">.</span><span class="n">stopTheWorldWithSema</span><span class="w"> </span><span class="err">{</span>
+<span class="w">  </span><span class="nv">@stw_start</span><span class="o">[</span><span class="n">pid</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">nsecs</span><span class="p">;</span><span class="w"> </span><span class="nv">@stw_faults</span><span class="o">[</span><span class="n">pid</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="nv">@stw_fault_ns</span><span class="o">[</span><span class="n">pid</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="err">}</span>
+<span class="nl">kprobe</span><span class="p">:</span><span class="n">do_swap_page</span><span class="p">,</span><span class="w"> </span><span class="nl">kprobe</span><span class="p">:</span><span class="n">filemap_fault</span><span class="w"> </span><span class="o">/</span><span class="nv">@stw_start</span><span class="o">[</span><span class="n">pid</span><span class="o">]/</span><span class="w"> </span><span class="err">{</span>
+<span class="w">  </span><span class="nv">@f_start</span><span class="o">[</span><span class="n">tid</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">nsecs</span><span class="p">;</span><span class="w"> </span><span class="nv">@stw_faults</span><span class="o">[</span><span class="n">pid</span><span class="o">]++</span><span class="p">;</span><span class="w"> </span><span class="nv">@stw_stack</span><span class="o">[</span><span class="n">ustack(5)</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nf">count</span><span class="p">();</span>
+<span class="err">}</span>
+</code></pre></div>
+
+<p><code>ustack(5)</code> 抓到的调用栈直接坐实了「元数据页」这个判断：</p>
+<div class="highlight"><pre><span></span><code><span class="nx">runtime</span><span class="p">.(</span><span class="o">*</span><span class="nx">spanSet</span><span class="p">).</span><span class="nx">reset</span><span class="w">      </span><span class="nx">internal</span><span class="o">/</span><span class="nx">runtime</span><span class="o">/</span><span class="nx">atomic</span><span class="o">/</span><span class="nx">types</span><span class="p">.</span><span class="nx">go</span><span class="p">:</span><span class="mi">194</span>
+<span class="nx">runtime</span><span class="p">.</span><span class="nx">finishsweep_m</span><span class="w">         </span><span class="nx">runtime</span><span class="o">/</span><span class="nx">mcentral</span><span class="p">.</span><span class="nx">go</span><span class="p">:</span><span class="mi">71</span>
+<span class="nx">runtime</span><span class="p">.</span><span class="nx">gcStart</span><span class="p">.</span><span class="nx">func2</span><span class="w">         </span><span class="nx">runtime</span><span class="o">/</span><span class="nx">mgc</span><span class="p">.</span><span class="nx">go</span><span class="p">:</span><span class="mi">724</span>
+<span class="nx">runtime</span><span class="p">.</span><span class="nx">systemstack</span><span class="w">           </span><span class="nx">runtime</span><span class="o">/</span><span class="nx">asm_amd64</span><span class="p">.</span><span class="nx">s</span><span class="p">:</span><span class="mi">518</span>
+<span class="nx">runtime</span><span class="p">.</span><span class="nx">gcStart</span><span class="w">               </span><span class="nx">runtime</span><span class="o">/</span><span class="nx">mgc</span><span class="p">.</span><span class="nx">go</span><span class="p">:</span><span class="mi">722</span>
+
+<span class="nx">runtime</span><span class="p">.</span><span class="nx">nextMarkBitArenaEpoch</span><span class="w">  </span><span class="nx">runtime</span><span class="o">/</span><span class="nx">mheap</span><span class="p">.</span><span class="nx">go</span><span class="p">:</span><span class="mi">2481</span>
+<span class="nx">runtime</span><span class="p">.</span><span class="nx">finishsweep_m</span><span class="w">          </span><span class="nx">runtime</span><span class="o">/</span><span class="nx">mgcsweep</span><span class="p">.</span><span class="nx">go</span><span class="p">:</span><span class="mi">268</span>
+<span class="nx">runtime</span><span class="p">.</span><span class="nx">gcStart</span><span class="p">.</span><span class="nx">func2</span><span class="w">          </span><span class="nx">runtime</span><span class="o">/</span><span class="nx">mgc</span><span class="p">.</span><span class="nx">go</span><span class="p">:</span><span class="mi">724</span>
+</code></pre></div>
+
+<p><code>finishsweep_m</code> 和 <code>nextMarkBitArenaEpoch</code> 都在 <code>gcStart</code> 的 sweep termination 阶段里跑。也就是说，STW 一开始，运行时就要去够那些已经被换出的 sweep 元数据。</p>
+<h2>数字：51 微秒到 40 毫秒</h2>
+<p>没有 swap 压力的对照组里，停顿中位数约 <strong>51 微秒</strong>，这符合大家对现代 Go GC 的预期。</p>
+<p>元数据放到 NVMe swap 上之后，最坏的一次停顿是 <strong>40ms</strong>。作者用 bpf 脚本把这段时间拆开：那一次 <code>39902 us</code> 的停顿里，有 <code>39013 us</code> 花在 page fault 上，期间发生 <strong>228 次</strong> major fault。换句话说，97% 的 STW 时间纯粹是在等块设备。</p>
+<p>这里要强调 STW 的含义：这 40ms 里，<strong>所有 goroutine、所有 P 都停了</strong>。不是某个请求慢了一点，是整个进程冻结。</p>
+<p>还有一个非致命的代价，孤立在单个 goroutine 上：构建一条 511 KiB 的消息，正常需要 3–5ms。元数据在 NVMe 上时跳到 <strong>105ms</strong>，换到 Hetzner 的网络卷之后是 <strong>903ms</strong>。这部分只有发起分配的那个 goroutine 付账，不像元数据停顿那样全局生效，但仍然是需要计入的账单。</p>
+<p>作者自己也承认还没完全定位这部分时间去哪了，但先记下来，诚实比编一个解释强。</p>
+<p>顺带一个跟进：有人问 Go 1.26 的 Green Tea GC 有没有改变元数据的读取方式。作者实测后结论是<strong>影响可以忽略</strong>。也就是说升级运行时不是这个问题的解药。</p>
+<h2>为什么「元数据换出」比「堆换出」更隐蔽</h2>
+<p>直觉上大家担心的是堆被换出。堆页换出确实也会慢，但堆的访问模式是热的：活跃对象被反复扫描，年龄很难涨上去。真正容易被换出的是那些<strong>访问间隔长、又不在堆上、运行时还假设它们「必定常驻」</strong>的页面。</p>
+<p>GC 元数据完全符合这三个特征：</p>
+<ol>
+<li><strong>间隔长</strong>：两次 GC 之间不动它，间隔由堆增长速率决定，可能就是几秒</li>
+<li><strong>不在堆上</strong>：<code>GOMEMLIMIT</code>、堆大小监控都看不见它，它是 <code>/memory/classes/metadata/mspan/inuse</code> 和 <code>/memory/classes/metadata/other</code> 这两类</li>
+<li><strong>运行时假设常驻</strong>：STW 阶段直接读，没有任何「可能要等 IO」的预案</li>
+</ol>
+<p>这解释了为什么监控上看不出问题：堆指标一切正常，元数据指标你不看就永远不知道它被换出去了。</p>
+<h2>动手排查的清单</h2>
+<p>如果你在怀疑同类问题，作者那套工具链的抓法可以直接抄：</p>
+<p><strong>第一步，先确认停顿的分布形态。</strong> 不要看平均值。读运行时的 <code>/gc/pauses:seconds</code> 直方图，用 <code>runtime/metrics</code> 拉出来只统计增量：</p>
+<div class="highlight"><pre><span></span><code><span class="nx">s</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="p">[]</span><span class="nx">metrics</span><span class="p">.</span><span class="nx">Sample</span><span class="p">{</span>
+<span class="w">    </span><span class="p">{</span><span class="nx">Name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/gc/pauses:seconds&quot;</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nx">Name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/memory/classes/metadata/mspan/inuse:bytes&quot;</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nx">Name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/memory/classes/metadata/other:bytes&quot;</span><span class="p">},</span>
+<span class="p">}</span>
+<span class="nx">metrics</span><span class="p">.</span><span class="nx">Read</span><span class="p">(</span><span class="nx">s</span><span class="p">)</span>
+</code></pre></div>
+
+<p><code>/gc/pauses:seconds</code> 是累计直方图，必须自己算差值，否则看到的是启动至今的累计分布，尖刺会被历史数据淹没。作者的做法是每轮读一次、减去上一轮的 counts，再算增量 p99 和最坏值。</p>
+<p><strong>第二步，确认 swap 真的在动。</strong> 看 cgroup 的 <code>memory.swap.current</code>，以及 <code>/proc/vmstat</code> 里的四个计数器：</p>
+<div class="highlight"><pre><span></span><code>pswpin        换入页数
+pswpout       换出页数
+swap_ra       swap 预读次数
+swap_ra_hit   预读命中次数
+</code></pre></div>
+
+<p><code>swap_ra_hit / swap_ra</code> 这个比值很能说明问题：它低说明预读在瞎猜，每次换入都得老老实实等盘。</p>
+<p><strong>第三步，把 STW 和 page fault 关联起来。</strong> 单看任何一边都会误判。bpftrace 挂 <code>stopTheWorldWithSema</code> 计 272 次 STW，同时挂 <code>do_swap_page</code> 计 major fault，两条线对上了，因果才成立。</p>
+<p><strong>第四步，把 swap 的等待时间再拆一层。</strong> 等盘的本质是等页锁。在 6.8 内核上 <code>folio_wait_bit</code> 被内联进 <code>__folio_lock_or_retry</code>，所以直接挂这个函数就能量到等待时长，并且要区分「这个 fault 自己发起了读」还是「在等别人发起的读」：</p>
+<div class="highlight"><pre><span></span><code><span class="nl">kprobe</span><span class="p">:</span><span class="n">swap_read_folio</span><span class="w"> </span><span class="o">/</span><span class="nv">@in_sw</span><span class="o">[</span><span class="n">tid</span><span class="o">]/</span><span class="w"> </span><span class="err">{</span><span class="w"> </span><span class="nv">@issued</span><span class="o">[</span><span class="n">tid</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span><span class="w"> </span><span class="err">}</span>
+<span class="nl">kretprobe</span><span class="p">:</span><span class="n">__folio_lock_or_retry</span><span class="w"> </span><span class="o">/</span><span class="nv">@w</span><span class="o">[</span><span class="n">tid</span><span class="o">]/</span><span class="w"> </span><span class="err">{</span>
+<span class="w">  </span><span class="err">$</span><span class="n">d</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">(</span><span class="n">uint64</span><span class="p">)(</span><span class="n">nsecs</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="nv">@w</span><span class="o">[</span><span class="n">tid</span><span class="o">]</span><span class="p">);</span>
+<span class="w">  </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nv">@issued</span><span class="o">[</span><span class="n">tid</span><span class="o">]</span><span class="p">)</span><span class="w"> </span><span class="err">{</span><span class="w"> </span><span class="nv">@own_ns</span><span class="o">[</span><span class="n">pid</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nf">sum</span><span class="p">(</span><span class="err">$</span><span class="n">d</span><span class="p">);</span><span class="w"> </span><span class="err">}</span><span class="w">   </span><span class="o">//</span><span class="w"> </span><span class="n">自己在等盘</span>
+<span class="w">  </span><span class="k">else</span><span class="w">              </span><span class="err">{</span><span class="w"> </span><span class="nv">@other_ns</span><span class="o">[</span><span class="n">pid</span><span class="o">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nf">sum</span><span class="p">(</span><span class="err">$</span><span class="n">d</span><span class="p">);</span><span class="w"> </span><span class="err">}</span><span class="w"> </span><span class="o">//</span><span class="w"> </span><span class="n">在等别的线程</span>
+<span class="err">}</span>
+</code></pre></div>
+
+<p>这个区分很实用：如果时间大量落在 <code>@other_*</code>，说明多个线程在抢同一个页，问题不是盘慢而是并发换入。</p>
+<h2>落到生产上该怎么选</h2>
+<p>作者的观点我认同：<strong>swap 不是洪水猛兽</strong>。Chris Down 那篇著名的辩护说得很清楚，适度 swap 能吸收内存尖峰，避免 OOM kill 掉整个进程，这比偶发几十毫秒停顿要划算得多。</p>
+<p>但 Go 服务和别的服务不太一样，它的 GC 会把运行时不常访问的元数据页「暴露」给内核的回收算法。所以在 Go 场景下，我的做法是分三步：</p>
+<p><strong>首选，给 cgroup 配 <code>memory.high</code> 而不是 <code>memory.max</code>。</strong> <code>memory.high</code> 是软限制，进程超了会被节流（throttle）而不是直接触发回收换出。让分配速率降下来，比让页面去硬盘上转一圈便宜得多。</p>
+<p><strong>其次，如果一定要开 swap，提升 GC 元数据的热度。</strong> 最简单粗暴的办法是把 <code>GOGC</code> 调低一点，让 GC 跑得更频繁。听起来反直觉，但元数据页被访问得越勤，年龄越难涨过邻居进程，就越不容易被换出。代价是 CPU 多烧一点。实验里用的是默认 <code>GOGC=100</code>。</p>
+<p><strong>最后，把元数据加进监控。</strong> 大部分人只盯 <code>heap/objects</code>，漏掉了 <code>metadata/mspan/inuse</code> 和 <code>metadata/other</code>。这两个值乘以页面换出概率，才是真正的风险敞口。</p>
+<p>至于 Go 1.26 的 Green Tea GC，作者的实测结论是别指望它。它改的是标记阶段的并行度，没改「元数据在 STW 里被同步读取」这个前提。</p>
+<h2>一个开发者的视角</h2>
+<p>这个 bug 最值得琢磨的地方，是它藏在一个<strong>边界</strong>上：Go 运行时假设自己的元数据页常驻物理内存，内核的回收策略不认这个假设，中间没有人做过仲裁。</p>
+<p>两边单看都没错。内核按 LRU 换出冷页面是正确策略；Go 在 STW 里同步读元数据也是合理设计，毕竟假设内存访问不会阻塞是绝大多数运行时的默认前提。错的是把它们放在一个内存吃紧的 cgroup 里，还开了 swap。</p>
+<p>所以碰上「偶发、低频率、无法解释的延迟尖刺」，除了怀疑锁竞争和 GC 参数，值得多问一句：<strong>我关心的那些数据结构，这一秒还真的在物理内存里吗？</strong> 用 bpftrace 挂上 <code>do_swap_page</code> 数一数 major fault，几十行脚本就有答案。这比在监控面板上翻 p99 曲线有用得多，因为换出去的页面，不会在堆指标里留任何痕迹。</p>
+<p>实验的全部代码、bpftrace 脚本和绘图都在作者的仓库里，核心逻辑不到 300 行 Go，值得自己跑一遍。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
