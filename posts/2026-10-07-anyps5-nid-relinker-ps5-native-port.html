@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>不用模拟器跑 PS5 游戏：拆解 AnyPS5 的 NID 动态链接与原生重链接机制 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>不用模拟器跑 PS5 游戏：拆解 AnyPS5 的 NID 动态链接与原生重链接机制</h1>
+<time>2026-10-07</time>
+<ul>
+<li>逆向工程</li>
+<li>二进制分析</li>
+<li>动态链接</li>
+<li>着色器编译</li>
+<li>开源项目</li>
+</ul>
+<hr />
+<p>主机模拟器这条路走了十几年，套路基本固定：给每个线程分配一块 guest 内存，遇到跳转就翻译指令，遇到系统调用就查表转发。慢，但通用。</p>
+<p>AnyPS5 选了另一条路。它的 README 第一句话就交代了立场：把 PS5 可执行文件转换成目标系统的原生格式，配上自己重写的系统库，动态链接进去。没有模拟器，没有独立的运行时进程。这是重链接（relink），不是解释执行。</p>
+<p>读它的源码目录，1931 个文件铺开来，能看出这不是玩具工程。我花了一晚上翻 <code>core/relinker</code> 和 <code>core/libs/nid</code> 两个目录，这里记录一下它是怎么把一份 PS5 ELF 变成 Linux 原生可执行文件的。</p>
+<h2>PS5 的导出表里没有符号名</h2>
+<p>这是理解整个项目的前提。</p>
+<p>在普通 ELF 里，动态链接靠符号名匹配。你调用 <code>printf</code>，链接器在 <code>.dynsym</code> 里找到那个叫 <code>printf</code> 的表项，填上地址。名字就是键。</p>
+<p>PS5 不用名字。它的每个导出函数有一个 NID（Name ID），是一个 11 字符的字符串，比如 <code>7CxI50-xlCk</code>、<code>pMxXhNozUX8</code>。你在反汇编里看到的调用目标全是这种乱码，没有任何语义信息。</p>
+<p>那 NID 是怎么算出来的？<code>core/libs/nid/src/NidCompute.cpp</code> 只有 54 行，把答案写得很清楚：</p>
+<div class="highlight"><pre><span></span><code><span class="k">constexpr</span><span class="w"> </span><span class="kt">uint8_t</span><span class="w"> </span><span class="n">kNidSuffix</span><span class="p">[</span><span class="mi">16</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="mh">0x51</span><span class="p">,</span><span class="w"> </span><span class="mh">0x8D</span><span class="p">,</span><span class="w"> </span><span class="mh">0x64</span><span class="p">,</span><span class="w"> </span><span class="mh">0xA6</span><span class="p">,</span><span class="w"> </span><span class="mh">0x35</span><span class="p">,</span><span class="w"> </span><span class="mh">0xDE</span><span class="p">,</span><span class="w"> </span><span class="mh">0xD8</span><span class="p">,</span><span class="w"> </span><span class="mh">0xC1</span><span class="p">,</span>
+<span class="w">    </span><span class="mh">0xE6</span><span class="p">,</span><span class="w"> </span><span class="mh">0xB0</span><span class="p">,</span><span class="w"> </span><span class="mh">0x39</span><span class="p">,</span><span class="w"> </span><span class="mh">0xB1</span><span class="p">,</span><span class="w"> </span><span class="mh">0xC3</span><span class="p">,</span><span class="w"> </span><span class="mh">0xE5</span><span class="p">,</span><span class="w"> </span><span class="mh">0x52</span><span class="p">,</span><span class="w"> </span><span class="mh">0x30</span>
+<span class="p">};</span>
+
+<span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="w"> </span><span class="nf">ComputeNid</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&amp;</span><span class="w"> </span><span class="n">symbolName</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="n">std</span><span class="o">::</span><span class="n">string</span><span class="o">&amp;</span><span class="w"> </span><span class="n">libraryName</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">std</span><span class="o">::</span><span class="n">vector</span><span class="o">&lt;</span><span class="kt">uint8_t</span><span class="o">&gt;</span><span class="w"> </span><span class="n">input</span><span class="p">(</span><span class="n">symbolName</span><span class="p">.</span><span class="n">begin</span><span class="p">(),</span><span class="w"> </span><span class="n">symbolName</span><span class="p">.</span><span class="n">end</span><span class="p">());</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">uint8_t</span><span class="w"> </span><span class="n">b</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="n">kNidSuffix</span><span class="p">)</span>
+<span class="w">        </span><span class="n">input</span><span class="p">.</span><span class="n">push_back</span><span class="p">(</span><span class="n">b</span><span class="p">);</span>
+
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="n">digest</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Sha1</span><span class="p">(</span><span class="n">input</span><span class="p">);</span>
+
+<span class="w">    </span><span class="kt">uint8_t</span><span class="w"> </span><span class="n">reversed</span><span class="p">[</span><span class="mi">8</span><span class="p">];</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">8</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span>
+<span class="w">        </span><span class="n">reversed</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">digest</span><span class="p">[</span><span class="mi">7</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">i</span><span class="p">];</span>
+<span class="w">    </span><span class="c1">// ... base64 编码成 11 字符</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>流程拆开就是四步：</p>
+<ol>
+<li>把函数名和那 16 字节固定后缀拼起来</li>
+<li>对这串字节算 SHA-1</li>
+<li>取摘要的前 8 个字节，<strong>反序</strong>排列</li>
+<li>用一个自定义的 64 字符表（<code>A-Za-z0-9+-</code>，注意最后两个是 <code>+</code> 和 <code>-</code>，不是标准的 <code>+/</code>）做 base64，截到 11 个字符</li>
+</ol>
+<p>所以 NID 不是随机数，它是函数名的单向哈希。这里有个关键的工程推论：<strong>你没法从 NID 反推出函数名，但你可以拿着函数名正推 NID</strong>。</p>
+<p>AnyPS5 的整套符号解析就建立在这个不对称上。它维护着一份已知 PS5 系统函数的名字清单，逐个算 NID，建一张 NID 到函数的映射表。重链接时遇到一个 NID，查表就知道它对应哪个函数，然后把它接到自己重写的实现上。</p>
+<p>这也是为什么项目的 <code>TechnicalDebt.md</code> 里到处出现 <code>shadPS4 aerolib NID list</code>、<code>SharpProspero</code>、<code>OpenAGC</code>、<code>KytyPS5</code> 这些名字。PS5 系统库有上万个导出函数，签名大多不公开，社区靠不同项目互相印证来逐步补齐这份清单。AnyPS5 新定义函数的依据，往往就是"shadPS4 的 NID 列表里它是这么命名的"加"SharpProspero 的绑定里参数是这个顺序"。两个独立来源对上了，才敢下笔。</p>
+<h2>Relinker 干的四件事</h2>
+<p><code>core/relinker</code> 是重链接器的本体，命令行接口就一个：</p>
+<div class="highlight"><pre><span></span><code>relinker<span class="w"> </span><span class="o">[</span>options<span class="o">]</span><span class="w"> </span>&lt;input.elf&gt;<span class="w"> </span>&lt;output&gt;
+relinker<span class="w"> </span>--windows<span class="w"> </span>source/input.elf<span class="w"> </span>app.exe<span class="w">      </span><span class="c1"># 输出 PE</span>
+relinker<span class="w"> </span>--to-intel<span class="w"> </span>source/input.elf<span class="w"> </span>app.elf<span class="w">      </span><span class="c1"># 兼容 Intel 主机</span>
+</code></pre></div>
+
+<p>输入要求是一份干净的 PS5 ELF，旁边的 <code>sce_module/</code> 或 <code>prx/</code> 目录里放它捆绑的模块。输出的默认格式是 Linux ELF，即使文件名叫 <code>.exe</code> 也不会自动切换，要显式加 <code>--windows</code>。</p>
+<p>它内部做的事，我按依赖关系理了一下：</p>
+<p><strong>第一件，重定位。</strong> PS5 的 ELF 有自己的重定位类型和动态段结构。<code>ElfPatcher.hpp</code> 里把 <code>Elf64_Ehdr</code>、<code>Elf64_Shdr</code>、<code>Elf64_Sym</code>、<code>Elf64_Rela</code>、<code>Elf64_Dyn</code>、<code>Elf64_Verneed</code> 这些结构体全部重新定义了一遍，不是拿现成的 libelf，而是自己按字节布局解析。重链接要改写这些段的内容，塞进目标格式能理解的重定位项。</p>
+<p><strong>第二件，NID 解析与导入改写。</strong> 这是 <code>core/libs/nid</code> 的活。<code>ElfNidPatcher.cpp</code> 有 21KB，<code>PeNidPatcher.cpp</code> 有 13KB，分别处理 ELF 和 PE 两种目标的导入表。流程是：扫描输入 ELF 的导入表，每一条是一个 NID 引用，查表解析成真实函数名，再在输出格式里生成一条以函数名标识的导入项，指向 AnyPS5 自己提供的 <code>libSce*.prx</code>。</p>
+<p><strong>第三件，未使用导入的裁剪。</strong> 这就是命令行里那几个 <code>unused-filter=0|1|2</code> 的含义：</p>
+<table>
+<thead>
+<tr>
+<th>值</th>
+<th>行为</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>保留全部 NID 引用（默认）</td>
+</tr>
+<tr>
+<td>1</td>
+<td>用控制流和 GOT 访问分析，过滤掉没用到的非 PLT 导入，保留 PLT</td>
+</tr>
+<tr>
+<td>2</td>
+<td>严格分析，同时压缩 PLT；遇到分析不了的情况直接报错</td>
+</tr>
+</tbody>
+</table>
+<p>模式 1 靠"这段代码有没有真的跳到过 GOT 项"来判断导入是否死代码。模式 2 更激进，把 PLT 表项也一起重排。默认给 0 是有道理的，激进裁剪会让一些通过函数指针间接调用的导入被误删。</p>
+<p><strong>第四件，AMD 专有指令的下沉（lowering）。</strong> 这是我认为项目里技术含量最高的部分。</p>
+<h2><code>--to-intel</code>：把 AMD 指令改写成 Intel 能跑的</h2>
+<p>PS5 用的是 AMD 的 Zen 2 架构。它的二进制里可能出现一批 Intel 上没有的指令：<code>CLZERO</code>、<code>RDPRU</code>、<code>MONITORX</code>、<code>MWAITX</code>、<code>MCOMMIT</code>，还有 SSE4a 扩展的 <code>EXTRQ</code>、<code>INSERTQ</code>、<code>MOVNTSS</code>、<code>MOVNTSD</code>。这些指令在 Intel 主机上会直接触发非法指令异常。</p>
+<p><code>--to-intel</code> 就是解决这个的。<code>core/relinker/codegen</code> 目录下是一整套 x86 指令解码器和改写器：</p>
+<div class="highlight"><pre><span></span><code>X64InstructionDecoder.hpp    /  X64InstructionRewriter.hpp
+Amd64OnlyInstructionMatcher.cpp   (11KB)
+ClzeroLowering.cpp           Sse4aLowering.cpp      (8KB)
+Sha1Lowering.cpp   (7KB)     Sha256Lowering.cpp     (7KB)
+ReciprocalLowering.cpp
+</code></pre></div>
+
+<p>工作原理是静态扫描代码段，逐条解码指令，匹配 AMD 专有条目，然后在原地替换成等价的 Intel 序列或一段 stub。几个具体的替换策略在 <code>Amd64OnlySubstitutionTable.hpp</code> 里能看到：</p>
+<div class="highlight"><pre><span></span><code><span class="n">AMD64_STUB</span><span class="p">(</span><span class="n">LeaRspBelowRedZone</span><span class="p">,</span><span class="w"> </span><span class="mh">0x48</span><span class="p">,</span><span class="w"> </span><span class="mh">0x8D</span><span class="p">,</span><span class="w"> </span><span class="mh">0xA4</span><span class="p">,</span><span class="w"> </span><span class="mh">0x24</span><span class="p">,</span><span class="w"> </span><span class="mh">0x70</span><span class="p">,</span><span class="w"> </span><span class="mh">0xFF</span><span class="p">,</span><span class="w"> </span><span class="mh">0xFF</span><span class="p">,</span><span class="w"> </span><span class="mh">0xFF</span><span class="p">)</span>
+<span class="n">AMD64_STUB</span><span class="p">(</span><span class="n">Pause</span><span class="p">,</span><span class="w"> </span><span class="mh">0xF3</span><span class="p">,</span><span class="w"> </span><span class="mh">0x90</span><span class="p">)</span>
+<span class="n">AMD64_STUB</span><span class="p">(</span><span class="n">Nop7</span><span class="p">,</span><span class="w"> </span><span class="mh">0x0F</span><span class="p">,</span><span class="w"> </span><span class="mh">0x1F</span><span class="p">,</span><span class="w"> </span><span class="mh">0x80</span><span class="p">,</span><span class="w"> </span><span class="mh">0x00</span><span class="p">,</span><span class="w"> </span><span class="mh">0x00</span><span class="p">,</span><span class="w"> </span><span class="mh">0x00</span><span class="p">,</span><span class="w"> </span><span class="mh">0x00</span><span class="p">)</span>
+</code></pre></div>
+
+<p><code>Pause</code> 很简单，<code>F3 90</code> 就是 <code>PAUSE</code>，Intel 上原生支持，直接用。NOP 的 1 到 7 字节变体也都备齐了，因为原地替换时新序列长度必须和原指令严格对齐，多出来的字节用对应长度的 NOP 填。</p>
+<p>有些指令没法直接等价替换，就得下沉成一段展开的 stub。<code>CLZERO</code>（清空一整条 cache line）在 Intel 上要拆成一串 SIMD 存储；<code>SHA1RNDS4</code>、<code>SHA256RNDS2</code> 这些 AMD 的 SHA 扩展指令，要展开成普通的移位、异或、加法序列来实现同样的轮函数。<code>Sha1Lowering.cpp</code> 和 <code>Sha256Lowering.cpp</code> 各有 7KB，基本就是在用标量指令重新实现一遍哈希轮运算。</p>
+<p>改动之前，扫描器要先收集所有分支目标（<code>_collectBranchTargets</code>），确保指令边界不会和跳转目标冲突。改错一个字节，整个代码段就崩了。</p>
+<p>这套东西的边界也写得很直白：不支持的指令，或者改写后产生的不可达 stub，<strong>直接抛异常</strong>，不会给你生成一个能编译但会崩溃的二进制。</p>
+<h2>着色器：从 RDNA2 汇编到底层 Vulkan</h2>
+<p>游戏渲染绕不开 GPU 指令。PS5 的 GPU 是 RDNA2，着色器是编译好的 GCN 汇编。要转换到原生平台，就得把它重新编译成目标 GPU 能执行的指令。</p>
+<p><code>core/shader/recompiler</code> 是一条完整的编译流水线：</p>
+<ul>
+<li><code>RdnaDecoder</code> 解码 RDNA2 标量/向量指令</li>
+<li><code>ControlFlow/</code> 从指令流重建控制流图，<code>GraphBuilder.cpp</code> 有 36KB，<code>Structurizer.cpp</code> 有 67KB，负责把 flat 的跳转结构还原成带分支和循环的中间表示</li>
+<li><code>IntermediateRepresentation/</code> 是 IR 层，<code>IrOpcode.hpp</code> 定义了全套操作码</li>
+<li>后端把 IR 生成 SPIR-V，用 <code>Spirv-Tools</code> 校验（需要编译时开 <code>ANYPS5_ENABLE_SPIRV_TOOLS</code>）</li>
+</ul>
+<p><code>TechnicalDebt.md</code> 里记了一个很典型的表现差异。如果目标环境不支持 <code>VK_KHR_fragment_shader_barycentric</code> 扩展，重编译器会<strong>丢弃</strong> <code>v_interp_p1_f32</code> 指令，而 <code>v_interp_p2_f32</code> 会退回去读 Vulkan 插值出来的属性值。对于只用 <code>v_interp</code> 的普通像素着色器，结果一样；但如果着色器拿重心坐标去做别的事，拿到的值就是错的。这种地方往往是画面出现细微瑕疵的根源，而且极难定位。</p>
+<h2>系统库重写：宁抛异常，不静默打桩</h2>
+<p>模拟器最坑的一点是"看起来能跑"。一个函数没实现，打桩返回个成功，游戏继续跑，跑到某个关键路径突然崩，或者更糟——存档写坏了。</p>
+<p>AnyPS5 对这件事的态度写在 <code>TechnicalDebt.md</code> 的开头：<strong>每一个阶段的每一个函数，要么做它该做的事，要么抛异常。</strong> <code>std::runtime_error</code>，<code>what()</code> 打到 stderr，进程终止。</p>
+<p>这份文档本身值得一读，因为它把"哪些地方破例了"一条条列出来。目前唯一的例外是一批对话框类库：</p>
+<ul>
+<li><code>libSceSaveDataDialog</code>、<code>libSceMsgDialog</code>、<code>libSceCommonDialog</code>、<code>libSceErrorDialog</code>、<code>libSceLoginDialog</code>：状态机照跑，但不显示任何 UI，登录对话框直接返回"用户取消"</li>
+<li><code>libSceHmd</code>：只实现"头显未连接"这条路，初始化成功但查询一律返回 <code>NotDetected</code></li>
+<li><code>libSceAudio3d</code>：不出声，<code>sceAudio3dPortPush</code> 只是按帧节奏排队，不产生音频</li>
+<li><code>libSceHttp</code>：没有任何请求会真正到达网络</li>
+</ul>
+<p>这些破例的选择很务实。对话框不显示不影响游戏逻辑，头显没接就当没接。但音频、网络这些会改变游戏行为的，宁可报错也不能假装成功。</p>
+<p>重写粒度细到什么程度？看 <code>libSceAgc</code>（PS5 的图形命令缓冲库）的目录结构就懂了：<code>DcbDraw/</code>、<code>DcbFlow/</code>、<code>DcbState/</code>、<code>Command/</code>、<code>Patch/</code>、<code>Predication/</code>、<code>Shader/</code> 分门别类，<code>Command/src/Memory.cpp</code> 9KB、<code>Packet.cpp</code> 8KB，连 <code>ShaderFusion.cpp</code>（着色器融合，18KB）都实现了一份。这不是"能跑就行"的桩，是照着硬件行为重写。</p>
+<h2>目前的实际状态</h2>
+<p>项目在 README 里挂了三张自动生成的进度图（系统库覆盖率、着色器覆盖率、进度地图），并且很诚实地标注了一句：系统库百分比指的是"项目目前已知的函数"里已实现的比例，不是 PS5 全部系统函数。已知集合本身还在涨。</p>
+<p>兼容性列表就一款游戏：</p>
+<table>
+<thead>
+<tr>
+<th>游戏</th>
+<th>ID</th>
+<th>Windows</th>
+<th>GTX 1050 Ti / i5-7500</th>
+<th>Intel HD 620 / i5-7200</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Dreaming Sarah</td>
+<td>PPSA02929</td>
+<td>可玩</td>
+<td>60 FPS</td>
+<td>36 FPS</td>
+</tr>
+</tbody>
+</table>
+<p>一款 2D 平台跳跃游戏，中端独显上稳定 60 帧。这是很好的成绩，但离"跑 3A"还很远。HN 上那条标题说的 87%，指的就是这张进度图里的系统库覆盖率，且要按上面那句注释来理解。</p>
+<p>构建层面的坑也在文档里：Windows 上需要特定版本的 MinGW（MinGW-w64 GCC 15.2.0，<code>x86_64-ucrt-posix-seh</code>），而且即使 prx 库编译出来了，运行时还得把 <code>libgcc_s_seh-1.dll</code>、<code>libstdc++-6.dll</code>、<code>libwinpthread-1.dll</code> 放在旁边。</p>
+<h2>一个做底层的视角</h2>
+<p>AnyPS5 值得关注的不是"能不能玩 PS5 游戏"这个结果，而是它的方法论：<strong>把跨平台问题拆成重链接问题，而不是执行问题。</strong></p>
+<p>模拟器要维护一整套 guest CPU/内存/内核模型，任何一处和硬件行为不一致都会变成诡异的兼容性 bug。重链接器换了个思路，直接产出目标平台的原生代码，指令是原生执行的，没有翻译层。代价是静态改写必须足够彻底——AMD 专有指令要重写，着色器要重编译，系统库要逐个重写。一旦某个环节分析不了，就只能报错，没有"先跑起来再说"的退路。</p>
+<p>这种"要么正确，要么显式失败"的工程纪律，比它现在能跑几款游戏更值得学。</p>
+<h2>附录：关键文件索引</h2>
+<p>如果你也想翻源码，这几个入口性价比最高：</p>
+<ul>
+<li><code>core/libs/nid/src/NidCompute.cpp</code>：54 行，NID 算法全部</li>
+<li><code>core/libs/nid/src/ElfNidPatcher.cpp</code>：ELF 导入表的 NID 解析与改写</li>
+<li><code>core/relinker/codegen/include/codegen/x86/Amd64OnlySubstitutionTable.hpp</code>：指令替换表</li>
+<li><code>core/relinker/codegen/src/Amd64OnlyConverter.cpp</code>：指令扫描与原地改写</li>
+<li><code>docs/dev/TechnicalDebt.md</code>：所有未实现/未验证的函数清单，信息密度极高</li>
+<li><code>docs/user/USAGE.md</code>：relinker 全部命令行选项与运行时目录布局</li>
+</ul>
+<p>仓库：<code>github.com/boykopovar/AnyPS5</code>（GPL-2.0）。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
