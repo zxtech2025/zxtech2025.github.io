@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JPEG XL 重回 Chrome：从 libjxl 的 C++ 安全债，到 Rust 解码器重写 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>JPEG XL 重回 Chrome：从 libjxl 的 C++ 安全债，到 Rust 解码器重写</h1>
+<time>2026-10-08</time>
+<ul>
+<li>图像编解码</li>
+<li>JPEG XL</li>
+<li>Rust</li>
+<li>内存安全</li>
+<li>浏览器引擎</li>
+</ul>
+<hr />
+<p>2022 年 Chrome 团队把 JPEG XL 从 Chromium 里拿掉的时候，理由不是"不好用"，而是"不划算"。三年后它又回来了，但回来的方式完全变了：这次 Chrome 用的不是一个几千行 C++ 的解码库直接编进浏览器，而是一个新的、用 Rust 重写的解码器。</p>
+<p>一个图像格式的进进出出，背后其实是一次关于内存安全的工程取舍。这篇把 JXL 的技术架构和这次回归的关键决策拆开讲。</p>
+<h2>先说格式本身：JXL 到底强在哪</h2>
+<p>JPEG XL 在 2022 年被标准化为 ISO/IEC 18181，分四个部分：18181-1 定义核心码流，18181-2 定义文件封装，18181-3 是解码器一致性测试，18181-4 是参考实现（就是 libjxl）。核心码流是"裸"的，文件以 <code>0xFF0A</code> 开头；也可以包在 ISOBMFF 容器里，起始字节是 <code>0x0000000C 4A584C20 0D0A870A</code>。</p>
+<p>它和 JPEG、AVIF 最大的区别在设计目标上。libjxl 的文档把需求写得很直白：一是高画质（在合理码率下做到视觉无损），二是解码速度——大图上多线程解码要能跑到约 <strong>400 兆像素/秒</strong>。为了这个速度目标，格式在内存带宽占用和 SIMD/GPU 可实现性上做了专门设计，而不是事后优化。</p>
+<p>JXL 有两种像素编码模式，这是它兼顾有损和无损的关键：</p>
+<ul>
+<li><strong>VarDCT 模式</strong>：变尺寸 DCT 变换，系数编码，永远有损。但它也能无损地表示一张已经是有损的 JPEG——这时只用 DCT 8x8，配合下面的 JPEG 重建数据，可以做到比特级还原。</li>
+<li><strong>Modular 模式</strong>：纯整数运算，真正无损。它可以套用可逆颜色变换（RCT）、调色板变换，以及一个改过的非线性 Haar 变换叫 <strong>Squeeze</strong>，方便（不强制）有损压缩，还顺带支持渐进解码。</li>
+</ul>
+<p>有意思的是 VarDCT 内部还用 Modular 子码流来存辅助图：低频图（LF image，1:8 下采样、含 DCT8x8 的 DC 系数）、alpha 等额外通道、自适应量化的权重。也就是说一个"有损"帧里嵌着"无损"的子结构。</p>
+<h2>那些让 JXL 省字节的细节</h2>
+<p>JXL 压缩率好，不是靠一个大杀器，而是一堆针对性的工具叠加：</p>
+<p><strong>Patches（补丁）</strong>：编码器能识别图像里重复出现的图案（比如一段文字里的同一个字母），只编码一次，然后在多个位置用补丁贴回去。补丁引用的是之前解码过的帧——可以是"隐藏帧"（不显示、只存着给后面引用的帧）。这个机制还让 Modular 编码的像素能加到 VarDCT 编码的帧上，反之亦然。</p>
+<p><strong>Splines（样条）</strong>：可以编码向心 Catmull-Rom 样条，沿弧长颜色和粗细都能变。因为细线条用 DCT 表示很失真，样条正好补这个短板。参考编码器目前还没用上这个码流特性，但格式里留了。</p>
+<p><strong>Noise（噪声注入）</strong>：亮度调制的合成噪声，用来模拟光子噪声。直接的好处是避免高频 DCT 系数压缩率太差。libjxl 文档里标了当前是 disabled 状态。</p>
+<p><strong>两组后处理滤波器</strong>：Gaborish（3x3 模糊，跨块和组边界应用，去块效应，编码器侧先做反锐化"预补偿"）和 EPF（边缘保留滤波器，类似双边滤波，强度可随位置自适应）。这两个都是可选件——在高码率下反而可能帮倒忙。</p>
+<h2>渐进解码和并行：TOC 是关键</h2>
+<p>JXL 最实用的工程特性是渐进。它的帧数据按 <strong>group</strong> 序列排布，每个 group 可以独立解码，帧头里带一张目录表（TOC），记录每个 group 码流的起始偏移。这直接带来三件事：并行解码、局部区域解码（ROI）、渐进预览。</p>
+<p>VarDCT 模式下 group 固定 256x256（边界处更小）。解码顺序是先 LF 图，也是 256x256 的组——但因为对应 1:8 的图，一组覆盖原图 2048x2048 像素。<strong>这意味着 VarDCT 模式下永远有一个基础预览可用</strong>。HF 组对应剩下的 AC 系数，可以分多趟编码做渐进细化，所有趟的系数是相加的。和 JPEG 的渐进扫描不同，JXL 允许"任意趟里在图像任意部位放任意细节"。</p>
+<p>Modular 模式 group 尺寸可以是 128/256/512/1024。如果用了 Squeeze 变换，数据分三块：Global groups（拉普拉斯金字塔顶端，装得进单个 group）、LF groups（中段，重建 1:8 图所需）、HF groups（底端，可再分三趟：1:4、1:2、1:1）。</p>
+<p>组顺序默认是扫描线（从上到下、从左到右），但<strong>可以任意置换</strong>。这就允许"中心优先"或"基于显著性"的排布，让码流按不同策略优先传渐进细化。</p>
+<h2>无损和 JPEG 重压缩</h2>
+<p>无损这边，Alexander Rhatushnyak 和 Jon Sneyers 设计的工具能把照片压到 <strong>PNG 的 60-75%</strong>，比 WebP 无损还小。做法是自适应预测器从 NW/N/NE/W 四个像素算出预测值，按历史误差加权组合；误差值编码进按启发式最大误差选的桶里，最后走 ANS 熵编码。</p>
+<p>对已有 JPEG 的重压缩是另一个亮点。JXL 能把一张 JPEG 无损地重新压小，文件里除了码流盒还带一个 <code>jbrd</code> 盒（JPEG Bitstream Reconstruction Data）。因为同一份图像数据有多种 JPEG 编码方式，要<strong>比特级还原原文件</strong>（不是只还原图像）就需要这份额外信息。它通常很小，而且只有还原原始 JPEG 才需要——显示重压缩后的图根本用不着它。</p>
+<h2>为什么会被拿掉，又为什么现在回来</h2>
+<p>2022 年 10 月 Chromium 移除 JXL 支持，走的是"简化图像编解码栈"的路线。但社区反对声一直很大，FSF 公开批评过这个决定。真正的转折点在<strong>安全性</strong>上。</p>
+<p>libjxl 是 C++ 写的。HN 讨论里有人直接点出来：libjxl 历史上出过不少漏洞，如果原样编进浏览器，风险量级可以跟 WebP 的漏洞相提并论——Google Project Zero 当时就提醒过浏览器团队，别急着加不安全的新解码器。查 libjxl 的 changelog 也确实如此，v0.11.2 一次就修了 CVE-2025-12474（低内存渲染管线的 tile 尺寸）和 CVE-2026-1837（灰度到灰度颜色变换的通道数），还有一个由 Project Zero 的 Mateusz Jurczyk 发现的 <code>jsize_t</code> 溢出。仓库 README 顶部挂着强调更新到 v0.12 的安全提示。</p>
+<p>所以这次 Chrome 回归，关键是<strong>解码器用了 Rust 重写</strong>。HN 上有人纠正说"Google 自己的"这个说法不太准确——写 Rust 版本的基本就是当初写 libjxl 的那批人，只是换了语言。这一点挺值得琢磨：换语言不等于换人，问题是 C++ 的内存模型本身给了太多出错空间，而一个解码器要处理的是不可信输入，攻击面天然就大。Rust 的借用检查和边界检查，把这些漏洞类别从"考程序员细心"变成"编译器强制"。</p>
+<p>顺带一个常被引用的现实案例：纯 Rust 的 <code>jxl-oxide</code> 就是一份 spec-conforming 的 JXL 解码器（crate 0.12.5，双许可 MIT/Apache-2.0），开了 <code>rayon</code> 多线程后单特性即可跑。这类纯 Rust 实现的存在，让"用 Rust 写 JXL 解码器"从一个设想变成了可验证的工程选项。</p>
+<h2>一个开发者的视角</h2>
+<p>对普通 Web 开发者，这次回归的直接意义是：<code>&lt;img src="x.jxl"&gt;</code> 在 Chrome 里重新可用，图片管线的另一个格式选项回来了。但更值得记的是这次的技术路线选择：</p>
+<ul>
+<li><strong>格式设计要为"可验证"留余地</strong>。JXL 把 TOC、独立 group、渐进趟数都做进码流，解码器才能并行和局部解码——这是设计时就定的，不是后来打补丁能补出来的。</li>
+<li><strong>解析不可信输入的组件，语言选择是一道真实的安全边界</strong>。libjxl 的 CVE 记录不是个例，是 C++ 处理畸形输入时的系统性风险。把一个规范符合的解码器用 Rust 重写，收益不在性能，在漏洞类别的整体消除。</li>
+<li><strong>渐进和"永远有预览"是可以设计出来的</strong>。VarDCT 强制先编码 LF 图，让任何 JXL 图天生带一张基础预览——这个约束换来了弱网和懒加载场景下的确定体验，比事后做 LQIP 占位图干净得多。</li>
+</ul>
+<p>格式之争最后往往不是"谁的压缩率高"决定的，而是"谁能在真实浏览器里被安全、稳定地维护"决定的。JXL 这次回来，答案写在了语言栏里。</p>
+<hr />
+<p>参考：libjxl 官方文档（format_overview / xl_overview）、Chrome "Shipping JPEG XL in Chrome" 公告、HN 讨论（555 分）。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
