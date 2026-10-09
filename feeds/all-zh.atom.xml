@@ -1,5 +1,89 @@
 <?xml version="1.0" encoding="utf-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom"><title>Kane's Blog</title><link href="/" rel="alternate"/><link href="feeds/all-zh.atom.xml" rel="self"/><id>/</id><updated>2026-10-08T00:00:00+08:00</updated><entry><title>JPEG XL 重回 Chrome：从 libjxl 的 C++ 安全债，到 Rust 解码器重写</title><link href="posts/2026-10-08-jpeg-xl-rust-decoder-chrome-return.html" rel="alternate"/><published>2026-10-08T00:00:00+08:00</published><updated>2026-10-08T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-10-08:posts/2026-10-08-jpeg-xl-rust-decoder-chrome-return.html</id><summary type="html">&lt;ul&gt;
+<feed xmlns="http://www.w3.org/2005/Atom"><title>Kane's Blog</title><link href="/" rel="alternate"/><link href="feeds/all-zh.atom.xml" rel="self"/><id>/</id><updated>2026-10-09T00:00:00+08:00</updated><entry><title>16.9 MB 跑语音识别：Whistle 是怎么把 Whisper 压缩 8.6 倍的</title><link href="posts/2026-10-09-whistle-16mb-speech-to-text.html" rel="alternate"/><published>2026-10-09T00:00:00+08:00</published><updated>2026-10-09T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-10-09:posts/2026-10-09-whistle-16mb-speech-to-text.html</id><summary type="html">&lt;ul&gt;
+&lt;li&gt;语音识别&lt;/li&gt;
+&lt;li&gt;模型压缩&lt;/li&gt;
+&lt;li&gt;端侧推理&lt;/li&gt;
+&lt;li&gt;架构设计&lt;/li&gt;
+&lt;li&gt;开源&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;p&gt;Whisper base 是 145.3 MB，一个 16.9 MB 的模型在 LibriSpeech test-clean、SPGISpeech、Earnings-22 上把它按在地上摩擦，首 token 延迟 …&lt;/p&gt;</summary><content type="html">&lt;ul&gt;
+&lt;li&gt;语音识别&lt;/li&gt;
+&lt;li&gt;模型压缩&lt;/li&gt;
+&lt;li&gt;端侧推理&lt;/li&gt;
+&lt;li&gt;架构设计&lt;/li&gt;
+&lt;li&gt;开源&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;p&gt;Whisper base 是 145.3 MB，一个 16.9 MB 的模型在 LibriSpeech test-clean、SPGISpeech、Earnings-22 上把它按在地上摩擦，首 token 延迟 11.1 ms，解码吞吐 1319 token/s。Cactus Compute 十月初放出的 Whistle 就是这个东西。&lt;/p&gt;
+&lt;p&gt;值得写一写的不是"又一个端侧模型"，这类东西每季度都冒出一堆。真正有意思的是它怎么用一个只占 16.9 MB 的骨架，同时干转写、词级时间戳、语音嵌入三件事，而且和他们的文本模型 Needle 共用同一套 C++ 引擎、同一份量化。&lt;/p&gt;
+&lt;h2&gt;它不是把大模型砍小，是换了骨架&lt;/h2&gt;
+&lt;p&gt;大多数"小模型"的做法是拿一个预训练好的大模型做剪枝、蒸馏、量化。Whistle 走的是另一条路：从头训一个结构上就不一样的东西。&lt;/p&gt;
+&lt;p&gt;编码器是 8 个 Simple Attention 块。里面有两个不常见的设计：四路 mHC 残差通道，以及用 Monarch Hadamard MLP 顶替标准 FFN。注意力是&lt;strong&gt;非因果的&lt;/strong&gt;：第 3 秒那一帧可以去看第 12 秒那一帧。这在流式场景里是致命的，但对着 30 秒整段音频做转写，全局注意力反而更准。&lt;/p&gt;
+&lt;p&gt;解码器也是 8 层，宽度 512，GQA 8 个 query 头对 2 个 KV 头，48 维的 q/k、64 维的 v。Q、K、V 上各挂一个 3-tap 因果卷积，第 3 层和 7 层插入 engram 查表（18,432 个槽位）。这些块和 Needle 的完全一致，只是层数不同，他们是真共用代码，不是复制一份改改。&lt;/p&gt;
+&lt;p&gt;真正为语音新增的东西，每层只有一处：&lt;strong&gt;门控交叉注意力&lt;/strong&gt;。&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;x ← x + σ(g) · softmax(q̂ K̂ᵀ/√d) V
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;每个解码器层从编码器读一次，门控 g 逐层学习，K 和 V 来自当前这段 clip。关键在于这个投影&lt;strong&gt;只在音频到达时算一次&lt;/strong&gt;，375 帧跨 8 层投影完就缓存住，整个解码过程复用。所以开 5 个 beam 的代价是 5 份短的转写缓存，而不是把音频过 5 遍。这是整篇论文里唯一一个"聪明"点：把跨模态注意力的开销挪出搜索循环。&lt;/p&gt;
+&lt;h2&gt;前端把 30 秒压成 375 帧&lt;/h2&gt;
+&lt;p&gt;音频走标准 frontend：16 kHz 单声道，25 ms 窗、10 ms hop，80 维 log-mel，频带限制在 250–3500 Hz，逐通道归一化。30 秒 = 3000 帧。&lt;/p&gt;
+&lt;p&gt;然后一个 128 通道、kernel 9 的卷积 stem 连做三次降采样，把帧数砍到 375，一帧对应 80 ms。&lt;strong&gt;这个降采样是整条流水线的性能分水岭&lt;/strong&gt;：之后所有阶段都在 375 帧的尺度上跑，包括 &lt;code&gt;embed&lt;/code&gt; 接口的返回（每帧一行）。把时域压 8 倍，解码器要处理的位置数直接少一个数量级，首 token 延迟才压得下来。&lt;/p&gt;
+&lt;p&gt;官方实测（Apple M4 Pro CPU，10 秒音频）：Whistle 首 token 5.9 ms（5 秒音频）/11.1 ms（10 秒）/36.3 ms（30 秒），延迟&lt;strong&gt;跟着 clip 长度走&lt;/strong&gt;。Whisper 因为要把输入永远 pad 到 30 秒，首 token 延迟是条平线，不随音频长短变化。&lt;/p&gt;
+&lt;h2&gt;三种深度，一套权重&lt;/h2&gt;
+&lt;p&gt;&lt;code&gt;--audio-depth&lt;/code&gt; 可以在加载时选 2 到 8 层之间的解码器深度，1 层起的每个深度都是&lt;strong&gt;独立训练&lt;/strong&gt;的一个模型，不是推理时切层。有意思的是编码器从不解剖：八个块在任何深度下都跑满。&lt;/p&gt;
+&lt;p&gt;解码用 5 个 beam，按长度归一化的对数概率排序。关键词偏置走 Aho-Corasick 自动机，在 beam 旁边并行推进匹配传给它的短语，匹配前进就抬升对应路径的 log 概率。词级时间戳不是后处理对齐出来的，是直接从解码器自己的注意力里读的。&lt;/p&gt;
+&lt;p&gt;有个不起眼但很实用的设计：引擎在起解码器之前先量 clip 的响度范围，低于阈值就直接返回空转写、空语言，压根不进 beam search。省掉一整个静音片段的计算。&lt;/p&gt;
+&lt;h2&gt;和 Whisper base 的正面碰撞&lt;/h2&gt;
+&lt;p&gt;作者贴的对比很实在，包括对自己不利的地方：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;指标&lt;/th&gt;
+&lt;th&gt;Whistle&lt;/th&gt;
+&lt;th&gt;Whisper base&lt;/th&gt;
+&lt;th&gt;Moonshine tiny v2&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;体积&lt;/td&gt;
+&lt;td&gt;16.9 MB&lt;/td&gt;
+&lt;td&gt;145.3 MB&lt;/td&gt;
+&lt;td&gt;41.9 MB&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;首 token&lt;/td&gt;
+&lt;td&gt;11.1 ms&lt;/td&gt;
+&lt;td&gt;73.2 ms&lt;/td&gt;
+&lt;td&gt;22.8 ms&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;解码速度&lt;/td&gt;
+&lt;td&gt;1319 tok/s&lt;/td&gt;
+&lt;td&gt;266 tok/s&lt;/td&gt;
+&lt;td&gt;262 tok/s&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;WER 上，Whistle 在 LibriSpeech test-clean/test-other、SPGISpeech、Earnings-22 和 FLEURS 平均上领先；Whisper base 在 TED-LIUM、AMI、MLS 平均上更准。作者没藏这一点，白纸黑字写了"Whisper base 在 TED-LIUM、AMI 和 MLS 平均上领先，代价是 145.3 MB 对 16.9 MB"。FF 这种报喜不报忧的模型发布会看多了，这种把短板摆出来的对比表反而可信。&lt;/p&gt;
+&lt;p&gt;WER 用 Whisper 的 normalizer 打分，Whistle 的数值是在 86,174 条 utterance 上测的。作者还声明：所有报告的测试集音频都没进过训练或验证数据，验证方式是逐数据集比对音频校验和与说话人 ID。&lt;/p&gt;
+&lt;h2&gt;社区实测泼的冷水&lt;/h2&gt;
+&lt;p&gt;814 分的 HN 帖子里，叫好和吐槽一半一半，后者更有价值。&lt;/p&gt;
+&lt;p&gt;英语场景基本被认可，"试着刁难它，结果它全听对了"。但多语言立刻露馅：有西语母语者反馈墨西哥和委内瑞拉口音识别不准、会写出不存在的词；另一个人说卡斯蒂利亚西语反而没问题。&lt;strong&gt;这其实暴露了"语言检测"这个卖点的软肋&lt;/strong&gt;：7 种语言里英语训练得最厚，其余明显稀。&lt;/p&gt;
+&lt;p&gt;更值得记的一个区分：&lt;strong&gt;通用 STT 不等于听写模型（dictation model）&lt;/strong&gt;。有条高赞评论讲他给中风后口齿不清的 84 岁父亲配转写，通用的 speech-to-text 帮不上忙——听写模型需要忽略"嗯""啊"、把"一头大象，不对，一只猴子爬上了树"自动收敛成"一只猴子爬上了树"、还要支持把标点念出来。Whistle 这类模型面向的是干净音频的通用转写，不是这个场景。这不是缺陷，是需求错配。&lt;/p&gt;
+&lt;p&gt;还有人对"体积"这个卖点本身不买账："STT 的难点从来不是二进制大小。"底下立刻有人反驳，而且反驳得有技术含量：&lt;strong&gt;如果模型能整个塞进 L3 缓存，延迟域就变了&lt;/strong&gt;，L3 命中比 L3+DRAM 的延迟低一个数量级。马上又有人补刀：L3 对 DRAM 确实快一个数量级，但在系统层面这更可能转化成吞吐差异，而不是端到端延迟差异。这段一来一回比原文还有意思。&lt;/p&gt;
+&lt;p&gt;另一个高频诉求是&lt;strong&gt;流式&lt;/strong&gt;：demo 是录音→松手→出结果的模式，没有边录边出字。对大多数实时 STT 应用这是硬需求。社区提到的替代方案（Nemotron、Parakeet、Zipformer、FUTO keyboard）都主打流式。&lt;/p&gt;
+&lt;h2&gt;一个开发者的视角&lt;/h2&gt;
+&lt;p&gt;Whistle 最值钱的地方不是"16.9 MB"这个数字，是它证明了一件事：&lt;strong&gt;模型的现场感（in-distribution）比绝对质量更决定可用性&lt;/strong&gt;。英语、高质量音频、标准口音下它和 Whisper base 打平甚至更好，因为架构再小，只要数据分布对得上，小模型就能赢。反过来说，口音重、嘈杂、非英语，它的短板会以肉眼可见的速度暴露。&lt;/p&gt;
+&lt;p&gt;几个可以立刻上手的点：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;它和 Needle 共用一个二进制&lt;/strong&gt;。&lt;code&gt;needle --model needle3.cact --model whistle.cact --audio clip.wav&lt;/code&gt; 一行就能让音频直接进工具调用，输出带 &lt;code&gt;audio_&lt;/code&gt; 前缀的 JSON 字段（&lt;code&gt;audio_text&lt;/code&gt;、&lt;code&gt;audio_language&lt;/code&gt;）。不需要你自己接转写→文本→function call 的三段式。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;17 个预编译目标&lt;/strong&gt;：macOS、Linux、Android、iOS、watchOS、Windows on ARM、RISC-V、MIPS，浏览器和 WASI 组件也在内。每个目录里是 &lt;code&gt;needle&lt;/code&gt; 二进制 + &lt;code&gt;libneedle.a&lt;/code&gt; + &lt;code&gt;needle.h&lt;/code&gt;，任何 &lt;code&gt;.cact&lt;/code&gt; 都能加载。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;&lt;code&gt;--audio-depth&lt;/code&gt; 是给端侧调优留的旋钮&lt;/strong&gt;。树莓派级别的设备上，先在 2 层深度上跑通链路，再往上加。&lt;/li&gt;
+&lt;li&gt;交付形式注意一下：权重在 Hugging Face，引擎和平台文件夹在 &lt;code&gt;Cactus-Compute/needle3&lt;/code&gt;。社区里关于 FUTO keyboard"是不是开源"的争论值得引以为戒：&lt;strong&gt;source-available 不等于 open source&lt;/strong&gt;，带非商用条款或可撤销条款的 license，法律上不是开源。落地商用前把 license 读一遍，别只看 README 上的 "open"。&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;端侧语音这几年一直在"能跑"和"好用"之间横跳。Whistle 的意义是它把 English-only 的干净音频场景推到了一个真正能用的点上，同时诚实地告诉你它没解决什么。&lt;/p&gt;</content></entry><entry><title>JPEG XL 重回 Chrome：从 libjxl 的 C++ 安全债，到 Rust 解码器重写</title><link href="posts/2026-10-08-jpeg-xl-rust-decoder-chrome-return.html" rel="alternate"/><published>2026-10-08T00:00:00+08:00</published><updated>2026-10-08T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-10-08:posts/2026-10-08-jpeg-xl-rust-decoder-chrome-return.html</id><summary type="html">&lt;ul&gt;
 &lt;li&gt;图像编解码&lt;/li&gt;
 &lt;li&gt;JPEG XL&lt;/li&gt;
 &lt;li&gt;Rust&lt;/li&gt;
@@ -12753,408 +12837,4 @@ eyJhbGciOiJSUzI1NiIsImtpZCI6InNtaUE1WS0yVXl2ZUhsTG
 &lt;p&gt;本文所述技术内容仅用于安全研究、防御建设和教育目的。所有漏洞分析、PoC 代码和攻击路径描述均基于公开的安全公告和已修复版本的反向分析，旨在帮助安全工程师、运维人员和开发者理解漏洞原理并采取相应防护措施。&lt;/p&gt;
 &lt;p&gt;读者&lt;strong&gt;不得&lt;/strong&gt;将本文中的任何技术信息用于未经授权的系统测试、渗透攻击或其他可能违反法律法规的活动。未经授权访问、攻击计算机系统在大多数国家和地区属于刑事犯罪。&lt;/p&gt;
 &lt;p&gt;作者不对任何人基于本文内容所采取的任何行为承担责任。在使用本文涉及的任何技术之前，请确保你已获得目标系统的合法授权，并遵守当地法律法规。如果你发现 Nuclio 实例存在受影响版本，请立即联系系统管理员或通过项目官方渠道进行报告。&lt;/p&gt;
-&lt;p&gt;本文中涉及的 CVE 编号、版本号、CVSS 评分、源码行号等技术细节，均以官方安全公告和源码仓库为准。如官方信息与本文章存在差异，以官方公告为准。&lt;/p&gt;</content><category term="技术"/></entry><entry><title>runc 三洞拆容器隔离底座：CVE-2025-31133 / 52565 / 52881 深度分析</title><link href="posts/2026-08-05-runcsan-dong-chai-rong-qi-ge-chi-di-zuo-cve-2025-31133-52565-52881shen-du-fen-xi.html" rel="alternate"/><published>2026-08-05T00:00:00+08:00</published><updated>2026-08-05T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-08-05:posts/2026-08-05-runcsan-dong-chai-rong-qi-ge-chi-di-zuo-cve-2025-31133-52565-52881shen-du-fen-xi.html</id><summary type="html">&lt;ul&gt;
-&lt;li&gt;技术
-slug: runc三洞拆容器隔离底座-cve-2025-31133-52565-52881深度分析&lt;/li&gt;
-&lt;/ul&gt;
-&lt;hr /&gt;
-&lt;h2&gt;一、背景&lt;/h2&gt;
-&lt;p&gt;runc 是 OCI（Open Container Initiative）运行时规范的参考实现，是 Docker、containerd、CRI-O、Kubernetes 等所有上层容器运行时的底层底座。无论是 &lt;code&gt;docker run&lt;/code&gt; 还是 …&lt;/p&gt;</summary><content type="html">&lt;ul&gt;
-&lt;li&gt;技术
-slug: runc三洞拆容器隔离底座-cve-2025-31133-52565-52881深度分析&lt;/li&gt;
-&lt;/ul&gt;
-&lt;hr /&gt;
-&lt;h2&gt;一、背景&lt;/h2&gt;
-&lt;p&gt;runc 是 OCI（Open Container Initiative）运行时规范的参考实现，是 Docker、containerd、CRI-O、Kubernetes 等所有上层容器运行时的底层底座。无论是 &lt;code&gt;docker run&lt;/code&gt; 还是 K8s 调度一个 Pod，最终都由 runc 完成 namespace 创建、rootfs 设置、设备节点生成与容器 init 进程拉起。可以说，runc 是整个云原生世界"容器隔离"的最后一道闸门。&lt;/p&gt;
-&lt;p&gt;2025 年 11 月 5 日，runc 同一天发布三个高危安全公告，合计 20+ 个补丁 commit。三个漏洞"殊途同归"——通过不同的方法绕过 runc 对 &lt;code&gt;/proc&lt;/code&gt; 文件写入的限制，实现完整的容器逃逸（container escape）。三者共享同一设计盲区：&lt;strong&gt;runc 信任了"本该是它自己控制的文件路径"是真实的、未被篡改的&lt;/strong&gt;。&lt;/p&gt;
-&lt;p&gt;本文从 runc 架构入手，逐一拆解三个 CVE 的根因、利用面、补丁思路，并给出链式利用与防御方案。&lt;/p&gt;
-&lt;h2&gt;二、runc 架构与信任模型&lt;/h2&gt;
-&lt;p&gt;runc 的核心代码位于 &lt;code&gt;libcontainer/&lt;/code&gt; 目录。一个容器的创建流程大致如下：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;┌─────────────────────────────────────────────────────────────────┐
-│                    runc create / run 流程                        │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  1. 配置解析 (config.json → libcontainer.Config)                │
-│        ↓                                                        │
-│  2. namespace 创建 (mnt/uts/ipc/pid/user/net)                   │
-│        ↓                                                        │
-│  3. rootfs 设置  ── pivot_root(2) ── 切换根目录                 │
-│        ↓                                                        │
-│  4. mount 配置 (maskedPaths / readonlyPaths / mounts)           │
-│        ↓                                                        │
-│  5. 设备创建 (/dev/null /dev/console /dev/pts/* ...)            │
-│        ↓                                                        │
-│  6. init 进程启动 (runc init)                                   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;其中最关键的时间窗口是 &lt;strong&gt;&lt;code&gt;pivot_root(2)&lt;/code&gt; 之后、容器进程启动之前&lt;/strong&gt;。在这个窗口内，runc 需要在容器 rootfs 上做大量 mount/设备操作。runc 的安全假设是：在这段窗口内它自己创建/挂载的文件 inode 是可信的。&lt;/p&gt;
-&lt;h3&gt;maskedPaths 实现机制&lt;/h3&gt;
-&lt;p&gt;maskedPaths 是 runc 保护宿主机敏感文件的核心机制，用于遮蔽 &lt;code&gt;/proc/kcore&lt;/code&gt;、&lt;code&gt;/proc/sysrq-trigger&lt;/code&gt;、&lt;code&gt;/proc/sys/kernel/addr&lt;/code&gt; 等不应被容器读取的路径。实现方式分两类：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;┌──────────────────────────────────────────────────────────────┐
-│                    maskedPaths 覆盖策略                       │
-├──────────────────────────────────────────────────────────────┤
-│                                                              │
-│  目录路径 (如 /proc/sys)                                     │
-│    └── 挂载一层只读 tmpfs 覆盖整个目录                       │
-│                                                              │
-│  文件路径 (如 /proc/kcore)                                   │
-│    └── bind-mount /dev/null 覆盖该文件                       │
-│        容器读 /proc/kcore 实际读到的是 /dev/null (EOF)        │
-│                                                              │
-│  信任假设：容器内的 /dev/null 是真实的字符设备 (1,3)          │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;这套机制的安全性完全建立在"容器内 &lt;code&gt;/dev/null&lt;/code&gt; 是真实的、未被篡改的字符设备"这一假设上。三个 CVE 正是从不同角度击穿了这个假设。&lt;/p&gt;
-&lt;h2&gt;三、三个 CVE 全景概览&lt;/h2&gt;
-&lt;table&gt;
-&lt;thead&gt;
-&lt;tr&gt;
-&lt;th&gt;CVE&lt;/th&gt;
-&lt;th&gt;GHSA&lt;/th&gt;
-&lt;th&gt;攻击的 bind-mount 点&lt;/th&gt;
-&lt;th&gt;根因&lt;/th&gt;
-&lt;th&gt;CVSS v4&lt;/th&gt;
-&lt;/tr&gt;
-&lt;/thead&gt;
-&lt;tbody&gt;
-&lt;tr&gt;
-&lt;td&gt;CVE-2025-31133&lt;/td&gt;
-&lt;td&gt;GHSA-9493-h29p-rfm2&lt;/td&gt;
-&lt;td&gt;maskedPaths 的 &lt;code&gt;/dev/null&lt;/code&gt;&lt;/td&gt;
-&lt;td&gt;bind-mount &lt;code&gt;/dev/null&lt;/code&gt; 时对 &lt;code&gt;ENOENT&lt;/code&gt; 静默跳过，未验证源 inode&lt;/td&gt;
-&lt;td&gt;7.3 High&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;CVE-2025-52565&lt;/td&gt;
-&lt;td&gt;GHSA-qw9x-cqr3-wc7r&lt;/td&gt;
-&lt;td&gt;&lt;code&gt;/dev/console&lt;/code&gt; → &lt;code&gt;/dev/pts/$n&lt;/code&gt;&lt;/td&gt;
-&lt;td&gt;创建 &lt;code&gt;/dev/console&lt;/code&gt; bind-mount 时对 &lt;code&gt;/dev/pts/$n&lt;/code&gt; 验证不足&lt;/td&gt;
-&lt;td&gt;7.3 High&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;CVE-2025-52881&lt;/td&gt;
-&lt;td&gt;GHSA-cgrx-mc8f-2prm&lt;/td&gt;
-&lt;td&gt;procfs LSM label / sysctl 写入&lt;/td&gt;
-&lt;td&gt;runc 写 procfs 时验证不足，可诱导写入重定向&lt;/td&gt;
-&lt;td&gt;7.3 High&lt;/td&gt;
-&lt;/tr&gt;
-&lt;/tbody&gt;
-&lt;/table&gt;
-&lt;p&gt;三者共享同一设计盲区：&lt;strong&gt;runc 信任了"本该是它自己控制的文件路径"是真实的、未被篡改的&lt;/strong&gt;。&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;┌─────────────────────────────────────────────────────────────────┐
-│                 三个 CVE 的共同攻击范式                         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│   runc 期望路径              攻击者篡改              后果       │
-│   ─────────────              ──────────              ────       │
-│   /dev/null (真实)     →     符号链接/删除      →   bind-mount   │
-│   /dev/pts/$n (真实)   →     符号链接替换       →   掉包挂载     │
-│   /proc/self/attr/*    →     no-op procfs 文件   →   写入重定向  │
-│                                                                 │
-│   核心模式：TOCTOU + 信任未验证的 inode                         │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;h2&gt;四、CVE-2025-31133 深入：拆穿 &lt;code&gt;/dev/null&lt;/code&gt; 信任&lt;/h2&gt;
-&lt;h3&gt;漏洞原理&lt;/h3&gt;
-&lt;p&gt;maskedPaths 用 &lt;code&gt;/dev/null&lt;/code&gt; 做 bind-mount 覆盖敏感路径（&lt;code&gt;/proc/kcore&lt;/code&gt;、&lt;code&gt;/proc/sysrq-trigger&lt;/code&gt; 等）。漏洞在于：runc 没有充分验证 bind-mount 的源（容器的 &lt;code&gt;/dev/null&lt;/code&gt;）确实是真实的 &lt;code&gt;/dev/null&lt;/code&gt; inode。攻击者可通过共享 mount（shared mount）的竞态，在容器创建过程中篡改 &lt;code&gt;/dev/null&lt;/code&gt;。&lt;/p&gt;
-&lt;h3&gt;两个攻击面&lt;/h3&gt;
-&lt;p&gt;&lt;strong&gt;Attack 1：任意挂载 gadget&lt;/strong&gt;&lt;/p&gt;
-&lt;p&gt;攻击者把 &lt;code&gt;/dev/null&lt;/code&gt; 替换为指向攻击者控制路径的符号链接，runc 随即把"任意源路径"bind-mount 到容器内路径。&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;┌────────────────────────────────────────────────────────────────┐
-│                CVE-2025-31133 Attack 1：挂载 gadget            │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  攻击者: rm /dev/null &amp;amp;&amp;amp; ln -s /proc/sys/kernel/core_pattern  │
-│                                                /dev/null       │
-│                                                                │
-│  runc maskPath(&amp;quot;/proc/kcore&amp;quot;):                                │
-│     mount(&amp;quot;/dev/null&amp;quot;, &amp;quot;/proc/kcore&amp;quot;, MS_BIND)                │
-│            ↓ 解析符号链接                                       │
-│     实际执行: mount(&amp;quot;/proc/sys/kernel/core_pattern&amp;quot;,          │
-│                      &amp;quot;/proc/kcore&amp;quot;, MS_BIND)                   │
-│                                                                │
-│  宿主机 DoS:   bind-mount /proc/sysrq-trigger → echo c 触发    │
-│  容器逃逸:     bind-mount /proc/sys/kernel/core_pattern        │
-│                → 重配 coredump helper                           │
-│                → 内核 upcall 不受 namespace 隔离                │
-│                → 以宿主机 root 运行                             │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;&lt;strong&gt;Attack 2：绕过 maskedPaths&lt;/strong&gt;&lt;/p&gt;
-&lt;p&gt;攻击者在 runc 做 bind-mount 前删除 &lt;code&gt;/dev/null&lt;/code&gt;，runc 因 &lt;code&gt;ENOENT&lt;/code&gt; 静默跳过 maskedPaths，导致 &lt;code&gt;/proc/kcore&lt;/code&gt; 等敏感文件对容器可读，泄露宿主机内核内存。&lt;/p&gt;
-&lt;h3&gt;漏洞代码&lt;/h3&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="c1"&gt;// libcontainer/rootfs_linux.go (修复前)&lt;/span&gt;
-&lt;span class="kd"&gt;func&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;maskPath&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;path&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kt"&gt;string&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;mountLabel&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kt"&gt;string&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kt"&gt;error&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
-&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="k"&gt;if&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;err&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;:=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;mount&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s"&gt;&amp;quot;/dev/null&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;path&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s"&gt;&amp;quot;&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;MS_BIND&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s"&gt;&amp;quot;&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;err&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;!=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kc"&gt;nil&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&amp;amp;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;!&lt;/span&gt;&lt;span class="nx"&gt;errors&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Is&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;err&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;os&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;ErrNotExist&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="k"&gt;if&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;errors&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Is&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;err&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;ENOTDIR&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
-&lt;span class="w"&gt;            &lt;/span&gt;&lt;span class="k"&gt;return&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;mount&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s"&gt;&amp;quot;tmpfs&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;path&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s"&gt;&amp;quot;tmpfs&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;MS_RDONLY&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;...&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="k"&gt;return&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;err&lt;/span&gt;
-&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
-&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="k"&gt;return&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kc"&gt;nil&lt;/span&gt;
-&lt;span class="p"&gt;}&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;问题在于 &lt;code&gt;!errors.Is(err, os.ErrNotExist)&lt;/code&gt; 这个判断：当源路径 &lt;code&gt;/dev/null&lt;/code&gt; 不存在（被攻击者删除）时，&lt;code&gt;mount&lt;/code&gt; 返回 &lt;code&gt;ENOENT&lt;/code&gt;，被静默忽略，maskedPaths 直接失效。同时，对源 inode 的真实性完全没有验证——只要路径存在就 bind-mount，不校验它是不是真正的字符设备 &lt;code&gt;(1,3)&lt;/code&gt;。&lt;/p&gt;
-&lt;h3&gt;补丁分析（4 个 commit）&lt;/h3&gt;
-&lt;p&gt;核心补丁 &lt;code&gt;8476df8&lt;/code&gt; 新增 &lt;code&gt;/dev/null&lt;/code&gt; inode 验证：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="kd"&gt;func&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;isDevNull&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;st&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Stat_t&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kt"&gt;bool&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
-&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="k"&gt;return&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;st&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Mode&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;S_IFMT&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;==&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;S_IFCHR&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&amp;amp;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;st&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Rdev&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;==&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Mkdev&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;3&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="p"&gt;}&lt;/span&gt;
-
-&lt;span class="kd"&gt;func&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;verifyDevNull&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;f&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="nx"&gt;os&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;File&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kt"&gt;error&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
-&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="k"&gt;return&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;sys&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;VerifyInode&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;f&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kd"&gt;func&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;st&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Stat_t&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;_&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Statfs_t&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kt"&gt;error&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="k"&gt;if&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;!&lt;/span&gt;&lt;span class="nx"&gt;isDevNull&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;st&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
-&lt;span class="w"&gt;            &lt;/span&gt;&lt;span class="k"&gt;return&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;errors&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;New&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s"&gt;&amp;quot;container&amp;#39;s /dev/null is invalid&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="k"&gt;return&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kc"&gt;nil&lt;/span&gt;
-&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="p"&gt;})&lt;/span&gt;
-&lt;span class="p"&gt;}&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;补丁 &lt;code&gt;1a30a8f&lt;/code&gt; 修正了 &lt;code&gt;ENOENT&lt;/code&gt; 的处理语义：&lt;code&gt;ENOENT&lt;/code&gt; 只在 mount &lt;strong&gt;目标侧&lt;/strong&gt;（被覆盖的 path）忽略，不再对&lt;strong&gt;源侧&lt;/strong&gt;（&lt;code&gt;/dev/null&lt;/code&gt;）静默跳过。即如果源 &lt;code&gt;/dev/null&lt;/code&gt; 不存在，应直接报错而非静默放行。&lt;/p&gt;
-&lt;h2&gt;五、CVE-2025-52565 深入：&lt;code&gt;/dev/console&lt;/code&gt; 的竞态掉包&lt;/h2&gt;
-&lt;h3&gt;漏洞原理&lt;/h3&gt;
-&lt;p&gt;runc 把宿主机分配的 &lt;code&gt;/dev/pts/$n&lt;/code&gt; bind-mount 到容器内 &lt;code&gt;/dev/console&lt;/code&gt;，用于容器标准输入输出。问题在于 runc 分配 &lt;code&gt;/dev/pts/$n&lt;/code&gt; 与实际执行 bind-mount 之间存在一个时间窗口。攻击者可在这个窗口内把 &lt;code&gt;/dev/pts/$n&lt;/code&gt; 替换为符号链接，使 runc 把链接目标文件挂进容器。&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;┌────────────────────────────────────────────────────────────────┐
-│              CVE-2025-52565：/dev/console 竞态掉包             │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  T0: runc 分配 pty → 得到 /dev/pts/3                           │
-│                                                                │
-│  T1: [竞态窗口] 攻击者 goroutine 循环执行:                     │
-│        os.Remove(&amp;quot;/dev/pts/3&amp;quot;)                                 │
-│        os.Symlink(&amp;quot;/proc/sys/kernel/core_pattern&amp;quot;,             │
-│                   &amp;quot;/dev/pts/3&amp;quot;)                                │
-│                                                                │
-│  T2: runc mount(&amp;quot;/dev/pts/3&amp;quot;, &amp;quot;/dev/console&amp;quot;, MS_BIND)         │
-│        ↓ 解析符号链接                                           │
-│      实际: mount(&amp;quot;/proc/sys/kernel/core_pattern&amp;quot;,             │
-│                   &amp;quot;/dev/console&amp;quot;, MS_BIND)                     │
-│                                                                │
-│  结果: 宿主机 /proc/sys/kernel/core_pattern 挂进容器可写       │
-│        → 重配 coredump helper → 宿主机 root 命令执行           │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;h3&gt;伪代码攻击逻辑&lt;/h3&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="c1"&gt;// 攻击者在独立 goroutine 中循环竞态&lt;/span&gt;
-&lt;span class="k"&gt;for&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
-&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="nx"&gt;os&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Remove&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;fmt&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Sprintf&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s"&gt;&amp;quot;/dev/pts/%d&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;n&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
-&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="nx"&gt;os&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Symlink&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s"&gt;&amp;quot;/proc/sys/kernel/core_pattern&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;fmt&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Sprintf&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s"&gt;&amp;quot;/dev/pts/%d&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;n&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
-&lt;span class="p"&gt;}&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;这个竞态窗口虽然窄，但循环尝试成功率可观，且攻击者完全控制触发时机（只要能诱导宿主机执行 &lt;code&gt;docker run&lt;/code&gt; / K8s 调度 / CI 构建即可）。&lt;/p&gt;
-&lt;h3&gt;补丁分析（8 个 commit）&lt;/h3&gt;
-&lt;ul&gt;
-&lt;li&gt;使用 &lt;code&gt;TIOCGPTPEER&lt;/code&gt; ioctl &lt;strong&gt;无竞态&lt;/strong&gt;获取 pty peer fd（Linux 4.13+ 支持），直接通过已打开的 fd 拿到 peer，绕过路径解析，从根上消除 TOCTOU。&lt;/li&gt;
-&lt;li&gt;对 &lt;code&gt;/dev/pts/$n&lt;/code&gt;、&lt;code&gt;/dev/ptmx&lt;/code&gt; 做 inode 验证（与 CVE-2025-31133 的 &lt;code&gt;verifyDevNull&lt;/code&gt; 思路一致）。&lt;/li&gt;
-&lt;li&gt;禁止 &lt;code&gt;os.Create&lt;/code&gt; 等不安全调用（新增 lint 规则），避免代码中再次出现基于路径的竞态写。&lt;/li&gt;
-&lt;/ul&gt;
-&lt;p&gt;核心思路：&lt;strong&gt;用 fd 而非路径&lt;/strong&gt;来引用对象，从语义上消除路径解析与对象操作之间的时间差。&lt;/p&gt;
-&lt;h2&gt;六、CVE-2025-52881 深入：procfs 写入重定向&lt;/h2&gt;
-&lt;h3&gt;漏洞原理&lt;/h3&gt;
-&lt;p&gt;CVE-2025-52881 是 CVE-2019-19921 的变体，攻击 runc 对 procfs 的写入逻辑。runc 在设置 LSM 标签（AppArmor/SELinux）和 sysctl 时需要写 &lt;code&gt;/proc/self/attr/&amp;lt;label&amp;gt;&lt;/code&gt; 等 procfs 文件。漏洞有两条路径：&lt;/p&gt;
-&lt;p&gt;&lt;strong&gt;路径 A：no-op procfs 文件伪装&lt;/strong&gt;&lt;/p&gt;
-&lt;p&gt;攻击者让 &lt;code&gt;/proc/self/attr/&amp;lt;label&amp;gt;&lt;/code&gt; 引用一个真实的 procfs 文件，但属于 no-op（无副作用）的文件，例如 &lt;code&gt;/proc/self/sched&lt;/code&gt;。这样能通过 runc 的"is a procfs file"检查，却不会真正设置 LSM 标签，导致 LSM 防护被静默绕过。&lt;/p&gt;
-&lt;p&gt;&lt;strong&gt;路径 B：共享 mount 竞态重定向&lt;/strong&gt;&lt;/p&gt;
-&lt;p&gt;通过共享 mount 竞态，用 tmpfs 上的符号链接把 runc 对 &lt;code&gt;/proc&lt;/code&gt; 的写入重定向到其他 procfs 文件。&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;┌────────────────────────────────────────────────────────────────┐
-│              CVE-2025-52881：procfs 写入重定向                  │
-├────────────────────────────────────────────────────────────────┤
-│                                                                │
-│  runc 期望写入: /proc/self/attr/current (设置 LSM 标签)        │
-│                                                                │
-│  路径 A: 攻击者把目标替换为 /proc/self/sched (真实 procfs)      │
-│          → 通过 &amp;quot;is procfs&amp;quot; 检查                               │
-│          → 写入是 no-op，LSM 标签未设置                         │
-│          → AppArmor/SELinux 防护被绕过                          │
-│                                                                │
-│  路径 B: 共享 mount 竞态                                        │
-│          /proc/self/attr/current → symlink → /proc/sys/...     │
-│          → sysctl 写入重定向                                    │
-│                                                                │
-│  最危险场景:                                                    │
-│    sysctl 写入重定向到 /proc/sys/kernel/core_pattern            │
-│    → 容器逃逸 (kernel upcall 以宿主机 root 运行)               │
-│                                                                │
-└────────────────────────────────────────────────────────────────┘
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;h3&gt;最危险场景&lt;/h3&gt;
-&lt;p&gt;sysctl 写入被重定向到 &lt;code&gt;/proc/sys/kernel/core_pattern&lt;/code&gt;，进而触发内核 upcall 以宿主机 root 身份执行任意命令，完成容器逃逸。这是三个 CVE 中唯一能独立完成逃逸的路径。&lt;/p&gt;
-&lt;h3&gt;补丁分析（16 个 commit）&lt;/h3&gt;
-&lt;p&gt;这是补丁量最大的一个，核心是引入&lt;strong&gt;基于 fd 的安全 procfs API&lt;/strong&gt;（依赖 securejoin v0.5.0）：&lt;/p&gt;
-&lt;ul&gt;
-&lt;li&gt;用 &lt;code&gt;openat2&lt;/code&gt; + &lt;code&gt;O_PATH&lt;/code&gt; 打开目标后 &lt;code&gt;fstat&lt;/code&gt; 确认 &lt;code&gt;st_dev&lt;/code&gt; 对应 procfs。&lt;/li&gt;
-&lt;li&gt;&lt;code&gt;fstatfs&lt;/code&gt; 确认文件系统魔法数为 &lt;code&gt;PROC_SUPER_MAGIC&lt;/code&gt;。&lt;/li&gt;
-&lt;li&gt;所有 procfs 写操作改用基于 fd 的安全 API，杜绝路径解析竞态。&lt;/li&gt;
-&lt;/ul&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="c1"&gt;// 补丁思路伪代码&lt;/span&gt;
-&lt;span class="nx"&gt;fd&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;err&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;:=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Openat2&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;dirfd&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;path&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;OpenHow&lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
-&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="nx"&gt;Flags&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;O_PATH&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;O_CLOEXEC&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;
-&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="nx"&gt;Resolve&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;RESOLVE_BENEATH&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;RESOLVE_NO_SYMLINKS&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;
-&lt;span class="p"&gt;})&lt;/span&gt;
-&lt;span class="c1"&gt;// ...&lt;/span&gt;
-&lt;span class="kd"&gt;var&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;st&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Stat_t&lt;/span&gt;
-&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Fstat&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;fd&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="nx"&gt;st&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="kd"&gt;var&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;sfs&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Statfs_t&lt;/span&gt;
-&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Fstatfs&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;fd&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="nx"&gt;sfs&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="k"&gt;if&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;sfs&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;Type&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;!=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;unix&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;PROC_SUPER_MAGIC&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
-&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="k"&gt;return&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;errors&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="nx"&gt;New&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s"&gt;&amp;quot;not a procfs file&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="p"&gt;}&lt;/span&gt;
-&lt;span class="c1"&gt;// 基于 fd 执行写入，而非基于路径&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;&lt;code&gt;openat2&lt;/code&gt; 的 &lt;code&gt;RESOLVE_NO_SYMLINKS&lt;/code&gt; 从内核层面禁止符号链接解析，&lt;code&gt;RESOLVE_BENEATH&lt;/code&gt; 限制路径不能逃逸出指定目录，两者结合把 TOCTOU 攻击面压缩到几乎为零。&lt;/p&gt;
-&lt;h2&gt;七、链式利用分析&lt;/h2&gt;
-&lt;p&gt;三个 CVE 并非孤立，它们可以组合成更强的攻击链。关键在于 CVE-2025-52881 能绕过 LSM 标签，而 LSM 是 CVE-2025-31133 和 CVE-2025-52565 在某些发行版上的缓解措施。&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;┌─────────────────────────────────────────────────────────────────┐
-│                       链式利用组合矩阵                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ① CVE-2025-52881 单独                                          │
-│     → 绕过 LSM 标签 (AppArmor 默认 unconfined 时直接生效)       │
-│     → 或通过 sysctl 写入重定向独立逃逸                          │
-│                                                                 │
-│  ② CVE-2025-52881 + CVE-2025-31133                             │
-│     → 52881 绕过 LSM，使 31133 的 AppArmor 缓解失效             │
-│     → 31133 的挂载 gadget 不再受 LSM 拦截                      │
-│                                                                 │
-│  ③ CVE-2025-52881 + CVE-2025-52565                             │
-│     → 52881 绕过 LSM，使 52565 的 SELinux 缓解失效              │
-│     → 52565 的 console 掉包不再受 SELinux 拦截                  │
-│                                                                 │
-│  ④ CVE-2025-52881 独立逃逸                                      │
-│     → sysctl 写入重定向到 core_pattern                          │
-│     → 不依赖其他 CVE                                            │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;h3&gt;完整攻击链流程&lt;/h3&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;┌─────────────────────────────────────────────────────────────────┐
-│                     完整攻击链 (端到端)                         │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  阶段0: 攻击者立足容器内                                        │
-│         (恶意镜像 / 应用层 RCE / 供应链投毒)                    │
-│            │                                                    │
-│            ↓                                                    │
-│  阶段1: 布置符号链接                                            │
-│         rm /dev/null &amp;amp;&amp;amp; ln -s /proc/sysrq-trigger /dev/null     │
-│         (或 /dev/pts/$n / /proc/self/attr/* 竞态循环)          │
-│            │                                                    │
-│            ↓                                                    │
-│  阶段2: 触发 runc 创建容器                                      │
-│         (docker run / K8s 调度 / CI docker build)               │
-│            │                                                    │
-│            ↓                                                    │
-│  阶段3: runc bind-mount 被掉包路径                              │
-│         → 宿主机敏感文件挂进容器                                │
-│            │                                                    │
-│            ↓ (可选: CVE-2025-52881 绕过 LSM)                    │
-│  阶段4: 逃逸到宿主机 root                                       │
-│         ├─ 读: /etc/shadow / kubelet 凭证 / SA token           │
-│         ├─ 写A: echo c &amp;gt; /proc/sysrq-trigger (宿主机崩溃)       │
-│         └─ 写B: 改 /proc/sys/kernel/core_pattern               │
-│                 → 宿主机 root 命令执行                          │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;值得强调的是 &lt;code&gt;core_pattern&lt;/code&gt; 逃逸是经典路径：内核在处理进程 coredump 时会执行 &lt;code&gt;core_pattern&lt;/code&gt; 指定的程序，这个 upcall 不受 namespace 隔离，且以 root 身份运行。只要能把 &lt;code&gt;/proc/sys/kernel/core_pattern&lt;/code&gt; 挂进容器并写入，就等同于宿主机 root 命令执行。&lt;/p&gt;
-&lt;h2&gt;八、受影响版本&lt;/h2&gt;
-&lt;table&gt;
-&lt;thead&gt;
-&lt;tr&gt;
-&lt;th&gt;分支&lt;/th&gt;
-&lt;th&gt;受影响版本&lt;/th&gt;
-&lt;th&gt;修复版本&lt;/th&gt;
-&lt;/tr&gt;
-&lt;/thead&gt;
-&lt;tbody&gt;
-&lt;tr&gt;
-&lt;td&gt;1.2.x&lt;/td&gt;
-&lt;td&gt;&amp;lt;= 1.2.7&lt;/td&gt;
-&lt;td&gt;1.2.8&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;1.3.x&lt;/td&gt;
-&lt;td&gt;&amp;lt;= 1.3.2&lt;/td&gt;
-&lt;td&gt;1.3.3&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;1.4.x&lt;/td&gt;
-&lt;td&gt;&amp;lt;= 1.4.0-rc.2&lt;/td&gt;
-&lt;td&gt;1.4.0-rc.3&lt;/td&gt;
-&lt;/tr&gt;
-&lt;/tbody&gt;
-&lt;/table&gt;
-&lt;p&gt;此外，CVE-2025-52881 还影响 &lt;code&gt;opencontainers/selinux &amp;lt;= 1.12.0&lt;/code&gt;，需升级到 1.13.0。值得注意的是，&lt;strong&gt;crun 和 youki 等其他 OCI 运行时也存在类似缺陷&lt;/strong&gt;，说明这不是 runc 独有的实现 bug，而是这一类"信任未验证 inode"设计模式的通病。&lt;/p&gt;
-&lt;p&gt;由于 runc 是底层底座，实际风险面要乘以所有上层：Docker、containerd、CRI-O、Kubernetes 各发行版、各云厂商的托管 K8s，都需要跟进底层 runc 版本升级。&lt;/p&gt;
-&lt;h2&gt;九、防御方案&lt;/h2&gt;
-&lt;h3&gt;1. 升级 runc（首要）&lt;/h3&gt;
-&lt;p&gt;升级到 1.2.8+ / 1.3.3+ / 1.4.0-rc.3+，同时升级 &lt;code&gt;opencontainers/selinux&lt;/code&gt; 到 1.13.0+。这是最直接、最彻底的修复。&lt;/p&gt;
-&lt;h3&gt;2. 使用 user namespace（核心缓解）&lt;/h3&gt;
-&lt;p&gt;runc 强烈推荐的核心缓解措施。user namespace 把容器内的 root 映射为宿主机上的非特权 uid，即使容器逃逸，攻击者在宿主机上也只是非特权用户，无法读写 &lt;code&gt;/proc/sys/kernel/core_pattern&lt;/code&gt; 等需要真实 root 的路径。&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;┌──────────────────────────────────────────────────────────────┐
-│              user namespace 的缓解效果                       │
-├──────────────────────────────────────────────────────────────┤
-│                                                              │
-│  无 user namespace:                                          │
-│    容器 root == 宿主机 root (uid 0)                          │
-│    → 逃逸后可直接写 /proc/sys/kernel/core_pattern            │
-│                                                              │
-│  有 user namespace:                                          │
-│    容器 root (uid 0) → 映射为宿主机 uid 100000               │
-│    → 逃逸后对 /proc/sys/* 无写权限                           │
-│    → core_pattern 逃逸路径失效                               │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;h3&gt;3. Rootless 容器&lt;/h3&gt;
-&lt;p&gt;Rootless 模式下 runc 本身以非特权用户运行，从根本上限制逃逸后的权限上限。&lt;/p&gt;
-&lt;h3&gt;4. 非 user namespace 容器的加固&lt;/h3&gt;
-&lt;p&gt;对于无法启用 user namespace的场景：使用非 root 用户运行容器进程 + &lt;code&gt;noNewPrivileges&lt;/code&gt;，限制逃逸后的横向移动能力。&lt;/p&gt;
-&lt;h3&gt;5. 运行时监控&lt;/h3&gt;
-&lt;p&gt;监控容器内对 &lt;code&gt;/dev/null&lt;/code&gt;、&lt;code&gt;/dev/pts/*&lt;/code&gt;、&lt;code&gt;/proc/*/attr/*&lt;/code&gt; 的异常操作（删除、符号链接替换、非常规写入），这些是三个 CVE 利用过程中的共性特征，可作为检测信号。&lt;/p&gt;
-&lt;h2&gt;十、关键启示&lt;/h2&gt;
-&lt;p&gt;&lt;strong&gt;1. 同一设计盲区的三次暴露。&lt;/strong&gt; 三个 CVE 表面上攻击不同的 bind-mount 点，本质都是 runc 信任了"本该由它自己控制的文件路径"是真实、未被篡改的。一个设计盲区被打了三次补丁，说明这类"信任未验证 inode"的模式在容器运行时中具有普遍性。&lt;/p&gt;
-&lt;p&gt;&lt;strong&gt;2. 防护机制变成攻击通道。&lt;/strong&gt; maskedPaths 本是为了保护宿主机不被容器读取敏感文件，结果因为信任 &lt;code&gt;/dev/null&lt;/code&gt;，反而成了把宿主机敏感文件挂进容器的"挂载 gadget"。安全机制本身成为攻击面，是值得警惕的反模式。&lt;/p&gt;
-&lt;p&gt;&lt;strong&gt;3. 竞态窗口是核心利用面。&lt;/strong&gt; 三个漏洞都依赖"路径解析"与"对象操作"之间的时间差。修复方向高度一致：用 fd 而非路径引用对象（&lt;code&gt;TIOCGPTPEER&lt;/code&gt;、&lt;code&gt;openat2&lt;/code&gt;+&lt;code&gt;O_PATH&lt;/code&gt;、基于 fd 的 procfs API），从语义上消灭 TOCTOU。&lt;/p&gt;
-&lt;p&gt;&lt;strong&gt;4. LSM 不是银弹。&lt;/strong&gt; CVE-2025-52881 专门绕过 LSM 标签，使得 CVE-2025-31133/52565 在依赖 AppArmor/SELinux 缓解的发行版上重新变得可利用。纵深防御的每一层都可能被单独击穿，不能把 LSM 当作唯一防线。&lt;/p&gt;
-&lt;p&gt;&lt;strong&gt;5. core_pattern 逃逸是经典路径。&lt;/strong&gt; 三个 CVE 中两个都把 &lt;code&gt;/proc/sys/kernel/core_pattern&lt;/code&gt; 作为逃逸目标，因为内核 upcall 不受 namespace 隔离且以 root 运行。这再次印证：跨 namespace 边界的内核 upcall 是容器逃逸的高价值目标，任何能控制该文件写入的路径都应被视为高危。&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;┌─────────────────────────────────────────────────────────────────┐
-│                      修复范式的统一性                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  CVE-2025-31133  →  verifyDevNull (fstat 校验 Rdev == (1,3))   │
-│  CVE-2025-52565  →  TIOCGPTPEER + inode 验证 (fd 直取 peer)    │
-│  CVE-2025-52881  →  openat2+O_PATH + fstatfs (PROC_SUPER_MAGIC)│
-│                                                                 │
-│  共同范式:                                                       │
-│    1. 用 fd 而非路径引用对象                                     │
-│    2. 操作前验证对象的内核身份 (inode/设备号/魔法数)             │
-│    3. 禁止对源侧 ENOENT 静默放行                                 │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;三个 CVE 的修复范式高度统一，反映出容器运行时安全正在从"基于路径的信任"向"基于 fd + 内核身份验证的零信任"演进。这对其他 OCI 运行时（crun、youki）乃至更广义的"操作不可信 rootfs"场景都有方法论上的参考价值。&lt;/p&gt;
-&lt;hr /&gt;
-&lt;h2&gt;免责声明&lt;/h2&gt;
-&lt;p&gt;本文仅用于安全技术研究和学习交流，旨在帮助安全研究人员、运维工程师和开发人员理解漏洞原理并采取相应的防御措施。文中涉及的漏洞利用方法、攻击链描述均基于公开的安全公告和补丁分析，不包含可直接用于攻击的完整 exploit 代码。&lt;/p&gt;
-&lt;p&gt;读者应严格遵守所在国家和地区的网络安全法律法规，未经授权对任何系统进行漏洞测试或攻击均属违法行为。因不当使用本文信息造成的任何后果，作者不承担任何法律责任。&lt;/p&gt;
-&lt;p&gt;请尽快将受影响的 runc 版本升级至修复版本，并结合自身环境采取相应的纵深防御措施。&lt;/p&gt;</content><category term="技术"/></entry></feed>
+&lt;p&gt;本文中涉及的 CVE 编号、版本号、CVSS 评分、源码行号等技术细节，均以官方安全公告和源码仓库为准。如官方信息与本文章存在差异，以官方公告为准。&lt;/p&gt;</content><category term="技术"/></entry></feed>

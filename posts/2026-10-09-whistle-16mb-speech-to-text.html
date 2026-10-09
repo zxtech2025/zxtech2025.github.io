@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>16.9 MB 跑语音识别：Whistle 是怎么把 Whisper 压缩 8.6 倍的 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>16.9 MB 跑语音识别：Whistle 是怎么把 Whisper 压缩 8.6 倍的</h1>
+<time>2026-10-09</time>
+<ul>
+<li>语音识别</li>
+<li>模型压缩</li>
+<li>端侧推理</li>
+<li>架构设计</li>
+<li>开源</li>
+</ul>
+<hr />
+<p>Whisper base 是 145.3 MB，一个 16.9 MB 的模型在 LibriSpeech test-clean、SPGISpeech、Earnings-22 上把它按在地上摩擦，首 token 延迟 11.1 ms，解码吞吐 1319 token/s。Cactus Compute 十月初放出的 Whistle 就是这个东西。</p>
+<p>值得写一写的不是"又一个端侧模型"，这类东西每季度都冒出一堆。真正有意思的是它怎么用一个只占 16.9 MB 的骨架，同时干转写、词级时间戳、语音嵌入三件事，而且和他们的文本模型 Needle 共用同一套 C++ 引擎、同一份量化。</p>
+<h2>它不是把大模型砍小，是换了骨架</h2>
+<p>大多数"小模型"的做法是拿一个预训练好的大模型做剪枝、蒸馏、量化。Whistle 走的是另一条路：从头训一个结构上就不一样的东西。</p>
+<p>编码器是 8 个 Simple Attention 块。里面有两个不常见的设计：四路 mHC 残差通道，以及用 Monarch Hadamard MLP 顶替标准 FFN。注意力是<strong>非因果的</strong>：第 3 秒那一帧可以去看第 12 秒那一帧。这在流式场景里是致命的，但对着 30 秒整段音频做转写，全局注意力反而更准。</p>
+<p>解码器也是 8 层，宽度 512，GQA 8 个 query 头对 2 个 KV 头，48 维的 q/k、64 维的 v。Q、K、V 上各挂一个 3-tap 因果卷积，第 3 层和 7 层插入 engram 查表（18,432 个槽位）。这些块和 Needle 的完全一致，只是层数不同，他们是真共用代码，不是复制一份改改。</p>
+<p>真正为语音新增的东西，每层只有一处：<strong>门控交叉注意力</strong>。</p>
+<div class="highlight"><pre><span></span><code>x ← x + σ(g) · softmax(q̂ K̂ᵀ/√d) V
+</code></pre></div>
+
+<p>每个解码器层从编码器读一次，门控 g 逐层学习，K 和 V 来自当前这段 clip。关键在于这个投影<strong>只在音频到达时算一次</strong>，375 帧跨 8 层投影完就缓存住，整个解码过程复用。所以开 5 个 beam 的代价是 5 份短的转写缓存，而不是把音频过 5 遍。这是整篇论文里唯一一个"聪明"点：把跨模态注意力的开销挪出搜索循环。</p>
+<h2>前端把 30 秒压成 375 帧</h2>
+<p>音频走标准 frontend：16 kHz 单声道，25 ms 窗、10 ms hop，80 维 log-mel，频带限制在 250–3500 Hz，逐通道归一化。30 秒 = 3000 帧。</p>
+<p>然后一个 128 通道、kernel 9 的卷积 stem 连做三次降采样，把帧数砍到 375，一帧对应 80 ms。<strong>这个降采样是整条流水线的性能分水岭</strong>：之后所有阶段都在 375 帧的尺度上跑，包括 <code>embed</code> 接口的返回（每帧一行）。把时域压 8 倍，解码器要处理的位置数直接少一个数量级，首 token 延迟才压得下来。</p>
+<p>官方实测（Apple M4 Pro CPU，10 秒音频）：Whistle 首 token 5.9 ms（5 秒音频）/11.1 ms（10 秒）/36.3 ms（30 秒），延迟<strong>跟着 clip 长度走</strong>。Whisper 因为要把输入永远 pad 到 30 秒，首 token 延迟是条平线，不随音频长短变化。</p>
+<h2>三种深度，一套权重</h2>
+<p><code>--audio-depth</code> 可以在加载时选 2 到 8 层之间的解码器深度，1 层起的每个深度都是<strong>独立训练</strong>的一个模型，不是推理时切层。有意思的是编码器从不解剖：八个块在任何深度下都跑满。</p>
+<p>解码用 5 个 beam，按长度归一化的对数概率排序。关键词偏置走 Aho-Corasick 自动机，在 beam 旁边并行推进匹配传给它的短语，匹配前进就抬升对应路径的 log 概率。词级时间戳不是后处理对齐出来的，是直接从解码器自己的注意力里读的。</p>
+<p>有个不起眼但很实用的设计：引擎在起解码器之前先量 clip 的响度范围，低于阈值就直接返回空转写、空语言，压根不进 beam search。省掉一整个静音片段的计算。</p>
+<h2>和 Whisper base 的正面碰撞</h2>
+<p>作者贴的对比很实在，包括对自己不利的地方：</p>
+<table>
+<thead>
+<tr>
+<th>指标</th>
+<th>Whistle</th>
+<th>Whisper base</th>
+<th>Moonshine tiny v2</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>体积</td>
+<td>16.9 MB</td>
+<td>145.3 MB</td>
+<td>41.9 MB</td>
+</tr>
+<tr>
+<td>首 token</td>
+<td>11.1 ms</td>
+<td>73.2 ms</td>
+<td>22.8 ms</td>
+</tr>
+<tr>
+<td>解码速度</td>
+<td>1319 tok/s</td>
+<td>266 tok/s</td>
+<td>262 tok/s</td>
+</tr>
+</tbody>
+</table>
+<p>WER 上，Whistle 在 LibriSpeech test-clean/test-other、SPGISpeech、Earnings-22 和 FLEURS 平均上领先；Whisper base 在 TED-LIUM、AMI、MLS 平均上更准。作者没藏这一点，白纸黑字写了"Whisper base 在 TED-LIUM、AMI 和 MLS 平均上领先，代价是 145.3 MB 对 16.9 MB"。FF 这种报喜不报忧的模型发布会看多了，这种把短板摆出来的对比表反而可信。</p>
+<p>WER 用 Whisper 的 normalizer 打分，Whistle 的数值是在 86,174 条 utterance 上测的。作者还声明：所有报告的测试集音频都没进过训练或验证数据，验证方式是逐数据集比对音频校验和与说话人 ID。</p>
+<h2>社区实测泼的冷水</h2>
+<p>814 分的 HN 帖子里，叫好和吐槽一半一半，后者更有价值。</p>
+<p>英语场景基本被认可，"试着刁难它，结果它全听对了"。但多语言立刻露馅：有西语母语者反馈墨西哥和委内瑞拉口音识别不准、会写出不存在的词；另一个人说卡斯蒂利亚西语反而没问题。<strong>这其实暴露了"语言检测"这个卖点的软肋</strong>：7 种语言里英语训练得最厚，其余明显稀。</p>
+<p>更值得记的一个区分：<strong>通用 STT 不等于听写模型（dictation model）</strong>。有条高赞评论讲他给中风后口齿不清的 84 岁父亲配转写，通用的 speech-to-text 帮不上忙——听写模型需要忽略"嗯""啊"、把"一头大象，不对，一只猴子爬上了树"自动收敛成"一只猴子爬上了树"、还要支持把标点念出来。Whistle 这类模型面向的是干净音频的通用转写，不是这个场景。这不是缺陷，是需求错配。</p>
+<p>还有人对"体积"这个卖点本身不买账："STT 的难点从来不是二进制大小。"底下立刻有人反驳，而且反驳得有技术含量：<strong>如果模型能整个塞进 L3 缓存，延迟域就变了</strong>，L3 命中比 L3+DRAM 的延迟低一个数量级。马上又有人补刀：L3 对 DRAM 确实快一个数量级，但在系统层面这更可能转化成吞吐差异，而不是端到端延迟差异。这段一来一回比原文还有意思。</p>
+<p>另一个高频诉求是<strong>流式</strong>：demo 是录音→松手→出结果的模式，没有边录边出字。对大多数实时 STT 应用这是硬需求。社区提到的替代方案（Nemotron、Parakeet、Zipformer、FUTO keyboard）都主打流式。</p>
+<h2>一个开发者的视角</h2>
+<p>Whistle 最值钱的地方不是"16.9 MB"这个数字，是它证明了一件事：<strong>模型的现场感（in-distribution）比绝对质量更决定可用性</strong>。英语、高质量音频、标准口音下它和 Whisper base 打平甚至更好，因为架构再小，只要数据分布对得上，小模型就能赢。反过来说，口音重、嘈杂、非英语，它的短板会以肉眼可见的速度暴露。</p>
+<p>几个可以立刻上手的点：</p>
+<ol>
+<li><strong>它和 Needle 共用一个二进制</strong>。<code>needle --model needle3.cact --model whistle.cact --audio clip.wav</code> 一行就能让音频直接进工具调用，输出带 <code>audio_</code> 前缀的 JSON 字段（<code>audio_text</code>、<code>audio_language</code>）。不需要你自己接转写→文本→function call 的三段式。</li>
+<li><strong>17 个预编译目标</strong>：macOS、Linux、Android、iOS、watchOS、Windows on ARM、RISC-V、MIPS，浏览器和 WASI 组件也在内。每个目录里是 <code>needle</code> 二进制 + <code>libneedle.a</code> + <code>needle.h</code>，任何 <code>.cact</code> 都能加载。</li>
+<li><strong><code>--audio-depth</code> 是给端侧调优留的旋钮</strong>。树莓派级别的设备上，先在 2 层深度上跑通链路，再往上加。</li>
+<li>交付形式注意一下：权重在 Hugging Face，引擎和平台文件夹在 <code>Cactus-Compute/needle3</code>。社区里关于 FUTO keyboard"是不是开源"的争论值得引以为戒：<strong>source-available 不等于 open source</strong>，带非商用条款或可撤销条款的 license，法律上不是开源。落地商用前把 license 读一遍，别只看 README 上的 "open"。</li>
+</ol>
+<p>端侧语音这几年一直在"能跑"和"好用"之间横跳。Whistle 的意义是它把 English-only 的干净音频场景推到了一个真正能用的点上，同时诚实地告诉你它没解决什么。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
