@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rust 借用检查器 11 年前的健全性漏洞：协变字段赋值如何绕过 'static 约束 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Rust 借用检查器 11 年前的健全性漏洞：协变字段赋值如何绕过 'static 约束</h1>
+<time>2026-10-13</time>
+<ul>
+<li>Rust</li>
+<li>编译器</li>
+<li>内存安全</li>
+<li>借用检查器</li>
+</ul>
+<hr />
+<p>上周三，Rust 仓库多了一个 issue #164250，标题朴素得不像个重磅炸弹：<code>struct's lifetime requirements can be bypassed via covariant field assignment</code>。几个小时内它就被打上 <code>P-critical</code>，随后降级为 <code>P-high</code>，标签栏挂着一排刺眼的字：<code>I-unsound</code>、<code>regression-from-stable-to-stable</code>、<code>A-borrow-checker</code>、<code>A-variance</code>。</p>
+<p><code>I-unsound</code> 意味着安全代码可以造成内存不安全。<code>regression-from-stable-to-stable</code> 意味着这不是 nightly 上的实验性特性，它已经污染了稳定版。评论区里有人翻出时间线：<strong>这个洞能编译通过的最早版本是 stable 1.4.0，2015 年</strong>。也就是说，Rust 宣称的内存安全保证，有一道裂缝已经存在了十一年。</p>
+<h2>触发它的代码长什么样</h2>
+<p>最小的复现只需要一个 <code>Drop</code> 实现、一个泛型约束和一次字段赋值：</p>
+<div class="highlight"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">sync</span><span class="p">::</span><span class="n">Mutex</span><span class="p">;</span>
+<span class="k">static</span><span class="w"> </span><span class="n">KEPT</span><span class="p">:</span><span class="w"> </span><span class="nc">Mutex</span><span class="o">&lt;</span><span class="nb">Vec</span><span class="o">&lt;</span><span class="nb">Box</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">any</span><span class="p">::</span><span class="n">Any</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">Send</span><span class="o">&gt;&gt;&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Mutex</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="nb">Vec</span><span class="p">::</span><span class="n">new</span><span class="p">());</span>
+
+<span class="k">struct</span><span class="w"> </span><span class="nc">Q</span><span class="o">&lt;</span><span class="n">T</span><span class="p">:</span><span class="w"> </span><span class="o">&#39;</span><span class="nb">static</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">Send</span><span class="o">&gt;</span><span class="p">(</span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="p">);</span>
+
+<span class="k">impl</span><span class="o">&lt;</span><span class="n">T</span><span class="p">:</span><span class="w"> </span><span class="o">&#39;</span><span class="nb">static</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">Send</span><span class="o">&gt;</span><span class="w"> </span><span class="nb">Drop</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">Q</span><span class="o">&lt;</span><span class="n">T</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">t</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="mf">0.</span><span class="n">take</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">KEPT</span><span class="p">.</span><span class="n">lock</span><span class="p">().</span><span class="n">unwrap</span><span class="p">().</span><span class="n">push</span><span class="p">(</span><span class="nb">Box</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">t</span><span class="p">));</span>
+<span class="w">        </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">l</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">String</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="s">&quot;hello world, this is long enough&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">q</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Q</span><span class="p">(</span><span class="nb">None</span><span class="p">);</span>
+<span class="w">        </span><span class="n">q</span><span class="p">.</span><span class="mi">0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="o">&amp;</span><span class="n">l</span><span class="p">);</span><span class="w">          </span><span class="c1">// 塞进去的是一个 &amp;&#39;local String</span>
+<span class="w">    </span><span class="p">}</span><span class="w">                            </span><span class="c1">// l 在这里析构</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">_z</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">String</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="s">&quot;XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX&quot;</span><span class="p">);</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">KEPT</span><span class="p">.</span><span class="n">lock</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;{}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">k</span><span class="p">[</span><span class="mi">0</span><span class="p">].</span><span class="n">downcast_ref</span><span class="p">::</span><span class="o">&lt;&amp;&#39;</span><span class="nb">static</span><span class="w"> </span><span class="nb">String</span><span class="o">&gt;</span><span class="p">().</span><span class="n">unwrap</span><span class="p">());</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>Q&lt;T&gt;</code> 声明里写了 <code>T: 'static</code>，<code>q.0</code> 的类型名义上是 <code>Option&lt;&amp;'static String&gt;</code>。可内层作用域里 <code>q.0 = Some(&amp;l)</code> 把一个只活到作用域结束的 <code>&amp;l</code> 赋了进去，借用检查器一声不吭。<code>l</code> 在花括号处析构，之后 <code>main</code> 又从静态全局里把那个引用捞出来当 <code>&amp;'static String</code> 打印——读的是一块已经被 <code>_z</code> 的分配覆盖掉的栈内存。</p>
+<p>作者在 Godbolt 上开了 AddressSanitizer，输出是标准的 <code>AddressSanitizer: stack-use-after-scope</code>。不开 ASan 时程序不崩，愉快地打印出 <code>XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX</code>。那块死掉的内存恰好被下一个局部变量的初始化盖上了。<strong>没有崩溃的 use-after-free，比崩溃的更危险。</strong></p>
+<h2>根因：类型统一时不检查生命周期的约束</h2>
+<p>问题的核心不在 <code>Drop</code>，也不在 <code>Mutex</code>，而在类型推断的 <code>unify</code> 阶段。@maxdexh 在评论里给了一个去掉 <code>Drop</code>、只用普通统一的版本，把问题定位得更干净：</p>
+<div class="highlight"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">Q</span><span class="o">&lt;</span><span class="n">T</span><span class="p">:</span><span class="w"> </span><span class="nb">Copy</span><span class="p">,</span><span class="w"> </span><span class="n">F</span><span class="p">:</span><span class="w"> </span><span class="nb">FnMut</span><span class="p">(</span><span class="n">T</span><span class="p">)</span><span class="o">&gt;</span><span class="p">(</span><span class="n">T</span><span class="p">,</span><span class="w"> </span><span class="n">F</span><span class="p">);</span>
+
+<span class="k">impl</span><span class="o">&lt;</span><span class="n">T</span><span class="p">:</span><span class="w"> </span><span class="nb">Copy</span><span class="p">,</span><span class="w"> </span><span class="n">F</span><span class="p">:</span><span class="w"> </span><span class="nb">FnMut</span><span class="p">(</span><span class="n">T</span><span class="p">)</span><span class="o">&gt;</span><span class="w"> </span><span class="nb">Drop</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">Q</span><span class="o">&lt;</span><span class="n">T</span><span class="p">,</span><span class="w"> </span><span class="n">F</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="bp">self</span><span class="p">.</span><span class="mi">1</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="mi">0</span><span class="p">)</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">type</span><span class="w"> </span><span class="nc">T</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="nb">Vec</span><span class="o">&lt;</span><span class="kt">i32</span><span class="o">&gt;&gt;</span><span class="p">;</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">long</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Box</span><span class="p">::</span><span class="n">leak</span><span class="p">(</span><span class="nb">Box</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">T</span><span class="p">::</span><span class="n">new</span><span class="p">()))</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="o">&amp;&#39;</span><span class="nb">static</span><span class="w"> </span><span class="n">T</span><span class="p">;</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">local</span><span class="p">:</span><span class="w"> </span><span class="nc">T</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="fm">vec!</span><span class="p">[</span><span class="fm">vec!</span><span class="p">[</span><span class="mi">1</span><span class="p">]];</span>
+<span class="w">        </span><span class="c1">// 数组元素类型被统一为 Q&lt;&amp;&#39;local T, fn(&amp;&#39;static T)&gt;，这个类型本身 ill-formed</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">unified</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">[</span>
+<span class="w">            </span><span class="n">Q</span><span class="p">(</span><span class="n">long</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="o">|</span><span class="n">s</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="o">&#39;</span><span class="nb">static</span><span class="w"> </span><span class="nc">T</span><span class="o">|</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* … */</span><span class="w"> </span><span class="p">})</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="k">fn</span><span class="p">(</span><span class="o">&amp;&#39;</span><span class="nb">static</span><span class="w"> </span><span class="n">T</span><span class="p">)),</span>
+<span class="w">            </span><span class="n">Q</span><span class="p">(</span><span class="o">&amp;</span><span class="n">local</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="o">|</span><span class="n">_</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">T</span><span class="o">|</span><span class="w"> </span><span class="p">{})</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="k">fn</span><span class="p">(</span><span class="o">&amp;</span><span class="n">T</span><span class="p">)),</span>
+<span class="w">        </span><span class="p">];</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="p">[</span><span class="n">l</span><span class="p">,</span><span class="w"> </span><span class="n">r</span><span class="p">]</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">unified</span><span class="p">;</span>
+<span class="w">        </span><span class="n">std</span><span class="p">::</span><span class="n">mem</span><span class="p">::</span><span class="n">swap</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">l</span><span class="p">.</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">r</span><span class="p">.</span><span class="mi">0</span><span class="p">);</span><span class="w">   </span><span class="c1">// 静默地把 &#39;static 引用换成了局部引用</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">std</span><span class="p">::</span><span class="n">thread</span><span class="p">::</span><span class="n">sleep_ms</span><span class="p">(</span><span class="mi">1000</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>当数组的两个元素类型不同时，编译器做 LUB（最小上界）统一，得到 <code>Q&lt;&amp;'local T, fn(&amp;'static T)&gt;</code>——注意这个类型是<strong>自身不合法</strong>的：第一个类型参数是 <code>&amp;'local T</code>（不满足 <code>T: 'static</code> 隐含要求的复制语义场景），第二个是要求 <code>&amp;'static T</code> 的函数指针。类型系统造出了一个它自己本该拒绝的类型，然后照着它往下编译。后续 <code>mem::swap</code> 把值换过来，约束就被绕过了。</p>
+<p>一句话总结：<strong><code>unify</code> 只保证两个类型"形状"一致，不校验统一结果本身是否满足泛型参数的 trait bound。</strong> 生命周期出现在结构体字段位置、又恰好协变时，字段赋值就成了后门。</p>
+<h2>为什么协变是这扇后门的关键</h2>
+<p>Rust 里大部分引用结构是<strong>协变</strong>的：<code>&amp;'long T</code> 可以当成 <code>&amp;'short T</code> 用，因为读操作只会让生命周期变短、不会变长。协变通常是便利特性，让子类型关系自然成立。但在<strong>可变字段赋值</strong>的场景下，协变配合不完整的统一检查，就变成了把短命引用塞进长命槽位的合法通道。</p>
+<p>@lcnr 给的版本甚至不需要 <code>Drop</code> 也拿掉了 <code>'static</code> 字面量，纯粹靠生命周期约束在字段间的流向：</p>
+<div class="highlight"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">MyType</span><span class="o">&lt;&#39;</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="o">&#39;</span><span class="na">b</span><span class="p">:</span><span class="w"> </span><span class="o">&#39;</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="o">&#39;</span><span class="na">c</span><span class="o">&gt;</span><span class="p">(</span><span class="o">&amp;&#39;</span><span class="na">c</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="o">&amp;&#39;</span><span class="na">a</span><span class="w"> </span><span class="kt">str</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;&#39;</span><span class="na">b</span><span class="w"> </span><span class="kt">str</span><span class="p">);</span>
+
+<span class="k">impl</span><span class="o">&lt;&#39;</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="o">&#39;</span><span class="na">b</span><span class="p">:</span><span class="w"> </span><span class="o">&#39;</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="o">&#39;</span><span class="na">c</span><span class="o">&gt;</span><span class="w"> </span><span class="nb">Drop</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">MyType</span><span class="o">&lt;&#39;</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="o">&#39;</span><span class="na">b</span><span class="p">,</span><span class="w"> </span><span class="o">&#39;</span><span class="na">c</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="o">*</span><span class="bp">self</span><span class="p">.</span><span class="mi">0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="mi">1</span><span class="p">;</span><span class="w">   </span><span class="c1">// &#39;b 里的值流进了 &#39;a 的槽位</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">me_out</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;rarw&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">l</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">String</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="s">&quot;some cool string&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">q</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MyType</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">me_out</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="n">q</span><span class="p">.</span><span class="mi">1</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="o">&amp;</span><span class="n">l</span><span class="p">;</span><span class="w">            </span><span class="c1">// &#39;local 的值写进了标称 &#39;b: &#39;a 的字段</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;me_out: {me_out}&quot;</span><span class="p">);</span><span class="w">   </span><span class="c1">// 打印悬垂引用</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>这个版本在 1.4.0 就能编译。@theemathas 在评论里连发了三个变体，最后半是感叹半是困惑地问：<strong>"这玩意儿到底怎么 11 年都没被发现的？？"</strong></p>
+<h2>一段优雅的"悬垂引用 + 线程逃逸"组合拳</h2>
+<p>最能说明危害的复现来自 @theemathas，把栈上引用通过 <code>spawn</code> 送到另一个线程，在 <code>Drop</code> 运行那一刻把生命周期强行延长：</p>
+<div class="highlight"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">time</span><span class="p">::</span><span class="n">Duration</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">thread</span><span class="p">;</span>
+
+<span class="k">struct</span><span class="w"> </span><span class="nc">Q</span><span class="o">&lt;&#39;</span><span class="na">a</span><span class="p">:</span><span class="w"> </span><span class="o">&#39;</span><span class="nb">static</span><span class="o">&gt;</span><span class="p">(</span><span class="nb">Option</span><span class="o">&lt;&amp;&#39;</span><span class="na">a</span><span class="w"> </span><span class="nb">String</span><span class="o">&gt;</span><span class="p">);</span>
+
+<span class="k">impl</span><span class="o">&lt;&#39;</span><span class="na">a</span><span class="p">:</span><span class="w"> </span><span class="o">&#39;</span><span class="nb">static</span><span class="o">&gt;</span><span class="w"> </span><span class="nb">Drop</span><span class="w"> </span><span class="k">for</span><span class="w"> </span><span class="n">Q</span><span class="o">&lt;&#39;</span><span class="na">a</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">fn</span><span class="w"> </span><span class="nf">drop</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="bp">self</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// 这段代码手里的引用按类型说是 &amp;&#39;static String</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">wrong</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="o">&#39;</span><span class="nb">static</span><span class="w"> </span><span class="nb">String</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="mf">0.</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="w">        </span><span class="n">thread</span><span class="p">::</span><span class="n">spawn</span><span class="p">(</span><span class="k">move</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">thread</span><span class="p">::</span><span class="n">sleep</span><span class="p">(</span><span class="n">Duration</span><span class="p">::</span><span class="n">from_secs</span><span class="p">(</span><span class="mi">1</span><span class="p">));</span>
+<span class="w">            </span><span class="fm">println!</span><span class="p">(</span><span class="s">&quot;{}&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">wrong</span><span class="p">);</span><span class="w">   </span><span class="c1">// 1 秒后才读，源数据早没了</span>
+<span class="w">        </span><span class="p">});</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">main</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">l</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">String</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="s">&quot;abc&quot;</span><span class="p">);</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">q</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Q</span><span class="p">(</span><span class="nb">None</span><span class="p">);</span>
+<span class="w">        </span><span class="n">q</span><span class="p">.</span><span class="mi">0</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="o">&amp;</span><span class="n">l</span><span class="p">);</span><span class="w">   </span><span class="c1">// 名义上是 &amp;&#39;static，实际是 &amp;&#39;local</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">thread</span><span class="p">::</span><span class="n">sleep</span><span class="p">(</span><span class="n">Duration</span><span class="p">::</span><span class="n">from_secs</span><span class="p">(</span><span class="mi">2</span><span class="p">));</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>'a: 'static</code> 这个约束字面要求 <code>'a</code> 至少和 <code>'static</code> 一样长，编译器却在赋值处放行了 <code>&amp;l</code>。子线程静默地读脏数据，主线程等它两秒收尸。这类"数据竞争 + 悬垂读"的组合，是内存安全语言里最不该出现的东西。</p>
+<h2>影响面有多大</h2>
+<p>三个事实决定了它的严重程度：</p>
+<p><strong>第一，跨稳定版。</strong> 标签 <code>regression-from-stable-to-stable</code> 说的是 1.85 及更早的稳定版全部中招；评论里追到 1.4.0（2015）。这不是刚引入的 bug，是长期潜伏的。任何在稳定版上跑的、字段类型涉及生命周期协变的代码都可能已经被它"放过"过。</p>
+<p><strong>第二，不需要 unsafe。</strong> 全部复现都是 100% 安全代码。这正是 <code>I-unsound</code> 标签的含义——Rust 的核心承诺（safe code 不产生 UB）被打破了。crate 里如果有类似的泛型结构 + <code>Drop</code> 组合，编译期看不出来任何异常。</p>
+<p><strong>第三，理论上可被利用。</strong> 一个能稳定构造 use-after-free 的健全性漏洞，在特定场景下可以升级成信息泄露或控制流劫持。Rust 生态里大量网络服务、解析器、加密库用泛型容器承载生命周期敏感的数据，攻击面不小。</p>
+<p>需要说明的是，"能编译"不等于"到处都能触发"。要命中需要三个条件同时满足：结构体类型参数带生命周期 bound、字段在该生命周期上协变、代码通过字段赋值（或类型统一）把不满足 bound 的值写进去。日常写业务代码很难自然踩到，但写泛型库、自研容器、FFI 封装时就不是小概率事件了。</p>
+<h2>现在的状态和缓解</h2>
+<p>issue 当前是 open 状态，assigned <code>P-high</code>（最初由 rustbot 自动打 <code>P-critical</code>，讨论后降级）。相关讨论已经开了 Zulip 主题，@rustbot 也把它和 #128225 关联了起来——那不是孤立事件，是同一类缺陷的另一处暴露。</p>
+<p>官方的修复方向是在类型统一完成后补一道校验：确认统一得到的具体类型确实满足泛型参数的 bound，不满足就报错而不是放行。这类改动触及 <code>unify</code> 这个编译器最核心的路径，改动面和回归风险都不小，短期内更可能是先加 lint 或推迟到某个 edition。</p>
+<p>在修复落地前，开发者能做的：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 关注安全通告，1.85+ 的 patch 版本升级优先</span>
+<span class="c1"># 对泛型 + Drop + 生命周期字段的代码，手动审计赋值路径</span>
+</code></pre></div>
+
+<p>如果自己的 crate 里有类似模式，可以先用 Miri 跑一遍测试套件。Miri 的栈借用模型（stacked borrows）对 use-after-scope 比 ASan 更敏感，很多这类问题在测试里就能被它揪出来：</p>
+<div class="highlight"><pre><span></span><code>rustup<span class="w"> </span>component<span class="w"> </span>add<span class="w"> </span>miri
+cargo<span class="w"> </span>+nightly<span class="w"> </span>miri<span class="w"> </span><span class="nb">test</span>
+</code></pre></div>
+
+<h2>一点个人看法</h2>
+<p>这件事最值得回味的不是 bug 本身，而是它藏了十一年。Rust 的借用检查器被当作内存安全的地基，社区习惯用"编译通过就安全"作为心智模型的锚点。这个 issue 提醒我们，那个锚点建立在编译器实现之上，而编译器是一个有边界、会漏的软件。</p>
+<p>对写泛型库的人来说，<strong>Miri 不该是 CI 里的选配，而该是标配</strong>——尤其是在你自研容器、手写 unsafe 封装、或者用 PhantomData 和生命周期参数玩花活的模块里。对普通业务开发者，这次大概率波及不到你，但它验证了一个朴素的工程直觉：任何声称"保证安全"的抽象，都值得在边界处留一道自己的检查。</p>
+<p>把复杂的安全论证外包给编译器是合理的，前提是知道那份委托契约里写了什么、以及它什么时候可能不成立。</p>
+<hr />
+<p><strong>参考链接</strong></p>
+<ul>
+<li>Rust issue #164250: <a href="https://github.com/rust-lang/rust/issues/164250">https://github.com/rust-lang/rust/issues/164250</a></li>
+<li>Godbolt（带 ASan）: <a href="https://rust.godbolt.org/z/83MvfbKde">https://rust.godbolt.org/z/83MvfbKde</a></li>
+<li>Godbolt（无 ASan）: <a href="https://rust.godbolt.org/z/GsGdqqMWe">https://rust.godbolt.org/z/GsGdqqMWe</a></li>
+</ul>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
