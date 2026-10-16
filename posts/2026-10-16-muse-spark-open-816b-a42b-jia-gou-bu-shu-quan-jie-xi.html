@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Muse Spark Open 深度拆解：816B/42B MoE、1M 上下文，以及"开放权重"这四个字到底是啥意思 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Muse Spark Open 深度拆解：816B/42B MoE、1M 上下文，以及"开放权重"这四个字到底是啥意思</h1>
+<time>2026-10-16</time>
+<ul>
+<li>大模型</li>
+<li>MoE</li>
+<li>本地部署</li>
+<li>开源</li>
+</ul>
+<hr />
+<p>Meta Superintelligence Labs 在 10 月 15 日放出了 Muse Spark Open，816B 总参数、42B 激活、100 万 token 上下文、原生多模态。发出来的当天 HN 上 854 分，讨论比模型本身还热闹：一半人在算显存，一半人在争论"这到底算不算开源"。我把模型卡、许可协议和部署文档都过了一遍，聊聊里面的工程细节。</p>
+<h2>先看架构：256 个专家，每个 token 只点火 8 个</h2>
+<p>Muse Spark Open 是标准的 MoE Transformer，但参数给得很细：</p>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th>数值</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>总参数 / 激活参数</td>
+<td>816B / 42B</td>
+</tr>
+<tr>
+<td>层数</td>
+<td>62</td>
+</tr>
+<tr>
+<td>隐藏维度</td>
+<td>8192</td>
+</tr>
+<tr>
+<td>词表</td>
+<td>202,048</td>
+</tr>
+<tr>
+<td>注意力头</td>
+<td>Q 128 / KV 16（GQA）</td>
+</tr>
+<tr>
+<td>头维度</td>
+<td>64</td>
+</tr>
+<tr>
+<td>专家数 / 每 token 激活</td>
+<td>256 / 8（top-k 路由）</td>
+</tr>
+<tr>
+<td>上下文</td>
+<td>1M token</td>
+</tr>
+</tbody>
+</table>
+<p>62 层配 8192 隐藏维，注意力用分组查询（GQA）压 KV 缓存：128 个 Q 头共享 16 个 KV 头，正好 8:1。这在 1M 上下文下不是可选项：KV 缓存随上下文长度线性增长，不压头数，长上下文推理显存直接爆。</p>
+<p>注意力块本身加了输出门控（output gate + output norm）并启用 QK-norm。QK-norm 是这两年长上下文模型的标配，目的是防止注意力 logits 随维度放大后 softmax 数值溢出。MoE 部分是 256 专家选 8，激活比例 42/816 ≈ 5.1%，这个稀疏度跟主流的 8/256 或 8/128 是一个量级。</p>
+<h2>多模态不是"外挂"，是塞进来的</h2>
+<p>模型类型一栏写的是"Mixture-of-Experts Transformer, with Perception Encoder"。感知编码器单列了一组参数：</p>
+<ul>
+<li>1.8B 参数，50 层，1536 隐藏维，16 头</li>
+<li>patch size 14×14，输出维度 4096</li>
+<li>位置编码用"学习式绝对编码 + 2D RoPE"混合</li>
+<li>稀疏注意力，每 4 层加最后一层走全注意力（factor 4）</li>
+</ul>
+<p>输入同时接受文本 + 图像 + 视频 + 音频，输出只有文本。常见坑写在模型卡里：视频太短或分辨率太低（几秒钟、大约 100px）时，模型会回你一句"我看不了这个视频"。文档建议短边至少 448px，用更长的片段。</p>
+<h2>跑起来要多少钱：700GB 起步</h2>
+<p>这是最劝退的一段，也是讨论区最热闹的地方。</p>
+<p>模型提供 BF16 和 NVFP4 两种权重。跑起来的最低要求：</p>
+<ul>
+<li><strong>NVFP4</strong>：单卡 700GB 显存</li>
+<li><strong>BF16</strong>：2TB 显存</li>
+</ul>
+<p>700GB 显存是什么概念：H100 是 80GB，得凑 9 张；H200 是 141GB，5 张打底。单机塞不下，得上多卡互联。模型卡里点名的推理框架有 SGLang、vLLM、Hugging Face、TensorRT-LLM、Unsloth、llama.cpp。</p>
+<p>真正让讨论区兴奋的是另一条：<strong>优化跑在两台 Mac Studio 上</strong>。Apple 的 MLX 团队同日发了篇博客，讲怎么用一台或几台 Mac Studio 把"接近万亿参数"的模型跑在桌面上。核心逻辑是 Apple 的统一内存架构：M5 Ultra 的集成 GPU 能用满 512GB 统一内存，两台就能装下整个模型；芯片 1.2TB/s 的内存带宽足够每步 token 读进那片需要的权重。</p>
+<p>配置组合有两种：</p>
+<ul>
+<li>两台 M5 Ultra + 512GB 统一内存</li>
+<li>四台 M5 Ultra + 256GB，合计 1TB，装 NVFP4 量化版</li>
+</ul>
+<p>有人算了一笔账：单台 M5 Ultra + 256GB 的 Mac Studio 大约 1.1 万美元，而 512GB 版本当时还没开卖。讨论区有人调侃"先用旧的双 512GB M3 Ultra 凑合，等 M5 到了再换"，下面立刻有人回复"我那几个 M3 Ultra 一直当门挡用"。</p>
+<p>顺便说一句，模型卡里还提到 2-bit 量化能塞进 256GB 内存的设备。但模型再压，也压不到普通消费级硬件上。有评论一针见血："原来以为开放模型都能量化到消费级硬件上跑，现在发现这个概念已经过时了。"另一位补刀："NPU 是给常驻小模型准备的，这个模型比 NPU 的舒适区大了差不多 500 倍。"</p>
+<p>这条对话其实回答了一个被营销话术搞混的问题：NPU 和本地大模型是两条线。Copilot+ PC 那批 NPU（AMD XDNA2、高通 Hexagon）设计目标是常驻小任务：实时翻译、视频降噪、文件检索，这些要压低功耗、常开不耗电。让它跑几百 B 的 MoE，方向就不对。</p>
+<h2>基准：不是最强，但很能打</h2>
+<p>模型卡里给了一张横向表，对手是同期开放权重模型。挑几个关键的（Muse 用 xhigh 推理档，温度 1.0 / top_p 1.0 / top_k 关闭）：</p>
+<table>
+<thead>
+<tr>
+<th>基准</th>
+<th>Muse Spark Open</th>
+<th>Qwen3.8-2.4T-A95B</th>
+<th>GLM 5.3</th>
+<th>Kimi K3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>综合智能指数</td>
+<td>39</td>
+<td>40</td>
+<td><strong>45</strong></td>
+<td>44</td>
+</tr>
+<tr>
+<td>JobBench（Agent）</td>
+<td><strong>61.8</strong></td>
+<td>52.7</td>
+<td>61.4</td>
+<td>54.3</td>
+</tr>
+<tr>
+<td>MCP-Atlas（工具调用）</td>
+<td><strong>89.2</strong></td>
+<td>84.5</td>
+<td>84.2</td>
+<td>82.3</td>
+</tr>
+<tr>
+<td>GDPVal-AA v2</td>
+<td>1401</td>
+<td>1613</td>
+<td><strong>1653</strong></td>
+<td>1537</td>
+</tr>
+<tr>
+<td>OSWorld Verified</td>
+<td>80.4</td>
+<td>—</td>
+<td>—</td>
+<td><strong>84.8</strong></td>
+</tr>
+<tr>
+<td>HLE-Diamond（无工具）</td>
+<td><strong>26.1</strong></td>
+<td>17.3</td>
+<td>16.4</td>
+<td>22.2</td>
+</tr>
+<tr>
+<td>SciCode</td>
+<td>58.5</td>
+<td>54.1</td>
+<td>59.0</td>
+<td><strong>59.5</strong></td>
+</tr>
+<tr>
+<td>GPQA Diamond</td>
+<td>89.0</td>
+<td><strong>93.5</strong></td>
+<td>91.7</td>
+<td><strong>93.5</strong></td>
+</tr>
+<tr>
+<td>Terminal-Bench 2.1</td>
+<td>76.4</td>
+<td>82.0</td>
+<td>83.9</td>
+<td><strong>85.0</strong></td>
+</tr>
+<tr>
+<td>SWE-Atlas-QnA</td>
+<td>58</td>
+<td>62</td>
+<td>59</td>
+<td><strong>66</strong></td>
+</tr>
+</tbody>
+</table>
+<p>几个观察。综合智能指数（39）没打过 GLM 5.3（45）和 Kimi K3（44），知识类基准（GPQA Diamond 89、SciCode 58.5）也都落后一截。但在 Agent 和工具调用上，MCP-Atlas 89.2 是第一，JobBench 61.8 也是第一；多模态系列（ZeroBench 50.0、BabyVision 80.2、SimpleVQA 73.6）几乎全面领先。这不是"最强模型"，是一个在 agentic 和原生多模态上偏科的模型，和它"Built for coding and agentic work"的定位一致。</p>
+<p>有一个数字值得单独拎出来：<strong>StrongREJECT v2（自适应攻击）拒答率 0.5，越低越好</strong>。同表里 Kimi K3 是 66.6，Qwen 是 65.6，GLM 是 62.9，Inkling 是 86.4。Muse 的 0.5 意味着在自适应越狱下几乎不设防。官方解释是这个开放版本"额外做了安全后训练以抵抗无系统护栏的独立使用"，但同一个模型卡又说"强烈建议作为带护栏的 AI 系统的一部分部署"。开放权重 + 几乎不拒答 + 能调工具，这个组合怎么用，取决于部署方自己——这也是为什么模型卡单独强调：agentic 场景下不可逆操作要做 human-in-the-loop 确认。</p>
+<h2>真正值得聊的：这个许可到底算不算"开放"</h2>
+<p>讨论区吵得最凶的不是性能，是许可。</p>
+<p>Muse 用的是自定义的"Muse Model License"，不是标准开源协议。几个关键条款：</p>
+<ol>
+<li>任何使用或衍生品，都必须在产品 UI、文档、网站或设置菜单里<strong>显著标注 "Built with Muse Spark Open"</strong>。注意"衍生品"定义很宽：用这个模型微调、蒸馏、改进出来的任何新模型都算。</li>
+<li>如果你把模型<strong>作为"模型即服务"（Model as a Service）</strong> 提供给第三方（即第三方拿到模型输出），且你和你关联方<strong>连续 12 个月总收入超过 2000 万美元</strong>，你必须先通知 Meta 并单独签协议。</li>
+<li>上述第 2 条不适用于内部使用、研究，以及<strong>不是</strong> MaaS 的商业活动。也就是说，你把模型当自己产品的一个组件来用（不直接对外暴露模型能力），不受这条约束。</li>
+<li>Meta 不主张模型输出的所有权。</li>
+</ol>
+<p>争论就集中在这里。一派认为这是"Open-washing"（开放洗白）：开放权重通常指"权重在开源协议下可用"，而开源协议的核心要求之一是"不限制使用领域"（自由软件定义里的 freedom 0，为任何目的运行软件的自由）。这份许可既要求署名，又对超过 2000 万美元收入的 MaaS 场景设卡，所以严格说不算开源协议。</p>
+<p>另一派觉得没那么苛刻：2000 万美元的门槛对绝大多数小团队是够不着的，非商业用途无条件免费，超过门槛后你依然可以在自己产品内部用它，只是不能把模型直接当服务转卖。一条评论总结得挺准："有点 Open-washing，但对训练方对公众都算合理。"</p>
+<p>我个人的看法偏第一派，但要分开看两件事：<strong>"权重可下载"和"开源"是两个不同的承诺</strong>。这次 Meta 至少做对了一件事：不是只丢一个权重文件让社区自己摸索，而是把 Unsloth、MLX、vLLM、SGLang 的部署路径都测了一遍并写了文档。讨论区有人说这是"把开放权重的标准往上抬了一格"。这句评价的分量，比争"开不开源"重要。</p>
+<h2>一个开发者的视角</h2>
+<p>如果你的团队在评估这个模型，我会这么用：</p>
+<p>第一，<strong>别为了本地跑而本地跑</strong>。700GB NVFP4 起步，两台 Mac Studio 是 2 万美元以上，四台要 4 到 6 万。除非你的数据不能出内网，否则 API 或托管推理（Fireworks 这类）在成本上大概率更划算。本地部署的真正理由是数据主权和可控性，不是省钱。</p>
+<p>第二，<strong>看它的偏科去匹配场景</strong>。知识问答、硬核推理它不占优（GPQA 89 落后），但工具调用（MCP-Atlas 89.2）和原生多模态（截图、图表、文档理解）是强项。如果你在搭 agent、需要模型"看屏幕操作"或处理图文混合输入，它是这批开放模型里对口的；如果你在做纯代码补全或数学推理，GLM / Kimi 的数字更好看。</p>
+<p>第三，<strong>注意那个 0.5 的拒答率</strong>。放它进 agent 循环、给它写文件和执行命令的权限之前，务必加护栏：不可逆操作要人确认，危险命令要拦截。这不是模型的问题，是任何开放权重 agent 模型的部署常识。</p>
+<p>最后一句：许可证里那条"必须在 UI 里标 Built with Muse Spark Open"，如果你的产品要商用，产品团队得提前排期，别到上线前才发现少了一个署名。</p>
+<hr />
+<p>参考：
+- 模型卡：https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B
+- 部署文档：https://dev.meta.ai/resources/blog/build-with-muse-spark-open
+- HN 讨论：https://news.ycombinator.com/item?id=50107379</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
