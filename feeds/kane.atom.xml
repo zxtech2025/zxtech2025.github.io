@@ -1,5 +1,197 @@
 <?xml version="1.0" encoding="utf-8"?>
-<feed xmlns="http://www.w3.org/2005/Atom"><title>Kane's Blog - Kane</title><link href="/" rel="alternate"/><link href="feeds/kane.atom.xml" rel="self"/><id>/</id><updated>2026-10-17T00:00:00+08:00</updated><entry><title>一个不可见注释 + 一张 1x1 像素：CamoLeak 如何零点击偷走私仓源码</title><link href="posts/2026-10-17-camoleak-copilot-camo-csp-bypass.html" rel="alternate"/><published>2026-10-17T00:00:00+08:00</published><updated>2026-10-17T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-10-17:posts/2026-10-17-camoleak-copilot-camo-csp-bypass.html</id><summary type="html">&lt;ul&gt;
+<feed xmlns="http://www.w3.org/2005/Atom"><title>Kane's Blog - Kane</title><link href="/" rel="alternate"/><link href="feeds/kane.atom.xml" rel="self"/><id>/</id><updated>2026-10-18T00:00:00+08:00</updated><entry><title>ripgrep 15 源码拆解：gitignore 崩溃与 -A 变慢背后的三处底层修复</title><link href="posts/2026-10-18-ripgrep-15-gitignore-memory-after-context.html" rel="alternate"/><published>2026-10-18T00:00:00+08:00</published><updated>2026-10-18T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-10-18:posts/2026-10-18-ripgrep-15-gitignore-memory-after-context.html</id><summary type="html">&lt;ul&gt;
+&lt;li&gt;ripgrep&lt;/li&gt;
+&lt;li&gt;Rust&lt;/li&gt;
+&lt;li&gt;源码分析&lt;/li&gt;
+&lt;li&gt;性能优化&lt;/li&gt;
+&lt;li&gt;开发者工具&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;p&gt;ripgrep 15.0 是一次安静的大版本：没有新子命令，没有重写引擎，release notes 通篇是 bug 修复和"轻微 …&lt;/p&gt;</summary><content type="html">&lt;ul&gt;
+&lt;li&gt;ripgrep&lt;/li&gt;
+&lt;li&gt;Rust&lt;/li&gt;
+&lt;li&gt;源码分析&lt;/li&gt;
+&lt;li&gt;性能优化&lt;/li&gt;
+&lt;li&gt;开发者工具&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;p&gt;ripgrep 15.0 是一次安静的大版本：没有新子命令，没有重写引擎，release notes 通篇是 bug 修复和"轻微性能改进"。但把 CHANGELOG 里那三十几个 issue 号点开，会发现三个值得单独讲的修复。它们分别踩在正则引擎、行缓冲读取、glob 解析器三个完全不同的层次上，每一个都是"症状在上层，根因在底层"的典型。&lt;/p&gt;
+&lt;p&gt;代码全部来自 &lt;code&gt;BurntSushi/ripgrep&lt;/code&gt; 的 &lt;code&gt;15.0.0&lt;/code&gt; tag。&lt;/p&gt;
+&lt;h2&gt;一、14 GB 峰值内存：一个 &lt;code&gt;(?:...)&lt;/code&gt; 引发的血案&lt;/h2&gt;
+&lt;p&gt;issue #2750 的标题很直白：&lt;code&gt;rg --files --ignore-file ~/.ultimate-gitignore&lt;/code&gt; 吃掉 7.1 GiB 内存然后被 OOM killer 干掉。语料只有两个文件和 &lt;code&gt;.git&lt;/code&gt; 目录，但 ignore 文件有 16332 行、9298 条规则。&lt;/p&gt;
+&lt;p&gt;作者 BurntSushi 的定位给出了关键对照组，同一份 ignore 文件、同一个 &lt;code&gt;/dev/null&lt;/code&gt;：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;$&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nb"&gt;time&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;rg-13.0.0&lt;span class="w"&gt; &lt;/span&gt;--ignore-file&lt;span class="w"&gt; &lt;/span&gt;.ultimate-gitignore&lt;span class="w"&gt; &lt;/span&gt;/dev/null
+real&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="m"&gt;0&lt;/span&gt;.143
+maxmem&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="m"&gt;49&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;MB
+
+$&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nb"&gt;time&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;rg-14.1.0&lt;span class="w"&gt; &lt;/span&gt;--ignore-file&lt;span class="w"&gt; &lt;/span&gt;.ultimate-gitignore&lt;span class="w"&gt; &lt;/span&gt;/dev/null
+real&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="m"&gt;1&lt;/span&gt;.445
+maxmem&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="m"&gt;14238&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;MB
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;13 到 14 之间，regex crate 换了引擎。&lt;/p&gt;
+&lt;p&gt;9298 条 ignore 规则会被 globset 编译成一条巨大的正则，每条规则是一个 &lt;code&gt;(?:...)&lt;/code&gt; 非捕获分组，全部用 &lt;code&gt;|&lt;/code&gt; 串起来。问题出在 regex-automata 的 PikeVM：它为每个正则预先构造执行所需的状态缓存，而缓存大小与分组数量成正比。ripgrep 的搜索路径几乎从不走 PikeVM，lazy DFA 能处理绝大多数情况，但缓存是&lt;strong&gt;在构造时就分配&lt;/strong&gt;的，不管用不用得上。&lt;/p&gt;
+&lt;p&gt;修复在 &lt;code&gt;rust-lang/regex#1302&lt;/code&gt;，标题 &lt;code&gt;automata: make PikeVM cache initialization lazy&lt;/code&gt;，改动只有 &lt;code&gt;+23 -36&lt;/code&gt;：&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;Prior to the advent of regex-automata, the PikeVM would decide how much space it needed at the beginning of every search. In regex-automata, ... we create the caches for each regex engine eagerly. So even if we never call the PikeVM ..., we end up paying for the memory of its cache.&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;改成懒初始化之后，内存回到 regex 1.7.3 以下的水位。&lt;/p&gt;
+&lt;p&gt;这里有个值得抄走的教训：&lt;strong&gt;性能回归不一定出在热路径上&lt;/strong&gt;。ripgrep 14 的搜索速度其实更快，慢的是"根本没被调用的代码"按时序付了预分配的钱。我在自己的工具链里也踩过类似的坑，一个 CLI 启动要 300ms，最后查出来是 &lt;code&gt;--help&lt;/code&gt; 路径里提前编译了全部子命令的 clap 结构。预分配和懒加载的边界得按"实际调用概率"划，不能按"代码组织方便"划。&lt;/p&gt;
+&lt;h2&gt;二、&lt;code&gt;-A&lt;/code&gt; 让 stdin 搜索变成指数级：一次 &lt;code&gt;read&lt;/code&gt; 的系统调用差异&lt;/h2&gt;
+&lt;p&gt;issue #3184 报告说 &lt;code&gt;-A&lt;/code&gt;（after-context）值越大，rg 越慢。BurntSushi 第一次没复现出来，因为他是拿显式文件路径测的：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;$&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nb"&gt;time&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;rg&lt;span class="w"&gt; &lt;/span&gt;-c&lt;span class="w"&gt; &lt;/span&gt;ZQZQZQZQZQ&lt;span class="w"&gt; &lt;/span&gt;bigger.txt
+real&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="m"&gt;0&lt;/span&gt;.645&lt;span class="w"&gt;    &lt;/span&gt;maxmem&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="m"&gt;7734&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;MB
+
+$&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nb"&gt;time&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;rg&lt;span class="w"&gt; &lt;/span&gt;-c&lt;span class="w"&gt; &lt;/span&gt;ZQZQZQZQZQ&lt;span class="w"&gt; &lt;/span&gt;bigger.txt&lt;span class="w"&gt; &lt;/span&gt;-A999999
+real&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="m"&gt;0&lt;/span&gt;.645&lt;span class="w"&gt;    &lt;/span&gt;maxmem&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="m"&gt;7734&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;MB
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;换成管道喂 stdin，同样的数据和参数，时间立刻失控：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;$&lt;span class="w"&gt; &lt;/span&gt;cat&lt;span class="w"&gt; &lt;/span&gt;bigger.txt&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;time&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;rg&lt;span class="w"&gt; &lt;/span&gt;ZQZQZQZQZQ&lt;span class="w"&gt; &lt;/span&gt;-A999&lt;span class="o"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;wc&lt;span class="w"&gt; &lt;/span&gt;-l
+real&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="m"&gt;2&lt;/span&gt;.009&lt;span class="w"&gt;    &lt;/span&gt;maxmem&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="m"&gt;29&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;MB
+
+$&lt;span class="w"&gt; &lt;/span&gt;cat&lt;span class="w"&gt; &lt;/span&gt;bigger.txt&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;(&lt;/span&gt;&lt;span class="nb"&gt;time&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;rg&lt;span class="w"&gt; &lt;/span&gt;ZQZQZQZQZQ&lt;span class="w"&gt; &lt;/span&gt;-A9999&lt;span class="o"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;wc&lt;span class="w"&gt; &lt;/span&gt;-l
+real&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="m"&gt;10&lt;/span&gt;.459&lt;span class="w"&gt;   &lt;/span&gt;maxmem&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="m"&gt;29&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;MB
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;code&gt;-A&lt;/code&gt; 从 999 加到 9999，时间从 2 秒跳到 10.5 秒。管道下内存只有 29 MB，不是内存问题，是 CPU 空转。&lt;/p&gt;
+&lt;p&gt;真相在 &lt;code&gt;crates/searcher/src/line_buffer.rs&lt;/code&gt; 的 &lt;code&gt;fill()&lt;/code&gt;。核心缓冲容量是 64 KB（&lt;code&gt;DEFAULT_BUFFER_CAPACITY = 64 * (1 &amp;lt;&amp;lt; 10)&lt;/code&gt;），修复前每次 &lt;code&gt;fill()&lt;/code&gt; 只做&lt;strong&gt;一次&lt;/strong&gt; &lt;code&gt;read&lt;/code&gt;：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="k"&gt;loop&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;ensure_capacity&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt;&lt;span class="o"&gt;?&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="kd"&gt;let&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;readlen&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;rdr&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;read&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;free_buffer&lt;/span&gt;&lt;span class="p"&gt;().&lt;/span&gt;&lt;span class="n"&gt;as_bytes_mut&lt;/span&gt;&lt;span class="p"&gt;())&lt;/span&gt;&lt;span class="o"&gt;?&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="k"&gt;if&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;readlen&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;==&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;last_lineterm&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;end&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="k"&gt;return&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nb"&gt;Ok&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;!&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;buffer&lt;/span&gt;&lt;span class="p"&gt;().&lt;/span&gt;&lt;span class="n"&gt;is_empty&lt;/span&gt;&lt;span class="p"&gt;());&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="kd"&gt;let&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;oldend&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;end&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;end&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;+=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;readlen&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="o"&gt;..&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="k"&gt;if&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kd"&gt;let&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nb"&gt;Some&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;newbytes&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;rfind_byte&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;config&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;lineterm&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;last_lineterm&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;oldend&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;i&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="k"&gt;return&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nb"&gt;Ok&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="kc"&gt;true&lt;/span&gt;&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;读普通文件时，内核乐于一次填满整个 64 KB 缓冲。从管道读时，Linux 上单次 &lt;code&gt;read&lt;/code&gt; 往往只返回一小块。同样要把 &lt;code&gt;-A9999&lt;/code&gt; 需要的上下文窗口填满，走 stdin 需要的 &lt;code&gt;fill()&lt;/code&gt; 调用次数多一个数量级，每次调用还要重新 &lt;code&gt;rfind_byte&lt;/code&gt; 扫一遍行尾。&lt;/p&gt;
+&lt;p&gt;我把这个放大机理单独抽出来跑了一遍（单次 &lt;code&gt;read&lt;/code&gt; 上限 64 KB、缓冲上限 256 KB）：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="n"&gt;requested&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;64&lt;/span&gt;&lt;span class="n"&gt;K&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="kr"&gt;in&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;one&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;fill&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;reads&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;
+&lt;span class="n"&gt;requested&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;512&lt;/span&gt;&lt;span class="n"&gt;K&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kr"&gt;in&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;one&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;fill&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;reads&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;4&lt;/span&gt;
+&lt;span class="n"&gt;requested&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;4&lt;/span&gt;&lt;span class="n"&gt;M&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="kr"&gt;in&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;one&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;fill&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;reads&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;4&lt;/span&gt;
+&lt;span class="n"&gt;requested&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;64&lt;/span&gt;&lt;span class="n"&gt;M&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="kr"&gt;in&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;one&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;fill&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;reads&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;4&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;&lt;code&gt;reads&lt;/code&gt; 是 &lt;code&gt;fill()&lt;/code&gt; 的调用次数。&lt;code&gt;-A&lt;/code&gt; 越大需要填的字节越多，调用次数线性增长，每次调用又附一次全缓冲扫描，两者相乘就是用户感知到的"指数级变慢"。&lt;/p&gt;
+&lt;p&gt;两处修复（PR #3185，&lt;code&gt;+22 -11&lt;/code&gt;，4 个文件）。第一，&lt;code&gt;fill()&lt;/code&gt; 里改成内层 &lt;code&gt;while&lt;/code&gt; 循环，一次填满缓冲再返回：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="kd"&gt;let&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;oldend&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;end&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="k"&gt;while&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;!&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;free_buffer&lt;/span&gt;&lt;span class="p"&gt;().&lt;/span&gt;&lt;span class="n"&gt;is_empty&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="kd"&gt;let&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;readlen&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;rdr&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;read&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;free_buffer&lt;/span&gt;&lt;span class="p"&gt;())&lt;/span&gt;&lt;span class="o"&gt;?&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="k"&gt;if&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;readlen&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;==&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="k"&gt;break&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;end&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;+=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;readlen&lt;/span&gt;&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;我用 Python 复刻了这个改动，同样的读取上限下 &lt;code&gt;reads&lt;/code&gt; 从按需线性增长变成常数 4 次，填满就停。&lt;/p&gt;
+&lt;p&gt;第二处在 &lt;code&gt;crates/searcher/src/searcher/core.rs&lt;/code&gt;，限制 &lt;code&gt;preceding()&lt;/code&gt; 的搜索窗口：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="c1"&gt;// ... however, we only need to find the N preceding lines based&lt;/span&gt;
+&lt;span class="c1"&gt;// on before context. We can skip this (potentially costly, for&lt;/span&gt;
+&lt;span class="c1"&gt;// large values of N) step when before_context==0.&lt;/span&gt;
+&lt;span class="kd"&gt;let&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;context_start&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;lines&lt;/span&gt;&lt;span class="p"&gt;::&lt;/span&gt;&lt;span class="n"&gt;preceding&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="n"&gt;buf&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;config&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;line_term&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;as_byte&lt;/span&gt;&lt;span class="p"&gt;(),&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;config&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;before_context&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="c1"&gt;// 原来是 max_context()&lt;/span&gt;
+&lt;span class="p"&gt;);&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;原来传 &lt;code&gt;max_context()&lt;/code&gt;，也就是 &lt;code&gt;before + after&lt;/code&gt; 取大。只用 &lt;code&gt;-A&lt;/code&gt; 时 &lt;code&gt;before_context == 0&lt;/code&gt;，代码照样去缓冲里倒着找 N 行前面的位置，一个完全无用的 O(N) 扫描。改成只按 &lt;code&gt;before_context&lt;/code&gt; 算，&lt;code&gt;-A&lt;/code&gt; 场景直接跳过。&lt;/p&gt;
+&lt;p&gt;顺带说，GNU grep 在 &lt;code&gt;-B&lt;/code&gt; 上有同样的毛病，而且更慢。这类上下文窗口回溯的性能陷阱跟语言无关，跟"有没有人认真区分 before 和 after 的语义差异"有关。&lt;/p&gt;
+&lt;p&gt;实用结论：在管道 + 大 &lt;code&gt;-A&lt;/code&gt; 做日志分析的话，15.0 值得升级。但 15.1.0 紧接着修了这次改动带来的 &lt;code&gt;--line-buffered&lt;/code&gt; 回归（#3194，输出延迟、&lt;code&gt;tail -f&lt;/code&gt; 行为异常），真要用直接上 15.2.0。&lt;/p&gt;
+&lt;h2&gt;三、gitignore 匹配：四个互相独立的错误&lt;/h2&gt;
+&lt;p&gt;&lt;code&gt;ignore&lt;/code&gt; crate 这一轮修了 4 个匹配错误，都是"规则该生效却没生效"：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;issue&lt;/th&gt;
+&lt;th&gt;症状&lt;/th&gt;
+&lt;th&gt;根因&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;#829 / #2731 / #3076&lt;/td&gt;
+&lt;td&gt;传目录作参数时 &lt;code&gt;.gitignore&lt;/code&gt; 不生效&lt;/td&gt;
+&lt;td&gt;参数路径没走父目录的 ignore 匹配链&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;#2750&lt;/td&gt;
+&lt;td&gt;大 gitignore 文件内存爆炸&lt;/td&gt;
+&lt;td&gt;regex 引擎 eager cache（见第一节）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;#3173&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;.&lt;/code&gt; 作参数时，祖先 &lt;code&gt;.ignore&lt;/code&gt; 白名单的隐藏文件搜不到&lt;/td&gt;
+&lt;td&gt;隐藏文件过滤先于白名单求值&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;#3179&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;core.excludesfile&lt;/code&gt; 里的 &lt;code&gt;/.venv&lt;/code&gt; 这类 rooted 模式失效&lt;/td&gt;
+&lt;td&gt;绝对路径搜索时全局 gitignore 没做根目录归一化&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h1&gt;3179 尤其隐蔽，最初是在 helix 编辑器里发现的，因为 helix 的文件选择器直接用 &lt;code&gt;ignore&lt;/code&gt; crate 的 &lt;code&gt;WalkBuilder&lt;/code&gt;。全局 gitignore 里写 &lt;code&gt;/.venv&lt;/code&gt;（只在仓库根忽略），命令行 &lt;code&gt;rg&lt;/code&gt; 下工作正常，一换到"给绝对路径"就失效，因为 rooted 模式得先知道根在哪，绝对路径把根信息抹掉了。&lt;/h1&gt;
+&lt;p&gt;同版本还加了个小功能：&lt;code&gt;.jj&lt;/code&gt; 目录现在被当作 git 仓库对待（PR #2842）。用 Jujutsu 的人终于不用手动 &lt;code&gt;--no-ignore&lt;/code&gt;。&lt;/p&gt;
+&lt;h2&gt;四、glob 支持嵌套花括号&lt;/h2&gt;
+&lt;p&gt;PR #3048（&lt;code&gt;+46 -30&lt;/code&gt;）实用性很高。以前想同时选中 &lt;code&gt;node_modules&lt;/code&gt; 下的 ts/js 和 &lt;code&gt;crates&lt;/code&gt; 下的 rs/toml，得写两条 &lt;code&gt;-g&lt;/code&gt;。现在一条就够：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;rg --files -g &amp;#39;**/{node_modules/**/*/{ts,js},crates/**/*.{rs,toml}}&amp;#39;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;我在本地跑了几组对照，目录里只有 &lt;code&gt;a.rs b.py c.txt sub/d.rs sub/e.py&lt;/code&gt;：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;$&lt;span class="w"&gt; &lt;/span&gt;rg&lt;span class="w"&gt; &lt;/span&gt;--files&lt;span class="w"&gt; &lt;/span&gt;-g&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s1"&gt;&amp;#39;*.{rs,py}&amp;#39;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;.
+./a.rs&lt;span class="w"&gt; &lt;/span&gt;./b.py&lt;span class="w"&gt; &lt;/span&gt;./sub/d.rs&lt;span class="w"&gt; &lt;/span&gt;./sub/e.py&lt;span class="w"&gt;          &lt;/span&gt;&lt;span class="c1"&gt;# 4 个文件，正确&lt;/span&gt;
+
+$&lt;span class="w"&gt; &lt;/span&gt;rg&lt;span class="w"&gt; &lt;/span&gt;--files&lt;span class="w"&gt; &lt;/span&gt;-g&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s1"&gt;&amp;#39;*.{rs,{py,txt}}&amp;#39;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;.
+./a.rs&lt;span class="w"&gt; &lt;/span&gt;./b.py&lt;span class="w"&gt; &lt;/span&gt;./c.txt&lt;span class="w"&gt; &lt;/span&gt;./sub/d.rs&lt;span class="w"&gt; &lt;/span&gt;./sub/e.py&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="c1"&gt;# 三层嵌套，正确&lt;/span&gt;
+
+$&lt;span class="w"&gt; &lt;/span&gt;rg&lt;span class="w"&gt; &lt;/span&gt;--files&lt;span class="w"&gt; &lt;/span&gt;-g&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s1"&gt;&amp;#39;*.{rs,py&amp;#39;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;.
+rg:&lt;span class="w"&gt; &lt;/span&gt;error&lt;span class="w"&gt; &lt;/span&gt;parsing&lt;span class="w"&gt; &lt;/span&gt;glob&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s1"&gt;&amp;#39;*.{rs,py&amp;#39;&lt;/span&gt;:&lt;span class="w"&gt; &lt;/span&gt;unclosed&lt;span class="w"&gt; &lt;/span&gt;alternate&lt;span class="w"&gt; &lt;/span&gt;group&lt;span class="p"&gt;;&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;missing&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s1"&gt;&amp;#39;}&amp;#39;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;(&lt;/span&gt;maybe&lt;span class="w"&gt; &lt;/span&gt;escape&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s1"&gt;&amp;#39;{&amp;#39;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;with&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s1"&gt;&amp;#39;[{]&amp;#39;&lt;/span&gt;?&lt;span class="o"&gt;)&lt;/span&gt;
+&lt;span class="w"&gt;                                             &lt;/span&gt;&lt;span class="c1"&gt;# exit 2，报错信息相当友好&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;最后一条是我最想强调的：&lt;strong&gt;glob 的逗号只有落在 &lt;code&gt;{}&lt;/code&gt; 里才是分隔符&lt;/strong&gt;。看 &lt;code&gt;glob.rs&lt;/code&gt; 的 &lt;code&gt;parse_comma()&lt;/code&gt; 就明白：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="k"&gt;fn&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nf"&gt;parse_comma&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;&amp;amp;&lt;/span&gt;&lt;span class="k"&gt;mut&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;-&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nb"&gt;Result&lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="p"&gt;(),&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;Error&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="c1"&gt;// If we aren&amp;#39;t inside a group alternation, then don&amp;#39;t&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="c1"&gt;// treat commas specially.&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="k"&gt;if&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;alternates_stack&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;is_empty&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;push_token&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Token&lt;/span&gt;&lt;span class="p"&gt;::&lt;/span&gt;&lt;span class="n"&gt;Literal&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="sc"&gt;&amp;#39;,&amp;#39;&lt;/span&gt;&lt;span class="p"&gt;))&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="k"&gt;else&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;{&lt;/span&gt;
+&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="nb"&gt;Ok&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;branches&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="n"&gt;push&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Tokens&lt;/span&gt;&lt;span class="p"&gt;::&lt;/span&gt;&lt;span class="n"&gt;default&lt;/span&gt;&lt;span class="p"&gt;()))&lt;/span&gt;
+&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;嵌套的实现是把"当前分支栈"做成 &lt;code&gt;Vec&amp;lt;Tokens&amp;gt;&lt;/code&gt;：&lt;code&gt;{&lt;/code&gt; 压入新分支、&lt;code&gt;}&lt;/code&gt; 弹栈合并成 &lt;code&gt;Token::Alternates&lt;/code&gt;、&lt;code&gt;,&lt;/code&gt; 在当前层切分支。解析完如果 &lt;code&gt;branches.len() &amp;gt; 1&lt;/code&gt;，说明有没闭合的 &lt;code&gt;{&lt;/code&gt;，直接抛 &lt;code&gt;UnclosedAlternates&lt;/code&gt;。结构和手写表达式解析器没有区别，改动量自然小。&lt;/p&gt;
+&lt;h2&gt;五、顺手能用的组合：&lt;code&gt;-r&lt;/code&gt; 和 &lt;code&gt;--json&lt;/code&gt; 一起用&lt;/h2&gt;
+&lt;p&gt;15 版让 &lt;code&gt;--replace&lt;/code&gt; 的替换结果直接进 JSON 的 submatch 对象（#1872）。实测：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;$&lt;span class="w"&gt; &lt;/span&gt;rg&lt;span class="w"&gt; &lt;/span&gt;-r&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s1"&gt;&amp;#39;BAZ&amp;#39;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;--json&lt;span class="w"&gt; &lt;/span&gt;foo&lt;span class="w"&gt; &lt;/span&gt;r.txt
+&lt;span class="o"&gt;{&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;type&amp;quot;&lt;/span&gt;:&lt;span class="s2"&gt;&amp;quot;match&amp;quot;&lt;/span&gt;,&lt;span class="s2"&gt;&amp;quot;data&amp;quot;&lt;/span&gt;:&lt;span class="o"&gt;{&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;path&amp;quot;&lt;/span&gt;:&lt;span class="o"&gt;{&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;text&amp;quot;&lt;/span&gt;:&lt;span class="s2"&gt;&amp;quot;r.txt&amp;quot;&lt;/span&gt;&lt;span class="o"&gt;}&lt;/span&gt;,&lt;span class="s2"&gt;&amp;quot;lines&amp;quot;&lt;/span&gt;:&lt;span class="o"&gt;{&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;text&amp;quot;&lt;/span&gt;:&lt;span class="s2"&gt;&amp;quot;foo\n&amp;quot;&lt;/span&gt;&lt;span class="o"&gt;}&lt;/span&gt;,
+&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;line_number&amp;quot;&lt;/span&gt;:1,&lt;span class="s2"&gt;&amp;quot;absolute_offset&amp;quot;&lt;/span&gt;:0,
+&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;submatches&amp;quot;&lt;/span&gt;:&lt;span class="o"&gt;[{&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;match&amp;quot;&lt;/span&gt;:&lt;span class="o"&gt;{&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;text&amp;quot;&lt;/span&gt;:&lt;span class="s2"&gt;&amp;quot;foo&amp;quot;&lt;/span&gt;&lt;span class="o"&gt;}&lt;/span&gt;,
+&lt;span class="w"&gt;                &lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;replacement&amp;quot;&lt;/span&gt;:&lt;span class="o"&gt;{&lt;/span&gt;&lt;span class="s2"&gt;&amp;quot;text&amp;quot;&lt;/span&gt;:&lt;span class="s2"&gt;&amp;quot;BAZ&amp;quot;&lt;/span&gt;&lt;span class="o"&gt;}&lt;/span&gt;,&lt;span class="s2"&gt;&amp;quot;start&amp;quot;&lt;/span&gt;:0,&lt;span class="s2"&gt;&amp;quot;end&amp;quot;&lt;/span&gt;:3&lt;span class="o"&gt;}]}}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;以前要自己按 &lt;code&gt;start/end&lt;/code&gt; 切片再拼接，现在引擎替你算好。写代码审计工具、批量重命名脚本的时候，这条能省掉一整段字符串处理逻辑。&lt;/p&gt;
+&lt;h2&gt;我的做法&lt;/h2&gt;
+&lt;p&gt;配置里三件事。&lt;/p&gt;
+&lt;p&gt;&lt;code&gt;~/.config/ripgrep/config&lt;/code&gt; 只放默认行为，不放一次性开关。&lt;code&gt;--type-add&lt;/code&gt; 这类要长期生效的才写进去：&lt;/p&gt;
+&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="nx"&gt;smart&lt;/span&gt;&lt;span class="o"&gt;-&lt;/span&gt;&lt;span class="k"&gt;case&lt;/span&gt;
+&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="k"&gt;type&lt;/span&gt;&lt;span class="o"&gt;-&lt;/span&gt;&lt;span class="nx"&gt;add&lt;/span&gt;&lt;span class="p"&gt;=&lt;/span&gt;&lt;span class="nx"&gt;crack&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;.{&lt;/span&gt;&lt;span class="nx"&gt;hash&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="nx"&gt;pot&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="nx"&gt;rule&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="k"&gt;type&lt;/span&gt;&lt;span class="o"&gt;-&lt;/span&gt;&lt;span class="nx"&gt;add&lt;/span&gt;&lt;span class="p"&gt;=&lt;/span&gt;&lt;span class="nx"&gt;log&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;&lt;span class="o"&gt;*&lt;/span&gt;&lt;span class="p"&gt;.{&lt;/span&gt;&lt;span class="nx"&gt;log&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="nx"&gt;out&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="nx"&gt;err&lt;/span&gt;&lt;span class="p"&gt;}&lt;/span&gt;
+&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
+
+&lt;p&gt;大 &lt;code&gt;-A&lt;/code&gt; 加管道的场景用 &lt;code&gt;--stats&lt;/code&gt; 观察是否还在空转。&lt;code&gt;bytes_searched&lt;/code&gt; 和 &lt;code&gt;elapsed&lt;/code&gt; 的比例异常（只搜了 2 MB 却花了 10 秒），基本就是缓冲没填满在反复扫描。&lt;/p&gt;
+&lt;p&gt;第三件事是这次读源码最大的收获。ripgrep 的整个 15.0 大版本几乎没有用户可见的新功能，全部产出是把上一版埋下的坑填掉。一个维护了十几年的工具还在用这种密度修 bug，这比任何新特性都说明问题。工具的可靠性不是发布时声明的，是 issue 号一条条攒出来的。&lt;/p&gt;</content></entry><entry><title>一个不可见注释 + 一张 1x1 像素：CamoLeak 如何零点击偷走私仓源码</title><link href="posts/2026-10-17-camoleak-copilot-camo-csp-bypass.html" rel="alternate"/><published>2026-10-17T00:00:00+08:00</published><updated>2026-10-17T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-10-17:posts/2026-10-17-camoleak-copilot-camo-csp-bypass.html</id><summary type="html">&lt;ul&gt;
 &lt;li&gt;AI安全&lt;/li&gt;
 &lt;li&gt;提示注入&lt;/li&gt;
 &lt;li&gt;CSP绕过&lt;/li&gt;
@@ -10117,421 +10309,4 @@ reboot
 &lt;/ol&gt;
 &lt;p&gt;NVIDIA 应该尽快把 Vera 硬件送到独立评测者手上，放开频率、功耗、工作负载限制。如果 Vera 真的像架构设计暗示的那么强，那些测试会比把 x86 SMT 画成两车道红绿灯有说服力得多。&lt;/p&gt;
 &lt;hr /&gt;
-&lt;p&gt;&lt;em&gt;参考来源：&lt;a href="https://chipsandcheese.com/p/nvidias-vera-whitepaper-has-a-thread"&gt;Chips and Cheese - NVIDIA's Vera Whitepaper Has a Thread Loose&lt;/a&gt; / &lt;a href="https://resources.nvidia.com/en-us-vera-cpu"&gt;NVIDIA Vera Whitepaper&lt;/a&gt; / Phoronix Vera benchmarks&lt;/em&gt;&lt;/p&gt;</content></entry><entry><title>GhostAccess：跨租户 GPU 侧信道攻击技术深度分析</title><link href="posts/2026-08-05-ghostaccesskua-zu-hu-gpuce-xin-dao-gong-ji-ji-zhu-shen-du-fen-xi.html" rel="alternate"/><published>2026-08-05T00:00:00+08:00</published><updated>2026-08-05T00:00:00+08:00</updated><author><name>Kane</name></author><id>tag:None,2026-08-05:posts/2026-08-05-ghostaccesskua-zu-hu-gpuce-xin-dao-gong-ji-ji-zhu-shen-du-fen-xi.html</id><summary type="html">&lt;ul&gt;
-&lt;li&gt;技术
-slug: ghostaccess跨租户gpu侧信道攻击技术深度分析&lt;/li&gt;
-&lt;/ul&gt;
-&lt;hr /&gt;
-&lt;h2&gt;一、论文信息与研究背景&lt;/h2&gt;
-&lt;h3&gt;1.1 论文信息&lt;/h3&gt;
-&lt;ul&gt;
-&lt;li&gt;&lt;strong&gt;标题&lt;/strong&gt;：GhostAccess: Attacking the GPU on the Multi-tenant Cloud via CPU LLC under Unified Memory&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;作者&lt;/strong&gt;：Zihao Dan, Shinan Liu, Shuwen Deng, Yanan Guo, Yinqian Zhang, Dongsheng Wang …&lt;/li&gt;&lt;/ul&gt;</summary><content type="html">&lt;ul&gt;
-&lt;li&gt;技术
-slug: ghostaccess跨租户gpu侧信道攻击技术深度分析&lt;/li&gt;
-&lt;/ul&gt;
-&lt;hr /&gt;
-&lt;h2&gt;一、论文信息与研究背景&lt;/h2&gt;
-&lt;h3&gt;1.1 论文信息&lt;/h3&gt;
-&lt;ul&gt;
-&lt;li&gt;&lt;strong&gt;标题&lt;/strong&gt;：GhostAccess: Attacking the GPU on the Multi-tenant Cloud via CPU LLC under Unified Memory&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;作者&lt;/strong&gt;：Zihao Dan, Shinan Liu, Shuwen Deng, Yanan Guo, Yinqian Zhang, Dongsheng Wang, Yun Chen&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;机构&lt;/strong&gt;：香港科技大学（广州）&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;会议&lt;/strong&gt;：MICRO 2026（第 59 届 IEEE/ACM 国际微体系结构会议，2026 年 10 月，希腊雅典）&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;披露状态&lt;/strong&gt;：已负责任披露给 NVIDIA 安全团队并得到确认&lt;/li&gt;
-&lt;/ul&gt;
-&lt;h3&gt;1.2 研究背景&lt;/h3&gt;
-&lt;p&gt;公有云 GPU 实例已成为大模型训练与推理的基础设施。云厂商普遍以 NVIDIA 的 MIG（Multi-Instance GPU）、vGPU、MPS 等机制向多个租户共享同一颗物理 GPU，并承诺计算、缓存、内存控制器等资源在租户间物理隔离。GhostAccess 的核心贡献在于揭示了一个被长期忽视的耦合路径：&lt;strong&gt;GPU 通过 CUDA 统一内存（Unified Memory, UM）向系统内存写入数据时，数据会被强制加载到 CPU 的末级缓存（LLC）中，而下级缓存对应行被失效&lt;/strong&gt;。这一行为类似于 Intel DDIO（Data Direct I/O），但从未在 NVIDIA 官方文档中被描述。&lt;/p&gt;
-&lt;p&gt;由于 CPU LLC 是跨租户共享资源，攻击者只要在 CPU 侧租户上运行 Prime+Probe，就能观测到 GPU 侧租户通过 UM 写操作留下的 LLC 痕迹，从而在两个物理隔离的租户之间建立侧信道与隐蔽信道。这是首个攻击者完全不需要 GPU 访问权限、且 MIG 隔离对其近乎无效的跨租户 GPU 攻击。&lt;/p&gt;
-&lt;h2&gt;二、核心发现：UVM 一致性行为逆向&lt;/h2&gt;
-&lt;h3&gt;2.1 统一虚拟内存（UVM）机制&lt;/h3&gt;
-&lt;p&gt;CUDA Unified Memory（统一内存）为 CPU 与 GPU 提供统一的虚拟地址空间，由驱动与硬件协作完成页迁移与一致性维护。开发者通过 &lt;code&gt;cudaMallocManaged&lt;/code&gt; 分配内存，并通过 &lt;code&gt;cudaMemAdvise&lt;/code&gt; 系列接口向驱动提供迁移提示。其中 &lt;code&gt;cudaMemAdviseSetPreferredLocation&lt;/code&gt; 用于将某段内存的"首选位置"固定到指定设备。&lt;/p&gt;
-&lt;p&gt;当 GPU 通过此类 UM 映射向系统内存（host memory）写入数据时，驱动与一致性协议会触发一条特殊的数据路径，这条路径的缓存行为是 GhostAccess 的攻击根基。&lt;/p&gt;
-&lt;h3&gt;2.2 关键技术发现&lt;/h3&gt;
-&lt;p&gt;GhostAccess 首次系统性逆向了 UVM 中未被文档记录的、针对 CPU 侧缓存的一致性行为：&lt;/p&gt;
-&lt;ul&gt;
-&lt;li&gt;&lt;strong&gt;GPU 写操作&lt;/strong&gt;：当 GPU 通过 &lt;code&gt;cudaMemAdviseSetPreferredLocation&lt;/code&gt; 建立映射并向系统内存写入数据时，数据被&lt;strong&gt;直接加载到 CPU 的 LLC 中&lt;/strong&gt;，且下级缓存（L1/L2）对应行被失效（invalidate）。这一行为类似 Intel DDIO，使数据驻留在 LLC 以便 CPU 快速访问。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;GPU 读操作&lt;/strong&gt;：不改变 CPU 缓存状态，不会在 LLC 留下痕迹。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;时序特征&lt;/strong&gt;：GPU 写操作发生后，CPU 端访问该地址的延迟稳定降至 LLC 命中级别（约 160 cycles）；若 GPU 未写过，CPU 访问需穿透到下级缓存或内存（约 300+ cycles）。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;平台验证&lt;/strong&gt;：在 5 种 CPU+GPU 组合上验证（覆盖阿里云、AWS 等公有云环境），行为一致。&lt;/li&gt;
-&lt;/ul&gt;
-&lt;p&gt;下图刻画了 GPU 写操作引发的双向缓存状态变化：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="c"&gt;            GPU 侧 (租户 A)                     CPU 侧 (共享 LLC)&lt;/span&gt;
-&lt;span class="c"&gt;   &lt;/span&gt;&lt;span class="nb"&gt;+-------------------------+&lt;/span&gt;&lt;span class="c"&gt;        &lt;/span&gt;&lt;span class="nb"&gt;+----------------------------------+&lt;/span&gt;
-&lt;span class="c"&gt;   | cudaMemAdviseSetPrefLoc  |        |   LLC (末级缓存&lt;/span&gt;&lt;span class="nt"&gt;,&lt;/span&gt;&lt;span class="c"&gt; 跨租户共享)       |&lt;/span&gt;
-&lt;span class="c"&gt;   |   建立系统内存 UM 映射     |        |  &lt;/span&gt;&lt;span class="nb"&gt;+-----+&lt;/span&gt;&lt;span class="c"&gt; &lt;/span&gt;&lt;span class="nb"&gt;+-----+&lt;/span&gt;&lt;span class="c"&gt; &lt;/span&gt;&lt;span class="nb"&gt;+-----+&lt;/span&gt;&lt;span class="c"&gt; &lt;/span&gt;&lt;span class="nb"&gt;+-----+&lt;/span&gt;&lt;span class="c"&gt; |&lt;/span&gt;
-&lt;span class="c"&gt;   &lt;/span&gt;&lt;span class="nb"&gt;+-------------------------+&lt;/span&gt;&lt;span class="c"&gt;        |  |set 0| |set 1| |set 2| |&lt;/span&gt;&lt;span class="nt"&gt;...&lt;/span&gt;&lt;span class="c"&gt;  | |&lt;/span&gt;
-&lt;span class="c"&gt;                |                     |  &lt;/span&gt;&lt;span class="nb"&gt;+-----+&lt;/span&gt;&lt;span class="c"&gt; &lt;/span&gt;&lt;span class="nb"&gt;+-----+&lt;/span&gt;&lt;span class="c"&gt; &lt;/span&gt;&lt;span class="nb"&gt;+-----+&lt;/span&gt;&lt;span class="c"&gt; &lt;/span&gt;&lt;span class="nb"&gt;+-----+&lt;/span&gt;&lt;span class="c"&gt; |&lt;/span&gt;
-&lt;span class="c"&gt;                v                     |      ^            ^                |&lt;/span&gt;
-&lt;span class="c"&gt;   &lt;/span&gt;&lt;span class="nb"&gt;+-------------------------+&lt;/span&gt;&lt;span class="c"&gt;        |      |            |                |&lt;/span&gt;
-&lt;span class="c"&gt;   |   GPU 写系统内存 (UM)    |&lt;/span&gt;&lt;span class="nb"&gt;--------+------+------------+&lt;/span&gt;&lt;span class="c"&gt;                |&lt;/span&gt;
-&lt;span class="c"&gt;   |   数据强制加载到 CPU LLC |        |  数据驻留 LLC (命中 ~160 cyc)      |&lt;/span&gt;
-&lt;span class="c"&gt;   &lt;/span&gt;&lt;span class="nb"&gt;+-------------------------+&lt;/span&gt;&lt;span class="c"&gt;        |  下级 L1/L2 对应行被失效           |&lt;/span&gt;
-&lt;span class="c"&gt;                                     &lt;/span&gt;&lt;span class="nb"&gt;+----------------------------------+&lt;/span&gt;
-&lt;span class="c"&gt;            GPU 读操作 &lt;/span&gt;&lt;span class="nb"&gt;--&lt;/span&gt;&lt;span class="nv"&gt;&amp;gt;&lt;/span&gt;&lt;span class="c"&gt; 不改变 CPU 缓存状态 (无痕迹)&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;h3&gt;2.3 攻击可行性根源&lt;/h3&gt;
-&lt;p&gt;这一发现的安全含义在于：GPU 厂商在实现跨设备内存优化时，隐式地让一个本应"属于 GPU"的写操作在 CPU 的共享 LLC 上留下了可观测的状态。而 LLC 恰恰是跨租户共享且经典侧信道攻击（Prime+Probe）的主战场。于是，一个物理上分配给租户 A 的 GPU，通过 UM 写操作，在租户 B（CPU 侧）可见的 LLC 上"投下阴影"——这正是 GhostAccess 命名的由来。&lt;/p&gt;
-&lt;h2&gt;三、GPU 多租户共享隔离机制&lt;/h2&gt;
-&lt;p&gt;在分析攻击之前，需要先理解 GPU 多租户共享的三种主流隔离机制，以及它们各自的隔离边界。&lt;/p&gt;
-&lt;h3&gt;3.1 MIG（Multi-Instance GPU）&lt;/h3&gt;
-&lt;p&gt;MIG 是 NVIDIA 在 Ampere 架构（A100）引入的硬件级 GPU 分区技术，将一颗物理 GPU 空间分区为多个 GPU 实例（GI）：&lt;/p&gt;
-&lt;ul&gt;
-&lt;li&gt;每个 GI 拥有&lt;strong&gt;专用计算资源&lt;/strong&gt;（SMs/GPCs）&lt;/li&gt;
-&lt;li&gt;每个 GI 拥有&lt;strong&gt;专用 L2 缓存切片&lt;/strong&gt;&lt;/li&gt;
-&lt;li&gt;每个 GI 拥有&lt;strong&gt;专用内存控制器和 DRAM 通道&lt;/strong&gt;&lt;/li&gt;
-&lt;li&gt;NVIDIA 声称 MIG"确保一个 client 不能影响其他 client 的工作"&lt;/li&gt;
-&lt;li&gt;A100 最多 7 个 GI，H100 最多 7 个 GI&lt;/li&gt;
-&lt;/ul&gt;
-&lt;p&gt;MIG 的设计目标是提供强隔离的"GPU 切片"，使每个租户在计算、L2、显存层面互不可见。&lt;/p&gt;
-&lt;h3&gt;3.2 vGPU&lt;/h3&gt;
-&lt;p&gt;vGPU 采用内存分区共享 GPU、计算资源时间片共享的方式。现代部署中通常将 vGPU 与 MIG 结合：将专用 GI 分配给每个 VM，以获得更强的隔离。&lt;/p&gt;
-&lt;h3&gt;3.3 MPS（Multi-Process Service）&lt;/h3&gt;
-&lt;p&gt;MPS 允许多个 CUDA kernel 在同一 GPU 上并行执行，提升利用率。但 MPS &lt;strong&gt;不提供地址空间隔离或错误隔离&lt;/strong&gt;，不可用于多租户互不信任场景。&lt;/p&gt;
-&lt;p&gt;下图刻画了 GPU 多租户共享架构与各机制的隔离边界：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+================================================================+&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;                    &lt;/span&gt;&lt;span class="nt"&gt;物理&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;GPU&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;(&lt;/span&gt;&lt;span class="nt"&gt;A100&lt;/span&gt;&lt;span class="o"&gt;/&lt;/span&gt;&lt;span class="nt"&gt;H100&lt;/span&gt;&lt;span class="o"&gt;)&lt;/span&gt;&lt;span class="w"&gt;                        &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;                                                                &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="nt"&gt;-----------------&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="nt"&gt;-----------------&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="nt"&gt;-------------&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="nt"&gt;GI-0&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;(&lt;/span&gt;&lt;span class="nt"&gt;租户A&lt;/span&gt;&lt;span class="o"&gt;)&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="nt"&gt;GI-1&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;(&lt;/span&gt;&lt;span class="nt"&gt;租户B&lt;/span&gt;&lt;span class="o"&gt;)&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="nt"&gt;GI-2&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;...&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;专用&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;SMs&lt;/span&gt;&lt;span class="o"&gt;/&lt;/span&gt;&lt;span class="nt"&gt;GPCs&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;专用&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;SMs&lt;/span&gt;&lt;span class="o"&gt;/&lt;/span&gt;&lt;span class="nt"&gt;GPCs&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;             &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;专用&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;L2&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;切片&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;专用&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;L2&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;切片&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;             &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;专用&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;DRAM&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;通道&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;专用&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;DRAM&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;通道&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;             &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="nt"&gt;-----------------&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="nt"&gt;-----------------&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="nt"&gt;-------------&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;          &lt;/span&gt;&lt;span class="nt"&gt;MIG&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;硬件分区边界&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;(&lt;/span&gt;&lt;span class="nt"&gt;计算&lt;/span&gt;&lt;span class="o"&gt;/&lt;/span&gt;&lt;span class="nt"&gt;L2&lt;/span&gt;&lt;span class="o"&gt;/&lt;/span&gt;&lt;span class="nt"&gt;DRAM&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;隔离&lt;/span&gt;&lt;span class="o"&gt;)&lt;/span&gt;&lt;span class="w"&gt;                   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;                                                                &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="nt"&gt;--&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;MPS&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;kernel&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;并行&lt;/span&gt;&lt;span class="o"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;无地址&lt;/span&gt;&lt;span class="o"&gt;/&lt;/span&gt;&lt;span class="nt"&gt;错误隔离&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;(&lt;/span&gt;&lt;span class="nt"&gt;不可用于互不信任&lt;/span&gt;&lt;span class="o"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;--&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt;&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="nt"&gt;--&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;vGPU&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;内存分区&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="nt"&gt;时间片&lt;/span&gt;&lt;span class="o"&gt;;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="nt"&gt;MIG&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;则分配专用&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;GI&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;给&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;VM&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;--&lt;/span&gt;&lt;span class="o"&gt;&amp;gt;&lt;/span&gt;&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+====================+===========================================+&lt;/span&gt;
-&lt;span class="w"&gt;                        &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;                        &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="nt"&gt;PCIe&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;/&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;C2C&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;Link&lt;/span&gt;
-&lt;span class="w"&gt;                        &lt;/span&gt;&lt;span class="nt"&gt;v&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+================================================================+&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;              &lt;/span&gt;&lt;span class="nt"&gt;CPU&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;侧&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;(&lt;/span&gt;&lt;span class="nt"&gt;系统内存&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;LLC&lt;/span&gt;&lt;span class="o"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;跨租户共享&lt;/span&gt;&lt;span class="o"&gt;)&lt;/span&gt;&lt;span class="w"&gt;                &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="nt"&gt;-----------------&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="nt"&gt;-----------------&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt;                     &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="nt"&gt;CPU&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;租户&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;(&lt;/span&gt;&lt;span class="nt"&gt;A&lt;/span&gt;&lt;span class="o"&gt;)&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="nt"&gt;CPU&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;租户&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;(&lt;/span&gt;&lt;span class="nt"&gt;B&lt;/span&gt;&lt;span class="o"&gt;)&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;&amp;lt;&lt;/span&gt;&lt;span class="nt"&gt;--&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;GhostAccess&lt;/span&gt;&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="nt"&gt;共享&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;LLC&lt;/span&gt;&lt;span class="w"&gt;      &lt;/span&gt;&lt;span class="o"&gt;|&amp;lt;==|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="nt"&gt;共享&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;LLC&lt;/span&gt;&lt;span class="w"&gt;      &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;      &lt;/span&gt;&lt;span class="nt"&gt;攻击者在此&lt;/span&gt;&lt;span class="w"&gt;      &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="nt"&gt;-----------------&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="nt"&gt;-----------------&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="w"&gt;                     &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;          &lt;/span&gt;&lt;span class="nt"&gt;LLC&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;是跨租户共享资源&lt;/span&gt;&lt;span class="o"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;MIG&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;不隔离&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nt"&gt;LLC&lt;/span&gt;&lt;span class="w"&gt;                  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+================================================================+&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;关键观察：MIG 隔离了 GPU 内部的计算、L2 与 DRAM，却&lt;strong&gt;无法隔离 CPU 侧的 LLC&lt;/strong&gt;。一旦 GPU 的 UM 写操作把数据"溅射"到 CPU LLC，MIG 的硬件分区边界就被绕过了。&lt;/p&gt;
-&lt;h2&gt;四、GhostAccess 攻击原理与信息流&lt;/h2&gt;
-&lt;h3&gt;4.1 信息流架构&lt;/h3&gt;
-&lt;p&gt;GhostAccess 的攻击者完全在 CPU 侧操作，不需要任何 GPU 访问权限。攻击的信息流如下：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="err"&gt;受害租户&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;GPU&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt;                &lt;/span&gt;&lt;span class="n"&gt;CPU&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;系统内存&lt;/span&gt;&lt;span class="w"&gt;              &lt;/span&gt;&lt;span class="n"&gt;CPU&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;LLC&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;缓存状态&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+-------------+&lt;/span&gt;&lt;span class="w"&gt;               &lt;/span&gt;&lt;span class="o"&gt;+-------------+&lt;/span&gt;&lt;span class="w"&gt;          &lt;/span&gt;&lt;span class="o"&gt;+-----------------+&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="n"&gt;UM&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;映射写&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="err"&gt;写入数据&lt;/span&gt;&lt;span class="o"&gt;--&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;系统内存页&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="err"&gt;加载&lt;/span&gt;&lt;span class="o"&gt;--&amp;gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;LLC&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;缓存集变化&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;Trojan&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;               &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;host&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;mem&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;          &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="err"&gt;驱逐&lt;/span&gt;&lt;span class="o"&gt;/&lt;/span&gt;&lt;span class="err"&gt;驻留&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt;     &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+-------------+&lt;/span&gt;&lt;span class="w"&gt;               &lt;/span&gt;&lt;span class="o"&gt;+-------------+&lt;/span&gt;&lt;span class="w"&gt;          &lt;/span&gt;&lt;span class="o"&gt;+-----------------+&lt;/span&gt;
-&lt;span class="w"&gt;                                                                  &lt;/span&gt;&lt;span class="o"&gt;^&lt;/span&gt;
-&lt;span class="w"&gt;                                                                  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;观测&lt;/span&gt;
-&lt;span class="w"&gt;                                                                  &lt;/span&gt;&lt;span class="n"&gt;v&lt;/span&gt;
-&lt;span class="w"&gt;                                                    &lt;/span&gt;&lt;span class="o"&gt;+-------------------------+&lt;/span&gt;
-&lt;span class="w"&gt;                                                    &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;攻击者租户&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;CPU&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;                                                    &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;Prime&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="n"&gt;Probe&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;LLC&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;缓存集&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;                                                    &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="err"&gt;无需&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;GPU&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;权限&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt;         &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;                                                    &lt;/span&gt;&lt;span class="o"&gt;+-------------------------+&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;攻击者利用 Prime+Probe 监控特定 LLC 缓存集的驱逐情况：若 GPU 侧通过 UM 写入了映射到该缓存集的地址，攻击者 Prime 后该地址的数据驻留 LLC，Probe 时表现为命中（低延迟）；若 GPU 未写入，攻击者 Prime 的数据可能被驱逐或地址未驻留，Probe 表现为未命中（高延迟）。&lt;/p&gt;
-&lt;h3&gt;4.2 侧信道攻击原语：Prime+Yield+Probe&lt;/h3&gt;
-&lt;p&gt;由于受害者在 GPU 上执行，攻击者在 CPU 上无法直接控制时序同步。GhostAccess 设计了 Prime+Yield+Probe 三阶段原语：&lt;/p&gt;
-&lt;ol&gt;
-&lt;li&gt;&lt;strong&gt;Prime&lt;/strong&gt;：攻击者先用 eviction set 填充目标 LLC 缓存集，驱逐其他数据。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;Yield&lt;/strong&gt;：攻击者调用 &lt;code&gt;sched_yield()&lt;/code&gt; 让出 CPU 核心，等待受害 GPU 执行 UM 加速任务（此时 GPU 写操作改变 LLC 状态）。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;Probe&lt;/strong&gt;：攻击者重新探测缓存集，统计命中/未命中，收集执行轨迹。&lt;/li&gt;
-&lt;/ol&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="err"&gt;时间轴&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;------------------------------------------------------------&amp;gt;&lt;/span&gt;
-
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="err"&gt;攻击者&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;CPU&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;Prime&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;填充&lt;/span&gt;&lt;span class="nf"&gt;set&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;sched_yield&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;让出&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;&lt;span class="o"&gt;----&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;Probe&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;探测统计&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;
-&lt;span class="w"&gt;                                        &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;                    &lt;/span&gt;&lt;span class="o"&gt;^&lt;/span&gt;
-&lt;span class="w"&gt;                                        &lt;/span&gt;&lt;span class="n"&gt;v&lt;/span&gt;&lt;span class="w"&gt;                    &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="err"&gt;受害者&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;GPU&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;&lt;span class="w"&gt;                &lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="n"&gt;UM&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;加速任务执行&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;&lt;span class="w"&gt;                &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;                                    &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="n"&gt;GPU&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;写系统内存&lt;/span&gt;&lt;span class="w"&gt;            &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;                                    &lt;/span&gt;&lt;span class="n"&gt;v&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="err"&gt;数据加载到&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="n"&gt;LLC&lt;/span&gt;&lt;span class="w"&gt;           &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="n"&gt;LLC&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;状态&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;&lt;span class="w"&gt;    &lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="nf"&gt;set&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;被攻击者填充&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;--&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="nf"&gt;set&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;被&lt;/span&gt;&lt;span class="n"&gt;GPU写驱逐&lt;/span&gt;&lt;span class="o"&gt;/&lt;/span&gt;&lt;span class="err"&gt;驻留&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;--&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="err"&gt;攻击者探测命中模式&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;
-&lt;span class="w"&gt;                                                                     &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;                                                          &lt;/span&gt;&lt;span class="err"&gt;解码&lt;/span&gt;&lt;span class="o"&gt;:&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="err"&gt;命中&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;~&lt;/span&gt;&lt;span class="mi"&gt;160&lt;/span&gt;&lt;span class="n"&gt;cyc&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;
-&lt;span class="w"&gt;                                                                &lt;/span&gt;&lt;span class="err"&gt;未命中&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="o"&gt;~&lt;/span&gt;&lt;span class="mi"&gt;300&lt;/span&gt;&lt;span class="n"&gt;cyc&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="mi"&gt;0&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;h3&gt;4.3 隐蔽信道攻击原语：Trojan-Spy 通信&lt;/h3&gt;
-&lt;p&gt;在隐蔽信道场景中，攻击者同时控制 GPU 侧的 Trojan 与 CPU 侧的 Spy，二者通过 LLC 状态传递信息：&lt;/p&gt;
-&lt;ul&gt;
-&lt;li&gt;&lt;strong&gt;Trojan（受害 GPU 上）&lt;/strong&gt;：通过 UM 映射写内存编码比特 &lt;code&gt;1&lt;/code&gt;（不写代表 &lt;code&gt;0&lt;/code&gt;）。GPU 写操作会把数据加载到 CPU LLC。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;Spy（攻击者 CPU 端）&lt;/strong&gt;：通过 Prime+Probe 监控 LLC 缓存集驱逐解码。LLC 命中（约 160 cycles）表示 GPU 写过（比特 &lt;code&gt;1&lt;/code&gt;），未命中（约 300+ cycles）表示 GPU 未写（比特 &lt;code&gt;0&lt;/code&gt;）。&lt;/li&gt;
-&lt;/ul&gt;
-&lt;h2&gt;五、攻击原语代码示例&lt;/h2&gt;
-&lt;p&gt;下面给出 GhostAccess 攻击的概念性伪代码，用于说明攻击原理。&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="c1"&gt;# GhostAccess 攻击概念伪代码&lt;/span&gt;
-&lt;span class="kn"&gt;import&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nn"&gt;ctypes&lt;/span&gt;
-&lt;span class="kn"&gt;import&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nn"&gt;time&lt;/span&gt;
-&lt;span class="kn"&gt;import&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nn"&gt;sched&lt;/span&gt;
-
-&lt;span class="c1"&gt;# 攻击者（CPU侧租户）—— Prime+Yield+Probe&lt;/span&gt;
-&lt;span class="k"&gt;class&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nc"&gt;GhostAccessAttacker&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;
-    &lt;span class="k"&gt;def&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="fm"&gt;__init__&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;target_cache_set&lt;/span&gt;&lt;span class="p"&gt;):&lt;/span&gt;
-        &lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;cache_set&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;target_cache_set&lt;/span&gt;
-
-    &lt;span class="k"&gt;def&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nf"&gt;prime&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;):&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="sd"&gt;&amp;quot;&amp;quot;&amp;quot;填充目标缓存集，驱逐其他数据&amp;quot;&amp;quot;&amp;quot;&lt;/span&gt;
-        &lt;span class="c1"&gt;# 通过eviction set填充特定LLC缓存集&lt;/span&gt;
-        &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="n"&gt;addr&lt;/span&gt; &lt;span class="ow"&gt;in&lt;/span&gt; &lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;eviction_set&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;
-            &lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;read_cached&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;addr&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-
-    &lt;span class="k"&gt;def&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nf"&gt;yield_and_wait&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;duration_ms&lt;/span&gt;&lt;span class="p"&gt;):&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="sd"&gt;&amp;quot;&amp;quot;&amp;quot;让出CPU核心，等待GPU执行UM操作&amp;quot;&amp;quot;&amp;quot;&lt;/span&gt;
-        &lt;span class="n"&gt;time&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;sleep&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;duration_ms&lt;/span&gt; &lt;span class="o"&gt;/&lt;/span&gt; &lt;span class="mf"&gt;1000.0&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-
-    &lt;span class="k"&gt;def&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nf"&gt;probe&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;):&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="sd"&gt;&amp;quot;&amp;quot;&amp;quot;探测缓存集，统计命中/未命中&amp;quot;&amp;quot;&amp;quot;&lt;/span&gt;
-        &lt;span class="n"&gt;timings&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="p"&gt;[]&lt;/span&gt;
-        &lt;span class="k"&gt;for&lt;/span&gt; &lt;span class="n"&gt;addr&lt;/span&gt; &lt;span class="ow"&gt;in&lt;/span&gt; &lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;eviction_set&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;
-            &lt;span class="n"&gt;t0&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;time&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;perf_counter&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt;
-            &lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;read_cached&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;addr&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-            &lt;span class="n"&gt;t1&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;time&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;perf_counter&lt;/span&gt;&lt;span class="p"&gt;()&lt;/span&gt;
-            &lt;span class="n"&gt;timings&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;append&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;t1&lt;/span&gt; &lt;span class="o"&gt;-&lt;/span&gt; &lt;span class="n"&gt;t0&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-        &lt;span class="k"&gt;return&lt;/span&gt; &lt;span class="n"&gt;timings&lt;/span&gt;
-
-    &lt;span class="k"&gt;def&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nf"&gt;decode&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;timings&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;threshold&lt;/span&gt;&lt;span class="p"&gt;):&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="sd"&gt;&amp;quot;&amp;quot;&amp;quot;根据访问时间解码比特&amp;quot;&amp;quot;&amp;quot;&lt;/span&gt;
-        &lt;span class="c1"&gt;# LLC命中(~160 cycles) = &amp;#39;1&amp;#39;(GPU写过)&lt;/span&gt;
-        &lt;span class="c1"&gt;# LLC未命中(~300+ cycles) = &amp;#39;0&amp;#39;(GPU未写)&lt;/span&gt;
-        &lt;span class="k"&gt;return&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt; &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="nb"&gt;sum&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;timings&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="o"&gt;/&lt;/span&gt; &lt;span class="nb"&gt;len&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;timings&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt; &lt;span class="o"&gt;&amp;lt;&lt;/span&gt; &lt;span class="n"&gt;threshold&lt;/span&gt; &lt;span class="k"&gt;else&lt;/span&gt; &lt;span class="mi"&gt;0&lt;/span&gt;
-
-&lt;span class="c1"&gt;# 受害者（GPU侧租户）—— Trojan&lt;/span&gt;
-&lt;span class="k"&gt;class&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nc"&gt;GhostAccessTrojan&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;
-    &lt;span class="k"&gt;def&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="fm"&gt;__init__&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;um_mapped_addr&lt;/span&gt;&lt;span class="p"&gt;):&lt;/span&gt;
-        &lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;addr&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="n"&gt;um_mapped_addr&lt;/span&gt;  &lt;span class="c1"&gt;# UM映射的系统内存地址&lt;/span&gt;
-
-    &lt;span class="k"&gt;def&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nf"&gt;send_bit&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;bit&lt;/span&gt;&lt;span class="p"&gt;):&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="sd"&gt;&amp;quot;&amp;quot;&amp;quot;通过GPU UM写操作发送比特&amp;quot;&amp;quot;&amp;quot;&lt;/span&gt;
-        &lt;span class="k"&gt;if&lt;/span&gt; &lt;span class="n"&gt;bit&lt;/span&gt; &lt;span class="o"&gt;==&lt;/span&gt; &lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;
-            &lt;span class="c1"&gt;# GPU通过UM映射写内存 -&amp;gt; 数据加载到CPU LLC&lt;/span&gt;
-            &lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;gpu_write&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;addr&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;payload_data&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-        &lt;span class="c1"&gt;# bit == 0时不写，不改变CPU LLC状态&lt;/span&gt;
-
-    &lt;span class="k"&gt;def&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nf"&gt;send_byte&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt; &lt;span class="n"&gt;byte_val&lt;/span&gt;&lt;span class="p"&gt;):&lt;/span&gt;
-&lt;span class="w"&gt;        &lt;/span&gt;&lt;span class="sd"&gt;&amp;quot;&amp;quot;&amp;quot;并发发送8比特（利用GPU并行性）&amp;quot;&amp;quot;&amp;quot;&lt;/span&gt;
-        &lt;span class="c1"&gt;# 启动8个GPU线程，同时向映射到不同缓存集的地址写入&lt;/span&gt;
-        &lt;span class="n"&gt;kernel&lt;/span&gt; &lt;span class="o"&gt;=&lt;/span&gt; &lt;span class="bp"&gt;self&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;build_parallel_kernel&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;byte_val&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-        &lt;span class="n"&gt;kernel&lt;/span&gt;&lt;span class="o"&gt;.&lt;/span&gt;&lt;span class="n"&gt;launch&lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="n"&gt;num_threads&lt;/span&gt;&lt;span class="o"&gt;=&lt;/span&gt;&lt;span class="mi"&gt;8&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;需要注意，上述伪代码中的 &lt;code&gt;read_cached&lt;/code&gt;、&lt;code&gt;gpu_write&lt;/code&gt;、&lt;code&gt;build_parallel_kernel&lt;/code&gt; 等均为概念占位。实际实现中，攻击者需要构造 LLC eviction set（通过经典的缓存冲突地址推导）、并通过 CUDA UM API 完成 GPU 侧写操作。&lt;code&gt;decode&lt;/code&gt; 的阈值需根据具体平台的 LLC 命中/未命中延迟分布校准。&lt;/p&gt;
-&lt;h2&gt;六、并发传输算法&lt;/h2&gt;
-&lt;h3&gt;6.1 并行比特传输&lt;/h3&gt;
-&lt;p&gt;GhostAccess 的隐蔽信道性能得益于 GPU 的天然并行性。单个 GPU Kernel 可启动多线程，同时向映射到不同 LLC 缓存集的地址写入，从而在单轮时序内并行传输多个比特：&lt;/p&gt;
-&lt;ul&gt;
-&lt;li&gt;单个 GPU Kernel 启动 8 个线程，同时向 8 个不同 LLC 缓存集地址写入 → 单轮传输 8 比特（一个字节）&lt;/li&gt;
-&lt;li&gt;16 个 CPU 线程配合 GPU 并发传输，最终达到 1.02 Mbps 信道容量&lt;/li&gt;
-&lt;/ul&gt;
-&lt;h3&gt;6.2 并发传输流程&lt;/h3&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="nx"&gt;GPU&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;Kernel&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;单轮&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+---&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;thread&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="p"&gt;&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;UM写&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kd"&gt;addr&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="p"&gt;&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;LLC&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;set&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;比特0&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+---&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;thread&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="p"&gt;&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;UM写&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kd"&gt;addr&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="p"&gt;&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;LLC&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;set&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;比特1&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+---&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;thread&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="p"&gt;&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;UM写&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kd"&gt;addr&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="p"&gt;&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;LLC&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;set&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;2&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;比特2&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="w"&gt;       &lt;/span&gt;&lt;span class="o"&gt;...&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+---&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;thread&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;7&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="p"&gt;&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;UM写&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="kd"&gt;addr&lt;/span&gt;&lt;span class="p"&gt;[&lt;/span&gt;&lt;span class="mi"&gt;7&lt;/span&gt;&lt;span class="p"&gt;]&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="p"&gt;&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;LLC&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;set&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;7&lt;/span&gt;&lt;span class="w"&gt;  &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="nx"&gt;比特7&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-&lt;span class="w"&gt;                    &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;                    &lt;/span&gt;&lt;span class="nx"&gt;v&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="nx"&gt;单轮时序内并行传输&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;8&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;比特&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;1&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;byte&lt;/span&gt;&lt;span class="p"&gt;)&lt;/span&gt;
-
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="nx"&gt;CPU&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;侧&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="p"&gt;(&lt;/span&gt;&lt;span class="mi"&gt;16&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;线程并发&lt;/span&gt;&lt;span class="p"&gt;):&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="o"&gt;+---&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;CPU&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;thread&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="mi"&gt;0&lt;/span&gt;&lt;span class="p"&gt;.&lt;/span&gt;&lt;span class="m m-Double"&gt;.15&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="o"&gt;--&lt;/span&gt;&lt;span class="p"&gt;&amp;gt;&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;分别&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;Prime&lt;/span&gt;&lt;span class="o"&gt;+&lt;/span&gt;&lt;span class="nx"&gt;Probe&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;不同&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;set&lt;/span&gt;&lt;span class="p"&gt;,&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;配合&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;GPU&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;并发&lt;/span&gt;
-&lt;span class="w"&gt;                    &lt;/span&gt;&lt;span class="o"&gt;|&lt;/span&gt;
-&lt;span class="w"&gt;                    &lt;/span&gt;&lt;span class="nx"&gt;v&lt;/span&gt;
-&lt;span class="w"&gt;   &lt;/span&gt;&lt;span class="nx"&gt;汇总&lt;/span&gt;&lt;span class="p"&gt;:&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="m m-Double"&gt;1.02&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;Mbps&lt;/span&gt;&lt;span class="w"&gt; &lt;/span&gt;&lt;span class="nx"&gt;隐蔽信道容量&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;p&gt;这种设计巧妙地把 GPU 的大规模线程并行性"翻译"为 LLC 缓存集层面的并行比特通道，是 GhostAccess 达到高带宽的关键。&lt;/p&gt;
-&lt;h2&gt;七、攻击性能评估&lt;/h2&gt;
-&lt;p&gt;GhostAccess 在多种攻击场景下均表现出色：&lt;/p&gt;
-&lt;table&gt;
-&lt;thead&gt;
-&lt;tr&gt;
-&lt;th&gt;攻击场景&lt;/th&gt;
-&lt;th&gt;性能指标&lt;/th&gt;
-&lt;/tr&gt;
-&lt;/thead&gt;
-&lt;tbody&gt;
-&lt;tr&gt;
-&lt;td&gt;隐蔽信道&lt;/td&gt;
-&lt;td&gt;1.02 Mbps，错误率仅 0.3%&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;MIG 隔离有效性&lt;/td&gt;
-&lt;td&gt;开启 MIG 后信道容量仅降低 4.7%&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;ML 应用指纹识别&lt;/td&gt;
-&lt;td&gt;6 种 ML 应用，准确率 99.6%&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;K-means 参数提取&lt;/td&gt;
-&lt;td&gt;8 种配置，准确率 99.8%&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;CNN 架构窃取&lt;/td&gt;
-&lt;td&gt;8 种卷积核大小，准确率 99.6%&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;LLM 指纹识别&lt;/td&gt;
-&lt;td&gt;模型架构和大小，准确率 99.6%&lt;/td&gt;
-&lt;/tr&gt;
-&lt;/tbody&gt;
-&lt;/table&gt;
-&lt;h3&gt;7.1 隐蔽信道性能&lt;/h3&gt;
-&lt;p&gt;隐蔽信道达到 1.02 Mbps、错误率仅 0.3%，比此前最先进的跨租户隐蔽信道快 &lt;strong&gt;12.7 倍&lt;/strong&gt;。这一带宽足以在短时间内传输密钥、模型参数等敏感数据。&lt;/p&gt;
-&lt;h3&gt;7.2 MIG 无效性&lt;/h3&gt;
-&lt;p&gt;开启 MIG 后，信道容量仅降低 4.7%。这是因为 GhostAccess 的信号载体是 CPU LLC，而 MIG 仅隔离 GPU 内部资源，对 CPU LLC 毫无影响。这是 GhostAccess 区别于此前所有 GPU 侧信道攻击的根本特性——&lt;strong&gt;攻击者不需要任何 GPU 访问权限&lt;/strong&gt;。&lt;/p&gt;
-&lt;h3&gt;7.3 侧信道应用场景&lt;/h3&gt;
-&lt;p&gt;在侧信道场景下，攻击者可对受害 GPU 上的工作负载进行指纹识别与参数窃取：&lt;/p&gt;
-&lt;ul&gt;
-&lt;li&gt;&lt;strong&gt;ML 应用指纹&lt;/strong&gt;：通过 Prime+Yield+Probe 收集受害 GPU 上 ML 任务的执行轨迹，识别 6 种 ML 应用，准确率 99.6%。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;K-means 参数提取&lt;/strong&gt;：从聚类参数中恢复 8 种配置，准确率 99.8%。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;CNN 架构窃取&lt;/strong&gt;：窃取 8 种卷积核大小配置，准确率 99.6%，威胁模型知识产权。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;LLM 指纹&lt;/strong&gt;：识别大模型架构与大小，准确率 99.6%，可推断竞争对手的模型选型。&lt;/li&gt;
-&lt;/ul&gt;
-&lt;h2&gt;八、相关 GPU 侧信道攻击对比&lt;/h2&gt;
-&lt;p&gt;下表对比 GhostAccess 与其他 GPU 侧信道攻击：&lt;/p&gt;
-&lt;table&gt;
-&lt;thead&gt;
-&lt;tr&gt;
-&lt;th&gt;攻击&lt;/th&gt;
-&lt;th&gt;共享资源&lt;/th&gt;
-&lt;th&gt;需要GPU访问&lt;/th&gt;
-&lt;th&gt;MIG有效?&lt;/th&gt;
-&lt;th&gt;信道容量&lt;/th&gt;
-&lt;/tr&gt;
-&lt;/thead&gt;
-&lt;tbody&gt;
-&lt;tr&gt;
-&lt;td&gt;GhostAccess&lt;/td&gt;
-&lt;td&gt;CPU LLC&lt;/td&gt;
-&lt;td&gt;否&lt;/td&gt;
-&lt;td&gt;无效(仅降4.7%)&lt;/td&gt;
-&lt;td&gt;1.02 Mbps&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;Behind Bars&lt;/td&gt;
-&lt;td&gt;L2缓存(membars)&lt;/td&gt;
-&lt;td&gt;是&lt;/td&gt;
-&lt;td&gt;无效&lt;/td&gt;
-&lt;td&gt;未报告&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;Tunnels for Bootlegging&lt;/td&gt;
-&lt;td&gt;L3-TLB&lt;/td&gt;
-&lt;td&gt;是&lt;/td&gt;
-&lt;td&gt;无效&lt;/td&gt;
-&lt;td&gt;31 kbps&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;MIGraine&lt;/td&gt;
-&lt;td&gt;PCIe/UVM(页错误)&lt;/td&gt;
-&lt;td&gt;是&lt;/td&gt;
-&lt;td&gt;无效&lt;/td&gt;
-&lt;td&gt;未报告&lt;/td&gt;
-&lt;/tr&gt;
-&lt;tr&gt;
-&lt;td&gt;BarraCUDA&lt;/td&gt;
-&lt;td&gt;EM辐射&lt;/td&gt;
-&lt;td&gt;物理接触&lt;/td&gt;
-&lt;td&gt;N/A&lt;/td&gt;
-&lt;td&gt;参数级&lt;/td&gt;
-&lt;/tr&gt;
-&lt;/tbody&gt;
-&lt;/table&gt;
-&lt;h3&gt;8.1 Behind Bars（USENIX Security 2026）&lt;/h3&gt;
-&lt;ul&gt;
-&lt;li&gt;揭示 MIG 的 L2 缓存分区并非完全隔离&lt;/li&gt;
-&lt;li&gt;membars（内存屏障）可跨 MIG 实例传播&lt;/li&gt;
-&lt;li&gt;&lt;code&gt;LD.STRONG.GPU&lt;/code&gt; 指令在 membars 存在时变慢&lt;/li&gt;
-&lt;li&gt;首个跨 MIG 实例的缓存攻击，但仍需 GPU 访问权限&lt;/li&gt;
-&lt;/ul&gt;
-&lt;h3&gt;8.2 Tunnels for Bootlegging（CCS 2023）&lt;/h3&gt;
-&lt;ul&gt;
-&lt;li&gt;发现 MIG 不分区最后一级 TLB（L3-TLB）&lt;/li&gt;
-&lt;li&gt;所有 MIG 实例共享 L3-TLB&lt;/li&gt;
-&lt;li&gt;故意制造 L3-TLB 争用构建隐蔽信道&lt;/li&gt;
-&lt;li&gt;传输速度 31 kbps，准确率 99.8%&lt;/li&gt;
-&lt;/ul&gt;
-&lt;h3&gt;8.3 MIGraine&lt;/h3&gt;
-&lt;ul&gt;
-&lt;li&gt;利用 UVM 页错误中断产生跨 GI 干扰&lt;/li&gt;
-&lt;li&gt;页错误缓冲区跨 GI 共享&lt;/li&gt;
-&lt;li&gt;可指纹识别 LLM 工作负载，准确率 96%&lt;/li&gt;
-&lt;/ul&gt;
-&lt;p&gt;GhostAccess 与上述攻击的根本差异在于：&lt;strong&gt;它不需要攻击者拥有任何 GPU 访问权限&lt;/strong&gt;，攻击面完全在 CPU 侧的 LLC，而 MIG 对 LLC 无能为力，因此 MIG 隔离近乎完全失效。下图对比了各攻击在 MIG 隔离下的有效性：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="c"&gt;   MIG 隔离有效性对比 (信道容量衰减):&lt;/span&gt;
-
-&lt;span class="c"&gt;   GhostAccess          &lt;/span&gt;&lt;span class="k"&gt;[&lt;/span&gt;&lt;span class="c"&gt;████████████████████&lt;/span&gt;&lt;span class="k"&gt;]&lt;/span&gt;&lt;span class="c"&gt; 仅降 4&lt;/span&gt;&lt;span class="nt"&gt;.&lt;/span&gt;&lt;span class="c"&gt;7%  &lt;/span&gt;&lt;span class="nb"&gt;--&lt;/span&gt;&lt;span class="nv"&gt;&amp;gt;&lt;/span&gt;&lt;span class="c"&gt; MIG 无效&lt;/span&gt;
-&lt;span class="c"&gt;   Behind Bars          &lt;/span&gt;&lt;span class="k"&gt;[&lt;/span&gt;&lt;span class="c"&gt;MIG 对 L2 membars 无效&lt;/span&gt;&lt;span class="k"&gt;]&lt;/span&gt;&lt;span class="c"&gt;         &lt;/span&gt;&lt;span class="nb"&gt;--&lt;/span&gt;&lt;span class="nv"&gt;&amp;gt;&lt;/span&gt;&lt;span class="c"&gt; MIG 无效 (但需GPU访问)&lt;/span&gt;
-&lt;span class="c"&gt;   Tunnels for Bootleg&lt;/span&gt;&lt;span class="nt"&gt;.&lt;/span&gt;&lt;span class="c"&gt; &lt;/span&gt;&lt;span class="k"&gt;[&lt;/span&gt;&lt;span class="c"&gt;MIG 对 L3&lt;/span&gt;&lt;span class="nb"&gt;-&lt;/span&gt;&lt;span class="c"&gt;TLB 无效&lt;/span&gt;&lt;span class="k"&gt;]&lt;/span&gt;&lt;span class="c"&gt;              &lt;/span&gt;&lt;span class="nb"&gt;--&lt;/span&gt;&lt;span class="nv"&gt;&amp;gt;&lt;/span&gt;&lt;span class="c"&gt; MIG 无效 (但需GPU访问)&lt;/span&gt;
-&lt;span class="c"&gt;   MIGraine             &lt;/span&gt;&lt;span class="k"&gt;[&lt;/span&gt;&lt;span class="c"&gt;MIG 对页错误缓冲区无效&lt;/span&gt;&lt;span class="k"&gt;]&lt;/span&gt;&lt;span class="c"&gt;          &lt;/span&gt;&lt;span class="nb"&gt;--&lt;/span&gt;&lt;span class="nv"&gt;&amp;gt;&lt;/span&gt;&lt;span class="c"&gt; MIG 无效 (但需GPU访问)&lt;/span&gt;
-
-&lt;span class="c"&gt;   关键差异:&lt;/span&gt;
-&lt;span class="c"&gt;   &lt;/span&gt;&lt;span class="nb"&gt;+-------------------+----------------+-------------------+&lt;/span&gt;
-&lt;span class="c"&gt;   |  攻击者需要GPU?  |  攻击载体      |  MIG 能否阻断?    |&lt;/span&gt;
-&lt;span class="c"&gt;   &lt;/span&gt;&lt;span class="nb"&gt;+-------------------+----------------+-------------------+&lt;/span&gt;
-&lt;span class="c"&gt;   | GhostAccess: 否   |  CPU LLC       |  否 (仅降4&lt;/span&gt;&lt;span class="nt"&gt;.&lt;/span&gt;&lt;span class="c"&gt;7%)   |&lt;/span&gt;
-&lt;span class="c"&gt;   | 其他攻击:   是   |  GPU内部资源   |  否 (但需GPU权限) |&lt;/span&gt;
-&lt;span class="c"&gt;   &lt;/span&gt;&lt;span class="nb"&gt;+-------------------+----------------+-------------------+&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;h2&gt;九、防御方案&lt;/h2&gt;
-&lt;p&gt;针对 GhostAccess 揭示的攻击面，论文提出以下防御方向：&lt;/p&gt;
-&lt;ol&gt;
-&lt;li&gt;
-&lt;p&gt;&lt;strong&gt;重新审视缓存一致性策略&lt;/strong&gt;：在跨设备内存映射（如 UM 写操作）时，限制类似 DDIO 的行为，避免 GPU 写操作强制将数据加载到 CPU LLC。可考虑将 GPU 写入的系统内存数据绕过 LLC 或仅驻留在 GPU 专用缓存路径。&lt;/p&gt;
-&lt;/li&gt;
-&lt;li&gt;
-&lt;p&gt;&lt;strong&gt;CPU 侧缓存集按租户隔离&lt;/strong&gt;：对 LLC 缓存集实施租户级分区（如基于 Intel CAT/AMD L3 CAT 技术），确保不同租户的 LLC 使用互不重叠，从物理上切断 Prime+Probe 的观测路径。&lt;/p&gt;
-&lt;/li&gt;
-&lt;li&gt;
-&lt;p&gt;&lt;strong&gt;切断跨租户 UM 映射路径&lt;/strong&gt;：在云调度层限制或禁用跨租户场景下的 UM 系统内存映射，或在 hypervisor 层对 UM 写操作引入额外隔离。&lt;/p&gt;
-&lt;/li&gt;
-&lt;li&gt;
-&lt;p&gt;&lt;strong&gt;L3-TLB 按 GI 分区&lt;/strong&gt;：针对 Tunnels for Bootlegging 揭示的缺陷，将 L3-TLB 按 MIG 实例分区，消除共享 TLB 带来的侧信道。&lt;/p&gt;
-&lt;/li&gt;
-&lt;li&gt;
-&lt;p&gt;&lt;strong&gt;membars 隔离&lt;/strong&gt;：针对 Behind Bars 揭示的缺陷，强化 membars 的跨实例隔离，防止跨 GI 传播。&lt;/p&gt;
-&lt;/li&gt;
-&lt;li&gt;
-&lt;p&gt;&lt;strong&gt;页错误处理隔离&lt;/strong&gt;：针对 MIGraine 揭示的缺陷，将页错误缓冲区按 GI 隔离，避免跨实例干扰。&lt;/p&gt;
-&lt;/li&gt;
-&lt;li&gt;
-&lt;p&gt;&lt;strong&gt;不要将 MIG 视为完整隔离方案&lt;/strong&gt;：这是最重要的防御原则。MIG 仅隔离 GPU 内部资源，无法覆盖 CPU 侧共享资源。安全评估必须将 GPU-CPU 跨设备路径纳入威胁模型。&lt;/p&gt;
-&lt;/li&gt;
-&lt;/ol&gt;
-&lt;p&gt;下图给出防御方案的分层视图：&lt;/p&gt;
-&lt;div class="highlight"&gt;&lt;pre&gt;&lt;span&gt;&lt;/span&gt;&lt;code&gt;&lt;span class="c"&gt;   防御层级:&lt;/span&gt;
-
-&lt;span class="c"&gt;   &lt;/span&gt;&lt;span class="nb"&gt;+---------------------------------------------------------------+&lt;/span&gt;
-&lt;span class="c"&gt;   | 1&lt;/span&gt;&lt;span class="nt"&gt;.&lt;/span&gt;&lt;span class="c"&gt; 一致性策略: 跨设备UM写限制DDIO行为&lt;/span&gt;&lt;span class="nt"&gt;,&lt;/span&gt;&lt;span class="c"&gt; 不加载到CPU LLC          |&lt;/span&gt;
-&lt;span class="c"&gt;   &lt;/span&gt;&lt;span class="nb"&gt;+---------------------------------------------------------------+&lt;/span&gt;
-&lt;span class="c"&gt;   | 2&lt;/span&gt;&lt;span class="nt"&gt;.&lt;/span&gt;&lt;span class="c"&gt; LLC分区:    CPU侧缓存集按租户隔离 (Intel/AMD CAT)           |&lt;/span&gt;
-&lt;span class="c"&gt;   &lt;/span&gt;&lt;span class="nb"&gt;+---------------------------------------------------------------+&lt;/span&gt;
-&lt;span class="c"&gt;   | 3&lt;/span&gt;&lt;span class="nt"&gt;.&lt;/span&gt;&lt;span class="c"&gt; 映射切断:    云调度层限制跨租户UM系统内存映射                 |&lt;/span&gt;
-&lt;span class="c"&gt;   &lt;/span&gt;&lt;span class="nb"&gt;+---------------------------------------------------------------+&lt;/span&gt;
-&lt;span class="c"&gt;   | 4&lt;/span&gt;&lt;span class="nt"&gt;.&lt;/span&gt;&lt;span class="c"&gt; GPU微架构:  L3&lt;/span&gt;&lt;span class="nb"&gt;-&lt;/span&gt;&lt;span class="c"&gt;TLB按GI分区 | membars隔离 | 页错误隔离       |&lt;/span&gt;
-&lt;span class="c"&gt;   &lt;/span&gt;&lt;span class="nb"&gt;+---------------------------------------------------------------+&lt;/span&gt;
-&lt;span class="c"&gt;   | 5&lt;/span&gt;&lt;span class="nt"&gt;.&lt;/span&gt;&lt;span class="c"&gt; 安全模型:    不要将MIG视为完整隔离&lt;/span&gt;&lt;span class="nt"&gt;,&lt;/span&gt;&lt;span class="c"&gt; 纳入CPU侧共享资源威胁模型 |&lt;/span&gt;
-&lt;span class="c"&gt;   &lt;/span&gt;&lt;span class="nb"&gt;+---------------------------------------------------------------+&lt;/span&gt;
-&lt;/code&gt;&lt;/pre&gt;&lt;/div&gt;
-
-&lt;h2&gt;十、对机密计算的启示&lt;/h2&gt;
-&lt;p&gt;GhostAccess 对机密计算（Confidential Computing）提出了深刻警示。GPU 厂商在引入统一内存等跨设备优化技术时，往往只关注 GPU 侧的性能与功能，缺乏对 CPU 侧微架构状态变化的全面审视。这导致一个被物理隔离的 GPU 资源，通过共享的 CPU LLC 与其他租户发生"隐性耦合"。&lt;/p&gt;
-&lt;p&gt;在机密计算场景下，这种隐性耦合尤为危险：&lt;/p&gt;
-&lt;ul&gt;
-&lt;li&gt;&lt;strong&gt;TEE 边界被绕过&lt;/strong&gt;：即使 GPU 工作负载运行在受保护环境（如 NVIDIA Confidential Computing, H100 CC mode），只要其 UM 写操作影响 CPU LLC，CPU 侧的攻击者就能通过侧信道推断工作负载行为，破坏机密性。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;隔离幻觉&lt;/strong&gt;：云厂商与租户普遍信任 MIG 提供的物理隔离，但 GhostAccess 证明，GPU 与 CPU 之间的共享路径（LLC、TLB、页错误缓冲区）构成了 MIG 之外的隐性耦合面，这些路径在多租户场景下必须被显式隔离。&lt;/li&gt;
-&lt;li&gt;&lt;strong&gt;跨设备优化的安全债务&lt;/strong&gt;：UM 等跨设备优化技术显著提升了性能，但其未被文档记录的缓存副作用构成了潜在的安全债务。未来 GPU 架构设计必须将"跨设备写操作对 CPU 微架构状态的影响"纳入安全审计范围。&lt;/li&gt;
-&lt;/ul&gt;
-&lt;p&gt;更广泛地说，GhostAccess 揭示了一个趋势：随着 GPU 与 CPU 的集成度提升（如 Grace Hopper 的统一内存架构、C2C 互连），GPU-CPU 跨设备路径将成为侧信道攻击的新前线。防御方需要从"GPU 内部隔离"思维转向"GPU-CPU 系统级隔离"思维，将所有跨设备共享资源纳入威胁模型。&lt;/p&gt;
-&lt;h2&gt;免责声明&lt;/h2&gt;
-&lt;p&gt;本文为纯技术分析文章，基于 MICRO 2026 公开论文的技术数据撰写，旨在促进安全研究与防御建设。文中所述攻击方法、概念性伪代码与防御方案仅供学术研究、安全评估与系统加固参考。任何读者不得将本文内容用于未经授权的实际攻击、渗透测试或破坏他人系统。在未获得明确授权的情况下对云环境或他人系统实施侧信道攻击属于违法行为，可能违反相关法律法规与云服务条款。作者与发布方不对任何因不当使用本文信息而造成的后果承担责任。云安全研究与防御建设应在合法授权与负责任披露框架下进行。&lt;/p&gt;</content><category term="技术"/></entry></feed>
+&lt;p&gt;&lt;em&gt;参考来源：&lt;a href="https://chipsandcheese.com/p/nvidias-vera-whitepaper-has-a-thread"&gt;Chips and Cheese - NVIDIA's Vera Whitepaper Has a Thread Loose&lt;/a&gt; / &lt;a href="https://resources.nvidia.com/en-us-vera-cpu"&gt;NVIDIA Vera Whitepaper&lt;/a&gt; / Phoronix Vera benchmarks&lt;/em&gt;&lt;/p&gt;</content></entry></feed>
