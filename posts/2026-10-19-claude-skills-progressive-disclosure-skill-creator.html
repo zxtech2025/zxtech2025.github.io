@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Skills 源码拆解：431 字节的触发代价、被低估的执行脚本，以及那个自己跑评测的 skill-creator - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Claude Skills 源码拆解：431 字节的触发代价、被低估的执行脚本，以及那个自己跑评测的 skill-creator</h1>
+<time>2026-10-19</time>
+<ul>
+<li>Claude Skills</li>
+<li>Agent 工程</li>
+<li>上下文工程</li>
+<li>MCP</li>
+<li>源码分析</li>
+</ul>
+<hr />
+<p>前段时间 Claude Skills 在 HN 上拿下 816 分、428 条评论，评论区的第一反应几乎都是同一个问题:这不就是把 markdown 塞进上下文吗，和 MCP 有什么区别。争论了一整天之后，真正有信息量的答案不在讨论里，在 <code>anthropics/skills</code> 这个仓库里。</p>
+<p>我把仓库拉下来数了一遍，几个数字比任何类比都更能说明问题:</p>
+<ul>
+<li>仓库 541 个文件，22 个官方 skill，18 万 star</li>
+<li><code>pdf</code> skill 的 <code>SKILL.md</code> 正文 310 行，加上 <code>forms.md</code>、<code>reference.md</code> 和 8 个 Python 脚本，实际载体接近 55KB</li>
+<li>每次会话真正常驻上下文的，只有 frontmatter 里那 437 个字符的 description</li>
+</ul>
+<p>Skill 的设计不是"把文档塞给模型"，而是"设计一个索引结构，让模型自己决定什么时候去翻哪一页"。本文拆三件事:触发机制的真实成本、脚本作为确定性工具的价值，以及被大多数人忽略的 <code>skill-creator</code>，一个能给自己跑 A/B 评测的 skill。</p>
+<h2>一、431 字节：常驻成本的账要算清楚</h2>
+<p><code>pdf/SKILL.md</code> 的 frontmatter 一共 515 字节，扣掉 <code>name</code>、<code>license</code> 这些固定字段，真正进入系统提示词的 description 是 437 个字符。它必须在一句话里同时说清两件事:这个 skill 干什么，以及什么情况下该用它。</p>
+<div class="highlight"><pre><span></span><code><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pdf</span>
+<span class="nt">description</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Use this skill whenever the user wants to do anything with PDF files.</span>
+<span class="w">  </span><span class="l l-Scalar l-Scalar-Plain">This includes reading or extracting text/tables from PDFs, combining or merging</span>
+<span class="w">  </span><span class="l l-Scalar l-Scalar-Plain">multiple PDFs into one, splitting PDFs apart, rotating pages, adding watermarks,</span>
+<span class="w">  </span><span class="l l-Scalar l-Scalar-Plain">creating new PDFs, filling PDF forms, encrypting/decrypting PDFs, extracting</span>
+<span class="w">  </span><span class="l l-Scalar l-Scalar-Plain">images, and OCR on scanned PDFs to make them searchable. If the user mentions</span>
+<span class="w">  </span><span class="l l-Scalar l-Scalar-Plain">a .pdf file or asks to produce one, use this skill.</span>
+</code></pre></div>
+
+<p>注意它把"读取、合并、拆分、旋转、加水印、填表单、加解密、抽图、OCR"这九个动作全部列了出来。这不是啰嗦，是在为意图匹配补充召回。MCP 工具的描述通常只写"管理 PDF 文件"，剩下靠参数 schema 表达;skill 的 description 没有 schema 可以依赖，只能把触发词直接铺在文本里。</p>
+<p>这就是成本结构的根本差异。HN 上有人做了实测对照，几个热门 MCP 的 catalog 在没做任何事情之前就要吃掉:</p>
+<table>
+<thead>
+<tr>
+<th>MCP</th>
+<th>工具数</th>
+<th>常驻 token</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Linear</td>
+<td>23</td>
+<td>~12,935</td>
+</tr>
+<tr>
+<td>JetBrains</td>
+<td>20</td>
+<td>~12,252</td>
+</tr>
+<tr>
+<td>Playwright</td>
+<td>21</td>
+<td>~9,804</td>
+</tr>
+</tbody>
+</table>
+<p>Linear 的 23 个工具、12935 个 token 是每次请求都在付的固定成本，不管这次会话要不要动 Linear。而 22 个 skill 的 description 全加起来，量级也就是一两千 token，因为每个 skill 只占 431 字节这个数量级。</p>
+<p>三级渐进披露的代价和收益：</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>内容</th>
+<th>何时进上下文</th>
+<th>pdf skill 实测</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L1</td>
+<td>name + description</td>
+<td>每次会话常驻</td>
+<td>431 字节</td>
+</tr>
+<tr>
+<td>L2</td>
+<td>SKILL.md 正文</td>
+<td>触发时读入</td>
+<td>7551 字节 / 310 行</td>
+</tr>
+<tr>
+<td>L3</td>
+<td>reference.md、forms.md、scripts/</td>
+<td>模型按需再读</td>
+<td>16692 + 11854 + 23391 字节</td>
+</tr>
+</tbody>
+</table>
+<p>关键在于 L3 的 8 个 Python 脚本。模型可以执行它们，但<strong>不需要把脚本读进上下文</strong>，这是它和"把代码贴进 prompt"的本质区别，也是下面第四节的重点。</p>
+<h2>二、MCP 描述的是能力，Skill 描述的是流程</h2>
+<p>评论区里最有价值的一句来自 simonw:MCP 最擅长的是"不需要完整沙箱环境也能用"，而 skill 恰恰相反，它假设模型有文件系统和命令执行能力。这条边界决定了二者根本不是替代关系。</p>
+<p>真正的区别在描述对象上。MCP 描述的是<strong>能力边界</strong>:有哪些工具、每个工具收什么参数、返回什么结构。Skill 描述的是<strong>流程决策</strong>:先做什么、什么情况下换一条路径、哪一步容易出错。</p>
+<p><code>webapp-testing/SKILL.md</code> 是这份仓库里最像"工程经验"的一份，它直接给了一棵决策树:</p>
+<div class="highlight"><pre><span></span><code>User task → Is it static HTML?
+    ├─ Yes → Read HTML file directly to identify selectors
+    │         ├─ Success → Write Playwright script using selectors
+    │         └─ Fails/Incomplete → Treat as dynamic (below)
+    └─ No (dynamic webapp) → Is the server already running?
+        ├─ No → Run: python scripts/with_server.py --help
+        └─ Yes → Reconnaissance-then-action:
+            1. Navigate and wait for networkidle
+            2. Take screenshot or inspect DOM
+            3. Identify selectors from rendered state
+            4. Execute actions with discovered selectors
+</code></pre></div>
+
+<p>这个流程里有两条是模型自己几乎不可能"想"出来的：静态 HTML 应该直接读文件而不是起浏览器；动态页面必须先 <code>networkidle</code> 再截图取选择器，否则拿到的是渲染到一半的 DOM。这些是踩过坑才有的顺序知识，写成 20 个工具的参数描述根本表达不了。</p>
+<p>同一份文件里还有一句很硬的指令:</p>
+<blockquote>
+<p>Always run scripts with <code>--help</code> first... DO NOT read the source until you try running the script first. These scripts can be very large and thus pollute your context window.</p>
+</blockquote>
+<p>这句话把"用 CLI 代替工具定义"的思路写死了。模型不知道 <code>with_server.py</code> 怎么实现，也不需要知道，<code>--help</code> 的输出就是它的接口文档。缺少参数时它自己会再问一次 <code>--help</code>，这个来回的成本远低于把整个脚本读进 24 万 token 的上下文。</p>
+<p>对比之下，MCP 的形态是"把 API 表面预先翻译成 schema 塞进上下文"，skill 的形态是"把 API 表面留在磁盘上，让模型用 <code>--help</code> 自己去发现"。前者确定性高但固定成本大，后者固定成本极低但依赖模型会查文档。</p>
+<h2>三、技能自举：skill-creator 会给自己的 skill 跑 A/B 评测</h2>
+<p>22 个 skill 里最有意思的是 <code>skill-creator</code>。它不处理 PDF 也不画图，它负责造别的 skill，并且带一整套评测基础设施。</p>
+<p>先看它的目录结构，这已经不像一个"提示词文件"了:</p>
+<div class="highlight"><pre><span></span><code><span class="n">skill</span><span class="o">-</span><span class="n">creator</span><span class="o">/</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">SKILL</span><span class="p">.</span><span class="n">md</span><span class="w">                      </span><span class="mh">33</span><span class="p">,</span><span class="mh">168</span><span class="w"> </span><span class="err">字节</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">agents</span><span class="o">/</span><span class="n">grader</span><span class="p">.</span><span class="n">md</span><span class="w">              </span><span class="mh">9</span><span class="p">,</span><span class="mh">049</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">agents</span><span class="o">/</span><span class="n">comparator</span><span class="p">.</span><span class="n">md</span><span class="w">          </span><span class="mh">7</span><span class="p">,</span><span class="mh">287</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">agents</span><span class="o">/</span><span class="n">analyzer</span><span class="p">.</span><span class="n">md</span><span class="w">           </span><span class="mh">10</span><span class="p">,</span><span class="mh">376</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">scripts</span><span class="o">/</span><span class="n">improve_description</span><span class="p">.</span><span class="n">py</span><span class="w"> </span><span class="mh">11</span><span class="p">,</span><span class="mh">116</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">scripts</span><span class="o">/</span><span class="n">aggregate_benchmark</span><span class="p">.</span><span class="n">py</span><span class="w"> </span><span class="mh">14</span><span class="p">,</span><span class="mh">386</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">scripts</span><span class="o">/</span><span class="n">run_eval</span><span class="p">.</span><span class="n">py</span><span class="w">           </span><span class="mh">11</span><span class="p">,</span><span class="mh">464</span>
+<span class="err">├──</span><span class="w"> </span><span class="n">references</span><span class="o">/</span><span class="n">schemas</span><span class="p">.</span><span class="n">md</span><span class="w">         </span><span class="mh">12</span><span class="p">,</span><span class="mh">061</span>
+<span class="err">└──</span><span class="w"> </span><span class="n">eval</span><span class="o">-</span><span class="n">viewer</span><span class="o">/</span><span class="n">generate_review</span><span class="p">.</span><span class="n">py</span><span class="w"> </span><span class="mh">16</span><span class="p">,</span><span class="mh">365</span>
+</code></pre></div>
+
+<p>它的工作流是标准的实验设计，只是执行者是子代理:</p>
+<ol>
+<li>根据意图写出 skill 草稿和 2-3 条真实用户会说的话作为 test prompt</li>
+<li>对每条 prompt <strong>同时</strong>起两个子代理，一个带 skill 一个不带，一起跑完</li>
+<li>跑的过程中并行起草可程序化校验的 assertion</li>
+<li>每个子代理结束时从通知里抓 <code>total_tokens</code> 和 <code>duration_ms</code>，立刻写进 <code>timing.json</code></li>
+<li>grader 子代理逐条判定 assertion，<code>aggregate_benchmark.py</code> 输出 mean ± stddev 与 pass_rate delta</li>
+<li>起一个本地 viewer，让用户逐条看输出、填反馈，feedback 存成 JSON 喂下一轮</li>
+</ol>
+<p>它把"这条 skill 到底有没有用"变成了一个可以重复测量的数。HN 上有人质疑 Anthropic 的发布博客里没有任何评测数据，<code>skill-creator</code> 就是对这个问题的方法论回答，代价是这件事得你自己跑。</p>
+<p>其中 <code>improve_description.py</code> 解决的是一个很实际的失效模式:<strong>skill 不被触发</strong>。HN 用户 rane 的实测是典型的:</p>
+<blockquote>
+<p>我写了一个描述极其明确的 skill：<code>Use when creating or editing bash scripts</code>，但让 Claude 写 bash 脚本时它根本不触发。我又改成 <code>description: CRITICAL: Use when writing bash scripts</code>，仍然没有任何效果。</p>
+</blockquote>
+<p>这不是描述写得不够醒目，而是"该不该触发"这件事本身没有 ground truth。<code>improve_description.py</code> 的做法是把它变成一个分类任务:构造 should_trigger / shouldn't_trigger 两组查询，每条跑多次统计触发率，把 false positive 和 false negative 分别列给模型，要求它泛化到意图类别而不是堆关键词，每轮的 description 和训练结果记进 history，显式要求"不要重复之前的尝试，换个句子结构"。最后取分数最高的那一版。</p>
+<p>description 超过 1024 字符会被截断，所以脚本里还有一道兜底:生成结果若超限，会再发一次单轮请求，把超长版本塞回去要求压缩。</p>
+<p>这套东西的定位很清楚:它衡量的是<strong>触发准确率</strong>，不是回答质量。真正衡量后者的是 grader + benchmark 那条链，需要人工写 assertion、人工看 viewer 里的输出。</p>
+<h2>四、执行脚本：把确定性外包给代码</h2>
+<p><code>slack-gif-creator</code> 只有 4 个核心文件，但把"什么时候该写代码、什么时候该交给模型自由发挥"分得很清楚。</p>
+<p><code>core/validators.py</code> 里有 <code>validate_gif()</code>，返回 <code>(passes, results)</code>，results 里带 <code>size_kb</code>、<code>frame_count</code>、<code>duration_seconds</code>、<code>fps</code>，并且分别校验 emoji（要求 128x128，64 到 128 之间算 acceptable）和 message GIF（宽高比不超过 2.0，短边 320 到 640）。</p>
+<p><code>core/gif_builder.py</code> 的 <code>save()</code> 才是真正解决问题的地方:</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span> <span class="n">optimize_for_emoji</span><span class="p">:</span>
+    <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">width</span> <span class="o">&gt;</span> <span class="mi">128</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">height</span> <span class="o">&gt;</span> <span class="mi">128</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">width</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">height</span> <span class="o">=</span> <span class="mi">128</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">frames</span> <span class="o">=</span> <span class="p">[</span><span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">Image</span><span class="o">.</span><span class="n">fromarray</span><span class="p">(</span><span class="n">f</span><span class="p">)</span><span class="o">.</span><span class="n">resize</span><span class="p">((</span><span class="mi">128</span><span class="p">,</span> <span class="mi">128</span><span class="p">),</span> <span class="n">Image</span><span class="o">.</span><span class="n">Resampling</span><span class="o">.</span><span class="n">LANCZOS</span><span class="p">))</span>
+                       <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">frames</span><span class="p">]</span>
+    <span class="n">num_colors</span> <span class="o">=</span> <span class="nb">min</span><span class="p">(</span><span class="n">num_colors</span><span class="p">,</span> <span class="mi">48</span><span class="p">)</span>      <span class="c1"># emoji 更强的调色板限制</span>
+    <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">frames</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">12</span><span class="p">:</span>             <span class="c1"># 帧数压到 12 附近</span>
+        <span class="n">keep_every</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">frames</span><span class="p">)</span> <span class="o">//</span> <span class="mi">12</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">frames</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">frames</span><span class="p">[::</span><span class="n">keep_every</span><span class="p">]</span>
+</code></pre></div>
+
+<p>再加 <code>deduplicate_frames(threshold=0.9995)</code>:用逐像素平均差算相似度，把几乎一样的连续帧删掉，阈值刻意定在 0.9995 而不是 0.98，注释写得很直白，保留细微动画。</p>
+<p>同一份 <code>pdf</code> skill 里还有一段更典型的硬约束，正文用了全大写的 IMPORTANT:</p>
+<blockquote>
+<p>Never use Unicode subscript/superscript characters (₀₁₂₃₄₅₆₇₈₉, ⁰¹²³⁴⁵⁶⁷⁸⁹) in ReportLab PDFs. The built-in fonts do not include these glyphs, causing them to render as solid black boxes.</p>
+</blockquote>
+<p>这种句子通常是踩了坑才写下来的，所以我在本机用 reportlab 5.0.1 + pypdf 6.21.1 复现了一遍，两种写法各生成一份 PDF:</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># A：直接写 Unicode 下标</span>
+<span class="n">c</span> <span class="o">=</span> <span class="n">canvas</span><span class="o">.</span><span class="n">Canvas</span><span class="p">(</span><span class="s2">&quot;/tmp/a.pdf&quot;</span><span class="p">,</span> <span class="n">pagesize</span><span class="o">=</span><span class="n">letter</span><span class="p">)</span>
+<span class="n">c</span><span class="o">.</span><span class="n">setFont</span><span class="p">(</span><span class="s2">&quot;Helvetica&quot;</span><span class="p">,</span> <span class="mi">20</span><span class="p">)</span>
+<span class="n">c</span><span class="o">.</span><span class="n">drawString</span><span class="p">(</span><span class="mi">72</span><span class="p">,</span> <span class="mi">700</span><span class="p">,</span> <span class="s2">&quot;H</span><span class="se">\u2082</span><span class="s2">O  CO</span><span class="se">\u2082</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="n">c</span><span class="o">.</span><span class="n">save</span><span class="p">()</span>
+
+<span class="c1"># B：用 ReportLab 的 &lt;sub&gt; 标签</span>
+<span class="n">doc</span><span class="o">.</span><span class="n">build</span><span class="p">([</span><span class="n">Paragraph</span><span class="p">(</span><span class="s2">&quot;H&lt;sub&gt;2&lt;/sub&gt;O  CO&lt;sub&gt;2&lt;/sub&gt;&quot;</span><span class="p">,</span> <span class="n">styles</span><span class="p">[</span><span class="s2">&quot;Normal&quot;</span><span class="p">])])</span>
+</code></pre></div>
+
+<p>A 抽出来的文本是 <code>H■O  CO■</code>，字体资源里除了 <code>/Helvetica</code> 还多出一个 <code>/ZapfDingbats</code>:找不到字形时 reportlab 退到 Dingbats 里碰运气，屏幕上就是两个黑块。B 抽出来是 <code>H2O CO2</code>，2 是被真正排版成下标的独立文本对象，字体资源只有 <code>/Helvetica</code> 一个，渲染出来是缩小下沉的数字。</p>
+<p>这个例子能解释 skill 里为什么值得放脚本和硬约束:模型的默认写法是 <code>H₂O</code>，这个写法在 HTML 里完全正确，在 ReportLab 里就错。一句 Never 加一段对照代码，比让模型自己在几百页 ReportLab 文档里翻字体覆盖表便宜太多。</p>
+<p>为什么这些必须写成代码而不是写在 SKILL.md 里让模型自己做？三个原因:</p>
+<ul>
+<li><strong>GIF 的大小不是"感觉一下"能判断的</strong>。少 10 个颜色、多减 3 帧，文件从 2.1MB 掉到 1.8MB，这种反馈必须可测量</li>
+<li><strong>调色板要全局共享</strong>。<code>optimize_colors(use_global_palette=True)</code> 会先均匀采样 5 帧拼成一张图做量化，得到单一调色板再套用到所有帧;逐帧各自量化会让颜色在帧间抖动，文件也更大</li>
+<li><strong>确定性的步骤不该花 token</strong>。用 token 生成的方式"排序一个列表"极其昂贵，同理，用模型去估算 GIF 尺寸既慢又不准</li>
+</ul>
+<p>这也是 skill 与"塞一段长 prompt"最实际的差别:prompt 能描述步骤，不能提供可执行的校验器。有 validator 之后，模型的失败模式从"交出一个超限的 GIF 然后说完成了"变成"看到 <code>passes=False</code> 再调一次参数"。</p>
+<h2>五、两个真实的设计约束</h2>
+<p>拆完源码，有两件事值得写下来。</p>
+<p>先说第一件，触发是靠文本匹配，不是靠语义理解。429 条评论里对这一点最集中的抱怨是"我说的明明就是这件事，它没用"。description 的字面覆盖度基本决定了召回率，所以官方 <code>skill-creator</code> 里明确建议把 description 写得"pushy"一点，把用户可能说的各种同义表达铺进去。这也解释了为什么 <code>pdf</code> 的 description 要穷举九个动作。反过来说，skill 数量一多，description 之间会开始竞争，<code>improve_description.py</code> 里"要 distinctive"那一条就是为这个准备的。</p>
+<p>第二件事，skill 会拿到代码执行权限。Anthropic 自己的工程博客在这一段没有绕弯:</p>
+<blockquote>
+<p>malicious skills may introduce vulnerabilities in the environment where they're used or direct Claude to exfiltrate data and take unintended actions. We recommend installing skills only from trusted sources.</p>
+</blockquote>
+<p>这条风险在 2026 年上半年已经有过实例:某 skill 市场被注入上千个恶意 skill，套路是安装成功后弹一个伪造的"诊断命令"，实际是 base64 载荷，解码后下载窃密程序。skill 的形态决定了它的分发成本极低:一个 markdown 加几个脚本就能装，而安装动作本身就等于把命令执行权交出去。</p>
+<h2>我的做法</h2>
+<p>如果要在自己的仓库里用 skill，我目前只做三件事:</p>
+<p><strong>一是把流程写在 skill 里，把校验写成脚本。</strong> 凡是"怎么判断做对了"能用代码表达的，就不写进 markdown。<code>validate_gif()</code> 那种返回 <code>(bool, dict)</code> 的函数，比十句"请注意文件大小不要超过限制"有用得多。</p>
+<p><strong>二是 description 当接口来写，并且测触发率。</strong> 写了 skill 但很少被触发，通常是 description 的问题而不是模型的问题。构造十几条"该触发"和"不该触发"的查询，跑三遍看触发率，比反复调措辞靠谱。</p>
+<p><strong>三是第三方 skill 先读脚本再装。</strong> 这条没有捷径，<code>SKILL.md</code> 可以写得很无害，真正干活的在 <code>scripts/</code> 里。</p>
+<p>Skill 这个概念本身很朴素，<code>SKILL.md</code> 就是一个带 YAML 头的 markdown。真正让它成立的是配套的那套东西:一个足够的索引层、一组可执行的确定性脚本、一个能自己跑评测的循环。缺了后两样，它就只是一段比较长的提示词。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
