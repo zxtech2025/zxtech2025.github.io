@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>一次内存引起的网络丢包：从现象到根因的排障路径 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>一次内存引起的网络丢包：从现象到根因的排障路径</h1>
+<time>2026-10-30</time>
+<ul>
+<li>运维</li>
+<li>网络排障</li>
+<li>内存</li>
+<li>丢包</li>
+<li>性能分析</li>
+</ul>
+<hr />
+<p>丢包是最难查的故障之一。</p>
+<p>因为它不像宕机那样给你一个明确的错误，也不像慢查询那样有个清晰的耗时。它只是<strong>偶发地、随机地</strong>让一部分请求消失，日志里可能什么都没有。</p>
+<p>这篇文章讨论一类具体的、容易被忽视的丢包原因：<strong>内存问题导致的网络丢包</strong>。</p>
+<p>不聊具体的某个案例，而是把这类问题的排查路径讲清楚——因为关键不是记住某次怎么修的，而是形成一套可复用的诊断思路。</p>
+<hr />
+<h2>一、先确认：真的是丢包吗</h2>
+<p>这是最容易踩空的一步。很多人一看"请求超时"就断定丢包，其实可能是：</p>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>真实原因</th>
+<th>区分方法</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>请求超时</td>
+<td>服务处理慢</td>
+<td>看服务端处理耗时</td>
+</tr>
+<tr>
+<td>请求超时</td>
+<td>连接建立失败</td>
+<td>看 TCP 握手状态</td>
+</tr>
+<tr>
+<td>请求超时</td>
+<td><strong>真的丢包</strong></td>
+<td>ping / mtr / 抓包</td>
+</tr>
+<tr>
+<td>请求失败</td>
+<td>应用层错误</td>
+<td>看 HTTP 状态码/错误码</td>
+</tr>
+</tbody>
+</table>
+<h3>分层定位</h3>
+<div class="highlight"><pre><span></span><code>应用层报错？
+  ├─ 有明确错误码 → 应用问题，不是丢包
+  └─ 超时/无响应 → 往下查
+
+传输层通不通？
+  ├─ ping 丢包率高 → 网络层问题
+  ├─ ping 正常但 TCP 建连失败 → 可能是 SYN 丢包/防火墙
+  └─ TCP 建连正常但传输卡 → 可能是 MTU/拥塞/缓冲区
+
+系统层有没有异常？
+  └─ 内核丢包计数、内存、中断
+</code></pre></div>
+
+<hr />
+<h2>二、内核层的丢包计数：最容易被忽略的地方</h2>
+<p>Linux 内核会把各种原因的丢包记录在统计计数器里，但<strong>很多人只看 <code>netstat -s</code> 的汇总</strong>，不看细分。</p>
+<h3>关键计数器</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 全局丢包统计</span>
+netstat<span class="w"> </span>-s<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-iE<span class="w"> </span><span class="s2">&quot;drop|overflow|error&quot;</span>
+
+<span class="c1"># 或更详细的</span>
+nstat<span class="w"> </span>-az<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-iE<span class="w"> </span><span class="s2">&quot;drop|overflow&quot;</span>
+</code></pre></div>
+
+<p>几个值得重点关注的：</p>
+<table>
+<thead>
+<tr>
+<th>计数器</th>
+<th>含义</th>
+<th>常见原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>TcpExtTCPBacklogDrop</code></td>
+<td>全连接队列满</td>
+<td>应用 accept 太慢</td>
+</tr>
+<tr>
+<td><code>TcpExtListenOverflows</code></td>
+<td>listen 队列溢出</td>
+<td>accept 跟不上</td>
+</tr>
+<tr>
+<td><code>TcpExtTCPReqQFullDrop</code></td>
+<td>半连接队列满</td>
+<td>SYN flood / 建连太快</td>
+</tr>
+<tr>
+<td><code>TcpExtTCPTimeouts</code></td>
+<td>TCP 超时重传</td>
+<td>网络质量</td>
+</tr>
+<tr>
+<td><code>TcpExtTCPAbortOnMemory</code></td>
+<td><strong>内存不足导致断开</strong></td>
+<td><strong>内存压力</strong></td>
+</tr>
+<tr>
+<td><code>TcpExtPruneCalled</code></td>
+<td>内存压力下裁剪发送缓冲</td>
+<td><strong>内存压力</strong></td>
+</tr>
+</tbody>
+</table>
+<h3>最后两个是关键</h3>
+<p>如果你的丢包伴随 <code>TCPAbortOnMemory</code> 或 <code>PruneCalled</code> 增长，那<strong>问题就在内存</strong>，不在网络。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 持续观察（每2秒一次）</span>
+nstat<span class="w"> </span>-n<span class="w"> </span>-z<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s2">&quot;AbortOnMemory|PruneCalled|BacklogDrop&quot;</span>
+</code></pre></div>
+
+<hr />
+<h2>三、内存怎么导致丢包</h2>
+<p>这里要理解一个机制：<strong>内核的 socket 缓冲区是从系统内存里分配的。</strong></p>
+<h3>传导路径</h3>
+<div class="highlight"><pre><span></span><code>系统内存紧张
+    ↓
+内核启用内存回收压力
+    ↓
+socket 缓冲区被裁剪（prune）
+    ↓
+接收窗口缩小 / 发送缓冲不足
+    ↓
+数据发不出去 / 收到的数据被丢
+    ↓
+上层感知：丢包、超时
+</code></pre></div>
+
+<h3>三个具体机制</h3>
+<p><strong>机制一：tcp_mem 限制</strong></p>
+<div class="highlight"><pre><span></span><code>sysctl<span class="w"> </span>net.ipv4.tcp_mem
+<span class="c1"># 输出：单位是&quot;页&quot;，不是字节</span>
+<span class="c1"># 例：94011  125351  188022</span>
+<span class="c1">#      ↑min   ↑pressure ↑max</span>
+</code></pre></div>
+
+<ul>
+<li>低于 min：无压力</li>
+<li>超过 pressure：<strong>开始裁剪 socket 缓冲</strong></li>
+<li>超过 max：<strong>拒绝新连接</strong></li>
+</ul>
+<p><strong>机制二：rmem/wmem 上限</strong></p>
+<div class="highlight"><pre><span></span><code>sysctl<span class="w"> </span>net.core.rmem_max<span class="w"> </span>net.core.wmem_max
+sysctl<span class="w"> </span>net.ipv4.tcp_rmem<span class="w"> </span>net.ipv4.tcp_wmem
+</code></pre></div>
+
+<p>给得太小，高带宽长肥管道（BDP 大）场景下缓冲不够，丢包；给得太大，内存压力大。</p>
+<p><strong>机制三：内存回收抖动</strong></p>
+<p>当系统在做频繁的内存回收时，网络处理会被拖慢，间接导致丢包。</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 看回收压力</span>
+cat<span class="w"> </span>/proc/vmstat<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s2">&quot;pgscan|pgsteal|pgmajfault&quot;</span>
+<span class="c1"># 看是否有 OOM 前的征兆</span>
+dmesg<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-iE<span class="w"> </span><span class="s2">&quot;oom|out of memory&quot;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>tail<span class="w"> </span>-20
+</code></pre></div>
+
+<hr />
+<h2>四、完整排查路径</h2>
+<p>按这个顺序走，能大概率定位：</p>
+<h3>第 1 步：确认丢包位置</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 从本机到对端，逐跳看丢包</span>
+mtr<span class="w"> </span>-rwc<span class="w"> </span><span class="m">100</span><span class="w"> </span>&lt;target&gt;
+
+<span class="c1"># 本机抓包看是否收到</span>
+tcpdump<span class="w"> </span>-i<span class="w"> </span>any<span class="w"> </span>-nn<span class="w"> </span><span class="s1">&#39;host &lt;target&gt; and tcp&#39;</span><span class="w"> </span>-w<span class="w"> </span>/tmp/cap.pcap
+<span class="c1"># 然后用 wireshark 或 tcpdump 读，看重传/乱序</span>
+</code></pre></div>
+
+<p><strong>关键问题：丢在发出前，还是丢在到达前？</strong></p>
+<p>本地抓包有、对端没收到 → 网络问题
+本地抓包都没有 → 系统/应用问题</p>
+<h3>第 2 步：看内核计数器</h3>
+<div class="highlight"><pre><span></span><code>nstat<span class="w"> </span>-az<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-iE<span class="w"> </span><span class="s2">&quot;drop|overflow|prune|abort&quot;</span>
+</code></pre></div>
+
+<p>对比两个时间点，看哪个在增长。</p>
+<h3>第 3 步：看内存状态</h3>
+<div class="highlight"><pre><span></span><code>free<span class="w"> </span>-h
+cat<span class="w"> </span>/proc/meminfo<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s2">&quot;MemAvailable|MemFree|Cached|Slab&quot;</span>
+<span class="c1"># Slab 特别值得看：内核对象占用</span>
+slabtop<span class="w"> </span>-o<span class="w"> </span>-s<span class="w"> </span>c<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-20
+</code></pre></div>
+
+<p><strong>注意 <code>MemAvailable</code> 而不是 <code>MemFree</code></strong>——<code>MemFree</code> 低很正常（缓存会用满），<code>MemAvailable</code> 才是真正可用的。</p>
+<h3>第 4 步：看 TCP 缓冲配置</h3>
+<div class="highlight"><pre><span></span><code>sysctl<span class="w"> </span>net.ipv4.tcp_mem<span class="w"> </span>net.ipv4.tcp_rmem<span class="w"> </span>net.ipv4.tcp_wmem
+sysctl<span class="w"> </span>net.core.rmem_max<span class="w"> </span>net.core.wmem_max<span class="w"> </span>net.core.netdev_max_backlog
+</code></pre></div>
+
+<h3>第 5 步：看应用侧</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 每个连接的收发队列是否堆积</span>
+ss<span class="w"> </span>-tnmi<span class="w"> </span><span class="p">|</span><span class="w"> </span>head<span class="w"> </span>-40
+<span class="c1"># Recv-Q / Send-Q 堆积说明应用读得慢</span>
+</code></pre></div>
+
+<hr />
+<h2>五、常见调整</h2>
+<p><strong>警告：调参前先解释现象。</strong> 不懂原因乱调，往往是把问题藏得更深。</p>
+<h3>如果是全连接队列溢出</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 应用 accept 太慢 —— 优先优化应用，而不是调参</span>
+sysctl<span class="w"> </span>net.core.somaxconn<span class="w">          </span><span class="c1"># 增大 backlog</span>
+sysctl<span class="w"> </span>net.ipv4.tcp_max_syn_backlog
+</code></pre></div>
+
+<p>优先看应用是不是被 CPU 或 GC 卡住了。</p>
+<h3>如果是内存压力导致裁剪</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 提高 tcp_mem 上限（单位：页，1页=4KB）</span>
+<span class="c1"># 例：18GB 内存机器，可以给到 max = 4GB / 4KB = 1048576 页</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>net.ipv4.tcp_mem<span class="o">=</span><span class="s2">&quot;100000 300000 1048576&quot;</span>
+</code></pre></div>
+
+<p><strong>但更好的做法是找出谁在吃内存。</strong> 调高上限只是延后问题。</p>
+<h3>如果是 BDP 大导致缓冲不足</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 高带宽长延迟场景</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>net.ipv4.tcp_rmem<span class="o">=</span><span class="s2">&quot;4096 87380 16777216&quot;</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>net.ipv4.tcp_wmem<span class="o">=</span><span class="s2">&quot;4096 65536 16777216&quot;</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>net.core.rmem_max<span class="o">=</span><span class="m">16777216</span>
+sysctl<span class="w"> </span>-w<span class="w"> </span>net.core.wmem_max<span class="o">=</span><span class="m">16777216</span>
+</code></pre></div>
+
+<hr />
+<h2>六、这次排查的方法论</h2>
+<p>把上面的路径抽象一下，其实是三步：</p>
+<h3>1. 定位层级</h3>
+<p>网络问题有明确的层次：物理 → 链路 → 网络 → 传输 → 应用。</p>
+<p><strong>先确定在哪一层，再往下挖。</strong> 不要一上来就抓包，也不要一上来就调内核参数。</p>
+<h3>2. 找增量而不是绝对值</h3>
+<p>内核计数器都是累计值。<strong>看增长速率，不看总量。</strong></p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 两次取样看差值</span>
+nstat<span class="w"> </span>-az<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>AbortOnMemory<span class="w"> </span>&gt;<span class="w"> </span>/tmp/a
+sleep<span class="w"> </span><span class="m">60</span>
+nstat<span class="w"> </span>-az<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>AbortOnMemory<span class="w"> </span>&gt;<span class="w"> </span>/tmp/b
+diff<span class="w"> </span>/tmp/a<span class="w"> </span>/tmp/b
+</code></pre></div>
+
+<h3>3. 解释现象再动手</h3>
+<p>任何调整前，先能回答："这个参数变化会怎么影响我观察到的现象？"</p>
+<p>答不上来，就还没找到根因。</p>
+<hr />
+<h2>七、一点提醒</h2>
+<p>"内存引起网络丢包"这类问题，最容易在两种场景出现：</p>
+<ol>
+<li><strong>容器化环境下</strong>：容器有内存限制，但内核网络缓冲是整个宿主的，容易超限</li>
+<li><strong>高并发长连接场景</strong>：每个连接都占缓冲，连接数一多，内存压力就上来了</li>
+</ol>
+<p>如果你在用容器，特别要查一下：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 容器内存限制 vs 实际使用</span>
+docker<span class="w"> </span>stats<span class="w"> </span>--no-stream
+<span class="c1"># 宿主机的内核网络内存</span>
+cat<span class="w"> </span>/proc/net/sockstat
+<span class="c1"># 输出里的 TCP: inuse / orphan / tw / alloc / mem</span>
+<span class="c1"># mem 那项是页数，和 tcp_mem 上限对比</span>
+</code></pre></div>
+
+<p><code>/proc/net/sockstat</code> 里的 <code>mem</code> 字段很多人不看，但它直接告诉你<strong>当前 socket 缓冲用了多少内存</strong>。如果它贴近 <code>tcp_mem</code> 的 pressure 值，问题就找到了。</p>
+<hr />
+<h2>参考来源</h2>
+<ol>
+<li>Linux 内核文档：<code>Documentation/networking/ip-sysctl.txt</code></li>
+<li><code>nstat</code> / <code>ss</code> / <code>slabtop</code> man pages</li>
+</ol>
+<hr />
+<p>⚠️ <strong>免责声明</strong>：本文为通用运维方法论整理，具体参数需根据实际硬件、负载、内核版本调整。生产环境修改前请先在测试环境验证，并做好回滚预案。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
