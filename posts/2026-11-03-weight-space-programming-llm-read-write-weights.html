@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>不改一行训练代码，直接手写权重：MIT 的 Weight-Space Programming 到底做了什么 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>不改一行训练代码，直接手写权重：MIT 的 Weight-Space Programming 到底做了什么</h1>
+<time>2026-11-03</time>
+<ul>
+<li>深度学习</li>
+<li>可解释性</li>
+<li>LLM</li>
+<li>权重编辑</li>
+</ul>
+<hr />
+<p>MIT CSAIL 昨天放出一篇博客，标题直白得有点冒犯：LLM 能原生读写神经网络权重。作者是 Rikiya Takehi、Jayden Teoh、Alex Zhang、Omar Khattab。</p>
+<p>数字先摆出来。给 Qwen3.5-0.8B 做数学能力优化，不允许梯度、不允许训练循环，只改 0.016% 的权重，MATH-500 从 7.9% 提到 48.1%，GSM8K 从 13.8% 提到 67.1%，顺带把 IFEval 从 21.0% 抬到 62.3%。</p>
+<p>我第一反应是又一个标题党。读完日志仓库之后判断变了：他们把所有实验的完整轨迹开源了，135MB，包含 Astra 每一步发给模型的 prompt、模型回的每一个代码块、跑出来的输出、forward pass 的请求和返回。论文可以圆，日志不好圆。</p>
+<h2>为什么这件事在直觉上说不通</h2>
+<p>我们习惯的分工是：文本 artifacts（prompt、harness、训练脚本）可以让人或 LLM 手工优化，因为人类能读懂文本、能手改代码。权重不行，权重是一堆浮点数，人类没法"手写"一个能打游戏的网络，所以这部分一直留给 Adam、Muon 这类符号优化器。</p>
+<p>这篇博客要拆的就是这条线。它提出一个概念叫 Weight-Space Programming：通用 LLM 绕过优化器、绕过梯度，直接按自然语言规格读和写权重。注意"通用"两个字。不是训练一个专门读权重的模型，就是拿现成的 frontier 模型，把权重转成文本喂进去。</p>
+<h2>实验设计：先证明它真的在读权重</h2>
+<p>最容易被质疑的地方是"你怎么知道它不是在猜"。所以前三个实验刻意把其他线索全部掐掉。</p>
+<p><strong>实验 1</strong>：四个 PPO 网络分别打 Breakout、Pong、Pac-Man、Freeway。同一个 10×10 网格，同样五个动作，同样的 MLP 结构 500→32→32→5，17,253 个权重，同一个 tanh。四个网络维度完全一致，除了权重本身没有任何可区分的信息。Astra 拿到全部权重文本，prompt 里只说这是网格和动作，不告诉它候选游戏有哪些。四个全中。</p>
+<p>它给的理由是结构性的：Breakout 里 agent 那一层输入通道的权重集中在底行，那是挡板的位置；再看输出层把哪些动作区分开了。</p>
+<p><strong>实验 2</strong>：三个 DDPM，12×12 灰度图，分别生成实心圆、方块、三角。23,824 个权重。禁止调用任何 forward pass。Astra 全部识别正确，但它画出来的是<strong>轮廓</strong>，而这几个模型实际生成的是实心图形。</p>
+<p>这个错误反而成了证据。如果它在脑子里跑前向，不会画错。它读的是输出层里每个隐单元权重画出的那段边缘几何，然后把边缘拼起来，没去管填充。错误的形态恰好说明它走的是读结构这条路。</p>
+<p><strong>实验 3</strong> 是我认为最硬的一个。三个 7.16M 的字符级 transformer（4 层 × 6 头，宽度 384），分别训练在 Python 代码、罗马字日文、英文上。然后<strong>把输入层和输出层删掉</strong>，只给 Astra 中间四个 block 的权重。</p>
+<p>没有 embedding 和 unembedding，权重里没有任何东西说明哪个字符对应哪个 id，网络也无法在任何输入上运行。Astra 只能拿 Python 分析这堆矩阵，不许跑网络，不许跑任何一层。</p>
+<p>它三选三全中，同时正确指出了每一个 copying head（induction head）的坐标：Python 网络是 2.1、3.1、3.5，罗马字是 3.3，英文是 3.1，和实际跑网络测出来的完全一致，而且没有多指认任何一个非 copying head。</p>
+<p>它怎么做到的：先找到一个只看前一个字符的 first-layer head，然后通过矩阵相乘，顺着这个 head 提供的信息找到后面那些用它做检索的 head。这其实就是 Elhage 等人提出的路径展开方法，而研究团队从未向 Astra 提过这个方法。</p>
+<p>判罗马字靠的是另一个信号：给定四个 block 里最后那个（不是被删掉的输出层）写出的方向数更少，因为罗马字根本用不到 q、l、v、x 这几个字母。</p>
+<h2>写权重：从 0 开始，不给梯度</h2>
+<p>读已经够意外了，写更难。</p>
+<p><strong>实验 4</strong> 是修一个坏网络。Kinetix 环境里一辆车要冲过斜坡，得先倒车拉开加速距离。PPO 训了 10 亿步，收敛到局部最优：直冲斜坡，永远卡住，256 个 episode 全败。Astra 拿到权重、场景描述和一局录像，一次回复、不用工具，改了 3.5% 的权重，1,024 个 episode 全部成功。</p>
+<p>它的编辑思路很具体：每层加一小段旁路单元，读车的位置和速度；等绿轮过了红条，这条路径关掉，剩下交给原网络跑。</p>
+<p><strong>实验 5</strong> 更极端：从零写。三个 MinAtar 游戏，只给游戏规则和源码，没有数据、没有 loss、没有梯度、没有 rollout，每个权重初始为 0，Astra 直接以文本形式写出整个网络的权重。写出来的网络在三个游戏上都打赢了训了 1 亿步的 PPO。</p>
+<table>
+<thead>
+<tr>
+<th>游戏</th>
+<th>PPO 1亿步</th>
+<th>PPO 5亿步</th>
+<th>Astra 一次性写出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Breakout</td>
+<td>15.8</td>
+<td>25.3</td>
+<td>517.4</td>
+</tr>
+<tr>
+<td>Seaquest</td>
+<td>5.6</td>
+<td>88.9</td>
+<td>53.1</td>
+</tr>
+<tr>
+<td>Asterix</td>
+<td>25.8</td>
+<td>55.2</td>
+<td>53.2</td>
+</tr>
+</tbody>
+</table>
+<p>Breakout 那个 517.4 对 25.3，二十倍。原因也不神秘：它把第一层写成计算球落点，第二层写成把挡板移过去。这就是一段手工程序，只不过被直接翻译成了权重矩阵。</p>
+<h2>规模化：沙箱、forward pass 预算</h2>
+<p>上面这些网络的权重还能塞进上下文。真实模型塞不进去，所以实验 6 起换成工具模式。</p>
+<p>我看了一下他们开源的 harness 代码，几个约束写得挺讲究：</p>
+<div class="highlight"><pre><span></span><code><span class="n">TIMEOUT</span><span class="p">,</span> <span class="n">MAX_OUT</span><span class="p">,</span> <span class="n">MEM</span> <span class="o">=</span> <span class="mi">900</span><span class="p">,</span> <span class="mi">20_000</span><span class="p">,</span> <span class="mi">96</span> <span class="o">&lt;&lt;</span> <span class="mi">30</span>
+<span class="n">cmd</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;bwrap&quot;</span><span class="p">,</span> <span class="s2">&quot;--unshare-all&quot;</span><span class="p">,</span> <span class="s2">&quot;--die-with-parent&quot;</span><span class="p">,</span> <span class="s2">&quot;--new-session&quot;</span><span class="p">,</span> <span class="s2">&quot;--clearenv&quot;</span><span class="p">,</span>
+       <span class="s2">&quot;--ro-bind&quot;</span><span class="p">,</span> <span class="s2">&quot;/usr&quot;</span><span class="p">,</span> <span class="s2">&quot;/usr&quot;</span><span class="p">,</span> <span class="s2">&quot;--proc&quot;</span><span class="p">,</span> <span class="s2">&quot;/proc&quot;</span><span class="p">,</span> <span class="s2">&quot;--dev&quot;</span><span class="p">,</span> <span class="s2">&quot;/dev&quot;</span><span class="p">,</span>
+       <span class="s2">&quot;--ro-bind&quot;</span><span class="p">,</span> <span class="n">SANDBOX_VENV</span><span class="p">,</span> <span class="n">SANDBOX_VENV</span><span class="p">,</span> <span class="s2">&quot;--bind&quot;</span><span class="p">,</span> <span class="n">work_dir</span><span class="p">,</span> <span class="s2">&quot;/work&quot;</span><span class="p">,</span>
+       <span class="s2">&quot;--setenv&quot;</span><span class="p">,</span> <span class="s2">&quot;CUDA_VISIBLE_DEVICES&quot;</span><span class="p">,</span> <span class="s2">&quot;&quot;</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span>
+</code></pre></div>
+
+<p>bubblewrap 断网、断环境变量、不给 GPU，每次运行 900 秒、96GB 内存上限、输出截断在两万字符。预置的 <code>load</code>/<code>save</code> 会强制校验张量形状和 <code>np.isfinite</code>，<code>save</code> 里那行 <code>assert a.shape == tuple(SHAPES[name])</code> 挡住了乱写形状这条路。</p>
+<p>然后是 forward pass 预算。这个设计是全文最聪明的部分：<strong>看网络行为是要花钱的</strong>，10 次、25 次、50 次，一次 pass 可以让网络答最多 512 道题、或者读最多 1,024 段文本的 log-prob 和激活。Astra 在 pass 之间穿插改权重。</p>
+<p>实验 6 用 9×9 围棋、243→512×6→82（148 万参数）验证这一点。零次 forward pass 时，它写的网络已经能赢两个小 PPO 网络一半以上的对局；给到 50 次 pass，打赢了训过 2,000 万局的同尺寸 PPO。零 pass 那版是它一次 Python 运行里写了 336 行代码，逐层构造：前几层标出双方棋子和相邻空点（气），中间几层沿连通块传几步找危险的棋组，最后一层给每个落点打分：能吃、能救、避免自己被打吃、别填自己的眼，再加一点位置偏好。</p>
+<p>这和前面 Breakout 是同一个套路。它不是在"训练"，它在写程序，只是编译目标从指令集换成了权重矩阵。</p>
+<h2>Qwen 那次编辑，前两轮是失败的</h2>
+<p>实验 8 是唯一的真实大模型结果，也是这篇博客最值得看的部分，因为它把失败也放出来了。</p>
+<p>任务：让 Qwen3.5-0.8B 数学更好，禁止梯度、禁止训练。可用的是 7,469 道 GSM8K 训练题、7,275 道 MATH 训练题（都不是测试集）、最多 300 次 Python 运行、以及 10/25/50 次 forward pass。<code>save_edit</code> 还额外拒绝了三类编辑：动 final norm、动 embedding/输出层、以及"整体乘一个常数"。</p>
+<p>三轮的结果：</p>
+<table>
+<thead>
+<tr>
+<th>轮次</th>
+<th>pass</th>
+<th>最终编辑</th>
+<th>MATH-500</th>
+<th>GSM8K</th>
+<th>IFEval</th>
+<th>答到上限占比</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>原始</td>
+<td>-</td>
+<td>-</td>
+<td>7.9</td>
+<td>13.8</td>
+<td>21.0</td>
+<td>93.0</td>
+</tr>
+<tr>
+<td>10 pass</td>
+<td>10</td>
+<td>从 8-22 层 30 个输出矩阵里减掉循环方向，<code>W' = W - 1.5·u(uᵀW)</code></td>
+<td>12.3</td>
+<td>25.7</td>
+<td>49.0</td>
+<td>87.2</td>
+</tr>
+<tr>
+<td>25 pass</td>
+<td>25</td>
+<td>关掉第 15 层第 7 个注意力头（256 个输出列置零）</td>
+<td>14.1</td>
+<td>25.1</td>
+<td>39.9</td>
+<td>86.4</td>
+</tr>
+<tr>
+<td>50 pass</td>
+<td>50</td>
+<td>从 15、19 层 MLP 中写出该方向最多的 64 个输出列各减去该方向</td>
+<td>48.1</td>
+<td>67.1</td>
+<td>62.3</td>
+<td>33.1</td>
+</tr>
+</tbody>
+</table>
+<p>前三轮几乎没动真格。10 pass 和 25 pass 都只把"答到 32,768 token 上限的比例"从 93% 降到 87% 和 86%，循环还在，只是稍微轻了一点。真正的转折在 50 pass 那轮：它首先看到的证据是，最初的 96 道练习题里 85 道直接把上下文跑满，压根没给出答案。</p>
+<p>定位过程是这样的：循环由 15 层和 19 层 MLP 写出的某个方向造成。它先算出这个方向向量 <code>u</code>，然后从这两层各挑出写入该方向最强的 64 个输出列，做列级投影减法。总改动 2 × 64 × 1,024 = 131,072 个权重，占 0.8B 的 0.016%。</p>
+<p>结果里最有信息量的不是 MATH-500 那 40 个点的涨幅，是 IFEval 从 21.0% 跳到 62.3%。这个任务的 prompt 里没有任何指令遵循的内容。循环不是数学特有的毛病，模型一旦陷进重复，任何需要按格式收尾的任务都会崩。去掉这个毛病，所有被它掩盖的能力一起回来了。</p>
+<h2>对照组说明它到底有多不能</h2>
+<p>他们自己也做了反面实验。Gemma 3 270M 很少循环，答到上限的比例只有 8.5%（Qwen 是 93%）。同样让它改数学：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>原始</th>
+<th>5 pass</th>
+<th>10 pass</th>
+<th>25 pass</th>
+<th>50 pass</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MATH-500</td>
+<td>6.8</td>
+<td>7.0</td>
+<td>7.6</td>
+<td>7.7</td>
+<td>7.0</td>
+</tr>
+</tbody>
+</table>
+<p>基本没动。Astra 读完 Gemma 的失败案例，发现是普通推理错误：算错数、代数步骤不合法，背后没有哪个单一组件可以关掉。它的编辑退化成很小的局部调整（比如把某个对数字敏感的神经元翻倍），没有一项变动超过一个点，Astra 自己也承认这个提升不成立。</p>
+<p>这条对照把结论钉住了：<strong>权重编辑能移除挡在能力前面的障碍，不能凭空加上本就没有的能力。</strong> Qwen 那 40 个点不是"教会了它做数学"，是"让它能算完"。</p>
+<h2>一个没解决的失败</h2>
+<p>实验 7 值得单独说，因为它是唯一一个"直接从权重读"失败的任务。</p>
+<p>两份 Gemma 3 270M，同样的数据、同样的微调流程、冻结 embedding 和输出层，一份学正确回答，一份学谄媚，用户说什么就顺着答什么。让 Astra 只看权重判断哪份是谄媚的：四次尝试全败。它能列出一堆权重上的差异，但无法把差异映射到行为。</p>
+<p>放宽条件，允许它自己写最多 16 段文本，然后只看两个模型跑这些文本时的 attention 模式（看不到输出）。三对全中。答案在第 10 层第 2 个头上：诚实模型在答案位置看向题干数字的注意力是 94.3%，看向用户给的答案是 0.75%；谄媚模型反过来，3.5% 对 85.7%。</p>
+<p>这个失败划出了方法的边界。小网络的权重组装方式可以从数字里读出来（实验 1-3），但一个 2.7 亿参数模型里"态度"这种高层行为，光看权重还不够，得让它动起来。</p>
+<h2>我的判断</h2>
+<p>直接说结论：这个工作值得跟，但离"LLM 自己优化自己的权重"还很远，距离感比标题给人的印象大得多。</p>
+<p>值得跟的地方在于，它把一件长期被当作不可行的事变成了工程问题。沙箱、pass 预算、形状校验、变更清单、可复现日志，这套 harness 的形态说明作者自己也不认为这是什么玄学，他们在给它建评测标准，这是往工程学科走的标志。</p>
+<p>离得远的地方有三个：</p>
+<p><strong>上下文和效率还没解决。</strong> 148 万参数的围棋网络就要靠沙箱了，0.8B 的模型是 50 次 pass、158 轮、80 次 Python 运行、20.3 小时。这不是可以日常用的技术，是"能做成"的证明。</p>
+<p><strong>"能力"的边界很清楚。</strong> 对照实验里 Gemma 那一条不能忽略。能修好 loop，修不好算术。任何拿这个说"无梯度微调要取代 fine-tuning"的解读，都不符合他们自己的数据。</p>
+<p><strong>不可解释性从训练环节转移到了编辑环节。</strong> 原来我们不知道梯度下降收敛到哪，现在变成不知道 Astra 为什么挑这 64 个列。日志里它给了推理摘要，但推理摘要和真实决策机制是两回事，这一点我们在大模型上已经吃过一次亏了。</p>
+<p>如果这件事真往下走，我更好奇的反而不是"自动优化模型"，是审计方向：不跑推理、不建测试集，直接从权重里读出一个模型有没有后门、有没有被植入的行为倾向。现在的安全评估全靠"想得到去测什么"，想到不测就没有，这在开源权重满天飞的环境里迟早撑不住。Astra 在实验 7 上失败说明这条路还早，但它至少指出了这个失败长什么样。</p>
+<hr />
+<p>原文：<a href="https://rikiyat.github.io/blog/weight-space-programming/">Sparks of Weight-Space Programming</a>（MIT CSAIL，2026-11-02）
+实验日志：<a href="https://github.com/RikiyaT/lm_understand-logs">RikiyaT/lm_understand-logs</a></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
