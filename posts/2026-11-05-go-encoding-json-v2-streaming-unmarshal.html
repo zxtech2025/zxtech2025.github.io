@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>encoding/json 被重写了：Go 1.27 的 json/v2 到底改了什么，Unmarshal 快 10 倍从哪来 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>encoding/json 被重写了：Go 1.27 的 json/v2 到底改了什么，Unmarshal 快 10 倍从哪来</h1>
+<time>2026-11-05</time>
+<ul>
+<li>Go</li>
+<li>标准库</li>
+<li>性能优化</li>
+<li>JSON</li>
+</ul>
+<hr />
+<p><code>encoding/json</code> 是 Go 里被 import 次数最多的包之一，也是被吐槽最多的包之一。它有一堆改不动的问题：大小写不敏感匹配字段、接受重复键名、nil slice 序列化成 <code>null</code>、<code>Decoder.Decode</code> 不检查尾部垃圾数据。这些都能改，但都不能在 Go 1 兼容承诺下改。</p>
+<p>Go 1.27 的做法是换一代。<code>encoding/json/v2</code> 和 <code>encoding/json/jsontext</code> 进标准库，同时 <code>encoding/json</code> 自己变成 v2 的一层壳。最反直觉的地方在这儿：v1 的 API 一个字没动，行为一个字没变，但底层跑的已经是全新的实现。</p>
+<h2>分成两层：语法归语法，语义归语义</h2>
+<p>v2 把 marshal 和 encode 这两件事切开了。<strong>jsontext</strong> 只管语法：处理 <code>{</code>、<code>}</code>、字符串转义、数字格式，对应 RFC 8259 里那个字面叫 "JSON-text" 的语法定义，不碰 Go 反射。<strong>json/v2</strong> 只管语义：Go 值到 JSON 值的映射规则，反射在这里。</p>
+<p>底层 API 长这样：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">package</span><span class="w"> </span><span class="nx">jsontext</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">Encoder</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">...</span><span class="w"> </span><span class="p">}</span>
+<span class="kd">func</span><span class="w"> </span><span class="nx">NewEncoder</span><span class="p">(</span><span class="nx">io</span><span class="p">.</span><span class="nx">Writer</span><span class="p">,</span><span class="w"> </span><span class="o">...</span><span class="nx">Options</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="nx">Encoder</span>
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="nx">Encoder</span><span class="p">)</span><span class="w"> </span><span class="nx">WriteValue</span><span class="p">(</span><span class="nx">Value</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span>
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="nx">Encoder</span><span class="p">)</span><span class="w"> </span><span class="nx">WriteToken</span><span class="p">(</span><span class="nx">Token</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">Decoder</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">...</span><span class="w"> </span><span class="p">}</span>
+<span class="kd">func</span><span class="w"> </span><span class="nx">NewDecoder</span><span class="p">(</span><span class="nx">io</span><span class="p">.</span><span class="nx">Reader</span><span class="p">,</span><span class="w"> </span><span class="o">...</span><span class="nx">Options</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="nx">Decoder</span>
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="nx">Decoder</span><span class="p">)</span><span class="w"> </span><span class="nx">ReadValue</span><span class="p">()</span><span class="w"> </span><span class="p">(</span><span class="nx">Value</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span>
+<span class="kd">func</span><span class="w"> </span><span class="p">(</span><span class="o">*</span><span class="nx">Decoder</span><span class="p">)</span><span class="w"> </span><span class="nx">ReadToken</span><span class="p">()</span><span class="w"> </span><span class="p">(</span><span class="nx">Token</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">Kind</span><span class="w"> </span><span class="kt">byte</span>
+<span class="kd">type</span><span class="w"> </span><span class="nx">Value</span><span class="w"> </span><span class="p">[]</span><span class="kt">byte</span><span class="w">          </span><span class="c1">// v1 的 RawMessage 现在就是它的别名</span>
+<span class="kd">type</span><span class="w"> </span><span class="nx">Token</span><span class="w"> </span><span class="kd">struct</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="o">...</span><span class="w"> </span><span class="p">}</span><span class="w">  </span><span class="c1">// 不分配内存就能表示的任意 token</span>
+</code></pre></div>
+
+<p>上层则保持熟悉的手感，只是补了 options：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">package</span><span class="w"> </span><span class="nx">json</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="nx">Marshal</span><span class="p">(</span><span class="nx">in</span><span class="w"> </span><span class="kt">any</span><span class="p">,</span><span class="w"> </span><span class="nx">opts</span><span class="w"> </span><span class="o">...</span><span class="nx">Options</span><span class="p">)</span><span class="w"> </span><span class="p">(</span><span class="nx">out</span><span class="w"> </span><span class="p">[]</span><span class="kt">byte</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span>
+<span class="kd">func</span><span class="w"> </span><span class="nx">MarshalWrite</span><span class="p">(</span><span class="nx">out</span><span class="w"> </span><span class="nx">io</span><span class="p">.</span><span class="nx">Writer</span><span class="p">,</span><span class="w"> </span><span class="nx">in</span><span class="w"> </span><span class="kt">any</span><span class="p">,</span><span class="w"> </span><span class="nx">opts</span><span class="w"> </span><span class="o">...</span><span class="nx">Options</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span>
+<span class="kd">func</span><span class="w"> </span><span class="nx">MarshalEncode</span><span class="p">(</span><span class="nx">out</span><span class="w"> </span><span class="o">*</span><span class="nx">jsontext</span><span class="p">.</span><span class="nx">Encoder</span><span class="p">,</span><span class="w"> </span><span class="nx">in</span><span class="w"> </span><span class="kt">any</span><span class="p">,</span><span class="w"> </span><span class="nx">opts</span><span class="w"> </span><span class="o">...</span><span class="nx">Options</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span>
+
+<span class="kd">func</span><span class="w"> </span><span class="nx">Unmarshal</span><span class="p">(</span><span class="nx">in</span><span class="w"> </span><span class="p">[]</span><span class="kt">byte</span><span class="p">,</span><span class="w"> </span><span class="nx">out</span><span class="w"> </span><span class="kt">any</span><span class="p">,</span><span class="w"> </span><span class="nx">opts</span><span class="w"> </span><span class="o">...</span><span class="nx">Options</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span>
+<span class="kd">func</span><span class="w"> </span><span class="nx">UnmarshalRead</span><span class="p">(</span><span class="nx">in</span><span class="w"> </span><span class="nx">io</span><span class="p">.</span><span class="nx">Reader</span><span class="p">,</span><span class="w"> </span><span class="nx">out</span><span class="w"> </span><span class="kt">any</span><span class="p">,</span><span class="w"> </span><span class="nx">opts</span><span class="w"> </span><span class="o">...</span><span class="nx">Options</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span>
+<span class="kd">func</span><span class="w"> </span><span class="nx">UnmarshalDecode</span><span class="p">(</span><span class="nx">in</span><span class="w"> </span><span class="o">*</span><span class="nx">jsontext</span><span class="p">.</span><span class="nx">Decoder</span><span class="p">,</span><span class="w"> </span><span class="nx">out</span><span class="w"> </span><span class="kt">any</span><span class="p">,</span><span class="w"> </span><span class="nx">opts</span><span class="w"> </span><span class="o">...</span><span class="nx">Options</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span>
+</code></pre></div>
+
+<p><code>MarshalWrite</code> / <code>UnmarshalRead</code> 直接吃 <code>io.Writer</code> / <code>io.Reader</code>，不用先造个 Encoder 再传进去。<code>MarshalEncode</code> / <code>UnmarshalDecode</code> 是它们底下的真实实现。</p>
+<h2>性能从哪来：别让 json 包替你做两次解析</h2>
+<p>旧的 <code>MarshalJSON</code> / <code>UnmarshalJSON</code> 接口有个结构性的坑，跟实现质量无关，是接口签名决定的。</p>
+<p><code>MarshalJSON()</code> 返回 <code>[]byte</code>，所以要强制分配一次；返回之后 <code>encoding/json</code> 还必须校验它是合法 JSON，再按缩进重新格式化一遍。<code>UnmarshalJSON([]byte)</code> 要求传进来的是一个完整且不含尾部数据的 JSON 值，于是 <code>encoding/json</code> 必须先把整个值解析一遍确定边界，找到边界后调用你的方法，你的方法再从零解析一遍。同一份数据解析两次。</p>
+<p>更糟的是递归场景。如果一个 <code>UnmarshalJSON</code> 内部又调用了 <code>json.Unmarshal</code>，复杂度直接变成 O(n²)。这不是理论问题，Kubernetes 就踩了四年。</p>
+<p>v2 的做法是加一对流式接口：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">type</span><span class="w"> </span><span class="nx">Marshaler</span><span class="w"> </span><span class="kd">interface</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">MarshalJSON</span><span class="p">()</span><span class="w"> </span><span class="p">([]</span><span class="kt">byte</span><span class="p">,</span><span class="w"> </span><span class="kt">error</span><span class="p">)</span>
+<span class="p">}</span>
+<span class="kd">type</span><span class="w"> </span><span class="nx">MarshalerTo</span><span class="w"> </span><span class="kd">interface</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">MarshalJSONTo</span><span class="p">(</span><span class="o">*</span><span class="nx">jsontext</span><span class="p">.</span><span class="nx">Encoder</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span>
+<span class="p">}</span>
+
+<span class="kd">type</span><span class="w"> </span><span class="nx">Unmarshaler</span><span class="w"> </span><span class="kd">interface</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">UnmarshalJSON</span><span class="p">([]</span><span class="kt">byte</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span>
+<span class="p">}</span>
+<span class="kd">type</span><span class="w"> </span><span class="nx">UnmarshalerFrom</span><span class="w"> </span><span class="kd">interface</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">UnmarshalJSONFrom</span><span class="p">(</span><span class="o">*</span><span class="nx">jsontext</span><span class="p">.</span><span class="nx">Decoder</span><span class="p">)</span><span class="w"> </span><span class="kt">error</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>差别在于：边界判定和格式化交给 Encoder/Decoder，实现方只负责往流里写或从流里读。options 也能顺着传下去，从 Encoder/Decoder 上的 <code>Options()</code> 取，而 v1 的 <code>DisallowUnknownFields</code> 一旦进了自定义 <code>UnmarshalJSON</code> 就失效，这个坑很多人踩过。</p>
+<h2>一个真实案例：Kubernetes 的 10 倍和 38 倍</h2>
+<p>kube-openapi 的 issue #315 标题很直白：<em>Deserializing into <code>spec.Swagger</code> is almost 20x slower than deserializing into <code>map[string]interface{}</code></em>。</p>
+<p>原始数据是在 i7-8559U 上测的：</p>
+<div class="highlight"><pre><span></span><code>BenchmarkJsonUnmarshalSwagger-8        3    529833040 ns/op
+BenchmarkJsonUnmarshalInterface-8     37     29475772 ns/op
+</code></pre></div>
+
+<p>529ms 对 29ms。同一个文件，同一个 JSON，只是目标类型不同。根因是 OpenAPI 的 vendor extension（<code>x-</code> 开头的任意字段）实现方式。为了接住所有未知字段，各种类型里递归地重复解析同一份输入，某些路径上<strong>同一个输入被解析了 5 次</strong>。</p>
+<p>Joe Tsai 把 <code>spec.Swagger</code> 改成实现流式 <code>UnmarshalJSONFrom</code> 之后，同一台机器上的 benchstat：</p>
+<div class="highlight"><pre><span></span><code>name                       old time/op    new time/op    delta
+UnmarshalJSON/Swagger-8       538ms ± 8%      38ms ±25%  -92.93%
+UnmarshalJSON/Interface-8    33.5ms ±13%    25.3ms ± 9%  -24.37%
+
+name                       old alloc/op   new alloc/op   delta
+UnmarshalJSON/Swagger-8      88.5MB ± 0%    21.7MB ± 0%  -75.53%
+UnmarshalJSON/Interface-8    10.6MB ± 0%    10.0MB ± 0%   -5.72%
+
+name                       old allocs/op  old allocs/op  delta
+UnmarshalJSON/Swagger-8       1.25M ± 0%     0.11M ± 0%  -91.49%
+UnmarshalJSON/Interface-8     164k ± 0%      140k ± 0%  -14.38%
+</code></pre></div>
+
+<p>时间降 93%，分配次数从 125 万降到 11 万，降 91%。注意这个收益<strong>不是来自"Go 官方优化了 json 包"</strong>，而是来自把类型自己的反序列化逻辑改成流式，v2 只是第一次提供了这个接口。你手上那些自己写了 <code>UnmarshalJSON</code> 的类型，是同一类问题。</p>
+<h2>默认值变严了，这是刻意的</h2>
+<p>v2 在几个地方故意和 v1 不一样：</p>
+<table>
+<thead>
+<tr>
+<th>行为</th>
+<th>v1</th>
+<th>v2</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>非法 UTF-8</td>
+<td>接受（静默损坏数据）</td>
+<td>报错</td>
+</tr>
+<tr>
+<td>对象里重复键名</td>
+<td>接受（取哪个由实现决定）</td>
+<td>报错</td>
+</tr>
+<tr>
+<td>nil slice / map</td>
+<td>序列化成 <code>null</code></td>
+<td><code>[]</code> / <code>{}</code></td>
+</tr>
+<tr>
+<td>字段名匹配</td>
+<td>大小写不敏感</td>
+<td>大小写敏感</td>
+</tr>
+<tr>
+<td><code>omitempty</code></td>
+<td>按 Go 零值判断</td>
+<td>按"是否编码成空 JSON 值"（<code>null</code>/<code>""</code>/<code>[]</code>/<code>{}</code>）判断</td>
+</tr>
+</tbody>
+</table>
+<p>重复键名那条值得单独说。RFC 8259 没规定怎么处理，所以不同实现会给出不同结果，同一个 JSON 在两个服务里解析出两个意思。这不是理论风险，CVE-2017-12635 就是靠 CouchDB 和 JavaScript 引擎对重复键的解析差异拿到了管理员权限。</p>
+<p><code>omitempty</code> 的变化会影响一批线上代码。以前一个 <code>int</code> 字段是 0 不会省略（因为 v1 看 Go 零值，0 是零值所以省略，但 <code>*int</code> 指向 0 就不省略），现在判断标准换成"编码后是不是空 JSON 值"，<code>0</code> 不算空值，所以带 <code>omitempty</code> 的 <code>int</code> 为 0 时会<strong>输出 <code>0</code> 而不是被省略</strong>。有下游服务依赖"字段不存在"和"字段为 0"语义区分的，迁移时得逐个字段过一遍。</p>
+<p>还有个新行为：序列化 <code>time.Duration</code> 直接报错。因为 Duration 底层是 int64 纳秒，v1 会老实输出个纳秒数，接收方几乎不可能正确理解。v2 让你显式决定怎么表示。</p>
+<h2>v1 和 v2 能在同一个二进制里共存</h2>
+<p>这是整个设计里我觉得最巧的部分。官方没有把 v1 冻结在旧代码上，而是<strong>用 v2 实现 v1</strong>。v1 的行为差异全部由一组 options 描述，v1 就等于"打了全套兼容 options 的 v2"。</p>
+<p>结果是双向兼容：</p>
+<p>你的包用 v2 marshal 一个结构体，里面某个字段的类型来自另一个仍用 v1 <code>MarshalJSON</code> 的包，v2 认 <code>MarshalJSON</code>，正常工作。反过来，你的包用 v1 marshal，依赖的类型用了 v2 的 <code>MarshalJSONTo</code>，v1 在底层也认，正常工作。生态不需要一刀切迁移。</p>
+<p>想逐步迁移也不用一次改完，可以按行为粒度挑：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 全部用 v2 行为，但允许重复键名</span>
+<span class="nx">json</span><span class="p">.</span><span class="nx">Marshal</span><span class="p">(</span><span class="nx">v</span><span class="p">,</span><span class="w"> </span><span class="nx">json</span><span class="p">.</span><span class="nx">DefaultOptionsV2</span><span class="p">(),</span><span class="w"> </span><span class="nx">jsontext</span><span class="p">.</span><span class="nx">AllowDuplicateName</span><span class="p">(</span><span class="kc">true</span><span class="p">))</span>
+
+<span class="c1">// 全部保持 v1 行为，但禁掉重复键名</span>
+<span class="nx">json</span><span class="p">.</span><span class="nx">Marshal</span><span class="p">(</span><span class="nx">v</span><span class="p">,</span><span class="w"> </span><span class="nx">jsonv1</span><span class="p">.</span><span class="nx">DefaultOptionsV1</span><span class="p">(),</span><span class="w"> </span><span class="nx">jsontext</span><span class="p">.</span><span class="nx">AllowDuplicateName</span><span class="p">(</span><span class="kc">false</span><span class="p">))</span>
+</code></pre></div>
+
+<p>第二种写法特别适合"我只想先修掉一个安全问题，别的都别动"的场景。</p>
+<h2>基准数据：Marshal 打平，Unmarshal 大幅领先</h2>
+<p>官方 jsonbench 仓库在 Ryzen 9 9950X 上跑的结果（数值是相对 v1 的倍数，越低越好）：</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>v2 相对 v1</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Marshal 具体类型</td>
+<td>1.4x 快 ~ 1.2x 慢（基本打平）</td>
+</tr>
+<tr>
+<td>Marshal interface 类型</td>
+<td>1.6x ~ 3.6x 快</td>
+</tr>
+<tr>
+<td>Unmarshal 具体类型</td>
+<td><strong>2.7x ~ 10.2x 快</strong></td>
+</tr>
+<tr>
+<td>Unmarshal interface 类型</td>
+<td>2.3x ~ 5.7x 快</td>
+</tr>
+<tr>
+<td>Unmarshal 到 RawValue</td>
+<td><strong>10.2x ~ 21.1x 快</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Unmarshal 到 <code>jsontext.Value</code>（即旧 <code>RawMessage</code>）快了 10-21 倍，这条最能说明问题。这个场景几乎不吃反射开销，纯粹考解码器本身。原因是 v1 的扫描器是词法分析式的，<strong>每读一个字节就做一次虚函数调用</strong>；v2 换成了迭代式线性解析。</p>
+<p>同时要诚实说清楚：v2 比用 <code>unsafe</code> 的第三方库慢。相对 <code>segmentio/encoding</code> 在 Marshal 上最多慢 2.0 倍，相对 <code>bytedance/sonic</code> 在 Marshal 上慢 1.2-3.4 倍（sonic 走 JIT 生成机器码，且不校验 UTF-8）。v2 的目标是<strong>默认安全正确</strong>，不是绝对最快。它每次都要检查对象键名唯一、都要维护语法状态机，这些都是正确性的代价。</p>
+<p>要极致性能就继续用 sonic，但要知道你买的是什么。</p>
+<h2>一个开发者的看法</h2>
+<p>给热路径上自己写了 <code>UnmarshalJSON</code> 的类型补一个 <code>UnmarshalJSONFrom</code>，这是我现在就会做的事。纯增量改动，v1 用户也能受益（v1 底层认 <code>UnmarshalJSONFrom</code>）。凡是方法体里 <code>json.Unmarshal</code> 调用自己的类型，都是候选。Kubernetes 那个 93% 就是这么来的，没有魔法。</p>
+<p>迁移前先过一遍 <code>encoding/json</code> 包的 v2 对比文档，逐条确认哪些行为你在依赖。重点看 <code>omitempty</code> 和大小写敏感这两条。它们最可能在测试里无声通过、在生产里炸。</p>
+<div class="highlight"><pre><span></span><code>go<span class="w"> </span>doc<span class="w"> </span>encoding/json<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-A<span class="w"> </span><span class="m">40</span><span class="w"> </span><span class="s2">&quot;v2&quot;</span>
+</code></pre></div>
+
+<p><code>GOEXPERIMENT=nojsonv2</code> 记在脑子里当应急开关，别当长期方案。官方明说了这个 opt-out 会在未来版本移除，它是排障用的，不是推迟迁移用的。</p>
+<p>至于要不要现在就把新代码写成 v2：很熟悉 v1 的话几乎可以直接写，签名长得一样，只是多了 options 参数。真正需要动脑的是判断哪些默认值变化会影响你的下游，这部分没有工具能替你做。</p>
+<p>参考：<a href="https://go.dev/blog/jsonv2">A new Go API for JSON</a> · <a href="https://go.dev/doc/go1.27">Go 1.27 Release Notes</a> · <a href="https://github.com/kubernetes/kube-openapi/issues/315">kubernetes/kube-openapi#315</a> · <a href="https://github.com/go-json-experiment/jsonbench">go-json-experiment/jsonbench</a></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
