@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>一个校验和偏移，掀翻整台宿主机：PwnEscape 从 virtio 元数据到 KVM 逃逸 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>一个校验和偏移，掀翻整台宿主机：PwnEscape 从 virtio 元数据到 KVM 逃逸</h1>
+<time>2026-11-07</time>
+<ul>
+<li>Linux内核</li>
+<li>虚拟化安全</li>
+<li>KVM</li>
+<li>漏洞分析</li>
+<li>网络协议栈</li>
+</ul>
+<hr />
+<p>一个 32 字节的宿主内存泄露，最后变成 root 代码执行。整条链的起点不在 KVM 里，在 <code>net/ipv4/ip_output.c</code> 的几行代码。</p>
+<p>pwn.ai 团队（Paulos Yibelo）在 Vercel 百万美元 Sandbox 挑战赛里做出来的东西，CVE-2026-99999，CVSS 9.3。三天找到原语，从提交上游到合入不到一个月。</p>
+<p>值得写的不是"又一个逃逸"，而是它暴露的结构性缺陷：同一份数据包，在内核不同阶段被赋予不同可信度，中间有一个延迟写入可以改掉已经被信任的那部分。</p>
+<hr />
+<h2>一、CHECKSUM_PARTIAL 是一张"稍后付款"的欠条</h2>
+<p>Linux 不总是立刻算传输层校验和。它先让包处于"待完成"状态，再由网卡或软件辅助函数 <code>skb_checksum_help()</code> 补齐：</p>
+<div class="highlight"><pre><span></span><code><span class="n">skb</span><span class="o">-&gt;</span><span class="n">ip_summed</span><span class="w">    </span><span class="o">=</span><span class="w"> </span><span class="n">CHECKSUM_PARTIAL</span><span class="w">   </span><span class="c1">// 校验和还没算</span>
+<span class="n">skb</span><span class="o">-&gt;</span><span class="n">csum_start</span><span class="w">   </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="err">偏移</span><span class="o">&gt;</span><span class="w">              </span><span class="c1">// 从哪儿开始累加</span>
+<span class="n">skb</span><span class="o">-&gt;</span><span class="n">csum_offset</span><span class="w">  </span><span class="o">=</span><span class="w"> </span><span class="o">&lt;</span><span class="err">偏移</span><span class="o">&gt;</span><span class="w">              </span><span class="c1">// 从起点再偏移多少写结果</span>
+
+<span class="err">写入位置</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">csum_start</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">csum_offset</span>
+</code></pre></div>
+
+<p>这三个值不是描述性元数据，而是<strong>一次写操作的授权</strong>。谁能影响它们，谁就间接决定了将来往内存哪个地址写两个字节。正常路径下这个地址落在 TCP/UDP 头的校验和字段，而 virtio 的 <code>__virtio_net_hdr_to_skb()</code> 从 guest 侧读这些值——guest 可以直接影响它们。</p>
+<p>历史代码在入口用 <code>skb_transport_offset(skb)</code> 做最小头部检查。这个偏移相对当前 <code>skb-&gt;data</code> 算，能挡住"起点明显太靠前"，但回答不了：<strong>包里带额外链路层头时，起点距离网络头有多远？</strong></p>
+<p>两个不等式看着像一回事，其实不是：</p>
+<div class="highlight"><pre><span></span><code>transport_offset                    &gt;= minimum_network_header_length
+transport_offset - network_offset   &gt;= minimum_network_header_length
+</code></pre></div>
+
+<p>前者是帧内相对坐标，后者是网络头相对坐标。二层头一剥离，两套坐标系就对不上。</p>
+<hr />
+<h2>二、真正的杀手是执行顺序</h2>
+<p>问题不在某个检查写错了，而在于<strong>检查和使用之间隔了一次可以改数据的写入</strong>。修复前 <code>ip_do_fragment()</code> 的次序：</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">ip_summed</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">CHECKSUM_PARTIAL</span><span class="p">)</span>
+<span class="w">        </span><span class="n">skb_checksum_help</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span><span class="w">   </span><span class="cm">/* 延迟写入发生在这里 */</span>
+
+<span class="n">iph</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ip_hdr</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+<span class="cm">/* 后面从 iph-&gt;ihl 推出头部长度 */</span>
+</code></pre></div>
+
+<p><code>skb_checksum_help()</code> 本身没问题。它变危险，是因为畸形元数据让它的写入<strong>落在已经被解析、已经被信任的 IPv4 头里面</strong>。</p>
+<p>被改的字段是 <code>ihl</code>，4 个 bit，单位 32 位字。受控几何里首字节从 <code>0x45</code>（IPv4，5 字 = 20 字节）变成 <code>0x4f</code>（IPv4，15 字 = 60 字节），版本位 <code>4</code> 没动，只有长度解释从 20 变成 60。</p>
+<div class="highlight"><pre><span></span><code>不可信输入                      宿主网络栈
+──────────                      ──────────────────────────
+包 + 部分校验和元数据 ───────►  元数据装入 skb → L3 归一化
+                                → IPv4 解析、重组、路由
+                                  头部按 IHL=5（20 字节）被信任
+                                → 出口分片 → skb_checksum_help()
+                                  延迟写入改掉已解析的头部
+                                → ip_do_fragment() 读到 IHL=15
+                                  头部声称 60 字节，拷贝超出线性数据
+                                → 发出的 IP options 里混进宿主字节
+</code></pre></div>
+
+<p>全过程确定性，不是线程竞态。隔开"检查"和"使用"的"时间"，是若干合法网络步骤，中间夹一次受攻击者影响的延迟写入。</p>
+<h3>32 字节是怎么来的</h3>
+<p>Linux 包缓冲不要求连续，<code>sk_buff</code> 有线性 head 还可能有非线性 frag。该案例重组后逻辑线性长度只有：</p>
+<div class="highlight"><pre><span></span><code><span class="mf">20</span><span class="w"> </span><span class="n">字节</span><span class="w">  </span><span class="n">原始</span><span class="w"> </span><span class="n">IPv4</span><span class="w"> </span><span class="n">头</span>
+<span class="w"> </span><span class="mf">8</span><span class="w"> </span><span class="n">字节</span><span class="w">  </span><span class="n">第一个分片里的有效载荷</span>
+<span class="err">────────</span>
+<span class="mf">28</span><span class="w"> </span><span class="n">字节</span><span class="w">  </span><span class="n">skb</span><span class="w"> </span><span class="n">逻辑线性长度</span>
+</code></pre></div>
+
+<p>延迟的校验和操作让分片器以为 IP 头有 60 字节，于是把 20 字节头之后的 40 字节全当 IPv4 options：8 字节确实在线性 head 里（本是载荷），<strong>剩下 32 字节根本不属于这个包的逻辑线性数据</strong>。<code>skb_headlen(skb) = 28</code>，后续拷贝长度 60，差正好 32。</p>
+<p>必须说清：<strong>"越界"指越出 sk_buff 的有效逻辑包数据，不必然越出整个分配器对象。</strong> 宿主可能已物理映射了 tailroom，读那些字节不会崩，但它们属于宿主内存。塞进要发出去的 IP 头就跨了机密性边界，而且可外部观测——旁边抓包就能看到这些字节冒充 IP options。</p>
+<p>实验设计上他们设了身份组（头长度不变，证明基线）和活跃组对照，除了抓包还有一路应用层收据独立验证。活跃案例每次稳定泄露 32 字节，并在自有的 Linux 6.12 / 7.x 机器上确认了宿主侧可用性故障。</p>
+<hr />
+<h2>三、从读原语到写原语</h2>
+<p>可重复、攻击者可控的宿主内存读取，在多租户环境里已经很严重。但更有意思的是它对<strong>漏洞研究本身</strong>的作用：有了读原语，宿主内存状态的不确定性大幅下降，下一批内存操纵假设变得可测试。在自有 KVM 环境里，研究推进到了选择性 64 字节宿主内核写，并在受限实验室链条里跑起宿主 root 辅助程序，把宿主产生的标记回传给 guest。四次真正的冷启动都复现了。</p>
+<p>原文措辞很克制，值得照着写：</p>
+<blockquote>
+<p>我们说"guest 到宿主逃逸"，指的是在隔离的自有验证环境里的证明。它不是从一次越界读推断出来的结论，也不是对任何厂商生产环境 root 命令执行的宣称。</p>
+</blockquote>
+<p>证据阶梯是：源码假设、受控变异、宿主内存泄露、选择性内核写、自有机器上的受限执行，每级是不同强度的主张。多数人写到第三级就直接喊 RCE 了。</p>
+<hr />
+<h2>四、Part 2：接管 Firecracker 的 vCPU 线程</h2>
+<p>Firecracker 是每个 microVM 在宿主上的一个进程，每个虚拟 CPU 对应进程里一个线程。线程进入 KVM 跑 guest，遇到需在用户态处理的事件时返回：</p>
+<div class="highlight"><pre><span></span><code><span class="n">ioctl</span><span class="p">(</span><span class="n">vcpu_fd</span><span class="p">,</span><span class="w"> </span><span class="n">KVM_RUN</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+</code></pre></div>
+
+<p>线程停留在该系统调用里时，宿主内核把它的用户态寄存器保存在 <code>pt_regs</code> 里。<strong>这些寄存器描述 Firecracker 线程：指令指针说该回到哪儿继续，栈指针说该用哪个用户态栈。</strong> 所以从 <code>KVM_RUN</code> 返回的那一刻是极好的攻击点——能改这个保存的寄存器帧，就能决定 Firecracker 回到用户态后执行什么。触发也简单：让 vCPU 返回一次。</p>
+<h3>定位链条四步</h3>
+<p><strong>第一步，找自己那个 guest 页在宿主的哪。</strong> guest 物理地址（GPA）和宿主物理地址（HPA）是两个空间，靠 EPT 翻译。他们往 guest 页放一个 nonce，搜宿主物理范围里的候选 EPT 根，按 guest 地址走表，走到物理页比 nonce：</p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span> <span class="n">root</span> <span class="ow">in</span> <span class="n">candidate_ept_roots</span><span class="p">:</span>
+    <span class="n">page_hpa</span> <span class="o">=</span> <span class="n">walk_ept</span><span class="p">(</span><span class="n">root</span><span class="p">,</span> <span class="n">guest_gpa</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">page_hpa</span> <span class="ow">is</span> <span class="n">invalid</span><span class="p">:</span> <span class="k">continue</span>
+    <span class="k">if</span> <span class="n">read_host</span><span class="p">(</span><span class="n">page_hpa</span><span class="p">,</span> <span class="n">length</span><span class="p">(</span><span class="n">nonce</span><span class="p">))</span> <span class="o">==</span> <span class="n">nonce</span><span class="p">:</span>
+        <span class="n">candidates</span><span class="o">.</span><span class="n">append</span><span class="p">((</span><span class="n">root</span><span class="p">,</span> <span class="n">page_hpa</span><span class="p">))</span>
+</code></pre></div>
+
+<p>两个候选，用嵌套页表验证收敛到一个，得到 <code>guest_page_hpa</code>。</p>
+<p><strong>第二步，反查是哪台进程映射了它。</strong> 正常页表遍历是从虚拟地址求物理地址，这里反过来：已知物理页，求虚拟地址和页表根（PGD）。遍历宿主页表找 <code>guest_page_hpa</code> 的映射，拿到候选的 <code>pgd</code> 和虚拟地址，再用 <code>walk_host_page_tables(pgd, va)</code> 正向走一遍确认能回到同一物理页、且内容仍是那个 nonce，双向校验通过才算数。留住 <code>host_pgd</code>。</p>
+<p><strong>第三步，找到 Firecracker 本体，绕过 ASLR。</strong> 找 ELF 镜像，校验 Firecracker <code>write(2)</code> 包装里一段已知字节序列。镜像内地址和运行时地址的差就是 load bias：</p>
+<div class="highlight"><pre><span></span><code><span class="n">runtime_code_address</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">load_bias</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">code_address_in_elf</span>
+</code></pre></div>
+
+<p><strong>第四步，锁定当前 vCPU 的寄存器帧。</strong> 线索是返回地址——在 <code>KVM_RUN</code> 里的线程，保存的指令指针应指向 ioctl 调用点之后，这个地址能从验证过的二进制加 load bias 算出。但单纯地址匹配会碰到栈上陈旧内容，所以候选还要同时满足栈检查（绑回从 guest 页恢复的地址空间）、指令和调用者地址（绑回 Firecracker 镜像）、系统调用字段（绑回正在跑 vCPU 的操作）。最后只剩一个。</p>
+<hr />
+<h2>五、劫持返回，然后恢复现场</h2>
+<p>payload 很朴素：让 Firecracker 往自己的 stderr 写一个可识别字符串。字符串 <code>N8V23M2\n</code>，七个字符加换行，正好一个栈字：</p>
+<div class="highlight"><pre><span></span><code><span class="n">write</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="s">&quot;N8V23M2</span><span class="se">\n</span><span class="s">&quot;</span><span class="p">,</span><span class="w"> </span><span class="mi">8</span><span class="p">);</span>
+</code></pre></div>
+
+<p>改之前先保存三个栈字（一个放字符串，两个放临时调用序列的返回地址），然后把保存的寄存器帧改成：</p>
+<div class="highlight"><pre><span></span><code>RIP = Firecracker write 包装的地址
+RDI = 2
+RSI = Firecracker 栈上标记字符串的虚拟地址
+RDX = 8
+RSP = 临时返回序列的虚拟地址
+</code></pre></div>
+
+<p>返回路径有个细节：<code>write</code> 成功返回 8，<code>KVM_RUN</code> 成功返回 0。所以返回序列第一个地址放 <code>xor eax,eax; ret</code> 清零，第二个地址跳回原本的 ioctl 继续点。触发方式是 guest 往自己串口写一个字节，这让 vCPU 线程从 <code>KVM_RUN</code> 返回，内核恢复被改过的寄存器，Firecracker 进入 write 包装。宿主侧单独捕获 stderr，完整输出八个字节：</p>
+<div class="highlight"><pre><span></span><code>N8V23M2
+</code></pre></div>
+
+<p>同时 Firecracker 还在跑，guest SSH 还能连，三个临时栈字已恢复。随后又跑一次不做内存修改的校验，重复寄存器、代码、栈三组检查，通过且无残留标记。</p>
+<p>环境：Firecracker v1.16.1 / x86-64，宿主内核 7.0.0-1011-aws，guest 内核 6.18.44+，Firecracker 由 <code>systemd-run</code> 直接以 root 启动并 <code>taskset</code> 绑核，所以那个受控调用以宿主 root 身份执行。</p>
+<p><strong>边界必须点明</strong>：这个配置没开 jailer。生产环境的 Firecracker 会降权限、用 namespace 和 seccomp 限制进程。用了那些管控的部署，打穿 VMM 之后还能拿多少权限，需要单独评估。</p>
+<hr />
+<h2>六、防御方该改什么</h2>
+<p>最终合入的是 Michael S. Tsirkin（Red Hat）的版本，commit <code>6785011f8b16</code>，10 月 8 日进 net.git，10 月 14 日进主线。思路是在每个消费点前加一道 IPv4 专用检查，而不是重做 virtio 校验和 API。共享辅助函数放在 <code>include/net/ip.h</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="k">static</span><span class="w"> </span><span class="kr">inline</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="nf">ip_check_csum_start</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">sk_buff</span><span class="w"> </span><span class="o">*</span><span class="n">skb</span><span class="p">)</span>
+<span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">unlikely</span><span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">csum_start</span><span class="w"> </span><span class="o">&lt;</span>
+<span class="w">                     </span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">network_header</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">ip_hdrlen</span><span class="p">(</span><span class="n">skb</span><span class="p">)))</span>
+<span class="w">                </span><span class="k">return</span><span class="w"> </span><span class="o">-</span><span class="n">EINVAL</span><span class="p">;</span>
+<span class="w">        </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>不变量一句话：<strong>校验和起点必须不早于「IPv4 网络头起点 + 已解析的 IPv4 头长度」。</strong> 对非负 <code>csum_offset</code>，这保证最终写入位置不会落进 IPv4 头。它<strong>不</strong>去认证目标是否合法 TCP/UDP 校验和字段，只做保护已信任 IPv4 头所必需的窄承诺。</p>
+<p>改动范围：6 个文件，44 行新增、12 行删除——<code>include/net/ip.h</code> 新增辅助函数，其余五处是消费点：<code>ip_output.c</code> 的 <code>ip_do_fragment()</code>、网桥的 <code>nf_conntrack_bridge.c</code>、XFRM 的 <code>xfrm_output.c</code>、<code>nfnetlink_queue.c</code> 的 <code>nf_queue_checksum_help()</code>、<code>xt_CHECKSUM.c</code> 的 <code>checksum_tg()</code>（IPv4 检查失败直接 <code>NF_DROP</code>）。</p>
+<p><code>ip_do_fragment()</code> 修复后：</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">skb</span><span class="o">-&gt;</span><span class="n">ip_summed</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">CHECKSUM_PARTIAL</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="n">err</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">ip_check_csum_start</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">err</span><span class="p">)</span>
+<span class="w">                </span><span class="n">err</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">skb_checksum_help</span><span class="p">(</span><span class="n">skb</span><span class="p">);</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">err</span><span class="p">)</span>
+<span class="w">                </span><span class="k">goto</span><span class="w"> </span><span class="n">fail</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><strong>先验起点，再补校验和。</strong> 就这一个顺序调换。补丁说明写得很明确，这是 defence in depth，完整入口校验还需要更多工作——别把"已修复"理解成"这个攻击面关了"。</p>
+<h3>自查</h3>
+<div class="highlight"><pre><span></span><code><span class="c1"># 1. 内核版本，对照 distro stable 分支是否已含 6785011f8b16</span>
+uname<span class="w"> </span>-r
+
+<span class="c1"># 2. 是否开了 jailer</span>
+ps<span class="w"> </span>-o<span class="w"> </span>pid,args<span class="w"> </span>-C<span class="w"> </span>firecracker<span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-c<span class="w"> </span>jailer
+
+<span class="c1"># 3. seccomp / 权限是否真的收住了</span>
+grep<span class="w"> </span>-E<span class="w"> </span><span class="s2">&quot;Seccomp|CapEff&quot;</span><span class="w"> </span>/proc/&lt;firecracker_pid&gt;/status
+</code></pre></div>
+
+<p>第三条尤其重要。PwnEscape 的杀伤力很大程度来自"VMM 进程权限过高"这个前提。降权到非 root、开 jailer、限制 seccomp，即使 VMM 被打穿，拿到的也只是受限进程。</p>
+<hr />
+<h2>七、这个模式有个名字：deferred-metadata trust inversion</h2>
+<p>原文给这类缺陷起了名，是最有复用价值的部分。三种信任转移叠加：</p>
+<ul>
+<li><strong>来源信任</strong>：较低信任的 guest 或进程，描述了宿主将来要执行的操作</li>
+<li><strong>解释信任</strong>：包在链路层处理中改变了表示，内核按某布局解析字段</li>
+<li><strong>时间信任</strong>：延迟操作在被解析状态被下一个消费者使用前把它改掉</li>
+</ul>
+<div class="highlight"><pre><span></span><code>不可信元数据进入 → 按早期表示校验 → 包被归一化/解析/授权
+  → 元数据驱动的操作稍后运行 → 安全相关字节变化
+  → 后来的消费者信任了被改过的解释 → 内存安全或策略边界失效
+</code></pre></div>
+
+<p>对应的审计问题不是"校验和偏移校验了吗"，而是：<strong>每一次变换之后，延迟写入还能不能指向那些语义已经被信任了的字节？</strong> 这个问题可以拿去问零拷贝路径、GSO/GRO 聚合、BPF 的 skb 改写、io_uring 提交队列。凡是"先检查后执行、中间还允许改数据"的地方都值得过一遍。</p>
+<hr />
+<h2>八、我的看法</h2>
+<p><strong>虚拟化边界的信任模型该重画了。</strong> 大家习惯认为 VM 隔离住在 hypervisor 里，攻击面就是 <code>arch/x86/kvm/</code>。实际 guest 面对的是整个宿主操作系统。PwnEscape 的漏洞不在 hypervisor，在 <code>net/ipv4/ip_output.c</code>。</p>
+<p><strong>性能契约是天然攻击面。</strong> <code>CHECKSUM_PARTIAL</code> 存在的唯一理由是性能。为了跑得快把工作推迟，天生拉长了不变量暴露窗口：你接受延迟，就等于接受"这段时间里数据不能变"这个额外约束，而这类约束最容易被漏掉。</p>
+<p><strong>研究方法的可复制性比漏洞本身值钱。</strong> 三天找到原语，靠的是把攻击面画成"哪里不可信状态被提升为可信状态"的地图，再逐个挑战后续消费者，而不是死磕初始解析器。证据分层那套比任何一份 hex dump 都更该抄进自己的报告模板。</p>
+<p><strong>AI 辅助漏洞研究已经不是新闻稿里的东西。</strong> 这次用 Omega-Pwn 加 GPT-5.6 Sol 做源码级分析，人类定范围和判定什么算证据，整轮 API 成本不到 700 美元。价值不在"AI 找到了漏洞"，而在那个循环：提出不变量违背 → 建受限测试 → 检查对照和否证案例 → 保留证据 → 与专家迭代 → 请独立 reviewer 攻击结论。</p>
+<p><strong>一点保留</strong>：所有结论都基于自有的、无 jailer 的 Firecracker 环境。看这类研究容易直接跳到"KVM 不安全"，但 Firecracker 的安全模型本来就是<strong>假设 VMM 会被打穿</strong>，用 jailer 兜底。如果你在跑 Firecracker 又没开 jailer，那才是今天该去改配置的事。</p>
+<hr />
+<h2>参考来源</h2>
+<ol>
+<li>pwn.ai Research《PwnEscape: Guest-to-Host KVM Escape》Part 1
+   https://pwn.ai/blog/pwnescape</li>
+<li>pwn.ai Research《Firecracker VM Escape: PwnEscape Part 2》
+   https://pwn.ai/blog/firecracker-escape</li>
+<li>上游修复 commit <code>6785011f8b16</code>
+   https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/patch/?id=6785011f8b16abf40b1e9d8b2e332232b3e68822</li>
+<li>NVD CVE-2026-99999（CVSS 3.1 9.3，<code>AV:L/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H</code>）</li>
+<li>内核文档 checksum offloads
+   https://docs.kernel.org/networking/checksum-offloads.html</li>
+</ol>
+<hr />
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
