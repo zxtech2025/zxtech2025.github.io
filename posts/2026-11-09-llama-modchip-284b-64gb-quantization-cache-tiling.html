@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>284B模型塞进64GB内存：llama-modchip的1.71bpw量化与四层Cache分块内核 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>284B模型塞进64GB内存：llama-modchip的1.71bpw量化与四层Cache分块内核</h1>
+<time>2026-11-09</time>
+<ul>
+<li>LLM推理</li>
+<li>量化</li>
+<li>MoE</li>
+<li>AVX-512</li>
+<li>llama.cpp</li>
+</ul>
+<hr />
+<p>HN上有个项目这周被反复顶上来：llama-modchip，宣称把284B的DeepSeek-V4-Flash塞进一台64GB内存的普通桌面机，零GPU，256K上下文，还不用swap。仓库10月29号建的，11天658星，今天还在推代码。</p>
+<p>标题听着像营销，但把README、FAQ和<code>scripts/transcode_dsv4_shard.py</code>读完之后，里面有几块硬东西值得拆：一个自定义的2bit量化格式、一套靠闭式解算出来的专家重要性权重、一套把DDR5带宽瓶颈往cache层级上挪的GEMM分块。另外有几个数字我自己算了一遍，和他们的宣传口径对不齐，这部分更有意思。</p>
+<p>先说结论：<strong>这个项目确实把模型塞进去了，但"跑得动"和"跑得快"是两回事。真跑起来你才会发现，卡住速度的是每个token那2.5GB权重要从DDR5搬一遍，内存反而不是问题。</strong></p>
+<h2>一、先算清楚账：284B × 1.71bpw 并不等于56.56GiB</h2>
+<p>README写得很整齐：284.33B总参数、13.17B激活、1.71bpw、56.56GiB。但这个1.71是<strong>平均</strong>出来的。FAQ自己承认：<code>284B × 3.75bpw</code> 会是133GiB，根本装不下。</p>
+<p>我按他们的分层配方重算了一遍：</p>
+<table>
+<thead>
+<tr>
+<th>张量组</th>
+<th>参数量</th>
+<th>量化格式</th>
+<th>位宽</th>
+<th>磁盘占用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MLA + Indexer Compressor（dense）</td>
+<td>~11.8B</td>
+<td>Fractal-64 (Q2_0)</td>
+<td>3.75bpw</td>
+<td>~5.2GiB</td>
+</tr>
+<tr>
+<td>256路由专家 <code>ffn_{gate,up,down}_exps</code></td>
+<td>~265B</td>
+<td>IQ1_S / IQ1_M / IQ2_XXS</td>
+<td>1.5625–2.0625bpw</td>
+<td>~48.2GiB</td>
+</tr>
+<tr>
+<td>共享专家 + embedding + norms + lm_head</td>
+<td>~2.8B</td>
+<td>Q5_K/Q6_K/F32</td>
+<td>~4bpw</td>
+<td>~1.3–2.8GiB</td>
+</tr>
+</tbody>
+</table>
+<p>加起来约54.7–56.6GiB，跟56.56对得上（差异来自我按4bpw估的那2.8B），平均<strong>1.65bpw左右</strong>。所以真实结构是两套完全不同的位宽：dense张量给到3.75bpw保精度，占体积95%的路由专家压到1.5625bpw。dense层每个token都过、专家层每个token只过6/256，这个取舍是合理的，但照1.71bpw去估算自己的模型会算错。</p>
+<p>整个模型从源头的<code>UD-IQ1_S</code>（76.87GiB）压到56.56GiB，砍掉20.31GiB，是原体积的73.6%。</p>
+<h2>二、SwiGLU-H2：不跑校准集，怎么定每个专家的量化权重</h2>
+<p>常规的GPTQ/AWQ量化需要跑一批校准数据，统计激活值来决定每个通道的敏感度。问题是：284B的模型跑一遍校准集，光前向就要几小时，还得先把未量化的完整模型加载起来，64GB的机器根本做不到。</p>
+<p>llama-modchip绕开了这一步。它用的是SwiGLU结构的一个闭式性质。</p>
+<p>SwiGLU的FFN是：</p>
+<div class="highlight"><pre><span></span><code>h_j = SiLU(g_j) <span class="gs">* u_j      g = W_gate *</span> x      u = W_up * x
+</code></pre></div>
+
+<p>在激活值近似各向同性、单位方差的假设下，第j个中间通道输出的能量期望正比于两个矩阵<strong>行范数平方之积</strong>：</p>
+<div class="highlight"><pre><span></span><code>E[h_j^2]  ∝  ||W_gate[j,:]||^2  *  ||W_up[j,:]||^2
+</code></pre></div>
+
+<p>这个量完全从权重本身算得出来，不需要任何数据。代码里确实是这么干的：处理<code>ffn_down_exps.weight</code>时，先把同层<code>ffn_gate_exps</code>和<code>ffn_up_exps</code>的指针取出来，连同目标缓冲区一起传给C扩展：</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span> <span class="n">name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s2">&quot;ffn_down_exps.weight&quot;</span><span class="p">):</span>
+    <span class="n">gt</span> <span class="o">=</span> <span class="n">by_name</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;blk.</span><span class="si">{</span><span class="n">blk_id</span><span class="si">}</span><span class="s2">.ffn_gate_exps.weight&quot;</span><span class="p">)</span>
+    <span class="n">ut</span> <span class="o">=</span> <span class="n">by_name</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;blk.</span><span class="si">{</span><span class="n">blk_id</span><span class="si">}</span><span class="s2">.ffn_up_exps.weight&quot;</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">gt</span> <span class="ow">and</span> <span class="n">ut</span><span class="p">:</span>
+        <span class="n">gate_ptr</span> <span class="o">=</span> <span class="n">src_base_addr</span> <span class="o">+</span> <span class="n">data_start</span> <span class="o">+</span> <span class="n">gt</span><span class="p">[</span><span class="s2">&quot;orig_off&quot;</span><span class="p">]</span>
+        <span class="n">up_ptr</span>   <span class="o">=</span> <span class="n">src_base_addr</span> <span class="o">+</span> <span class="n">data_start</span> <span class="o">+</span> <span class="n">ut</span><span class="p">[</span><span class="s2">&quot;orig_off&quot;</span><span class="p">]</span>
+<span class="n">lib</span><span class="o">.</span><span class="n">transcode_moe_exps</span><span class="p">(</span><span class="o">...</span><span class="p">,</span> <span class="n">ncol</span><span class="p">,</span> <span class="n">nrow</span><span class="p">,</span> <span class="n">n_exp</span><span class="p">,</span>
+                       <span class="n">gate_ptr</span><span class="p">,</span> <span class="n">gate_t</span><span class="p">,</span> <span class="n">up_ptr</span><span class="p">,</span> <span class="n">up_t</span><span class="p">)</span>
+</code></pre></div>
+
+<p>为什么down要单独处理：down的输入维上每一行，对应gate/up输出的一个通道。</p>
+<p>这个思路在文献里叫<strong>data-free importance</strong>，不是新东西，但落地很干净：一次性流式读三个张量、算完立刻<code>posix_fadvise(..., POSIX_FADV_DONTNEED)</code>把页缓存踢掉，否则在64GB机器上转码56GB模型会直接把内存打爆。</p>
+<h2>三、锚定层：哪些层不敢压</h2>
+<p>代码里有一组硬编码的层号集合，这是全篇最"工程"的部分：</p>
+<div class="highlight"><pre><span></span><code><span class="n">GATE_UP_KEEP_IQ2</span> <span class="o">=</span> <span class="p">{</span><span class="mi">1</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">26</span><span class="p">,</span> <span class="mi">28</span><span class="p">,</span> <span class="mi">40</span><span class="p">}</span>          <span class="c1"># 这几层的 gate/up 保持 IQ2</span>
+<span class="n">DOWN_IQ2_LAYERS</span>  <span class="o">=</span> <span class="p">{</span><span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="mi">26</span><span class="p">,</span> <span class="mi">28</span><span class="p">,</span> <span class="mi">41</span><span class="p">,</span> <span class="mi">42</span><span class="p">}</span>      <span class="c1"># 这几层的 down 给 IQ2_XXS</span>
+<span class="n">DOWN_IQ1M_LAYERS</span> <span class="o">=</span> <span class="p">{</span><span class="mi">2</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="mi">8</span><span class="p">,</span> <span class="mi">27</span><span class="p">,</span> <span class="mi">30</span><span class="p">,</span> <span class="mi">32</span><span class="p">,</span> <span class="mi">40</span><span class="p">}</span> <span class="c1"># 这几层给 IQ1_M</span>
+<span class="c1"># 其余一律 IQ1_S (1.5625bpw)</span>
+</code></pre></div>
+
+<p>为什么是这几个数？因为DeepSeek-V4-Flash的43层里，前3层（<code>il=0..2</code>）用的是<strong>token-ID哈希路由</strong>，不是学出来的router：</p>
+<ul>
+<li><code>il = 0..2</code>：<code>ffn_gate_tid2eid</code>把token ID直接映射到6个词法专家，权重接近均匀（0.22–0.30）。这几个专家是"查表"性质，砍掉任何一个等于丢了1/6的词汇查找能力。</li>
+<li><code>il = 3..42</code>：真正的Top-K路由器，<code>SQRT_SOFTPLUS</code>激活。这里专家权重呈幂律分布，top-4能覆盖约81.2%的路由权重。</li>
+</ul>
+<p>所以哈希层的0/1/2和首尾边界层26/28/40/41/42被单独保护，中间的层才敢往1.5625bpw压。这套规则<strong>不通用</strong>，是拿具体模型的结构试出来的：换个MoE模型，这组层号得重新扫。</p>
+<h2>四、L2正交重标定：为什么不能用线性缩放</h2>
+<p>这是我认为全篇最有技术含量的一段。</p>
+<p>既然专家层压到1.5625bpw必然掉精度，那就在<strong>运行时</strong>再省一点：每层只算top-4或top-5个专家，而不是全部6个。这样省下来的不只是计算，更是<strong>一次完整的权重读取</strong>。</p>
+<p>但直接跳过第6个专家会让输出变小。朴素做法是按权重和做线性补偿：</p>
+<div class="highlight"><pre><span></span><code>alpha_L1 = sum(w_i, i=1..6) / sum(w_i, i=1..k)  ≈ 1.23  (k=4)
+</code></pre></div>
+
+<p>问题在这里：6个专家的输出向量在4096维空间里近似正交，它们的和的期望能量是 <code>sum(w_i^2 * ||e_i||^2)</code>，不是 <code>(sum(w_i))^2</code>。线性补偿会把路由分支相对共享专家放大约23%，而共享专家是没被剪的。两边的比例一失衡，下游RMSNorm一除，偏差就传到后面43层。</p>
+<p>正确做法是按<strong>平方和</strong>补偿：</p>
+<div class="highlight"><pre><span></span><code>alpha_L2 = sqrt( sum(w_i^2, i=1..6) / sum(w_i^2, i=1..k) )
+         ≈ 1.015 (k=5)   /   1.042 (k=4)
+</code></pre></div>
+
+<p>差别有多大？他们的实测：Top-4配置下，线性重标定的KL散度是0.0671 nats，换成L2重标定降到<strong>0.0281 nats，降了58%</strong>。而decode速度两者是一样的。</p>
+<p>很多MoE剪枝实现（包括一些推理框架的<code>--n-expert</code>参数）就是少算几个专家、不做补偿，或者做线性补偿。省下来的是几十毫秒，赔进去的是输出质量的系统性偏移。</p>
+<h2>五、四层Cache分块：把瓶颈从DDR5挪走</h2>
+<p>prefill和decode的瓶颈完全不同。decode只算1个token，矩阵退化成矩阵-向量乘（GEMV），算术强度约1 FLOP/byte，被DDR5带宽卡死。prefill一次算512个token，是GEMM，算术强度上到160+ FLOP/byte，瓶颈变成<strong>计算和cache命中率</strong>。</p>
+<p>标准ggml-cpu的问题是：<code>vec_dot</code>按<code>1x1</code>执行，一个token一次、一行权重一次。同一块量化权重，处理8个token就要从L2/L3里解包8遍。解包一个<code>IQ1_S</code>权重块的开销（移位、掩码、查表）跟做一次乘加的代价是同数量级的。</p>
+<p>llama-modchip的做法是把权重块<strong>在寄存器里解包一次，乘以多个token列</strong>：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 概念示意：权重块解码进 ZMM 后广播给 K 个 token 列</span>
+<span class="k">for</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="n">in</span><span class="w"> </span><span class="p">{</span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">}</span><span class="o">:</span><span class="w">   </span><span class="c1">// 按 M 的分解依次取</span>
+<span class="w">    </span><span class="n">解包</span><span class="w"> </span><span class="mi">512</span><span class="o">-</span><span class="n">bit</span><span class="w"> </span><span class="n">权重块一次</span>
+<span class="w">    </span><span class="n">vpmaddubsw</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="n">vpmaddwd</span><span class="w"> </span><span class="n">覆盖</span><span class="w"> </span><span class="n">k</span><span class="w"> </span><span class="n">列输入</span>
+</code></pre></div>
+
+<p>为什么是<code>{8,4,3,2}</code>这组魔数？因为<strong>任何≥2的整数都能表示成这四个数的非负线性组合</strong>（5=3+2，9=4+3+2，10=8+2）。MoE的<code>MUL_MAT_ID</code>按专家分桶，256个专家、平均每个专家6.5–12.7个token，桶大小极不均匀。用<code>{8,4,3,2}</code>凑，让"每个专家只要≥2个token"就永远不退化到<code>1x1</code>路径，省掉了为边缘情况写单独分支。</p>
+<p>配套的还有几件事：</p>
+<ul>
+<li><strong>L2 tile 128行</strong>（64–276KB，远小于1MB L2），L1D 内层按token列分块，保证<code>[ne00, 64]</code>的切片常驻在32KB的L1D里。</li>
+<li><strong><code>_MM_HINT_NTA</code>非临时访存</strong>：MoE专家权重用完就不会再用（1.8GB的总量远超64MB的L3），所以用NTA提示让它们不污染L3，把L3留给反复访问的KV cache。</li>
+<li><strong><code>quantize_row_q8_K</code>的AVX-512重写</strong>：原来这函数在<code>arch/x86/quants.c</code>里是标量参考实现，每个token的激活量化都走它。改成16个ZMM寄存器的向量实现，位精确。</li>
+</ul>
+<p>效果：prefill从24.70 tok/s到43.16–44.36 tok/s（+77%），decode从5.91到9.06 tok/s（+53%）。</p>
+<h2>六、我算了一遍，有个数字对不上</h2>
+<p>到这里我停下来自己核了一遍物理上限。</p>
+<p>decode是带宽受限的。13.17B激活参数，混合位宽约1.56–2.0bpw，每个token要流的权重量是：</p>
+<div class="highlight"><pre><span></span><code><span class="mf">13.17e9</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mf">1.5625</span><span class="w"> </span><span class="n">bits</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mf">8</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mf">2.57</span><span class="w"> </span><span class="n">GB</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="kr">to</span><span class="n">ken</span>
+</code></pre></div>
+
+<p>Zen 5移动平台双通道DDR5-5600的理论带宽是89.6 GB/s。照这个算，纯带宽上限是 <code>89.6 / 2.572 ≈ 34.8 tok/s</code>。而他们实测的decode是9.06 tok/s，反推有效带宽 <code>2.572 GB × 9.06 ≈ 23.3 GB/s</code>。</p>
+<p><strong>只有理论峰值的26%。</strong></p>
+<p>这个gap说明：现在卡住它的<strong>不是DDR5带宽，是每个token那4551个计算节点的调度开销</strong>。profiling表也印证了这点：单token 110.33ms里，MLA和共享专家的<code>MUL_MAT</code>占61.81ms，路由MoE的<code>MUL_MAT_ID</code>占22.27ms，<code>HADAMARD</code>/<code>RMS_NORM</code>/<code>HC_PRE-POST</code>/<code>FLASH_ATTN</code>这堆非矩阵算子合计占9.85ms。4551个节点、43层、每层几百次小算子调用堆出来的。</p>
+<p>换句话说：<strong>1.71bpw量化把"装不下"变成了"装得下"，但没把"慢"解决掉。</strong> 9 tok/s大约是人的阅读速度的3倍，能跑agent，但谈不上流畅。真要提速，方向不是继续压位宽（已经到1.56bpw了，再压模型就废了），而是减少算子调用次数、把小的非矩阵算子融合掉。</p>
+<h2>七、几个使用上的坑</h2>
+<p><strong>1. Q2_0是CPU专属格式。</strong> <code>Fractal-64</code>用自定义type ID 42（<code>GGML_TYPE_Q2_0</code>），只有<code>ggml-cpu</code>实现了它的SIMD kernel，<code>ggml-vulkan</code>和<code>ggml-cuda</code>都没有。如果你用<code>-ngl 99 --n-cpu-moe 30</code>把这些层offload到GPU，GPU后端不认识这个类型，输出是<strong>空的或者乱码</strong>，而且不一定报错。</p>
+<p><strong>2. 未打补丁的llama.cpp/Ollama/LM Studio会直接拒绝。</strong> 报错是<code>unknown tensor type 42</code>。这不是文件坏了。</p>
+<p><strong>3. 64GB是硬下限，剩余空间只有3.6GiB。</strong> 峰值VmRSS 58.9GiB（256K上下文），64GB Linux可用约62.5GiB。留给页缓存和系统进程的空间非常窄，多开一个浏览器就可能触发OOM。想舒服一点应该上96GB。</p>
+<p><strong>4. 哈希层不能剪。</strong> <code>il=0..2</code>永远是6/6专家，代码里写死了。这不是保守，是因为那三层是token-ID查表，剪掉就是直接丢词。</p>
+<p><strong>5. Mamba-2的投机解码不能回滚。</strong> SSM的循环状态<code>h_t</code>不能像Transformer的KV cache那样把索引往回退。他们必须在投机批次前把46层状态（约18.4MB/slot）<code>memcpy</code>到<code>slot.spec_ckpt</code>，只要有一个draft token被拒（<code>n_rollback &gt; 0</code>）就得整段回放。这也解释了为什么draft模型用的是192KB的Zobrist置换表（Stockfish那套国际象棋引擎的招法）而不是神经网络draft：在71.7GB/s的CPU上，流一个600MB的1B draft模型做5步要40ms，比直接跑目标模型还慢。</p>
+<h2>八、我的看法</h2>
+<p>这类项目把"MoE模型的内存账"摊开给你看，比它本身能不能跑更有价值。</p>
+<p><strong>MoE的参数量是个假指标。</strong> 真正决定能不能跑的是两个数：总量能否装进内存（否则要流式加载，延迟爆炸），激活量能否被带宽喂饱。只看一个必然判断错。这也是llama-modchip和Swiftlet的分界：Swiftlet把专家留在SSD上流式读，适合内存真的不够（4.3GB跑80B）；llama-modchip把整个模型压进内存，适合内存刚好够（64GB跑284B）。前者拿低内存换读盘延迟，后者拿1.56bpw的量化损失换零swap。</p>
+<p><strong>闭式重要性权重是被低估的方向。</strong> 行范数平方之积，本质上在说"gate和up同时很大的通道才重要"。不需要校准数据，不需要前向，成本是一次流式扫描。对于大到跑不起校准集的模型，这可能是唯一可行的路径。精度够不够得看任务——他们的100分质量门给了满分，但那个门是自己设计的，我要看到独立评测才会信。</p>
+<p>另外提醒一句：<strong>别拿1.71bpw去套别的模型。</strong> 那套层号锚定（<code>{0,1,26,28,41,42}</code>保护、<code>{2,4,5,8,27,30,32,40}</code>给IQ1_M）是拿DeepSeek-V4-Flash的结构试出来的：3层哈希路由加40层学习路由、256专家、Top-6。换个MoE模型，层号和专家数一变，规则全部失效。想复现的话第一步应该是重扫敏感层，跑一遍perplexity找出哪几层一压就崩。</p>
+<p>如果我要在64GB机器上跑，会先上30B那条路。Nemotron-3.5-30B-A3B只有14.35GiB，16–32GB机器上能到25–60 tok/s，是这套东西真正好用的区间：</p>
+<div class="highlight"><pre><span></span><code>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/synchopate/llama-modchip.git
+<span class="nb">cd</span><span class="w"> </span>llama-modchip<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>./modchip<span class="w"> </span>status<span class="w">   </span><span class="c1"># 先确认AVX-512/大页支持，不下载模型</span>
+./modchip<span class="w"> </span>bench<span class="w">                        </span><span class="c1"># 30秒两阶段测速，出可提交的scorecard</span>
+</code></pre></div>
+
+<p>284B更像"证明可行"的工程样品：能跑，但9 tok/s的交互体验和紧到3.6GiB的内存余量，注定它是demo而不是日常工具。</p>
+<p>以上数字除标注来源外，位宽换算、带宽上限、有效带宽反推都是我按公开参数自己算的，算法在文中给了，可以复现。</p>
+<hr />
+<p>参考：
+- llama-modchip 仓库：https://github.com/synchopate/llama-modchip
+- DeepSeek-V4 优化细节：<code>docs/DEEPSEEK_V4_OPTIMIZATIONS.md</code>
+- 量化转换实现：<code>scripts/transcode_dsv4_shard.py</code>、<code>scripts/transcode_dsv4.c</code></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
