@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>15.9万个AI生成应用爬了一遍：缺省配置把数据库敞了多久 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>15.9万个AI生成应用爬了一遍：缺省配置把数据库敞了多久</h1>
+<time>2026-11-15</time>
+<ul>
+<li>安全</li>
+<li>AI编程</li>
+<li>Postgres</li>
+<li>云服务配置</li>
+<li>数据泄露</li>
+</ul>
+<hr />
+<p>11 月 2 日 Handelsblatt 发了一篇报道，标题问得很客气："流行的 AI 编程平台有安全问题吗"。汉堡一家做应用安全的公司 Crissy Field 配合做了调查，报告这几天才放出完整英文版。结论比标题难看得多：<strong>他们从 Common Crawl 里翻出 159,041 个用 Lovable 搭的项目，其中 24,664 个网站在页面加载时就把数据库记录吐了出来，不需要登录。</strong></p>
+<p>这个数字在安全圈被归到"vibe coding 又一个翻车案例"。但把报告的方法论读完，我发现真正的问题不在"AI 写的代码不安全"这种废话上。它暴露的是一整套架构选择的默认值问题：<strong>当后端即服务把数据库直接暴露给浏览器，而权限层需要用户手动打开时，一个不懂后端的用户造出来的每一个应用，都是一个待验证的洞。</strong></p>
+<h2>一、攻击面是爬出来的，不是扫出来的</h2>
+<p>报告最有价值的部分是方法论，值得逐条看：</p>
+<ul>
+<li>数据源用 Common Crawl，时间窗口 2025 年 12 月到 2026 年 9 月，识别并分析了 159,041 个 Lovable 项目</li>
+<li>其中 34,545 个用了 Supabase 作为数据库</li>
+<li>24,664 个网站在首次加载时就通过 Supabase 发出了数据库记录，无需登录或任何交互</li>
+<li>对这 24,664 个站再做额外的只读请求，发现 7,403 个站（30%）的 10,560 张表里含有邮箱地址记录</li>
+</ul>
+<p>注意报告自己写的三条限制，这几句话决定了这个 30% 该怎么读：</p>
+<ol>
+<li>首屏返回数据本身不是漏洞，可能是设计上就要公开展示的</li>
+<li>邮箱字段既可能是个人数据，也可能是公开联系方式或测试数据</li>
+<li>只取了数据集的一部分而非全量下载，所以真实暴露量只会更多</li>
+<li>反过来看，不含邮箱字段的个人记录被漏掉了</li>
+</ol>
+<p>所以 30% 不是"数据泄露率"，只能算"在我们细查的这批站里，有邮箱记录且可被额外请求读到的比例"。这种在数字旁边主动标定边界的写法，比结论本身更专业。</p>
+<p>报告没公布具体怎么构造请求，理由是"公开会让后续访问更容易"。这一点做得对，但这也意味着：<strong>方法不公开不影响复现，因为路径是平台的默认行为决定的。</strong></p>
+<h2>二、路径为什么可复制：一个键加一条 REST 规则</h2>
+<p>要理解为什么"一个 app 的打法能套到另一个 app 上"，得看 Supabase 的请求模型。我把官方文档里两块拼起来看，链条非常清楚。</p>
+<p>第一块是 API key 的定位。Supabase 当前有四种键，其中两种是给客户端（浏览器、移动端、CLI）用的：新的 <code>sb_publishable_...</code> 和旧的 <code>anon</code> JWT。官方对这类键的描述是"任何人都能读到，所以它只能触达 Row Level Security 允许的范围"。这句话本身就说明了一件事：<strong>这个键必然出现在打包产物里，泄漏不是事故，是设计前提。</strong></p>
+<p>键会映射到一个 Postgres 角色，规则写得很直白：</p>
+<div class="highlight"><pre><span></span><code>Publishable key + 未登录  → anon 角色
+Publishable key + 已登录  → authenticated 角色
+Secret key                → service_role（带 BYPASSRLS，绕过 RLS）
+</code></pre></div>
+
+<p>第二块是 PostgREST。Supabase 的 Data API 就是它，表名直接变成 REST 路径，列名直接变成查询参数：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 官方文档示例：查 age 小于 13 的 people</span>
+curl<span class="w"> </span><span class="s2">&quot;http://localhost:3000/people?age=lt.13&quot;</span>
+
+<span class="c1"># 多条件叠加，age&gt;=18 且是学生</span>
+curl<span class="w"> </span><span class="s2">&quot;http://localhost:3000/people?age=gte.18&amp;student=is.true&quot;</span>
+</code></pre></div>
+
+<p>运算符一整套都支持：<code>eq lt gt gte lte neq like ilike match imatch</code>，加上 <code>select=</code>、<code>order=</code>、<code>limit=</code>、<code>offset=</code> 和资源嵌入。</p>
+<p>把两块拼起来，攻击者拿到的就是一个通用模板：</p>
+<div class="highlight"><pre><span></span><code>GET https://&lt;project&gt;.supabase.co/rest/v1/&lt;table&gt;?select=*&amp;limit=1000&amp;offset=0
+apikey: &lt;从 JS bundle 里抠出来的 publishable key&gt;
+</code></pre></div>
+
+<p>表名靠猜和字典，字段名从首屏的响应结构里就能反推出来。<code>select=*</code> 拿到一条完整记录后，所有列名都知道了，接下来就是翻页。<strong>这就是"跨 app 可复制"的机制：不是漏洞一样，是请求语法完全一样。</strong></p>
+<p>报告里列举的实际案例，量级可以感受一下：</p>
+<ul>
+<li>一个德语生活社区暴露了 8 万多份用户资料，含全名、邮箱、生日、性别，另有 20 多万条聊天消息可读</li>
+<li>多家活动主办方和餐厅数万条门票、餐饮销售记录，含邮箱、电话、地址、支付信息、票券码</li>
+<li>一家物业管理公司暴露了内部邮件的 AI 生成摘要，内容涉及租户和业主</li>
+<li>一家服务商暴露了 1000 多条身份证件信息，含护照号、有效期、国籍</li>
+<li>另外还有数万份合同、发票、私人相册、内部即时通讯记录</li>
+<li>一家服务商 28 万封发给客户的邮件可读</li>
+</ul>
+<p>护照号那一条是典型的身份盗用素材，不需要任何"高级技巧"。</p>
+<h2>三、根因不是漏洞，是两个默认值叠加</h2>
+<p>如果只是"用户忘了开 RLS"，那就是教程没写清楚。但我把官方 RLS 文档翻到 Default privileges 一节，看到的是另一回事。</p>
+<p>文档原文的意思是：<strong>在已有项目上，<code>public</code> schema 里新建的表，默认就把全部权限授予了三个角色</strong>——<code>anon</code>、<code>authenticated</code>、<code>service_role</code>。默认授予的权限包括 <code>select</code>、<code>insert</code>、<code>update</code>、<code>delete</code>、<code>truncate</code>、<code>references</code>、<code>trigger</code>，Postgres 17 上还有 <code>maintain</code>。</p>
+<p>表格里"应该保留什么"那一列，<code>anon</code> 对应的是"只有未登录访客该读的东西"，<code>authenticated</code> 是"只有你的应用暴露给登录用户的操作"。也就是说，默认值与"应该"之间是错位的，需要用户自己纠正。</p>
+<p>更关键的一句：<strong>policy 不会收回 grant。</strong> 一张表只靠 policy 保护，如果你从没 revoke 掉 grant，它依然给 <code>anon</code> 留了一条 insert 路径。</p>
+<p>这就解释了大量案例的形成路径。一个不懂后端的用户做应用时，模型给的 SQL 通常长这样：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">-- 模型很爱生成这种&quot;能跑起来&quot;的策略</span>
+<span class="k">create</span><span class="w"> </span><span class="n">policy</span><span class="w"> </span><span class="ss">&quot;公开可读&quot;</span><span class="w"> </span><span class="k">on</span><span class="w"> </span><span class="n">profiles</span>
+<span class="w">  </span><span class="k">for</span><span class="w"> </span><span class="k">select</span><span class="w"> </span><span class="k">to</span><span class="w"> </span><span class="n">anon</span><span class="p">,</span><span class="w"> </span><span class="n">authenticated</span>
+<span class="w">  </span><span class="k">using</span><span class="w"> </span><span class="p">(</span><span class="k">true</span><span class="p">);</span>
+</code></pre></div>
+
+<p><code>using (true)</code> 的意思是：这个角色能通过 grant 触达的每一行，全部放行。文档专门警告了这一点——"只对本来就该公开的数据使用"。但当用户的目标是"让页面能显示数据"时，<code>true</code> 是最省事的写法。</p>
+<p>再加上视图这一层。文档里有一句容易漏掉的：</p>
+<blockquote>
+<p>视图默认绕过 RLS，因为通常由 postgres 用户创建，Postgres 自动把它建成 security definer。一个建在受保护表上的视图，会把它本来该拦住的所有行全部发出去。</p>
+</blockquote>
+<p>于是形成三个默认值的串联：<strong>新表默认全授权 → policy 不回收授权 → 视图绕过 RLS</strong>。任何一个环节用户没意识到，数据就出去了。而这三条都写在文档里，只是分散在不同页面，需要读完才知道它们会组合成一个洞。</p>
+<h2>四、我自己会怎么做这套检查</h2>
+<p>报告结尾的建议偏管理层（"上真实数据前找专家评审权限"）。对实际在写代码的人来说，缺的是能直接跑的东西。以下是我自己会用的检查顺序。</p>
+<h3>1. 从攻击者视角先验一遍</h3>
+<p>不要先看代码，先看线上。打开 DevTools，Network 面板筛 <code>rest/v1</code>，看首屏有没有直接打表。如果有，复制那条请求，把 <code>select=*</code> 加上，<code>limit</code> 改成 1000，翻几页。</p>
+<p>这一步能做的原因是：<strong>请求本身就是攻击载荷</strong>。如果 1000 条能拿到，后面加 <code>offset</code> 就能把整表拿走。</p>
+<h3>2. 查 schema 里哪些表没开 RLS</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">-- 已启用 RLS 的表</span>
+<span class="k">select</span><span class="w"> </span><span class="n">schemaname</span><span class="p">,</span><span class="w"> </span><span class="n">tablename</span><span class="p">,</span><span class="w"> </span><span class="n">rowsecurity</span>
+<span class="k">from</span><span class="w"> </span><span class="n">pg_tables</span>
+<span class="k">where</span><span class="w"> </span><span class="n">schemaname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;public&#39;</span><span class="p">;</span>
+
+<span class="c1">-- 更直接：列出所有暴露 schema 里没开 RLS 的表</span>
+<span class="k">select</span><span class="w"> </span><span class="k">c</span><span class="p">.</span><span class="n">relname</span>
+<span class="k">from</span><span class="w"> </span><span class="n">pg_class</span><span class="w"> </span><span class="k">c</span>
+<span class="k">join</span><span class="w"> </span><span class="n">pg_namespace</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="k">on</span><span class="w"> </span><span class="n">n</span><span class="p">.</span><span class="n">oid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">c</span><span class="p">.</span><span class="n">relnamespace</span>
+<span class="k">where</span><span class="w"> </span><span class="n">n</span><span class="p">.</span><span class="n">nspname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;public&#39;</span>
+<span class="w">  </span><span class="k">and</span><span class="w"> </span><span class="k">c</span><span class="p">.</span><span class="n">relkind</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;r&#39;</span>
+<span class="w">  </span><span class="k">and</span><span class="w"> </span><span class="k">c</span><span class="p">.</span><span class="n">relrowsecurity</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">false</span><span class="p">;</span>
+</code></pre></div>
+
+<p>这条查询应该是空的。不是空的就说明有人跳过了这一步。</p>
+<h3>3. 查有没有 <code>using (true)</code> 直接放给 anon</h3>
+<div class="highlight"><pre><span></span><code><span class="k">select</span><span class="w"> </span><span class="n">schemaname</span><span class="p">,</span><span class="w"> </span><span class="n">tablename</span><span class="p">,</span><span class="w"> </span><span class="n">policyname</span><span class="p">,</span><span class="w"> </span><span class="n">roles</span><span class="p">,</span><span class="w"> </span><span class="n">cmd</span><span class="p">,</span><span class="w"> </span><span class="n">qual</span>
+<span class="k">from</span><span class="w"> </span><span class="n">pg_policies</span>
+<span class="k">where</span><span class="w"> </span><span class="n">schemaname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;public&#39;</span>
+<span class="w">  </span><span class="k">and</span><span class="w"> </span><span class="p">(</span><span class="n">qual</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;true&#39;</span><span class="w"> </span><span class="k">or</span><span class="w"> </span><span class="n">qual</span><span class="w"> </span><span class="k">is</span><span class="w"> </span><span class="k">null</span><span class="p">)</span>
+<span class="k">order</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="n">tablename</span><span class="p">;</span>
+</code></pre></div>
+
+<p><code>qual is null</code> 要一起查，因为 insert 类 policy 用的是 <code>with check</code>，<code>qual</code> 为空，容易漏。再补一条看 <code>with check</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="k">select</span><span class="w"> </span><span class="n">schemaname</span><span class="p">,</span><span class="w"> </span><span class="n">tablename</span><span class="p">,</span><span class="w"> </span><span class="n">policyname</span><span class="p">,</span><span class="w"> </span><span class="n">roles</span><span class="p">,</span><span class="w"> </span><span class="n">cmd</span><span class="p">,</span><span class="w"> </span><span class="n">with_check</span>
+<span class="k">from</span><span class="w"> </span><span class="n">pg_policies</span>
+<span class="k">where</span><span class="w"> </span><span class="n">schemaname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;public&#39;</span><span class="w"> </span><span class="k">and</span><span class="w"> </span><span class="n">with_check</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;true&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<h3>4. 查 grant 和视图</h3>
+<div class="highlight"><pre><span></span><code><span class="c1">-- anon 到底被授了哪些权</span>
+<span class="k">select</span><span class="w"> </span><span class="k">table_name</span><span class="p">,</span><span class="w"> </span><span class="n">privilege_type</span>
+<span class="k">from</span><span class="w"> </span><span class="n">information_schema</span><span class="p">.</span><span class="n">role_table_grants</span>
+<span class="k">where</span><span class="w"> </span><span class="n">grantee</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;anon&#39;</span><span class="w"> </span><span class="k">and</span><span class="w"> </span><span class="n">table_schema</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;public&#39;</span>
+<span class="k">order</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="k">table_name</span><span class="p">;</span>
+
+<span class="c1">-- 有没有 security definer 的视图暴露在 public</span>
+<span class="k">select</span><span class="w"> </span><span class="n">n</span><span class="p">.</span><span class="n">nspname</span><span class="p">,</span><span class="w"> </span><span class="k">c</span><span class="p">.</span><span class="n">relname</span>
+<span class="k">from</span><span class="w"> </span><span class="n">pg_class</span><span class="w"> </span><span class="k">c</span><span class="w"> </span><span class="k">join</span><span class="w"> </span><span class="n">pg_namespace</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="k">on</span><span class="w"> </span><span class="n">n</span><span class="p">.</span><span class="n">oid</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">c</span><span class="p">.</span><span class="n">relnamespace</span>
+<span class="k">where</span><span class="w"> </span><span class="k">c</span><span class="p">.</span><span class="n">relkind</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;v&#39;</span><span class="w"> </span><span class="k">and</span><span class="w"> </span><span class="n">n</span><span class="p">.</span><span class="n">nspname</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;public&#39;</span><span class="p">;</span>
+</code></pre></div>
+
+<p>视图命中之后，判断它是不是 <code>security definer</code>，是的话就得单独给它加 <code>security_invoker = true</code>（Postgres 15+）或者干脆不暴露。</p>
+<h3>5. 把上面这些写成测试，别靠记</h3>
+<p>官方流程里有一句值得抄作业：每张表都在 <code>supabase/tests/</code> 下建一个 <code>.sql</code> 文件，对 select、insert、update、delete 四个操作，分别断言 <code>anon</code> 和 <code>authenticated</code> 的 allow 与 deny，然后 <code>supabase test db</code> 跑一遍。文档的原话是"在测试套件通过之前，你不知道 policy 是不是真的按你想要的在工作"。</p>
+<p>这一点我认同得很彻底。RLS 是一段求值在数据库里的逻辑，肉眼 review 的成功率很低，尤其是它只在你手动点过页面的那几条路径上被验证过一次，剩下 90% 的列和行根本没试过。</p>
+<h3>6. 一件事别做：把 secret key 当"保险"塞进客户端</h3>
+<p><code>service_role</code> 和新的 <code>sb_secret_...</code> 带 BYPASSRLS。文档说得很明确：只能存在服务端、Edge Function、cron 里。有些教程为了让数据"能读出来"，会直接建议在前端用 service key——这一下把所有权限层全部作废，比 <code>using (true)</code> 严重一个量级。</p>
+<h2>五、这件事真正该记下的教训</h2>
+<p>我不太认同把这事说成"AI 编程不安全"。人工写的应用同样会犯这个错，过去十年 Firebase 的公开规则、S3 的公开桶都出过一模一样的量级。</p>
+<p>真正变了的是三件事，按重要性排：</p>
+<p><strong>第一，产出速度和检查速度脱钩了。</strong> 过去一个人一年做三个应用，每个都可能被 review 一遍。现在一个人一周做三十个，权限层没人看过。报告里 159,041 个项目这个数字本身就是这个变化的度量。而且样本取自 Common Crawl，意味着这些是被爬到的、公开可访问的——真实总量只多不少。</p>
+<p><strong>第二，模式化让攻击成本趋近于零。</strong> 同一个平台、同一套默认值、同一种请求语法，攻击者写一个脚本就能横移。人工项目各有各的乱法，平台化项目是整齐地乱。</p>
+<p><strong>第三，不懂后端的用户无法自查。</strong> 这不是能力问题，是抽象层级的问题。当"发布"是一个按钮时，用户看到的是自己的应用能用了，看不到背后多了一个匿名可读的接口。报告里那句话说得克制："易用的开发平台不消除在应用处理机密数据前做专家评审的必要性。"</p>
+<p>对我自己，落地的就一条：<strong>任何应用接入真实用户数据之前，先按攻击者的方式把首屏请求重放一遍。</strong> 五分钟能做完，能挡掉这次报告里 90% 的案例。剩下那 10% 需要写测试，那就写测试。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<hr />
+<p><strong>参考来源</strong></p>
+<ul>
+<li>Crissy Field GmbH 研究报告：<a href="https://www.crissyfield.de/research/lovable-en/">https://www.crissyfield.de/research/lovable-en/</a></li>
+<li>Supabase Row Level Security 文档：<a href="https://supabase.com/docs/guides/database/postgres/row-level-security">https://supabase.com/docs/guides/database/postgres/row-level-security</a></li>
+<li>Supabase API Keys 文档：<a href="https://supabase.com/docs/guides/api/api-keys">https://supabase.com/docs/guides/api/api-keys</a></li>
+<li>PostgREST Tables and Views 文档：<a href="https://postgrest.org/en/stable/references/api/tables_views.html">https://postgrest.org/en/stable/references/api/tables_views.html</a></li>
+</ul>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
