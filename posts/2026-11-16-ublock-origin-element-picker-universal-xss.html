@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>一个广告拦截器里的通用 XSS：uBlock Origin 元素拾取器被网页反向控制 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>一个广告拦截器里的通用 XSS：uBlock Origin 元素拾取器被网页反向控制</h1>
+<time>2026-11-16</time>
+<ul>
+<li>浏览器安全</li>
+<li>uBlock Origin</li>
+<li>XSS</li>
+<li>扩展安全</li>
+<li>攻击链分析</li>
+</ul>
+<hr />
+<p>浏览器扩展是唯一一类同时拥有你的登录态和任意站点权限的本地代码。它的攻击面一旦被翻过来，攻击者拿到的不是某个站的 XSS，而是所有站的 XSS。11 月初 uBlock Origin 修掉的那个漏洞就是这条逻辑的教科书样本：受害者只需要在恶意页面上点一下，攻击者就能给任意域名植入一条受信任的注入规则，然后在这个域名下执行任意 JS。</p>
+<p>漏洞在 11 月 1 日通过邮件报告给作者 Raymond Hill，11 月 15 日 GitHub Security Advisory <code>GHSA-cmqw-9r2w-6wv2</code> 公开，评级 high，没有分配 CVE 编号。修复跨越 1.75.2、1.75.4、1.76.0、1.76.4 四个版本，前后四次提交。四次提交说明一件事：这不是一个补丁能关掉的问题，而是一串被拆开的信任假设；每关掉一处，攻击者就换一个入口进来。</p>
+<h2>攻击链：四步把"用户点一下"变成"任意站点执行 JS"</h2>
+<p>漏洞的原始报告写得很干净，攻击链只有四步。</p>
+<p>第一步，拿到扩展的内部 URL。Firefox 上 <code>moz-extension://</code> 后面的 UUID 每次安装随机生成，本来属于不好猜的东西。但 uBO 的默认规则集里有一条 uAssets 规则：</p>
+<div class="highlight"><pre><span></span><code>lootdest.*##+js(no-fetch-if, adsbygoogle, war:googlesyndication_adsbygoogle.js)
+</code></pre></div>
+
+<p>这条规则的意图是：当页面 fetch 广告脚本 <code>adsbygoogle.js</code> 时，不发真实请求，改为从扩展的 <code>web_accessible_resources</code> 目录里取一份不做事的替身脚本，保证页面的 API 形状不变但不真加载广告。问题在于它内部是用 XHR 去读那个 <code>moz-extension://</code> 地址的。而页面自己可以钩住 <code>XMLHttpRequest.prototype.open</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">const</span><span class="w"> </span><span class="nx">origOpen</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">XMLHttpRequest</span><span class="p">.</span><span class="nx">prototype</span><span class="p">.</span><span class="nx">open</span><span class="p">;</span>
+<span class="nx">XMLHttpRequest</span><span class="p">.</span><span class="nx">prototype</span><span class="p">.</span><span class="nx">open</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kd">function</span><span class="p">(</span><span class="nx">m</span><span class="p">,</span><span class="w"> </span><span class="nx">url</span><span class="p">,</span><span class="w"> </span><span class="p">...</span><span class="nx">a</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">e</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="sr">/^moz-extension:\/\/[^/]+/</span><span class="p">.</span><span class="nx">exec</span><span class="p">(</span><span class="nx">url</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="nx">e</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">// e[0] 就是 moz-extension://&lt;UUID&gt;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">origOpen</span><span class="p">.</span><span class="nx">call</span><span class="p">(</span><span class="k">this</span><span class="p">,</span><span class="w"> </span><span class="nx">m</span><span class="p">,</span><span class="w"> </span><span class="nx">url</span><span class="p">,</span><span class="w"> </span><span class="p">...</span><span class="nx">a</span><span class="p">);</span>
+<span class="p">};</span>
+</code></pre></div>
+
+<p>然后页面执行 <code>fetch('/adsbygoogle.js')</code> 触发这条规则，钩子随即拿到 UUID。防御边界是"UUID 不可预测"，但扩展自己把 UUID 当参数传给了页面可观察的 API，可预测性就消失了。</p>
+<p>第二步，iframe 拾取器。拿到 UUID 后，页面直接建一个 <code>&lt;iframe&gt;</code>，<code>src</code> 指向 <code>moz-extension://&lt;UUID&gt;/web_accessible_resources/epicker-ui.html</code>。这是在 <code>web_accessible_resources</code> 里声明的资源，任何网页本来就有权内嵌。至此页面里跑着一个扩展源的文档，而且这个文档带着扩展的全部特权。</p>
+<p>顺带说清楚为什么这一步能成：<code>web_accessible_resources</code> 的设计意图是"允许页面引用扩展的静态资源"，比如图标、样式、用来做替换的 shim 脚本。但 uBO 把整套元素拾取器 UI 也放进了这个目录，而拾取器不只是一个界面，它是能向后台发 <code>createUserFilter</code> 消息的控制端。资源可见性和控制能力被绑在了同一个 URL 上。</p>
+<p>第三步，跟它说话。拾取器 UI 在一个 MessageChannel 上等 <code>epickerStart</code> 消息，页面直接发：</p>
+<div class="highlight"><pre><span></span><code><span class="nx">iframe</span><span class="p">.</span><span class="nx">contentWindow</span><span class="p">.</span><span class="nx">postMessage</span><span class="p">({</span><span class="w"> </span><span class="nx">what</span><span class="o">:</span><span class="w"> </span><span class="s1">&#39;epickerStart&#39;</span><span class="w"> </span><span class="p">},</span><span class="w"> </span><span class="s1">&#39;*&#39;</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="nx">ch</span><span class="p">.</span><span class="nx">port2</span><span class="p">]);</span>
+</code></pre></div>
+
+<p>拾取器回一句 <code>start</code>，页面发 <code>showDialog</code> 带上要"展示"的过滤规则，再回 <code>resultsetDetails</code> 把"创建"按钮点亮。整段对话里双方都没有验证过对方的身份：<code>postMessage</code> 的 <code>'*'</code> 目标源，加上监听器里没有任何 origin 判断，等于页面对拾取器说"我是你的内容脚本"，拾取器就信了。</p>
+<p>这里还有一个更细的问题值得记下来。拾取器的消息监听是这样注册的：</p>
+<div class="highlight"><pre><span></span><code><span class="nb">globalThis</span><span class="p">.</span><span class="nx">addEventListener</span><span class="p">(</span><span class="s1">&#39;message&#39;</span><span class="p">,</span><span class="w"> </span><span class="nx">ev</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="p">...</span><span class="w"> </span><span class="p">},</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">once</span><span class="o">:</span><span class="w"> </span><span class="kc">true</span><span class="w"> </span><span class="p">});</span>
+</code></pre></div>
+
+<p><code>once: true</code> 的效果是第一条 <code>epickerStart</code> 决定一切。真实的用户操作要经过右键菜单、内容脚本启动、iframe 加载，中间有几十到几百毫秒；而恶意页面在 iframe 一加载就往里发消息。谁先到，谁就锁定了这个 MessagePort。这是典型的竞态型授权缺陷，不是"忘了校验"那么简单。</p>
+<p>第四步，投毒。这里是最漂亮的细节。<code>resultsetDetails</code> 里有个 <code>opt</code> 字段，本意是"这条规则匹配哪类网络请求"（<code>image</code>、<code>script</code> 之类），会被拼到规则末尾变成 <code>$image</code>。页面控制的字符串直接带换行：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">const</span><span class="w"> </span><span class="nx">opt</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;image\n&#39;</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="nb">String</span><span class="p">.</span><span class="nx">raw</span><span class="sb">`google.com##+js(trusted-rpnt, script, /^[\s\S]*$/, alert(&#39;injected on &#39;+document.domain))`</span><span class="p">;</span>
+</code></pre></div>
+
+<p>换行把单条规则劈成了两条。第一条 <code>||example.com^$image</code> 是给用户看的，第二条是一份完整的、针对 <code>google.com</code> 的脚本注入规则，用的是 uBO 的 <code>trusted-</code> 前缀脚本片段。因为<strong>元素拾取器创建的过滤器默认就被标记为可信</strong>（<code>trusted</code>），这条注入规则不需要用户信任模式即可生效。页面再把这个 iframe 的 <code>opacity</code> 设成 0 盖到任意位置，用户随手一点"创建"，规则就写进了"My filters"。</p>
+<p>之后攻击者打开 <code>google.com</code>，<code>alert</code> 里的内容在 <code>google.com</code> 的源里执行。换掉 <code>alert</code> 就是完整的信息窃取。</p>
+<h2>修复：四次提交，四个假设</h2>
+<p>把四次提交按时间排开，能清楚看到作者是怎么把这条链一段段掐断的，也能看到每一段背后的设计假设错在哪。</p>
+<p><strong>1.75.2（11 月 2 日，<code>bf69cf7</code>）：别再调用页面能改的方法。</strong> 这条提交只有 4 行新增、2 行删除，改的是 <code>src/js/resources/safe-self.js</code> 和 <code>src/js/resources/utils.js</code>。思路是把 XHR 的 <code>open</code>/<code>send</code> 从原型上"摘"下来，在 <code>safeSelf()</code> 里存一份干净引用：</p>
+<div class="highlight"><pre><span></span><code><span class="s1">&#39;XMLHttpRequest&#39;</span><span class="o">:</span><span class="w"> </span><span class="nx">self</span><span class="p">.</span><span class="nx">XMLHttpRequest</span><span class="p">,</span>
+<span class="s1">&#39;XMLHttpRequest_open&#39;</span><span class="o">:</span><span class="w"> </span><span class="nb">Function</span><span class="p">.</span><span class="nx">prototype</span><span class="p">.</span><span class="nx">call</span><span class="p">.</span><span class="nx">bind</span><span class="p">(</span><span class="nx">self</span><span class="p">.</span><span class="nx">XMLHttpRequest</span><span class="p">.</span><span class="nx">prototype</span><span class="p">.</span><span class="nx">open</span><span class="p">),</span>
+<span class="s1">&#39;XMLHttpRequest_send&#39;</span><span class="o">:</span><span class="w"> </span><span class="nb">Function</span><span class="p">.</span><span class="nx">prototype</span><span class="p">.</span><span class="nx">call</span><span class="p">.</span><span class="nx">bind</span><span class="p">(</span><span class="nx">self</span><span class="p">.</span><span class="nx">XMLHttpRequest</span><span class="p">.</span><span class="nx">prototype</span><span class="p">.</span><span class="nx">send</span><span class="p">),</span>
+</code></pre></div>
+
+<p>然后 <code>war:</code> 分支里的 <code>warXHR.open(...)</code> / <code>warXHR.send()</code> 改成 <code>safe.XMLHttpRequest_open(warXHR, ...)</code>。这是在扩展自己的 <code>safeSelf</code> 抽象里加两个白名单条目。uBO 早就有一套"页面可能污染过的 API"清单，只是 XHR 的方法漏了。</p>
+<p>补丁当天就被绕了。报告者在同一天回信：</p>
+<div class="highlight"><pre><span></span><code><span class="nb">Object</span><span class="p">.</span><span class="nx">defineProperty</span><span class="p">(</span>
+<span class="w">   </span><span class="nx">XMLHttpRequest</span><span class="p">.</span><span class="nx">prototype</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;responseText&#39;</span><span class="p">,</span><span class="w"> </span><span class="p">{</span>
+<span class="w">     </span><span class="nx">get</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">       </span><span class="nx">mount</span><span class="p">(</span><span class="sr">/^moz-extension:\/\/[^/]+/</span><span class="p">.</span><span class="nx">exec</span><span class="p">(</span><span class="k">this</span><span class="p">.</span><span class="nx">responseURL</span><span class="p">)[</span><span class="mf">0</span><span class="p">]);</span>
+<span class="w">     </span><span class="p">}});</span>
+</code></pre></div>
+
+<p><code>open</code> 和 <code>send</code> 收回来了，<code>responseText</code> 的 getter 还在原型上，而 getter 能读到 <code>this.responseURL</code>，里面就是 <code>moz-extension://&lt;UUID&gt;</code>。<strong>只要扩展还在用页面的 XHR 对象去碰自己的 URL，UUID 就守不住。</strong> 这个认识直接决定了第四次提交。</p>
+<p><strong>1.75.4（11 月 3 日，<code>9859477</code>）：加一道口令。</strong> 这次是结构性修复，19 行新增。后台脚本（<code>src/js/messaging.js</code>）在启动时生成一个随机口令：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">const</span><span class="w"> </span><span class="nx">epickerPassword</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">self</span><span class="p">.</span><span class="nx">crypto</span><span class="p">.</span><span class="nx">randomUUID</span><span class="p">();</span>
+</code></pre></div>
+
+<p>内容脚本（<code>src/js/scriptlets/epicker.js</code>）通过 <code>vAPI.messaging.send</code> 把它取回来，塞进启动消息：</p>
+<div class="highlight"><pre><span></span><code><span class="nx">iframe</span><span class="p">.</span><span class="nx">contentWindow</span><span class="p">.</span><span class="nx">postMessage</span><span class="p">(</span>
+<span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="nx">what</span><span class="o">:</span><span class="w"> </span><span class="s1">&#39;epickerStart&#39;</span><span class="p">,</span><span class="w"> </span><span class="nx">password</span><span class="o">:</span><span class="w"> </span><span class="nx">pickerPassword</span><span class="w"> </span><span class="p">},</span>
+<span class="w">    </span><span class="nx">url</span><span class="p">.</span><span class="nx">href</span><span class="p">,</span>
+<span class="w">    </span><span class="p">[</span><span class="w"> </span><span class="nx">channel</span><span class="p">.</span><span class="nx">port2</span><span class="w"> </span><span class="p">]</span>
+<span class="p">);</span>
+</code></pre></div>
+
+<p>拾取器 UI 侧（<code>src/js/epicker-ui.js</code>）改成异步函数，消息进来先比对：</p>
+<div class="highlight"><pre><span></span><code><span class="k">async</span><span class="w"> </span><span class="kd">function</span><span class="w"> </span><span class="nx">bootPicker</span><span class="p">(</span><span class="nx">ev</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">msg</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">ev</span><span class="p">.</span><span class="nx">data</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="p">{};</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nx">msg</span><span class="p">.</span><span class="nx">what</span><span class="w"> </span><span class="o">!==</span><span class="w"> </span><span class="s1">&#39;epickerStart&#39;</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">epickerPassword</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">await</span><span class="w"> </span><span class="nx">vAPI</span><span class="p">.</span><span class="nx">messaging</span><span class="p">.</span><span class="nx">send</span><span class="p">(</span><span class="s1">&#39;elementPicker&#39;</span><span class="p">,</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="nx">what</span><span class="o">:</span><span class="w"> </span><span class="s1">&#39;elementPickerPassword&#39;</span>
+<span class="w">    </span><span class="p">});</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nx">msg</span><span class="p">.</span><span class="nx">password</span><span class="w"> </span><span class="o">!==</span><span class="w"> </span><span class="nx">epickerPassword</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="p">...</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>口令存在 <code>vAPI.messaging</code> 的 background 侧，页面拿不到。因为它没有 <code>runtime.sendMessage</code> 权限，<code>web_accessible_resources</code> 里的文档不继承扩展的 API。攻击面从"任何人都能对话"缩小到"知道口令的对话方"。</p>
+<p><strong>1.76.0（11 月 8 日，<code>b1f7d27</code> 与 <code>150df12</code>）：校验内容、停掉通道。</strong></p>
+<p><code>b1f7d27</code> 加了 24 行、删了 17 行，只动一个文件，把过滤器校验抽成 <code>parseRawFilter</code> 并在<strong>两处</strong>补上。这是关键，因为原来的校验只在"从文本框读到规则"时做，不在"把候选规则拼成最终规则"时做：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">function</span><span class="w"> </span><span class="nx">parseRawFilter</span><span class="p">(</span><span class="nx">raw</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">parser</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">staticFilteringParser</span><span class="p">;</span>
+<span class="w">    </span><span class="nx">parser</span><span class="p">.</span><span class="nx">parse</span><span class="p">(</span><span class="nx">raw</span><span class="p">);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nx">parser</span><span class="p">.</span><span class="nx">isFilter</span><span class="p">()</span><span class="w"> </span><span class="o">===</span><span class="w"> </span><span class="kc">false</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nx">parser</span><span class="p">.</span><span class="nx">hasError</span><span class="p">()</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nx">parser</span><span class="p">.</span><span class="nx">isExtendedFilter</span><span class="p">()</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nx">parser</span><span class="p">.</span><span class="nx">isCosmeticFilter</span><span class="p">()</span><span class="w"> </span><span class="o">===</span><span class="w"> </span><span class="kc">false</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nx">parser</span><span class="p">.</span><span class="nx">isNetworkFilter</span><span class="p">()</span><span class="w"> </span><span class="o">===</span><span class="w"> </span><span class="kc">false</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">raw</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>userFilterFromCandidate</code> 里在拼完 <code>$opts</code> 之后补了一次：</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nx">parseRawFilter</span><span class="p">(</span><span class="nx">filter</span><span class="p">)</span><span class="w"> </span><span class="o">===</span><span class="w"> </span><span class="kc">undefined</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div>
+
+<p>换行偷渡的第二条规则这时候过不了 <code>parser.hasError()</code>。同一版本里的 <code>150df12</code> 更狠，直接把 <code>war:</code> 整个分支砍掉：</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nx">directive</span><span class="p">.</span><span class="nx">startsWith</span><span class="p">(</span><span class="s1">&#39;war:&#39;</span><span class="p">)</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// TODO: resources should be fetched by messaging ISOLATED world</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="s1">&#39;&#39;</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>war:</code> 是"从扩展包里取一份替身资源"的机制（WAR = web accessible resource），本身就有问题，它要求内容脚本去读扩展的 WAR 目录。作者的 TODO 注释说明了正确的方向：这类取资源的事应该回到隔离世界，通过 messaging 走，而不是让注入到页面的脚本去发请求。</p>
+<p>这个机制的设计意图不难理解。广告脚本被替换成空壳，能同时满足两个目标：页面不报错（<code>adsbygoogle</code> 这个全局对象还在、方法签名还在），广告又没真的加载。实现在 <code>generateContentFn</code> 里，页面侧的 shim 需要拿到那份空壳脚本的内容，于是它从扩展目录里 XHR 一份出来。便利性和隔离性在这里是直接冲突的：页面侧的代码要读到扩展目录的内容，就必须有一次跨边界的读取，而这次读取一旦发生，路径就暴露了。</p>
+<p>作者的最终选择是"砍掉便利性"：<code>return ''</code>，等以后用 messaging 从隔离世界重新实现。这条提交删了 19 行、加了 4 行，是整个修复里唯一一处功能回退。删代码比加校验更诚实，它承认了这个抽象的边界画错了。</p>
+<p><strong>1.76.4（11 月 15 日，<code>5466554</code>）：关掉剩下的口子。</strong> 这条提交的说明只有一行 "Address remaining reported security issues"，实际改了三处，其中两处值得单独说。</p>
+<p>一是清掉 <code>war:</code> 留下的 <code>warOrigin</code>/<code>warSecret</code>（<code>73ef1b23</code> 先删注入点，<code>5466554</code> 收尾）。<code>scriptletGlobals</code> 会以 <code>JSON.stringify</code> 形式塞进注入到页面的代码，也就是说扩展的内部 URL 和 WAR 密钥曾经直接写在页面可见的 JS 里。这解释了为什么单纯收回 XHR 方法没用：只要这些值还在注入代码里，页面读一遍就拿到了。</p>
+<p>这一条比表面看起来严重。这说明 1.75.2 那个补丁在逻辑上不完整：你把 <code>open</code> 和 <code>send</code> 的引用藏进 <code>safeSelf</code>，可同时序列化输出到页面的 <code>scriptletGlobals</code> 里就躺着 WAR 密钥。攻击者不需要钩任何东西，打开 DevTools 看一眼内联脚本就行。<strong>这里暴露的是个常见设计误区：把"给注入代码用的上下文变量"和"给扩展自己用的密钥"混在同一个结构里。</strong> 前者注定要跨边界，后者永远不该跨。</p>
+<p>二是顺手修了资源更新器（<code>src/js/diff-updater.js</code>）的去重键和校验逻辑：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">function</span><span class="w"> </span><span class="nx">getCanonicalPatchURL</span><span class="p">(</span><span class="nx">assetDetails</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nx">patchPath</span><span class="p">,</span><span class="w"> </span><span class="nx">cdnURLs</span><span class="p">,</span><span class="w"> </span><span class="nx">patchURLs</span><span class="w"> </span><span class="p">}</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">assetDetails</span><span class="p">;</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nb">Array</span><span class="p">.</span><span class="nx">isArray</span><span class="p">(</span><span class="nx">cdnURLs</span><span class="p">)</span><span class="w"> </span><span class="o">===</span><span class="w"> </span><span class="kc">false</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nx">cdnURLs</span><span class="p">.</span><span class="nx">length</span><span class="w"> </span><span class="o">===</span><span class="w"> </span><span class="mf">0</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="kd">const</span><span class="w"> </span><span class="nx">canonicalPatchURL</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">resolveURL</span><span class="p">(</span><span class="nx">patchPath</span><span class="p">,</span><span class="w"> </span><span class="nx">patchURLs</span><span class="o">?</span><span class="p">.[</span><span class="mf">0</span><span class="p">]</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nx">cdnURLs</span><span class="p">[</span><span class="mf">0</span><span class="p">]);</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nb">Boolean</span><span class="p">(</span><span class="nx">canonicalPatchURL</span><span class="p">)</span><span class="w"> </span><span class="o">===</span><span class="w"> </span><span class="kc">false</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">canonicalPatchURL</span><span class="p">.</span><span class="nx">href</span><span class="p">.</span><span class="nx">replace</span><span class="p">(</span><span class="sr">/#.*$/</span><span class="p">,</span><span class="w"> </span><span class="s1">&#39;&#39;</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>以及加了 checksum 长度下限：</p>
+<div class="highlight"><pre><span></span><code><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="ow">typeof</span><span class="w"> </span><span class="nx">checksum</span><span class="w"> </span><span class="o">!==</span><span class="w"> </span><span class="s1">&#39;string&#39;</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nx">checksum</span><span class="p">.</span><span class="nx">length</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mf">10</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nx">assetDetails</span><span class="p">.</span><span class="nx">error</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s1">&#39;badchecksum&#39;</span><span class="p">;</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="kc">false</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>原来的去重键是 URL 的 basename，不同 CDN 上的同名文件会互相覆盖缓存（<code>736ef4d10</code> 修的就是这个）；checksum 不校验长度，空串或极短值都能通过。这两条不是 XSS 主线，但同一个提交里一起关掉了。</p>
+<h2>MV3 侧：同样的缺陷，不同的补丁</h2>
+<p>uBO Lite（MV3 版本）也受影响，只是严重程度不同，MV3 没有 MV2 那样宽的自定义过滤能力，<code>trusted-</code> 脚本片段的可达面更小。它的修复是独立的一条（<code>ead588aa5c</code>，11 月 3 日），落在 <code>platform/mv3/extension/js/</code>：</p>
+<p>后台侧加了一个 <code>getToolOverlaySecret</code> 消息，首次调用时惰性生成 <code>crypto.randomUUID()</code>；<code>tool-overlay.js</code> 里 <code>install()</code> 改成先 <code>await</code> 拿口令，再把 <code>secret</code> 塞进 <code>startOverlay</code> 消息，且 <code>postMessage</code> 的目标源从 <code>'*'</code> 换成了 <code>realURL.origin</code>（由 <code>@@extension_id</code> 拼出来）。注意这里把 <code>new Promise(resolve =&gt; ...)</code> 改成了 <code>Promise.withResolvers()</code>——一个次要但影响可读性的重构。</p>
+<p>两边对照着看，作者的修复模式是统一的：<strong>凡是"页面能构造出扩展内部文档的引用"的地方，都要加一道页面拿不到的随机口令；凡是 <code>postMessage</code>，目标源不能是 <code>'*'</code>。</strong> 这不是 uBO 独有的问题，是所有需要往页面注入 UI 的扩展共同的毛病。1Password、Postman、各种密码管理器的自动填充浮层，用的都是同一套 iframe + MessageChannel 套路。</p>
+<h2>从防御侧看：四个可以立刻自查的点</h2>
+<p><strong>第一，检查你所有带 <code>web_accessible_resources</code> 的扩展。</strong> 这个清单里每一项都是页面可以直接内嵌的入口。Chromium 现在支持 <code>matches</code> 字段限缩来源，别用 <code>"&lt;all_urls&gt;"</code>。如果一个 UI 文档被列进 WAR 只是为了让内容脚本能 iframe 它，那它就不该在 WAR 里——内容脚本有 <code>vAPI.getURL()</code>，不需要 WAR 权限。</p>
+<p><strong>第二，所有 <code>postMessage</code> 的目标源和 <code>message</code> 事件的来源都要显式判断。</strong> 本文这条链的每一个环节都违反了这条：<code>'*'</code> 做目标源、监听器里没有 <code>ev.origin</code> 检查、<code>MessagePort</code> 建好就信。改造模板：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// 发送侧</span>
+<span class="nx">iframe</span><span class="p">.</span><span class="nx">contentWindow</span><span class="p">.</span><span class="nx">postMessage</span><span class="p">(</span><span class="nx">payload</span><span class="p">,</span><span class="w"> </span><span class="nx">expectedOrigin</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="nx">port2</span><span class="p">]);</span>
+
+<span class="c1">// 接收侧</span>
+<span class="nx">self</span><span class="p">.</span><span class="nx">addEventListener</span><span class="p">(</span><span class="s1">&#39;message&#39;</span><span class="p">,</span><span class="w"> </span><span class="nx">ev</span><span class="w"> </span><span class="p">=&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nx">ev</span><span class="p">.</span><span class="nx">origin</span><span class="w"> </span><span class="o">!==</span><span class="w"> </span><span class="nx">expectedOrigin</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nx">ev</span><span class="p">.</span><span class="nx">source</span><span class="w"> </span><span class="o">!==</span><span class="w"> </span><span class="nx">expectedWindow</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="w"> </span><span class="nx">ev</span><span class="p">.</span><span class="nx">data</span><span class="o">?</span><span class="p">.</span><span class="nx">password</span><span class="w"> </span><span class="o">!==</span><span class="w"> </span><span class="nx">secret</span><span class="w"> </span><span class="p">)</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="w">    </span><span class="c1">// ...</span>
+<span class="p">});</span>
+</code></pre></div>
+
+<p>三道判断成本为零，但能挡掉整类"页面冒充内容脚本"的攻击。</p>
+<p><strong>第三，别在注入到页面的代码里放任何内部标识。</strong> <code>scriptletGlobals</code> 那个坑最值得记住：扩展把 <code>warOrigin</code>、<code>warSecret</code> 序列化进注入脚本，等于把钥匙贴在门上。内容是给自己人看的，但执行环境是攻击者的页面。真要传值，走 <code>runtime.sendMessage</code> 的单向通道，别塞进字符串。</p>
+<p><strong>第四，版本判断。</strong> MV2 Firefox 版本 1.76.4 才集齐全部修复，Chromium 侧 uBO Lite 需要 <code>2026.1110.1816</code> 或更新。1.76.0 之前的版本能挡掉 iframe 劫持，但 1.75.4 又被 <code>responseText</code> 绕过，中间的窗口期是真实可用的。翻一下你浏览器里的版本号，低于 1.76.4 就直接更新。</p>
+<p>被利用过的话，痕迹会落在"My filters"里。打开 uBO 的仪表盘 → 我的过滤器，找这几类异常：</p>
+<ul>
+<li>你没有印象创建过的规则，尤其是带 <code>trusted-</code> 前缀的。<code>trusted-</code> 脚本片段只有元素拾取器和手动输入能写，正常使用中极少出现。</li>
+<li>一个域名下的规则指向另一个完全不相关的域名（比如一条 <code>example.com</code> 相关的规则里出现了 <code>google.com##+js(...)</code>）。</li>
+<li>带换行残片的规则，或者以 <code>$image</code>、<code>$script</code> 结尾后面还跟着内容的畸形条目。uBO 正常写入时会格式化，不会留下这种结构。</li>
+<li>规则里出现 <code>war:</code> 字样的（1.76.0 后这种过滤器已被禁用，但它作为历史残留值得看一眼）。</li>
+</ul>
+<p>自动化一点，直接读 uBO 的存储。Firefox 的扩展数据在 profile 目录下，规则本体在 IndexedDB 里，用 <code>sqlite3</code> 或浏览器控制台 <code>vAPI.storage</code> 都能取。想省事就在 uBO 仪表盘导出备份，JSON 里 <code>userFilters</code> 字段是明文的：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 从导出的备份里筛可疑规则</span>
+python3<span class="w"> </span>-<span class="w"> </span><span class="s">&lt;&lt;&#39;EOF&#39;</span>
+<span class="s">import json</span>
+<span class="s">d = json.load(open(&#39;ublock-backup.json&#39;))</span>
+<span class="s">for f in d.get(&#39;userFilters&#39;, []).split(&#39;\n&#39;):</span>
+<span class="s">    if &#39;trusted-&#39; in f or &#39;war:&#39; in f:</span>
+<span class="s">        print(f)</span>
+<span class="s">EOF</span>
+</code></pre></div>
+
+<p>命中就删掉，然后重新编译过滤器（改动后 uBO 会自动重建，可信标记也会一起清掉）。</p>
+<h2>一个开发者的视角</h2>
+<p>这个漏洞让我重新审了一遍自己对扩展的安全直觉。我一直把"扩展是可信的、页面是不可信的"当成默认前提，但这条链说明前提本身不成立：<strong>页面可以构造出一个扩展源的执行上下文，然后在里面操作扩展的特权</strong>。所谓信任边界，不是靠"文档从哪来"划的，是靠"消息是谁发的、带了什么凭证"划的。</p>
+<p>作者的处理方式也值得学。他没有憋一个大的"安全重构"，而是四天四版、每次 20 行上下，每一版都对应一个被证伪的假设。更重要的是他把整段邮件往来原样放进了 advisory，包括那个绕过的 <code>responseText</code> getter 和报告者自己说"我不太能稳定复现，但可能存在"的 iframe 竞态。这种披露的质量，比一份只说"已修复，请升级"的公告有用得多。</p>
+<p>顺带说一句：报告者在博客里写清楚了，漏洞是 GPT-5.6 Sol 找到的。他给了个方向假设（过滤规则注入应该有 UXSS），模型把具体路径翻了出来，他验证，Claude 写了 PoC 大部分代码。这件事本身没什么可惊奇的，值得注意的只是它和这个漏洞的性质很搭：<strong>都是"看起来没有桥的地方，其实有一座桥"</strong>。</p>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<h2>参考</h2>
+<ul>
+<li>GitHub Advisory：<a href="https://github.com/gorhill/uBlock/security/advisories/GHSA-cmqw-9r2w-6wv2">GHSA-cmqw-9r2w-6wv2</a></li>
+<li>漏洞报告原文：<a href="https://iter.ca/post/ubo-uxss/">Universal XSS in uBlock Origin from website-driven element picker</a></li>
+<li>关键提交：<a href="https://github.com/gorhill/uBlock/commit/bf69cf7405">bf69cf7</a> · <a href="https://github.com/gorhill/uBlock/commit/9859477ebc">9859477</a> · <a href="https://github.com/gorhill/uBlock/commit/b1f7d27c87">b1f7d27</a> · <a href="https://github.com/gorhill/uBlock/commit/150df125fd">150df12</a> · <a href="https://github.com/gorhill/uBlock/commit/5466554104">5466554</a></li>
+<li>MV3 侧修复：<a href="https://github.com/gorhill/uBlock/commit/ead588aa5c">ead588aa5c</a></li>
+</ul>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
