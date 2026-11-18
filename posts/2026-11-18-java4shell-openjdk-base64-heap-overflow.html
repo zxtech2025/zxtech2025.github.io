@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Java4Shell：65 个字符打穿 JVM——OpenJDK Base64 解码器堆溢出全解析 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>Java4Shell：65 个字符打穿 JVM——OpenJDK Base64 解码器堆溢出全解析</h1>
+<time>2026-11-18</time>
+<ul>
+<li>漏洞分析</li>
+<li>OpenJDK</li>
+<li>JVM</li>
+<li>CVE-2026-114938</li>
+<li>内存安全</li>
+</ul>
+<hr />
+<p>65 个字符，<code>A</code> 重复 64 次加一个 <code>=</code>，能让一台跑着 Keycloak 或 Confluence 的服务器交出整个 Java 堆。</p>
+<p>这不是比喻。11 月 17 日下午一点，Oracle 发了补丁；同一时间 OpenJDK 发了安全公告；CISA 当天傍晚挂出告警要求"立即打补丁"。漏洞编号 CVE-2026-114938，研究者给它起的名字叫 Java4Shell。</p>
+<p>我看完技术细节之后的第一反应跟 Log4Shell 无关，是另一件事：Java 的内存安全承诺，在自己实现的汇编代码里破了产。</p>
+<h2>漏洞长什么样</h2>
+<p>OpenJDK 的 Base64 解码有一个"快速通道"。如果某个解码函数被反复调用，C2（HotSpot 里最激进的 JIT 编译器）会把它编译成本地机器码；但普通机器码还不够快，HotSpot 会进一步替换成手写的 intrinsic，直接用 CPU 的特殊指令，一条顶几十条。</p>
+<p>在支持 AVX-512 VBMI 的 x86-64 CPU 上，Base64 解码走的就是这条路径。输入按 256 字节一块处理，不足 256 就退到 64 字节一块；不足 64 字节时用 <code>evmovdqub</code>，也就是 VMOVDQU8 指令的 intrinsic 封装。这条指令带一个 64 位掩码，掩码位为 1 的字节才读写内存。</p>
+<p>掩码的算法是这样的（研究者文章里的伪代码）：</p>
+<div class="highlight"><pre><span></span><code><span class="o">//</span><span class="w"> </span><span class="n">Zero</span><span class="w"> </span><span class="n">High</span><span class="w"> </span><span class="n">Bits</span><span class="w"> </span><span class="n">Starting</span><span class="w"> </span><span class="n">with</span><span class="w"> </span><span class="n">Specified</span><span class="w"> </span><span class="n">Bit</span><span class="w"> </span><span class="n">Position</span>
+<span class="n">input_mask</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="n">bzhiq</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="o">,</span><span class="w"> </span><span class="n">input_length</span><span class="p">)</span>
+<span class="n">output_len</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="p">(</span><span class="n">input_length</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">4</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="mi">3</span>
+
+<span class="o">//</span><span class="w"> </span><span class="err">处理</span><span class="w"> </span><span class="n">padding</span>
+<span class="k">if</span><span class="w"> </span><span class="n">input</span><span class="p">[</span><span class="n">input_length</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">]</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="p">&#39;</span><span class="o">=</span><span class="p">&#39;</span><span class="o">:</span>
+<span class="w">    </span><span class="n">output_len</span><span class="w"> </span><span class="o">-=</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="n">input_mask</span><span class="w"> </span><span class="o">&gt;&gt;=</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="n">input</span><span class="p">[</span><span class="n">input_length</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">2</span><span class="p">]</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="p">&#39;</span><span class="o">=</span><span class="p">&#39;</span><span class="o">:</span>
+<span class="w">        </span><span class="n">output_len</span><span class="w"> </span><span class="o">-=</span><span class="w"> </span><span class="mi">1</span>
+<span class="w">        </span><span class="n">input_mask</span><span class="w"> </span><span class="o">&gt;&gt;=</span><span class="w"> </span><span class="mi">1</span>
+
+<span class="n">output_mask</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="n">bzhiq</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="o">,</span><span class="w"> </span><span class="n">output_len</span><span class="p">)</span>
+</code></pre></div>
+
+<p>关键在于 <code>bzhiq</code>（BZHI，Zero High Bits Starting with Specified Bit Position）：它把源操作数从第 N 位往上的所有位置零。当 <code>output_len &gt;= 64</code> 时，<code>bzhiq(-1, output_len)</code> 一个位都不动，结果就是全 1，也就是 <code>0xFFFFFFFFFFFFFFFF</code>。</p>
+<p>问题出在<strong>余数段只有 padding 的情况</strong>。输入形如 <code>=</code>、<code>==</code>、<code>X=</code>、<code>X==</code>、<code>XY=</code>、<code>===</code> 时，<code>output_len</code> 先被算成 0，然后因为要减去 padding 字节数，无符号运算直接下溢成 -1 或 -2。<code>bzhiq(-1, -1)</code> 仍然返回全 1 的掩码。于是：</p>
+<div class="highlight"><pre><span></span><code><span class="n">evmovdqub</span><span class="p">(</span>
+<span class="w">    </span><span class="n">Address</span><span class="p">(</span><span class="n">dest</span><span class="p">,</span><span class="w"> </span><span class="n">dp</span><span class="p">),</span><span class="w">   </span><span class="c1">// 目标地址</span>
+<span class="w">    </span><span class="n">k1</span><span class="p">,</span><span class="w">                  </span><span class="c1">// k1 == output_mask == -1u64</span>
+<span class="w">    </span><span class="n">tmp</span><span class="p">,</span><span class="w">                 </span><span class="c1">// 源向量寄存器</span>
+<span class="w">    </span><span class="nb">true</span><span class="p">,</span>
+<span class="w">    </span><span class="n">Assembler</span><span class="o">::</span><span class="n">AVX_512bit</span>
+<span class="p">);</span>
+</code></pre></div>
+
+<p>掩码全 1，<strong>一次性写 64 个字节</strong>。</p>
+<h2>为什么 65 个字节就够</h2>
+<p>Java 侧在调用 intrinsic 之前会先算输出缓冲区大小：<code>ceil(inp_len / 4) * 3 - padding</code>。输入 65 字节（64 个 <code>A</code> 加一个 <code>=</code>），<code>ceil(65/4)</code> 是 17，<code>17 * 3</code> 是 51，减掉 1 个 padding 字节，这个公式给出 50 字节。</p>
+<p>解码器先正常处理前 64 个字符，输出 48 字节。剩下那一个孤零零的 <code>=</code> 走余数段，触发了上面那个下溢。从偏移 48 开始，64 字节被写出去。缓冲区到 50 就结束了，所以有 <strong>62 个字节落在缓冲区外面</strong>（偏移 50 到 111）。</p>
+<p>随后 Java 层发现输入非法，抛 <code>IllegalArgumentException</code>。但堆已经被改了。</p>
+<p>OpenJDK 17 上触发输入是 128 个 <code>A</code> 加 <code>=</code>，因为进入这条代码路径的长度阈值更高。</p>
+<p>有意思的是这段代码的自我定位。它是纯优化：让吞吐更高、CPU 利用率更低的快速通道。功能上，慢路径处理同样的输入会老老实实抛出异常，什么都不会写坏。所以这是一个<strong>只为性能存在、正确性完全不依赖它</strong>的代码路径，恰恰是这种代码最容易在 review 里被放过。它的测试只需要验证"解码结果对不对"，而这里的结果确实是对的：返回了非法输入、抛了正确的异常。越界写发生在返回值之前，测试用例看不见。</p>
+<p>这也是为什么它能活到 2026 年。Base64 intrinsic 在 JDK 17 就进了主线，经过多个 LTS 版本、无数次回归测试、以及所有下游发行版的打包验证，一直没人发现。</p>
+<h2>从固定写到一个可读可写的原语</h2>
+<p>写出去的内容不受控，这是最麻烦的地方。研究者给出的分布是：</p>
+<ul>
+<li>字节 0 完全可控（在界内）</li>
+<li>字节 1 只有 4 个 bit 可控（在界内）</li>
+<li>字节 2 到 63 不可控，其中 48 到 63 永远是 <code>0x9a</code></li>
+</ul>
+<p>也就是说，我们只能决定"从哪个位置开始溢出"，不能决定"溢出什么"。这看起来像个死局。</p>
+<p>他们的解法是从 JavaScript 引擎攻防里搬来的老招：<strong>改写缓冲区长度字段</strong>。</p>
+<p>把被溢出打到的那个数组叫 writer。它的长度字段被改大之后，就会继续接受我们写入的字节。在它后面放另一个数组或对象，就能用任意值去覆盖那个邻居。一次固定内容的越界写，升级成了有界但内容可控的线性写。</p>
+<p>同理，如果再去改另一个数组的长度字段，并且这个数组的内容会回显到 HTTP 响应里，就得到了读原语，叫 reader。到这一步，代码执行还没影，但 <strong>Java 堆已经能泄露了</strong>。研究者管这个阶段叫 JavaBleed，堆里可能有 PII、私钥、会话 token。</p>
+<p>有了 writer 和 reader，后面的工作就是工程问题：修复被线性写破坏的对象让 JVM 别崩、对应用逻辑做 data-only 攻击、把有界写升级成任意写最终够到 Code Cache 和 JVM hook。</p>
+<h2>G1 堆的风水</h2>
+<p>难点在布局。HotSpot 给每个线程一个 TLAB（thread-local allocation buffer），是 Eden 区里的一块私有切片。不同请求线程创建的对象的游标各自推进，一个线程里的 Base64 解码器和另一个线程里的 writer 之间没有任何可靠顺序。G1 又会把堆切分成固定大小的 region，地址由它自己挑。</p>
+<p>研究者的做法分两层。第一层控制分配路径：关键数组的大小和 TLAB 剩余空间共同决定 HotSpot 是给 TLAB 续命，还是走 TLAB 外的分配路径。这个判断是确定性的：<code>array_size</code> 和 <code>tlab_top</code> 到 <code>tlab_end</code> 的剩余量做比较，够就在 TLAB 里切一块，不够就去 Eden 里重新拿。所以先把 TLAB 的剩余空间"喂"到某个特定区间，就能逼着关键数组走外面的路径。</p>
+<p>第二层控制布局，用的是最朴素的办法——<strong>spray and pray</strong>。对着多个 writer/reader 对喷对象，让解码器的输出有多个可能的邻居；他们喷了好几对 writer/reader，成本换概率。只有当解码器的输出 region 正好落在某个 writer region 下方时，被改大长度的 reader 才会返回更大的响应。打偏了就丢弃重试。</p>
+<p>对象大小和填充决定了它在 region 内的偏移，所以对象数组的元素数、以及对象头加上字段的字节数，都要算进去。</p>
+<p>远程场景还多一层麻烦：要控制分配时序，就得控制 HTTP 请求体何时到达。他们采取的办法是把请求体分段发送：先发前面一截，确认 TCP 已经 ACK（数据已在目标端缓冲），再发结尾那一小段触发解析。这比一次性发大包稳定得多。而且小包到达的顺序更可预测，对大包来说中间任何一跳的抖动都会打乱时序。</p>
+<p>这个攻击对 RTT 和抖动敏感，所以他们干脆在同一区域的机房租了一台 VM 来解决延迟问题。研究者写得很直白：与其去调 TCP/IP 栈参数，不如花钱。</p>
+<h2>打偏了会怎样</h2>
+<p>会崩。JVM 会以一个看似无关的 <code>SIGSEGV</code> 或 GC 错误退出，日志里没有任何"攻击"的痕迹。</p>
+<p>这对防守方是坏消息，对攻击者是好消息：<strong>打偏的表现和普通的 JVM 崩溃完全一样</strong>。他们有 rehearse 阶段：先用合法输入跑一轮，校准目标的行为时序和响应特征，确认没错再触发。触发之后如果布局不对，直接用同样的输入重试即可，因为每次请求都是新的分配。</p>
+<p>整个流程大概是：</p>
+<div class="highlight"><pre><span></span><code>WARM     反复解码合法输入，让 JIT 把函数编译到 C2
+         并选中受影响的快速通道。此阶段不破坏任何内存。
+REHEARSE 一轮安全的校准，摸清目标的响应时序
+TRIGGER  发送畸形尾部。对象对上位置了，固定溢出就撑大了 writer
+DISCLOSE 继续写 writer，用选定字节撑大 reader，
+         再从响应里把堆数据捞出来
+REPAIR   用泄露出来的原始值把被写坏的临时头和邻居对象还原，
+         让 JVM 继续跑
+FINISH   执行应用侧的最终动作，用真实请求验证
+</code></pre></div>
+
+<p>REPAIR 那一步是这个链条里最见功力的地方。线性写会把沿途的每一个对象头都改掉，不修回去的话，下一次 GC 就会对着坏掉的对象图崩溃。但既然已经能读了，坏掉之前的值就在泄露出来的数据里。<strong>先读后修</strong>，链条就能一直跑下去，而不是一次性打崩目标。</p>
+<h2>谁被打穿了</h2>
+<p>研究者在默认配置下验证了远程代码执行。<strong>无需认证</strong>的：</p>
+<p>Keycloak、Atlassian Jira、Atlassian Confluence、JFrog Artifactory、Jenkins、PingFederate。</p>
+<p><strong>需要认证</strong>的：Apache Kafka Broker、Apache Solr、Elasticsearch、Gerrit、Spinnaker。</p>
+<p>这份清单不完整。他们还在 Apache Struts 和 Spring Boot 的样例应用上打通了，理由是"认证"和"文件上传"这类普通功能本身就在用 Base64。更麻烦的是客户端方向：研究者之一 samczsun 提供了一个客户端利用，一个 Java 程序只要向恶意服务器发起 TLS 连接就可能被打穿，哪怕它自己不监听任何端口。</p>
+<p>按攻击面排序，我个人最担心的是 Confluence 和 Jenkins。前者历史上就是被打得最多的 Java 应用之一，后者在大量内网里裸奔、还经常直接暴露在外。而 Keycloak 排第一意味着<strong>认证服务器本身可以被绕过</strong>。它自己就是发 token 的那个，被打穿之后整个 SSO 链条都失去意义。</p>
+<p>研究者说得很明确：针对具体产品的武器化链条他们要压一阵子再放，"until everyone has had a chance to upgrade"。所以现在还没到大规模在野利用的阶段，但验证过的目标清单已经在那儿了。</p>
+<h2>硬件前提：这一条很重要</h2>
+<p>这不是一个能无差别横扫的漏洞。要满足两个条件：</p>
+<ol>
+<li>OpenJDK <strong>17.0.6 或更新</strong>版本（11 及更早已在维护线上，不受影响）</li>
+<li>x86-64 CPU <strong>支持 AVX-512 VBMI</strong></li>
+</ol>
+<p>也就是说 ARM64 完全不受影响。而在 x86-64 里，符合条件的是：</p>
+<ul>
+<li>Intel Xeon：Ice Lake、Sapphire Rapids、Emerald Rapids、Granite Rapids</li>
+<li>AMD EPYC / Ryzen：Zen 4 及以后</li>
+</ul>
+<p>Linux 上一行命令可以自查：</p>
+<div class="highlight"><pre><span></span><code>grep<span class="w"> </span>-m1<span class="w"> </span><span class="s1">&#39;^flags&#39;</span><span class="w"> </span>/proc/cpuinfo<span class="w"> </span><span class="p">|</span><span class="w"> </span>tr<span class="w"> </span><span class="s1">&#39; &#39;</span><span class="w"> </span><span class="s1">&#39;\n&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-E<span class="w"> </span><span class="s1">&#39;^(avx512f|avx512bw|avx512vbmi|bmi2)$&#39;</span>
+</code></pre></div>
+
+<p>四个 flag 全出来才在风险范围内。少一个就安全。我顺手看了眼手边这台 i7-8750H（Coffee Lake），只有 <code>BMI2</code>，没有 AVX-512，不在范围内。这也解释了为什么这个漏洞听着吓人，但实际受影响面比 Log4Shell 窄得多：<strong>云上新一代 EPYC 和 Xeon 集体中招，个人开发机和大量老服务器反而没事</strong>。</p>
+<p>受影响的发行版等于所有基于 OpenJDK 构建的：Amazon Corretto、Eclipse Temurin、Microsoft Build of OpenJDK、Azul Zulu、BellSoft Liberica、SAP SapMachine、Red Hat OpenJDK、Oracle OpenJDK、Oracle Java SE、Oracle GraalVM for JDK。</p>
+<p>Oracle 给出的具体受影响版本号：</p>
+<div class="highlight"><pre><span></span><code><span class="mf">8</span><span class="n">u511b33</span><span class="o">-</span><span class="n">perf</span>
+<span class="mf">17.0.21.0.3</span>
+<span class="mf">21.0.13.0.3</span>
+<span class="mf">25.0.5.0.3</span>
+<span class="mf">27.0.1.0.3</span>
+</code></pre></div>
+
+<p>注意 8u511 那一行的 <code>-perf</code> 后缀。Oracle JDK 8 的普通版本不带 AVX-512 优化，只有带 <code>-perf</code> 的高性能变体才会走到这段 intrinsic。这也解释了为什么 8u 在大部分场景里是安全的，但如果你恰好用的是 <code>-perf</code> 构建，它在名单上。</p>
+<p>Red Hat 那边的产品状态矩阵更能说明问题。受影响的打包出一长串，我挑几个值得注意的：</p>
+<table>
+<thead>
+<tr>
+<th>产品</th>
+<th>状态</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Red Hat build of Keycloak</td>
+<td>Affected</td>
+</tr>
+<tr>
+<td>RHEL 8 / 9 / 10 的 java-17 / 21 / 25-openjdk</td>
+<td>Affected</td>
+</tr>
+<tr>
+<td>JBoss EAP 7 / 8</td>
+<td>Affected</td>
+</tr>
+<tr>
+<td>JBoss Web Server 7</td>
+<td>Affected</td>
+</tr>
+<tr>
+<td>streams for Apache Kafka 3</td>
+<td>Affected</td>
+</tr>
+<tr>
+<td>Quarkus Native builder（mandrel-25）</td>
+<td>Affected</td>
+</tr>
+<tr>
+<td>Data Grid 8</td>
+<td>Affected</td>
+</tr>
+<tr>
+<td>Cryostat 4 / Apicurio Registry 3</td>
+<td>Affected</td>
+</tr>
+<tr>
+<td>OpenJDK 11 ELS / OpenJDK 1.8（RHEL 6-9）</td>
+<td>Not affected</td>
+</tr>
+<tr>
+<td>Red Hat Hardened Images 的 <code>hi/openjdk</code></td>
+<td>Fix deferred</td>
+</tr>
+</tbody>
+</table>
+<p>最后两行信息量不小。<strong>JDK 8 和 11 全线安全</strong>，和 Oracle 说的"17.0.6 或更新"一致。但 <code>Fix deferred</code> 那一行说明连加固镜像的修复都被推迟了，如果你的基础镜像是 Hummingbird 系列，别指望通过 <code>dnf update</code> 解决。</p>
+<p>Red Hat 的 statement 里有一句我认为最该被引用的话：</p>
+<blockquote>
+<p>Exploitability is reported to depend on the host CPU supporting AVX-512 VBMI ... in addition to running OpenJDK 17.0.6 or later. Systems on ARM64 or on x86-64 CPUs without AVX-512 VBMI are not currently known to be affected.</p>
+</blockquote>
+<p>"not currently known to be affected"，注意措辞。这是"目前不知道受影响"，不是"确认不受影响"。他们的原始 statement 还写明"the exact upstream fixed version and affected release lines have not yet been confirmed by Oracle"，而这份 draft 是提前于 Oracle 的细节放出来的。</p>
+<h2>两个 CVSS 分数，差距不小</h2>
+<p>同一个漏洞，两套打分：</p>
+<table>
+<thead>
+<tr>
+<th>来源</th>
+<th>分数</th>
+<th>向量</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Oracle / NVD（CVSS 3.1）</td>
+<td>8.1 HIGH</td>
+<td><code>AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:H/A:H</code></td>
+</tr>
+<tr>
+<td>Red Hat（CVSS 3.0 draft）</td>
+<td>9.8 CRITICAL</td>
+<td><code>AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H</code></td>
+</tr>
+<tr>
+<td>Calif（CVSS 4.0）</td>
+<td>9.2 CRITICAL</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<p>差别全在 <code>AC</code>（攻击复杂度）这一个度量上：Oracle 打 <code>H</code>，Red Hat 打 <code>L</code>。NVD 的记录还标着 <code>CWE-122</code>（堆缓冲区溢出），Red Hat 记的是 <code>CWE-787</code>（越界写），分类上也不一致。</p>
+<p>技术上讲，Oracle 的 <code>AC:H</code> 有道理：研究者自己说了"没有通用 exploit"，每个目标都要定制 profile，一条解码器路径、一个活着的 writer、一个能回显的 reader、一套堆布局、一个应用侧动作，四样缺一不可。但 Red Hat 打 <code>L</code> 也不算离谱，因为对已经拿到清单的攻击者来说，剩下的只是工作量问题。我的看法是<strong>按 9.x 处理</strong>，别因为看到 8.1 就放松。Red Hat 官方的威胁等级是 Critical。</p>
+<h2>修复与缓解</h2>
+<p>补丁在 11 月 17 日太平洋时间 13:00 同时由 OpenJDK 和 Oracle 发布。CISA 的建议可以直接落地：</p>
+<ul>
+<li>清点 Java 资产，<strong>包括第三方应用内嵌的 JDK 和容器镜像里的运行时</strong>。这类往往不在软件清单里单独出现，是最容易漏的</li>
+<li>优先修补面向互联网的系统</li>
+<li>打不上补丁的过渡措施：在应用边界限制和校验 Base64 输入、限制输入长度、收紧未认证访问</li>
+<li>监控异常：异常启动的运行时、非预期的 JVM 崩溃、可疑的 Java 进程</li>
+</ul>
+<p>运行时侧的临时开关有两个：</p>
+<div class="highlight"><pre><span></span><code><span class="c1"># 关掉硬件加速的 Base64 intrinsic</span>
+java<span class="w"> </span>-XX:-UseBASE64Intrinsics<span class="w"> </span>...
+
+<span class="c1"># 或者关掉 AVX-512</span>
+java<span class="w"> </span>-XX:UseAVX<span class="o">=</span><span class="m">2</span><span class="w"> </span>...
+</code></pre></div>
+
+<p>第二个只在 x86-64 上有效，ARM 上的 OpenJDK 不认识这个参数会直接起不来。这两个开关都会掉一些解码性能，但比起被读走整个堆，值得。</p>
+<p>有个细节值得留意：<strong>nginx 默认缓冲请求体，这不能当通用缓解手段</strong>。研究者明确说了，他们的某些堆布局 profile 依赖请求体分段到达，代理把请求体收全再转发会破坏这部分时序，但 Elasticsearch 是拿着完整请求一口气处理的，缓冲对它无效；WebSocket 升级之后走隧道，body 缓冲也不再适用。</p>
+<h2>AI 是怎么参与进来的</h2>
+<p>这个漏洞的故事里有一段绕不开：发现过程是 AI 主导的。</p>
+<p>研究者说，他让 Codex 去审计 JIT 编译器、intrinsic、广泛可用的 API 和密码学这几个区域，前面二十分钟拿到的结果基本都是"slops"：要么不可达，要么利用条件完全不现实。他没停，继续加压，然后 Codex 把 Base64 解码器里的内存破坏递到了他手上。</p>
+<p>成本：<strong>发现漏洞一小时，做出第一个可用 exploit 再两小时，token 花费不到 200 美元</strong>。</p>
+<p>我不觉得这说明"AI 会自己打漏洞了"。真正稀缺的是第二句话里的那部分：研究者知道该审哪几个区域（因为他之前做过 Android Runtime 上的 0-click 利用，学到"跨边界的复杂系统最容易出错"），知道怎么判断哪些结果是废料，还专门写了一个小型的堆追踪器和可视化工具喂给 agent，让它在堆布局阶段不至于瞎猜。这些都是人的判断。</p>
+<p>但他说的那个词我觉得准确：centaur hacker，半人马黑客。AI 出马力，人出上下文。</p>
+<p>还有一件值得警惕的事。漏洞本身来自一个"没多少人需要"的优化：Base64 的硬件加速让处理海量数据的应用受益，但这段代码被塞进了所有人的运行时，包括那些根本不需要它的应用。研究者把这叫公地悲剧，并且喊出了一个名字很怪的口号："vibe-uncoding"，把你不需要的代码删掉。</p>
+<p>这话对做基础设施的人是重的。每一个"反正加了也不影响"的性能优化，都在给所有人加一份攻击面。</p>
+<h2>我的做法</h2>
+<p>先查 CPU 再查 JDK。绝大多数团队的第一反应是升级 JDK，但如果跑在 ARM 或者 AVX-512 之前的老 CPU 上，这个漏洞打不到你。反过来，跑在 Zen 4 / Sapphire Rapids 上的服务，就算你觉得"Java 很安全"，现在也得动。一条命令：</p>
+<div class="highlight"><pre><span></span><code>grep<span class="w"> </span>-m1<span class="w"> </span><span class="s1">&#39;^flags&#39;</span><span class="w"> </span>/proc/cpuinfo<span class="w"> </span><span class="p">|</span><span class="w"> </span>tr<span class="w"> </span><span class="s1">&#39; &#39;</span><span class="w"> </span><span class="s1">&#39;\n&#39;</span><span class="w"> </span><span class="p">|</span><span class="w"> </span>grep<span class="w"> </span>-cE<span class="w"> </span><span class="s1">&#39;^(avx512f|avx512bw|avx512vbmi|bmi2)$&#39;</span>
+</code></pre></div>
+
+<p>输出 4 才需要紧急处理。</p>
+<p>然后是把容器镜像算进资产清单。CISA 专门提了这一条不是凑字数。很多团队的 Java 版本清单来自 CMDB，而 CMDB 里没有"某个 Node 服务内置了一个 JRE"这种东西。<code>find / -name "libjvm.so"</code> 或者翻镜像的 <code>/usr/lib/jvm/</code> 往往能翻出惊喜。</p>
+<p>第三件事是把 <code>-XX:-UseBASE64Intrinsics</code> 当作抢修窗口里的临时开关，别当长期方案。它能让服务立刻脱离风险，但也会掩盖"你还没升级"这件事。打在 CI 的镜像扫描里，比记在 wiki 上靠谱。</p>
+<p>最后一句题外话。这次真正让我坐不住的不是 65 个字符，而是那段汇编代码的位置。它在 HotSpot 里，在"Java 帮我管内存"这个承诺的最底层。语言层的安全边界，最终还是要靠一层 C、C++ 和手写汇编撑着，而那层代码出错的时候，Java 的抽象一个都保护不了你。</p>
+<h2>参考</h2>
+<ul>
+<li>Calif.io 技术披露：https://calif.io/java4shell/</li>
+<li>NVD 记录：https://nvd.nist.gov/vuln/detail/CVE-2026-114938</li>
+<li>Oracle Critical Security Patch Update（2026 年 11 月）：https://www.oracle.com/security-alerts/cspunov2026.html</li>
+<li>Red Hat 漏洞库：https://access.redhat.com/security/cve/cve-2026-114938</li>
+<li>CISA 告警：https://www.cisa.gov/news-events/alerts/2026/11/17/critical-java-vulnerability-requires-immediate-patching</li>
+<li>oss-security 讨论串：https://www.openwall.com/lists/oss-security/2026/11/17/31</li>
+</ul>
+<h2>⚠️ 网络安全免责声明</h2>
+<p>本文内容仅供技术研究与安全学习之用。文中描述的漏洞分析、攻击链拆解和代码示例均基于公开披露的安全研究，旨在帮助开发者理解攻击原理、提升安全意识和防御能力。</p>
+<p>请勿将本文所述技术用于任何未经授权的安全测试、渗透攻击或非法用途。任何因滥用本文信息而造成的法律后果，由使用者自行承担，与本文作者无关。</p>
+<p>如发现系统安全漏洞，请通过合法渠道向相关厂商或平台报告，共同维护网络安全生态。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
