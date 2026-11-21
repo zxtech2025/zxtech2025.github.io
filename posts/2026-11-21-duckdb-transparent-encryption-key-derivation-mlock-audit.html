@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DuckDB 1.4 的透明加密：没有 OpenSSL 就查不了密钥，这事比听起来严重 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>DuckDB 1.4 的透明加密：没有 OpenSSL 就查不了密钥，这事比听起来严重</h1>
+<time>2026-11-21</time>
+<ul>
+<li>DuckDB</li>
+<li>数据库</li>
+<li>加密</li>
+<li>AES-GCM</li>
+<li>源码分析</li>
+</ul>
+<hr />
+<p>DuckDB 在 1.4 里加了静态数据加密，1.4.2 之后又做了一次不太引人注意的收口：<strong>没装 httpfs 扩展，就禁止往加密库里写数据</strong>。这个 0.2 版的补丁没有 CVE 编号，官方说法是"安全专家发现了随机数生成器的问题"。我顺着这条线把 <code>encryption_key_manager.cpp</code>、<code>encryption_functions.cpp</code> 和 issue #20162 都读了一遍，发现它暴露出的不是一个 bug，而是把一个加密特性塞进嵌入式数据库时四个绕不过去的约束。</p>
+<p>先把结论放前面：DuckDB 的加密设计大致是干净可用的，性能损失几乎测不出来。但它的密钥派生只有一次 SHA-256 加盐，没有慢哈希；它的密钥缓存依赖 <code>mlock</code>，而 <code>mlock</code> 在容器和 K8s 里能不能生效取决于内核的 RLIMIT_MEMLOCK；它的临时文件和 WAL 各自用一套密钥；它的"是不是加密库"判断居然取决于用户有没有装一个 HTTP 扩展。这四条都值得在选它之前先弄明白。</p>
+<h2>文件格式：主头永远明文</h2>
+<p>DuckDB 的存储层是一个主数据库头加若干数据块，块默认 256KB。加密设计的第一条决策很干脆：<strong>主头保持明文</strong>。</p>
+<p>主头的前 8 个字节是 magic bytes <code>DUCKDB</code>，用来校验文件身份。后面跟四个 8 字节的 flag 字段。加密库把第一个 flag 的最低位置 1，表示"这个库是加密的"。置位之后，主头里追加三样东西：</p>
+<ol>
+<li><strong>database identifier</strong>，16 个随机字节，当作 salt，每个库初始化时生成一次；</li>
+<li><strong>8 字节的加密元数据</strong>，逐字节定义：第 1 字节是 KDF 算法，第 2 字节表示是否使用 AAD，第 3 字节是加密算法，第 5 字节是密钥长度；</li>
+<li><strong>加密后的 canary</strong>，用来验证用户输入的密钥是否正确。</li>
+</ol>
+<p>主头之后是两个 4KB 的数据库头，记录块大小、存储版本这类信息。这两个头开始，所有内容全部加密。</p>
+<p>明文块的块头是 8 字节，装一个 checksum。加密块的块头变成 40 字节：前 16 字节是 nonce（IV），再 16 字节是 GCM tag，剩下的 checksum 本身也被加密进去了。这里有个细节处理得不错：checksum 原来能透露内容是否损坏，加密后它只对持钥者可见。而且块头必须保持 8 字节对齐，否则 checksum 算不对。</p>
+<p>这套布局的取舍很清楚。明文主头让任何工具都能一眼看出"这是个加密的 DuckDB 文件"，还能读出用了什么算法、salt 是什么。这些信息不算敏感，藏起来也没意义，毕竟文件里出现 <code>DUCKDB</code> 字样本来就已经暴露了格式。</p>
+<h2>密钥派生：SHA-256 加盐，一次就完</h2>
+<p>这是我觉得必须提的部分。看 <code>DeriveKey</code> 的实现：</p>
+<div class="highlight"><pre><span></span><code><span class="kt">void</span><span class="w"> </span><span class="nf">EncryptionKeyManager::DeriveKey</span><span class="p">(</span><span class="n">string</span><span class="w"> </span><span class="o">&amp;</span><span class="n">user_key</span><span class="p">,</span><span class="w"> </span><span class="n">data_ptr_t</span><span class="w"> </span><span class="n">salt</span><span class="p">,</span><span class="w"> </span><span class="n">data_ptr_t</span><span class="w"> </span><span class="n">derived_key</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">string</span><span class="w"> </span><span class="n">decoded_key</span><span class="p">;</span>
+<span class="w">    </span><span class="k">try</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">//! Key is base64 encoded</span>
+<span class="w">        </span><span class="n">decoded_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Base64Decode</span><span class="p">(</span><span class="n">user_key</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span><span class="w"> </span><span class="k">catch</span><span class="w"> </span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="n">ConversionException</span><span class="w"> </span><span class="o">&amp;</span><span class="n">e</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="c1">//! Todo; check if valid utf-8</span>
+<span class="w">        </span><span class="n">decoded_key</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">user_key</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+
+<span class="w">    </span><span class="n">KeyDerivationFunctionSHA256</span><span class="p">(</span><span class="k">reinterpret_cast</span><span class="o">&lt;</span><span class="n">const_data_ptr_t</span><span class="o">&gt;</span><span class="p">(</span><span class="n">decoded_key</span><span class="p">.</span><span class="n">data</span><span class="p">()),</span>
+<span class="w">                                </span><span class="n">decoded_key</span><span class="p">.</span><span class="n">size</span><span class="p">(),</span><span class="w"> </span><span class="n">salt</span><span class="p">,</span><span class="w"> </span><span class="n">derived_key</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">SecureClearData</span><span class="p">(</span><span class="n">data_ptr_cast</span><span class="p">(</span><span class="o">&amp;</span><span class="n">user_key</span><span class="p">[</span><span class="mi">0</span><span class="p">]),</span><span class="w"> </span><span class="n">user_key</span><span class="p">.</span><span class="n">size</span><span class="p">());</span>
+<span class="w">    </span><span class="n">SecureClearData</span><span class="p">(</span><span class="n">data_ptr_cast</span><span class="p">(</span><span class="o">&amp;</span><span class="n">decoded_key</span><span class="p">[</span><span class="mi">0</span><span class="p">]),</span><span class="w"> </span><span class="n">decoded_key</span><span class="p">.</span><span class="n">size</span><span class="p">());</span>
+<span class="w">    </span><span class="n">user_key</span><span class="p">.</span><span class="n">clear</span><span class="p">();</span>
+<span class="w">    </span><span class="n">decoded_key</span><span class="p">.</span><span class="n">clear</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>关键是 <code>KeyDerivationFunctionSHA256</code>：</p>
+<div class="highlight"><pre><span></span><code><span class="kt">void</span><span class="w"> </span><span class="nf">EncryptionKeyManager::KeyDerivationFunctionSHA256</span><span class="p">(</span><span class="n">const_data_ptr_t</span><span class="w"> </span><span class="n">key</span><span class="p">,</span><span class="w"> </span><span class="n">idx_t</span><span class="w"> </span><span class="n">key_size</span><span class="p">,</span>
+<span class="w">                                                       </span><span class="n">data_ptr_t</span><span class="w"> </span><span class="n">salt</span><span class="p">,</span><span class="w"> </span><span class="n">data_ptr_t</span><span class="w"> </span><span class="n">derived_key</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">//! For now, we are only using SHA256 for key derivation</span>
+<span class="w">    </span><span class="n">duckdb_mbedtls</span><span class="o">::</span><span class="n">MbedTlsWrapper</span><span class="o">::</span><span class="n">SHA256State</span><span class="w"> </span><span class="n">state</span><span class="p">;</span>
+<span class="w">    </span><span class="n">state</span><span class="p">.</span><span class="n">AddSalt</span><span class="p">(</span><span class="n">salt</span><span class="p">,</span><span class="w"> </span><span class="n">MainHeader</span><span class="o">::</span><span class="n">DB_IDENTIFIER_LEN</span><span class="p">);</span>
+<span class="w">    </span><span class="n">state</span><span class="p">.</span><span class="n">AddBytes</span><span class="p">(</span><span class="n">key</span><span class="p">,</span><span class="w"> </span><span class="n">key_size</span><span class="p">);</span>
+<span class="w">    </span><span class="n">state</span><span class="p">.</span><span class="n">FinalizeDerivedKey</span><span class="p">(</span><span class="n">derived_key</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>也就是 <code>derived_key = SHA256(salt ‖ user_key)</code>，取 32 字节。<strong>一次 SHA-256，没有迭代，没有内存硬化。</strong></p>
+<p>任何做过口令加密的人到这一步都会皱眉。SHA-256 的单次计算在现代 GPU 上能跑到每秒百亿次量级。如果用户按文档示例输入 <code>'asdf'</code> 这种口令，盐虽然让每个库的派生结果不同、挡住了彩虹表，但挡不住针对单个库的暴力枚举：攻击者拿到 .duckdb 文件，抽出主头里的 16 字节 salt，然后就是纯 GPU 离线爆破。</p>
+<p>严格说这不算实现缺陷：DuckDB 的文档明确写了推荐 32 字节 base64 密钥，用户自己对密钥强度负责，随机密钥本来也不需要慢哈希。但代码里 <code>enum KeyDerivationFunction { DEFAULT = 0, SHA256 = 1, PBKDF2 = 2 }</code> 这个枚举留着 PBKDF2 的位置却没有任何实现，说明作者知道这条路没走完。用口令而不是随机密钥的场景，缓冲余地很小。</p>
+<p>这里也一样，<code>asdf</code> 在博客示例里出现无害，被复制到生产会出事。</p>
+<h2>密钥缓存：mlock 生效与否看你内核</h2>
+<p>派生出的密钥存在 <code>EncryptionKeyManager</code> 里，实现方式值得看一眼：</p>
+<div class="highlight"><pre><span></span><code><span class="n">EncryptionKey</span><span class="o">::</span><span class="n">EncryptionKey</span><span class="p">(</span><span class="n">data_ptr_t</span><span class="w"> </span><span class="n">encryption_key_p</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">memcpy</span><span class="p">(</span><span class="n">key</span><span class="p">,</span><span class="w"> </span><span class="n">encryption_key_p</span><span class="p">,</span><span class="w"> </span><span class="n">MainHeader</span><span class="o">::</span><span class="n">DEFAULT_ENCRYPTION_KEY_LENGTH</span><span class="p">);</span>
+<span class="w">    </span><span class="c1">// zero out the encryption key in memory</span>
+<span class="w">    </span><span class="n">SecureClearData</span><span class="p">(</span><span class="n">encryption_key_p</span><span class="p">,</span><span class="w"> </span><span class="n">MainHeader</span><span class="o">::</span><span class="n">DEFAULT_ENCRYPTION_KEY_LENGTH</span><span class="p">);</span>
+<span class="w">    </span><span class="n">LockEncryptionKey</span><span class="p">(</span><span class="n">key</span><span class="p">);</span>
+<span class="p">}</span>
+
+<span class="kt">void</span><span class="w"> </span><span class="n">EncryptionKey</span><span class="o">::</span><span class="n">LockEncryptionKey</span><span class="p">(</span><span class="n">data_ptr_t</span><span class="w"> </span><span class="n">key</span><span class="p">,</span><span class="w"> </span><span class="n">idx_t</span><span class="w"> </span><span class="n">key_len</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="cp">#if defined(_WIN32)</span>
+<span class="w">    </span><span class="n">VirtualLock</span><span class="p">(</span><span class="n">key</span><span class="p">,</span><span class="w"> </span><span class="n">key_len</span><span class="p">);</span>
+<span class="cp">#else</span>
+<span class="w">    </span><span class="n">mlock</span><span class="p">(</span><span class="n">key</span><span class="p">,</span><span class="w"> </span><span class="n">key_len</span><span class="p">);</span>
+<span class="cp">#endif</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>mlock</code> 的作用是把这个内存页钉住，禁止内核把它换出到 swap。设计意图很正确：如果密钥被换到磁盘，整件事就白做了。</p>
+<p>问题在于 <code>mlock</code> 的返回值被完全忽略了。在 Linux 上，<code>mlock</code> 受 <code>RLIMIT_MEMLOCK</code> 限制，很多发行版的默认值是 64KB 到 8MB 不等；在容器的 <code>CAP_IPC_LOCK</code> 缺失时会直接失败返回 -1。更麻烦的是内存超卖环境，比如 cgroup v1 的 memsw 记账方式下，<code>mlock</code> 的页仍然可能被 swap 出去——钉住的只是虚拟内存，不是物理页。</p>
+<p>也就是说，你 attach 一个加密库，<code>PRAGMA</code> 一切正常，查询结果全对，密钥可能已经安静地躺在 swap 分区里了。这个失败模式没有任何信号。</p>
+<p>我的做法是在容器里显式检查：<code>cat /proc/self/status | grep VmLck</code> 看实际锁住的量，配合 <code>ulimit -l</code> 看上限。如果 <code>VmLck</code> 一直是 0，说明 <code>mlock</code> 从来没成功过，这时候要考虑关 swap 或者用 <code>tmpfs</code> 承载临时目录。这不是 DuckDB 独有的问题，但嵌入式数据库通常被塞进小容器跑，撞上的概率比 PostgreSQL 高得多。</p>
+<p>顺带一提销毁路径。<code>EncryptionKey::~EncryptionKey()</code> 先 <code>SecureClearData</code> 清零再 <code>munlock</code>，顺序对了：先擦内容再解锁，避免解锁后到析构完成之间被换出。</p>
+<h2>临时文件：最容易被忽略的落盘面</h2>
+<p>数据库的临时文件是排序、大 join、窗口函数溢写时的中间结果。这些东西往往比主库更能泄露隐私，一次 join 的中间态里全是明文关联结果。</p>
+<p>DuckDB 做了两层处理。第一，attach 加密库时自动加密临时文件；第二，<code>main</code> 库是明文的情况下，也可以单独打开：</p>
+<div class="highlight"><pre><span></span><code><span class="k">SET</span><span class="w"> </span><span class="n">temp_file_encryption</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">true</span><span class="p">;</span>
+</code></pre></div>
+
+<p>临时文件的密钥是独立的，代码里就一个固定名字：</p>
+<div class="highlight"><pre><span></span><code><span class="kt">void</span><span class="w"> </span><span class="nf">EncryptionEngine::AddTempKeyToCache</span><span class="p">(</span><span class="n">DatabaseInstance</span><span class="w"> </span><span class="o">&amp;</span><span class="n">db</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">const</span><span class="w"> </span><span class="k">auto</span><span class="w"> </span><span class="n">length</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">MainHeader</span><span class="o">::</span><span class="n">DEFAULT_ENCRYPTION_KEY_LENGTH</span><span class="p">;</span>
+<span class="w">    </span><span class="n">data_t</span><span class="w"> </span><span class="n">temp_key</span><span class="p">[</span><span class="n">length</span><span class="p">];</span>
+<span class="w">    </span><span class="n">GenerateRandomKey</span><span class="p">(</span><span class="n">db</span><span class="p">,</span><span class="w"> </span><span class="n">temp_key</span><span class="p">,</span><span class="w"> </span><span class="n">length</span><span class="p">);</span>
+
+<span class="w">    </span><span class="n">string</span><span class="w"> </span><span class="n">key_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s">&quot;temp_key&quot;</span><span class="p">;</span>
+<span class="w">    </span><span class="n">AddKeyToCache</span><span class="p">(</span><span class="n">db</span><span class="p">,</span><span class="w"> </span><span class="n">temp_key</span><span class="p">,</span><span class="w"> </span><span class="n">key_id</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>随机生成，只在内存里，进程崩溃就跟着没了。后续的临时文件变成不可解密的垃圾，这是正确设计，比"崩溃后残留可读中间结果"好太多。代价是崩溃后临时文件必须人工清理，官方博客也承认了这点。</p>
+<p>临时文件还分三种形态：标准 256KB 块布局的 <code>.tmp</code>、压缩过的 <code>.tmp</code>、超过块大小带长度前缀的 <code>.block</code>。它们<strong>不存 checksum</strong>，理由是计算 checksum 太贵。这个取舍合理，加密场景下 GCM 的 tag 已经提供了完整性验证，checksum 是重复劳动。</p>
+<h2>1.4.2 到底修了什么：一条被忽略的 RNG</h2>
+<p>官方博客里有一段话值得原文引：</p>
+<blockquote>
+<p>After we shipped encryption in DuckDB 1.4.0, security experts actually found issues with the random number generator we used in Mbed TLS mode. Even though it would be difficult to actually exploit this, we disabled writing to databases in MbedTLS mode from DuckDB 1.4.1. Instead, DuckDB now (version 1.4.2+) tries to auto-install and auto-load the httpfs extension whenever a write is attempted.</p>
+</blockquote>
+<p>拆一下这句话的因果链。DuckDB 为了保持零外部依赖、小体积，把加密实现了两遍：一遍基于 Mbed TLS，一遍基于 OpenSSL。OpenSSL 被塞进 httpfs 扩展里，因为那个扩展本来就要做 HTTPS。Mbed TLS 那份为了兼容性把硬件加速关掉了，官方自己承认"不是特别抗时序攻击"。</p>
+<p>加密的核心三要素里，nonce 必须是随机的，密钥必须随机，canary 也必须随机。这些全走 <code>GenerateRandomData</code>，最终落到 RNG 上。RNG 一坏，GCM 的 nonce 就可能重复；nonce 重复加上已知明文，攻击者 XOR 两份密文就能还原两者内容，这是 GCM 最经典的失效模式。所以即便"难以利用"，堵住写路径是对的。</p>
+<p>修复方式挺绕：不是换 RNG，而是让写操作强制走 OpenSSL，具体做法是尝试自动安装并加载 httpfs。于是出现一个很奇怪的状态：<strong>能不能往加密库里写，取决于一个 HTTP 扩展装没装上</strong>。离线环境、无网络、扩展目录只读的部署，都会在写加密库时踩坑。</p>
+<p>这正好解释了那些"离线部署怎么用"的提问为什么一直有人问。我的建议是离线环境提前把 httpfs 扩展预装好：</p>
+<div class="highlight"><pre><span></span><code>duckdb<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;INSTALL httpfs;&quot;</span>
+<span class="c1"># 扩展落在 ~/.duckdb/extensions/&lt;version&gt;/&lt;platform&gt;/</span>
+<span class="c1"># 整个目录打进镜像，或者设置 home_directory 指到只读镜像层</span>
+</code></pre></div>
+
+<p>容器里更省事的做法是把扩展目录挂成只读卷，同时设 <code>SET autoinstall_known_extensions = false;</code> 和 <code>SET autoload_known_extensions = false;</code>，把手动装载写在启动脚本里。别依赖自动安装，它需要网络，且在 air-gap 环境下失败得很难看。</p>
+<h2>canary 那条 issue：从"不合规"到"文档过期"</h2>
+<p>顺着加密实现往下查，会撞到 issue #20162，标题是「Store and verify tag for canary encryption」。这是 DuckDB Labs 自己人 Lotte Felius 提的，标签 <code>reproduced</code>，内容一句话说清：</p>
+<blockquote>
+<p>An encrypted canary is stored in the database header of an encrypted file, to check whether the <em>correct</em> key is used to decrypt a database. Currently, we use AES-GCM with a constant IV to en- and decrypt, without storing and checking the tag. This is not NIST-compliant.</p>
+</blockquote>
+<p>翻译成人话：验证密钥对不对的 canary，用 AES-GCM 加密时 IV 是写死的常量，而且 tag 算出来不存也不校验。</p>
+<p>在 GCM 里这个组合确实不该出现。固定 IV 加密不同明文会泄露明文之间的 XOR 关系；不校验 tag 则等于放弃了 GCM 的认证特性，退化成 CTR。虽然这里的明文只是一段 canary（内容固定、量极小），实际危害有限，但 NIST 的规范就是规范，合规审计过不去。</p>
+<p>真正值得记的是后续。2026 年 6 月有人回帖问这 issue 关了是不是真修了，因为文档里还挂着警告。作者回复："this issue is fully resolved since <code>v1.5</code> and the docs indeed are simply outdated." 又过了一周，同一个用户追了一句很实在的话：他们的安全评审要过，文档里那条警告卡着审批，问多久能更新。最后 <code>carlopi</code> 去开了 duckdb-web 的 PR #6981。</p>
+<p>一条代码修复在 1.5 就完成了，文档滞后了半年，而滞后的文档真实地卡住了一家公司的安全审批。这种事在任何项目里都常见，但它是加密特性的代价：加密功能的"能用"和"能过审"是两件事，后者需要文档、认证、变更记录三样对齐。</p>
+<h2>性能：基本测不出来</h2>
+<p>官方给的数字，我直接抄过来，因为这是这篇博客里唯一有实测价值的部分。</p>
+<p>微基准是一个 TPC-H lineitem 表的 <code>SUMMARIZE</code>，内存限制压到 200MB 逼着读写磁盘，在一台较新的 MacBook 上：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>SUMMARIZE 耗时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>不加密</td>
+<td>约 5.4 s</td>
+</tr>
+<tr>
+<td>加密（Mbed TLS）</td>
+<td>约 6.2 s</td>
+</tr>
+<tr>
+<td>加密（OpenSSL，硬件加速）</td>
+<td>约 5.4 s</td>
+</tr>
+</tbody>
+</table>
+<p>Mbed TLS 那份慢 15%，OpenSSL 那份完全不慢。原因很直白：查询执行里读块只占一小部分时间，解密开销被淹没；而 OpenSSL 的 AES 走 AES-NI 指令，单块加密快到可以忽略。</p>
+<p>完整 TPC-H Power 测试，SF=100，同一台机器：</p>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>Power@Size</th>
+<th>Throughput@Size</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>不加密</td>
+<td>624,296</td>
+<td>450,409</td>
+</tr>
+<tr>
+<td>加密（8GB 内存限制，强制溢写）</td>
+<td>571,985</td>
+<td>145,353</td>
+</tr>
+<tr>
+<td>不加密（同 8GB 限制）</td>
+<td>591,841</td>
+<td>153,690</td>
+</tr>
+</tbody>
+</table>
+<p>把内存压到 8GB 强制临时文件溢写之后，加密相对不加密的差距是 Power 掉 3.3%，Throughput 掉 5.4%。这个量级在任何真实工作负载里都被查询计划的方差盖住了。</p>
+<p>所以性能不是选不选它的理由。真正要评估的是上面那几条：密钥强度、<code>mlock</code> 是否生效、扩展是否预装、文档版本是否对得上。</p>
+<h2>我的做法</h2>
+<p>如果要在生产里用 DuckDB 加密，我现在会做这几件事：</p>
+<p><strong>一，密钥不用口令，用 32 字节随机值。</strong> 既然 KDF 只是一次 SHA-256，口令强度就是全部防线，别赌。</p>
+<div class="highlight"><pre><span></span><code>openssl<span class="w"> </span>rand<span class="w"> </span>-base64<span class="w"> </span><span class="m">32</span>
+</code></pre></div>
+
+<p>密钥存到 secret manager，不落配置文件。attach 语句从环境变量读：</p>
+<div class="highlight"><pre><span></span><code><span class="n">ATTACH</span><span class="w"> </span><span class="s1">&#39;analytics.duckdb&#39;</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">a</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="n">ENCRYPTION_KEY</span><span class="w"> </span><span class="n">getenv</span><span class="p">(</span><span class="s1">&#39;DUCKDB_ENC_KEY&#39;</span><span class="p">),</span>
+<span class="w">    </span><span class="n">ENCRYPTION_CIPHER</span><span class="w"> </span><span class="s1">&#39;GCM&#39;</span>
+<span class="p">);</span>
+</code></pre></div>
+
+<p><strong>二，安装后立刻验证加密状态，别信"我配了"。</strong></p>
+<div class="highlight"><pre><span></span><code><span class="k">FROM</span><span class="w"> </span><span class="n">duckdb_databases</span><span class="p">();</span>
+</code></pre></div>
+
+<p>看 <code>encrypted</code> 列是不是 <code>true</code>、<code>cipher</code> 列是不是 <code>GCM</code>。这一步比读文档可靠。</p>
+<p><strong>三，落地检查 <code>mlock</code> 真实生效。</strong> 容器里跑一行：</p>
+<div class="highlight"><pre><span></span><code>grep<span class="w"> </span>VmLck<span class="w"> </span>/proc/self/status
+</code></pre></div>
+
+<p>锁住量是 0 就说明密钥随时可能被换出去，要么调 <code>ulimit -l</code>，要么关 swap，或者接受这个风险但别在合规文档里写"密钥不会落盘"。</p>
+<p><strong>四，离线环境预装 httpfs，禁用自动安装。</strong></p>
+<div class="highlight"><pre><span></span><code><span class="k">SET</span><span class="w"> </span><span class="n">autoinstall_known_extensions</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">false</span><span class="p">;</span>
+<span class="k">LOAD</span><span class="w"> </span><span class="n">httpfs</span><span class="p">;</span>
+</code></pre></div>
+
+<p>1.4.2 之后写加密库要 OpenSSL，这在 air-gap 环境是一个硬依赖，不是可选优化。</p>
+<p><strong>五，临时目录单独管。</strong> 把 <code>temp_directory</code> 指到 tmpfs 或独立的加密卷，崩溃后残留的 <code>.tmp</code> / <code>.block</code> 文件按敏感数据对待，写进清理脚本。</p>
+<p>加密本身没问题，AES-GCM-256、nonce 每块随机、checksum 一并加密、临时文件和 WAL 独立密钥，这些设计都对。麻烦的从来不是算法，是密钥怎么派生、内存能不能真的钉住、扩展装没装、文档和代码对不对得上。这四件事每一项都能让加密在纸面上成立、在机器上失效。</p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
