@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>一台 VM 跑 1500 万个 Web 服务：把 TCP/IP 栈搬出内核的真实代价 - Kane's Blog</title>
+<link rel="stylesheet" href="../theme/css/dark.css">
+</head>
+<body>
+<nav>
+  <a href="../" class="brand">Kane's Blog</a>
+  <span class="nav-links">
+    <a href="../" >Blog</a>
+    <a href="../calendar.html" >日历</a>
+    <a href="../projects2026/" >Projects</a>
+  </span>
+</nav>
+<main>
+<article>
+<h1>一台 VM 跑 1500 万个 Web 服务：把 TCP/IP 栈搬出内核的真实代价</h1>
+<time>2026-11-22</time>
+<ul>
+<li>网络编程</li>
+<li>系统编程</li>
+<li>Rust</li>
+<li>smoltcp</li>
+<li>内核旁路</li>
+</ul>
+<hr />
+<p>kapteko 上个月发了篇博客，标题直白得像个玩笑：《15 million web servers on one VM》。目标是 10GB 内存、1 个 CPU 核，跑 1500 万个 HTTP 服务进程。作者自己说是 bootstrap 项目、没拿到投资，做这件事的理由也很幽默：给地球上每个人配一台 Web 服务器，需求降到零，网络安全问题一次性解决。</p>
+<p>玩笑归玩笑，文章里有一组数字值得认真看。它的价值在于把内核网络栈的固定开销逐层量化了，从系统调用一路拆到 <code>sizeof(struct tcp_sock)</code>，"1500 万"那个噱头反倒是最不重要的部分。</p>
+<p>我读原文的时候顺手把源码也拉了下来，然后在自己机器上重测了几个关键数字。有几处和原文对不上，还有一处是原文没提但我测出来的，下面按顺序说。</p>
+<h2>第一刀：端口</h2>
+<p>最朴素的 C 服务器只有五个系统调用：<code>socket</code>、<code>listen</code>、<code>accept</code>、<code>recv</code>、<code>send</code>、<code>close</code>。作者写了一个每连接回 <code>OK</code> 的版本，单机跑到 65k RPS。</p>
+<p>然后他试图起 1500 万个：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span><span class="k">for</span><span class="w"> </span>i<span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="k">$(</span>seq<span class="w"> </span><span class="m">1</span><span class="w"> </span>15_000_000<span class="k">)</span><span class="p">;</span><span class="w"> </span><span class="k">do</span><span class="w"> </span>./server<span class="w"> </span><span class="p">&amp;;</span><span class="w"> </span><span class="k">done</span>
+<span class="m">28232</span>
+program<span class="w"> </span>exited<span class="w"> </span>with<span class="w"> </span>error<span class="w"> </span><span class="m">1</span>
+</code></pre></div>
+
+<p>第 28232 个进程 <code>listen</code> 失败。原因是端口用完了：<code>bind</code> 时传 <code>sin_port = 0</code>，让内核从 <code>ip_local_port_range</code> 里挑一个：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>sysctl<span class="w"> </span>net.ipv4.ip_local_port_range
+net.ipv4.ip_local_port_range<span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="m">32768</span><span class="w"> </span><span class="m">60999</span>
+</code></pre></div>
+
+<p>只有 28k 个可用端口。为什么跳过这么多？作者列了三条：1-1024 需要 root；1024-32768 保留给动态分配，避免你 <code>connect</code> 出去的时候被分到 3306 结果 MySQL 起不来；60999 以上是 IP Masquerade 时代留下的历史排除。</p>
+<p>我第一次看到这段时以为他在卖关子，其实真正的限制在后面：TCP 协议里的端口是 <code>u16</code>。你就算把内核里所有 <code>u16</code> 都 <code>sed</code> 成 <code>u32</code>，客户端也连不上，因为字段宽度是协议规定的。</p>
+<p>绕过办法有两个。粗暴的那个是插 450 块网卡（1500万/32k），每块一个 IP。温和的那个叫 AnyIP：</p>
+<div class="highlight"><pre><span></span><code>$<span class="w"> </span>sudo<span class="w"> </span>ip<span class="w"> </span>-6<span class="w"> </span>route<span class="w"> </span>add<span class="w"> </span><span class="nb">local</span><span class="w"> </span><span class="m">2001</span>:db8:1234:5678::/64<span class="w"> </span>dev<span class="w"> </span>lo
+</code></pre></div>
+
+<p><code>::/64</code> 是 2^64 个地址。IPv4 的等价操作需要一个 1500 万地址的段，作者估了个价：2.5 亿美元。这里他顺手吐槽了一句网卡是过去一年唯一没涨价（反而降价）的硬件。</p>
+<p>代码改动只有一行，从 base IP 加上序号：</p>
+<div class="highlight"><pre><span></span><code><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">read_cli_param</span><span class="p">(</span><span class="n">argv</span><span class="p">[</span><span class="mi">1</span><span class="p">]);</span>
+<span class="k">const</span><span class="w"> </span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">base_ip</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mh">0x0a400001</span><span class="p">;</span><span class="w">      </span><span class="c1">// 10.64.0.1</span>
+<span class="n">addr</span><span class="p">.</span><span class="n">sin_addr</span><span class="p">.</span><span class="n">s_addr</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">htonl</span><span class="p">(</span><span class="n">first_ip</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">i</span><span class="p">);</span><span class="w">  </span><span class="c1">// 10.64.0.1 + i</span>
+</code></pre></div>
+
+<h2>第二刀：每个进程 1.5MB</h2>
+<p>端口问题解决后，脚本再跑一次，这次死得更早：</p>
+<div class="highlight"><pre><span></span><code>Out of memory
+</code></pre></div>
+
+<p>每个服务器进程吃 1.5MB，1500 万个就是 20TB。10GB 预算下这条路线本身不可行，不是参数没调好，是架构选错了。</p>
+<p>作者换了个思路：不跑进程，跑协程。1500 万个 guest 全部加载到一个进程里，自己写一个用户态调度器在它们之间切换。这个套路 V8 很熟，一个进程里跑几十万个 JS 上下文。</p>
+<p>关键是算清楚每个 guest 的最小状态。看那个服务器主循环：</p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">client</span><span class="p">;</span><span class="w"> </span><span class="p">(</span><span class="n">client</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">accept</span><span class="p">(</span><span class="n">server</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">))</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">0</span><span class="p">;)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">recv</span><span class="p">(</span><span class="n">client</span><span class="p">,</span><span class="w"> </span><span class="nb">NULL</span><span class="p">,</span><span class="w"> </span><span class="mi">4096</span><span class="p">,</span><span class="w"> </span><span class="n">MSG_TRUNC</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+<span class="w">        </span><span class="n">send</span><span class="p">(</span><span class="n">client</span><span class="p">,</span><span class="w"> </span><span class="n">reply</span><span class="p">,</span><span class="w"> </span><span class="k">sizeof</span><span class="w"> </span><span class="n">reply</span><span class="w"> </span><span class="o">-</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="n">MSG_NOSIGNAL</span><span class="p">);</span>
+<span class="w">    </span><span class="n">close</span><span class="p">(</span><span class="n">client</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>活着的状态只有两个变量：<code>server</code> 和 <code>client</code>，两个 fd。所以调度上下文只需要 16 字节：</p>
+<div class="highlight"><pre><span></span><code><span class="cp">#[repr(C)]</span>
+<span class="k">pub</span><span class="p">(</span><span class="k">super</span><span class="p">)</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">Task</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">pc</span><span class="p">:</span><span class="w"> </span><span class="kt">u64</span><span class="p">,</span><span class="w">        </span><span class="c1">// 返回地址</span>
+<span class="w">    </span><span class="n">fd_server</span><span class="p">:</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span>
+<span class="w">    </span><span class="n">fd_client</span><span class="p">:</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>源码里还留了一段编译期断言，把这个 16 字节的假设钉死。因为 AArch64 汇编那边是按固定偏移访问这些字段的，结构体一变，汇编就静默错了：</p>
+<div class="highlight"><pre><span></span><code><span class="k">const</span><span class="w"> </span><span class="n">_</span><span class="p">:</span><span class="w"> </span><span class="p">()</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="fm">assert!</span><span class="p">(</span><span class="n">std</span><span class="p">::</span><span class="n">mem</span><span class="p">::</span><span class="n">size_of</span><span class="p">::</span><span class="o">&lt;</span><span class="n">Task</span><span class="o">&gt;</span><span class="p">()</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">16</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">assert!</span><span class="p">(</span><span class="n">std</span><span class="p">::</span><span class="n">mem</span><span class="p">::</span><span class="n">offset_of</span><span class="o">!</span><span class="p">(</span><span class="n">Task</span><span class="p">,</span><span class="w"> </span><span class="n">pc</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">assert!</span><span class="p">(</span><span class="n">std</span><span class="p">::</span><span class="n">mem</span><span class="p">::</span><span class="n">offset_of</span><span class="o">!</span><span class="p">(</span><span class="n">Task</span><span class="p">,</span><span class="w"> </span><span class="n">fd_server</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">8</span><span class="p">);</span>
+<span class="w">    </span><span class="fm">assert!</span><span class="p">(</span><span class="n">std</span><span class="p">::</span><span class="n">mem</span><span class="p">::</span><span class="n">offset_of</span><span class="o">!</span><span class="p">(</span><span class="n">Task</span><span class="p">,</span><span class="w"> </span><span class="n">fd_client</span><span class="p">)</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="mi">12</span><span class="p">);</span>
+<span class="p">};</span>
+</code></pre></div>
+
+<p>1500 万个 × 16 字节 = 220MB。作者补了一句：pc 用不着完整的 u64，fd 也用不着 i32，位压缩后大概 8 字节，也就是 110MB。</p>
+<p>到这里账很好看。然后作者犯了个错。</p>
+<h2>第三刀：你以为空闲的连接不花钱</h2>
+<p>他假设空闲连接占用 0 字节。只是 <code>listen</code> 着，没人连，内核总不会给每个 listener 分配什么吧。于是写了个验证：</p>
+<div class="highlight"><pre><span></span><code><span class="k">for</span><span class="w"> </span><span class="p">(</span><span class="kt">int</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">14</span><span class="n">_000_000</span><span class="p">;</span><span class="w"> </span><span class="n">i</span><span class="o">++</span><span class="p">)</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kt">int</span><span class="w"> </span><span class="n">server</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">socket</span><span class="p">(</span><span class="n">AF_INET</span><span class="p">,</span><span class="w"> </span><span class="n">SOCK_STREAM</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">);</span>
+<span class="w">    </span><span class="n">listen</span><span class="p">(</span><span class="n">server</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">);</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>结果：</p>
+<div class="highlight"><pre><span></span><code>Out Of Memory
+</code></pre></div>
+
+<p>作者的原话是"我不得不承认我在这里低于平均水平"。一个 <code>socket()</code> 调用，不管这个 socket 是活跃、监听还是什么都不干，内核都给它分配大约 3300 字节。</p>
+<p>我在本机（macOS 14.8，x86_64）上实测了一下这个数字，结论比原文更有意思。</p>
+<p>创建 2000 个未绑定的 socket：</p>
+<div class="highlight"><pre><span></span><code><span class="n">create</span><span class="w"> </span><span class="mi">2000</span><span class="w"> </span><span class="n">unbound</span><span class="w"> </span><span class="n">sockets</span><span class="o">:</span><span class="w"> </span><span class="n">rss</span><span class="w"> </span><span class="mi">11336</span><span class="w"> </span><span class="n">KB</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="mi">11608</span><span class="w"> </span><span class="n">KB</span><span class="w"> </span><span class="p">(</span><span class="n">delta</span><span class="w"> </span><span class="mi">272</span><span class="w"> </span><span class="n">KB</span><span class="p">,</span><span class="w"> </span><span class="mi">139</span><span class="w"> </span><span class="n">B</span><span class="o">/</span><span class="n">socket</span><span class="p">)</span>
+<span class="n">tcp</span><span class="p">.</span><span class="n">pcbcount</span><span class="o">:</span><span class="w"> </span><span class="mi">58</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="mi">2058</span>
+</code></pre></div>
+
+<p>进程侧 RSS 每个只涨 139 字节，但 <code>tcp.pcbcount</code> 精确涨了 2000。也就是说开销几乎全在内核内存里，<code>ps</code> 完全看不见。接着对同样 2000 个 socket 调 <code>bind</code> + <code>listen</code>：</p>
+<div class="highlight"><pre><span></span><code>listen 2000 of 2000: rss delta 16 KB (8 B/listener)
+</code></pre></div>
+
+<p>8 字节。<code>listen</code> 本身几乎不花钱，钱在 <code>socket()</code> 那一步已经付掉了。</p>
+<p>再测已建立的连接。建 120 条 TCP 连接但先不 <code>accept</code>，让它们停在内核的 accept 队列里：</p>
+<div class="highlight"><pre><span></span><code><span class="n">queued</span><span class="o">-</span><span class="kr">not</span><span class="o">-</span><span class="n">accepted</span><span class="w"> </span><span class="mi">120</span><span class="o">:</span><span class="w"> </span><span class="n">rss</span><span class="w"> </span><span class="n">delta</span><span class="w"> </span><span class="mi">148</span><span class="w"> </span><span class="n">KB</span><span class="w"> </span><span class="p">(</span><span class="mi">1263</span><span class="w"> </span><span class="n">B</span><span class="w"> </span><span class="n">each</span><span class="p">),</span><span class="w"> </span><span class="n">pcb</span><span class="w"> </span><span class="mi">60</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="mi">299</span>
+<span class="n">after</span><span class="w"> </span><span class="n">accept</span><span class="o">:</span><span class="w">  </span><span class="n">extra</span><span class="w"> </span><span class="n">rss</span><span class="w"> </span><span class="n">delta</span><span class="w"> </span><span class="mi">52</span><span class="w"> </span><span class="n">KB</span><span class="w"> </span><span class="p">(</span><span class="mi">444</span><span class="w"> </span><span class="n">B</span><span class="w"> </span><span class="n">each</span><span class="p">),</span><span class="w"> </span><span class="n">pcb</span><span class="w"> </span><span class="mi">299</span><span class="w"> </span><span class="o">-&gt;</span><span class="w"> </span><span class="mi">299</span>
+<span class="n">TOTAL</span><span class="w"> </span><span class="n">per</span><span class="w"> </span><span class="n">established</span><span class="w"> </span><span class="n">conn</span><span class="p">,</span><span class="w"> </span><span class="nf">process</span><span class="o">-</span><span class="n">visible</span><span class="o">:</span><span class="w"> </span><span class="mi">1707</span><span class="w"> </span><span class="n">B</span><span class="o">/</span><span class="n">conn</span>
+</code></pre></div>
+
+<p>每条连接在进程侧可见约 1.7KB，而 <code>accept</code> 之后 pcb 计数不再涨。说明内核对象在三次握手完成时就已经建好了，<code>accept</code> 只是把它递给用户态。</p>
+<p>这里有个副作用值得记一笔。我原本想测 1000 条连接，结果 <code>connect</code> 直接超时。探了一下 accept 队列深度：</p>
+<div class="highlight"><pre><span></span><code><span class="nx">stalled</span><span class="w"> </span><span class="nx">at</span><span class="w"> </span><span class="nx">connection</span><span class="w"> </span><span class="err">#</span><span class="mi">128</span><span class="p">:</span><span class="w"> </span><span class="nx">timed</span><span class="w"> </span><span class="nx">out</span>
+<span class="nx">deepest</span><span class="w"> </span><span class="nx">un</span><span class="o">-</span><span class="nx">accepted</span><span class="w"> </span><span class="nx">backlog</span><span class="w"> </span><span class="nx">observed</span><span class="p">:</span><span class="w"> </span><span class="mi">128</span>
+</code></pre></div>
+
+<p><code>listen(1024)</code> 传了 1024，内核实际只给了 128。backlog 会被 <code>somaxconn</code> 之类的上限静默截断，你传多少它不一定给多少。这个数字和你说的那个数字没有关系，调 backlog 参数之前最好先实测。</p>
+<p>回到原文。作者把 3300 字节拆开了：</p>
+<table>
+<thead>
+<tr>
+<th>结构</th>
+<th>大小</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>struct tcp_sock</code></td>
+<td>2240B</td>
+<td>TCP 状态、队列、定时器、序号、拥塞控制、重传记录</td>
+</tr>
+<tr>
+<td><code>struct socket_alloc</code></td>
+<td>768B</td>
+<td>128B 的 <code>struct socket</code> + 等待队列 + 608B sockfs inode + padding</td>
+</tr>
+<tr>
+<td><code>struct file</code></td>
+<td>192B</td>
+<td>文件操作、flags、凭据、引用计数</td>
+</tr>
+<tr>
+<td><code>struct dentry</code></td>
+<td>192B</td>
+<td>sockfs 伪文件名、inode 指针、VFS 查找记账</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td><strong>3384B</strong></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<p>作者的吐槽很到位：他本来指望看到 <code>[u8; 3300]</code> 这样一个缓冲区，结果发现这些内存全是"有用的"记账结构，不重写半个内核基本压不下去。</p>
+<p>我想补一个更不直观的角度。这 3.3KB 里真正随连接规模增长的只有 <code>tcp_sock</code> 那 2.2KB，剩下 <code>socket_alloc</code>、<code>file</code>、<code>dentry</code> 三层是 VFS 抽象带来的固定税。也就是说，哪怕你把 TCP 状态机优化到极致，只要还走"一切皆文件"的路径，每连接至少还要付 1.1KB 给 inode 和 dentry。</p>
+<p>这解释了一个现象：连接数上到百万级之后，<code>slabtop</code> 里排名靠前的往往不是 <code>TCP</code>，而是 <code>filp</code>（file 对象）、<code>dentry</code> 和 <code>sock_inode_cache</code> 这几个 VFS 结构。排查连接泄漏时盯着 <code>TCP</code> 那一行是不够的。</p>
+<h2>换层：往下走三层</h2>
+<p>既然在当前抽象层面上无解，就换层。应用层 HTTP 往下是传输层 TCP/IP，再往下是网络层、数据链路层、物理层。</p>
+<p>关键洞察在这里：<strong>TCP/IP 是有状态的，它下面全是无状态的。</strong> 以太网帧不关心里面装的是什么，所以你完全可以自己拼 IP 包和以太网帧发出去。代价是你得自己实现 TCP。</p>
+<p>这件事嵌入式领域做了几十年了。最极端的例子是 Adam Dunkels 的 Miniweb，TCP/IP 实现加 HTTP 服务器一共 28 字节。成熟一些的选择：</p>
+<ul>
+<li><strong>gVisor</strong>：把整个操作系统连同网络栈一起重新实现</li>
+<li><strong>Seastar</strong>：自带网络栈的完整运行时，ScyllaDB 团队的产物</li>
+<li><strong>lwIP</strong>：C 实现，嵌入式标配</li>
+<li><strong>F-Stack</strong>：直接用 FreeBSD 的 TCP/IP 栈</li>
+</ul>
+<p>这四个的定位差得很远，值得说清楚，因为选错了代价很大。</p>
+<p><strong>gVisor</strong> 是最重的方案。它不只重写网络栈，而是重写整个系统调用接口：你的程序跑在一个叫 Sentry 的用户态内核上，系统调用被拦截后由 Sentry 用自己的实现处理。安全收益巨大（容器逃逸的攻击面从宿主机内核缩小到 Sentry 的 Go 代码），代价是系统调用密集的负载会明显变慢。它不是"更快的内核"，是"更安全的替代品"。</p>
+<p><strong>Seastar</strong> 是共享无（share-nothing）模型。每个 CPU 核跑一个独立的 reactor，核之间不共享内存、不加锁，靠消息传递通信。这不是为了省内存，是为了避免多核扩展时的锁竞争和缓存一致性开销。ScyllaDB 声称单个节点能跑几十万 OPS 靠的就是这个。代价是编程模型相当反直觉：你写的每一行代码都绑定在一个核上，跨核操作是显式的网络消息。</p>
+<p><strong>lwIP</strong> 是嵌入式路线，主打代码体积小、RAM 需求低，可以只开需要的协议子集。它没有"高性能"的野心，目标是跑在几百 KB 内存的 MCU 上。原文提到的 Adam Dunkels 就是这个领域的传奇人物，lwIP 和 uIP 都出自他手。</p>
+<p><strong>F-Stack</strong> 的思路最务实：不自己写 TCP，直接把 FreeBSD 的成熟栈移植到用户态，底下接 DPDK。这样协议实现的正确性由 FreeBSD 二十年积累保证，你只负责优化 datapath。</p>
+<p>smoltcp 在这四个之间找到了一个甜点：纯 Rust、无堆分配、不依赖操作系统，代码量小到能读懂。它不做高性能，也不做完整 POSIX 兼容，只做"够用的 TCP/IP 状态机加零分配"。原文选它做 POC 是对的，选它做生产服务就得想清楚你要哪个方向。</p>
+<p>我自己的判断是：<strong>如果你的问题真的是连接密度，那需要的是"每连接固定开销能压到多少"这个方向的栈，smoltcp 合适。如果问题是吞吐，那需要的是"每核能跑多少包"这个方向，选 Seastar 或 DPDK。这两个优化方向在对立面上，别指望一个方案同时满足。</strong></p>
+<p>原文选了 Rust 的 <strong>smoltcp</strong>，理由写得很简洁：</p>
+<blockquote>
+<p>smoltcp is a standalone, event-driven TCP/IP stack that is designed for bare-metal, real-time systems. smoltcp does not need heap allocation at all.</p>
+</blockquote>
+<p>我去 crates.io 核了一下，0.14.0 发布于 2026-08-17，累计下载 115 万次。源码里 <code>Cargo.toml</code> 钉的是精确版本 <code>version = "=0.14.0"</code>，feature 只开了需要的几项：</p>
+<div class="highlight"><pre><span></span><code><span class="n">smoltcp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">version</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="s2">&quot;=0.14.0&quot;</span><span class="p">,</span><span class="w"> </span><span class="n">default-features</span><span class="w"> </span><span class="p">=</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="n">features</span><span class="w"> </span><span class="p">=</span>
+<span class="w">    </span><span class="p">[</span><span class="s2">&quot;std&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;medium-ethernet&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;medium-ip&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;phy-tuntap_interface&quot;</span><span class="p">,</span>
+<span class="w">     </span><span class="s2">&quot;proto-ipv4&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;socket-tcp&quot;</span><span class="p">]</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div>
+
+<p>作者一句话点出了 smoltcp 的定位：<strong>它本质上是个聪明的解析器，不做 I/O</strong>。它跟网卡之间要有个适配层，三种选择：</p>
+<ul>
+<li><strong>TUN</strong>：内核提供的虚拟网卡，工作在 IP 层</li>
+<li><strong>TAP</strong>：再往下一层，以太网层</li>
+<li><strong>DPDK</strong>：直接拿以太网帧跟硬件对话，完全绕开内核</li>
+</ul>
+<p>前两个 smoltcp 自带，接上去就能跑：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">iface</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Interface</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">config</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">device</span><span class="p">,</span><span class="w"> </span><span class="n">Instant</span><span class="p">::</span><span class="n">now</span><span class="p">());</span>
+<span class="n">iface</span><span class="p">.</span><span class="n">update_ip_addrs</span><span class="p">(</span><span class="o">|</span><span class="n">addrs</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">addrs</span><span class="p">.</span><span class="n">push</span><span class="p">(</span><span class="n">IpCidr</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="n">IpAddress</span><span class="p">::</span><span class="n">v4</span><span class="p">(</span><span class="mi">192</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">),</span><span class="w"> </span><span class="mi">24</span><span class="p">)).</span><span class="n">unwrap</span><span class="p">();</span>
+<span class="p">});</span>
+<span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">sockets</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">SocketSet</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="nb">Vec</span><span class="p">::</span><span class="n">new</span><span class="p">());</span>
+
+<span class="k">loop</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">now</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Instant</span><span class="p">::</span><span class="n">now</span><span class="p">();</span>
+<span class="w">    </span><span class="n">iface</span><span class="p">.</span><span class="n">poll</span><span class="p">(</span><span class="n">now</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">device</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">sockets</span><span class="p">);</span>
+<span class="w">    </span><span class="n">wait</span><span class="p">(</span><span class="n">device</span><span class="p">.</span><span class="n">as_raw_fd</span><span class="p">(),</span><span class="w"> </span><span class="n">iface</span><span class="p">.</span><span class="n">poll_delay</span><span class="p">(</span><span class="n">now</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">sockets</span><span class="p">))</span><span class="o">?</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>这就是一个完整的用户态 TCP/IP 主循环。<code>poll</code> 处理收发，<code>poll_delay</code> 告诉你下次需要醒来的时间。</p>
+<p>这段代码值得停一下：它没有线程池，没有 epoll，没有 reactor。整个网络栈就是一个被动的数据结构和一次 <code>poll</code> 调用。等待事件靠的是 <code>wait(fd, timeout)</code> 把内核当定时器用。你失去的是内核帮你做的一切（协议细节、拥塞控制、拥塞算法、SACK、窗口缩放），换来的是每一字节内存都由你决定。</p>
+<p>这个交换在嵌入式里是划算的。在通用服务器上，通常是亏的。</p>
+<h2>DPDK 与 AF_XDP：两种绕内核的姿势</h2>
+<p>DPDK 的动机是一笔很实在的账：一次系统调用约 500ns，把数据从内核拷到用户态再加约 1000ns（取决于缓冲区大小）。听起来不多，但高频交易机构打满 400Gbps 网卡时是每秒 6 亿个包，合每包 1.7ns。在这种量级下，每次系统调用都是一道流血的伤口。</p>
+<p>我在本机（macOS 14.8 / x86_64，32GB）上实测了这个成本量级，结果比原文引用的大一截：</p>
+<div class="highlight"><pre><span></span><code><span class="k">send</span><span class="o">+</span><span class="nv">recv</span><span class="w"> </span>一次往返<span class="w"> </span><span class="ss">(</span><span class="mi">2</span><span class="w"> </span>个<span class="w"> </span><span class="nv">syscall</span><span class="ss">)</span>:<span class="w"> </span><span class="mi">2992</span><span class="w"> </span><span class="nv">ns</span><span class="w">  </span><span class="o">=&gt;</span><span class="w"> </span>单次<span class="w"> </span><span class="nv">syscall</span><span class="w"> </span>约<span class="w"> </span><span class="mi">1496</span><span class="w"> </span><span class="nv">ns</span>
+纯用户态<span class="w"> </span><span class="mi">64</span><span class="w"> </span>字节拷贝:<span class="w"> </span><span class="mi">279</span>.<span class="mi">1</span><span class="w"> </span><span class="nv">ns</span>
+比值:<span class="w"> </span><span class="nv">syscall</span><span class="w"> </span>往返<span class="w"> </span><span class="o">/</span><span class="w"> </span>用户态拷贝<span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">11</span><span class="nv">x</span>
+</code></pre></div>
+
+<p>单次系统调用约 1.5 微秒，是一次等长内存拷贝的 11 倍。这个数字在不同平台上差异很大（x86 的 <code>syscall</code> 指令、ARM 的 <code>svc</code>、内核的 KPTI 开关都影响结果），我用的还是 Python 调用层，本身带了解释器开销，所以它不是"系统调用的下限"，只是同平台下的相对量级。</p>
+<p>但量级关系是可靠的：<strong>一次跨内核边界的往返，相当于十几次纯内存操作</strong>。这就解释了为什么 DPDK 宁愿烧掉一个 CPU 核去忙轮询，也不肯付这个过路费。</p>
+<p>对照一下我另外测的一个数字：Python 生成器 resume 一次（纯用户态最小上下文切换）约 82 ns，一次 <code>getpid</code> 系统调用约 109 ns。在这个极简场景下两者只差 1.3 倍，因为 Python 解释器自身的开销把差距掩盖了。用 C 测会是另一个量级。这提醒我一件事：<strong>基准测试的结论很大程度上取决于你测的边界在哪</strong>，同一台机器上同一个概念能差出十倍。</p>
+<p>DPDK 的做法是让程序直接操作硬件网卡的内存映射缓冲区：要发数据就写进缓冲区，要收数据它已经在里面了，全程没有系统调用。</p>
+<p>还有个不太显眼的好处：正常情况下每个包到达都触发中断，CPU 切进内核处理完再切回来。包多到一定程度，你的应用会被中断打断到几乎不前进。这个现象叫 <strong>livelock</strong>，生产环境调这种东西应该是另一个层级的折磨。DPDK 用忙轮询彻底消灭了中断：</p>
+<div class="highlight"><pre><span></span><code><span class="n">loop</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">send_from_app_memory_to_network</span><span class="p">();</span>
+<span class="w">    </span><span class="n">receive_from_network_to_app_memory</span><span class="p">();</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>代价是一整个 CPU 核，以及<strong>独占网卡</strong>。这一点原文提醒得很到位：DPDK 驱动接管网卡之后，这块网卡就从操作系统里消失了，<code>ifconfig</code> 里看不到。如果你是 SSH 上去操作，敲完这条命令 SSH 就断了。</p>
+<p>AF_XDP 是后来者的折中方案：同样是内存映射缓冲区、零拷贝，但内核仍然持有设备、中断照常发生。包到达时内核跑一个 eBPF 过滤器，决定是直接丢给用户态缓冲区还是走正常网络栈。所以 SSH 不会断。它还支持 <code>SO_PREFER_BUSY_POLL</code> 模式，逼近 DPDK 的忙轮询效果。</p>
+<p>DPDK 更快，AF_XDP 更好管。这个权衡没有标准答案。</p>
+<p>来源：<a href="https://doc.dpdk.org/guides/index.html">DPDK 官方文档</a>、<a href="https://docs.kernel.org/networking/af_xdp.html">AF_XDP 内核文档</a>。</p>
+<p>源码里 DPDK 适配层只有一百多行（<code>network_dpdk_custom.c</code>），核心是两句：</p>
+<div class="highlight"><pre><span></span><code><span class="n">next</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+<span class="n">end</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">rte_eth_rx_burst</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="n">burst</span><span class="p">,</span><span class="w"> </span><span class="n">batch</span><span class="p">);</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="o">!</span><span class="n">end</span><span class="p">)</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span>
+</code></pre></div>
+
+<p>以及一个有 deadline 的 TX 攒批逻辑。不足 64 个包的批次会等最多 60 微秒再发，避免小包把 PCIe 打满：</p>
+<div class="highlight"><pre><span></span><code><span class="n">delay_cycles</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">60</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="p">(</span><span class="n">rte_get_timer_hz</span><span class="p">()</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">1000</span><span class="p">)</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="mi">1000</span><span class="p">;</span>
+<span class="k">if</span><span class="w"> </span><span class="p">(</span><span class="n">now</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">retry_at</span><span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="p">(</span><span class="n">count</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">batch</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">now</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="n">deadline</span><span class="p">))</span>
+<span class="w">    </span><span class="k">return</span><span class="p">;</span>
+</code></pre></div>
+
+<h2>最精巧的一处：一个 socket 服务两个角色</h2>
+<p>这部分是我读源码时最意外的设计。</p>
+<p>传统的 <code>accept</code> 语义是：listener socket 上收到 SYN，内核新建一个连接 socket，listener 继续 listen。smoltcp 的 <code>TcpSocket</code> 不是这样，一个对象只能处于一个状态，要么 listening，要么 established。</p>
+<p>作者的解法在 <code>scheduler.rs</code> 的 <code>ingress</code> 里：SYN 到达时，把这个 listener 的 <code>SocketSet</code> 整个<strong>换走</strong>给连接用，同时塞一个新的、干净的 listener 进去：</p>
+<div class="highlight"><pre><span></span><code><span class="c1">// The resident socket consumed the SYN. Keep its TCP state and</span>
+<span class="c1">// leave a listening socket at the guest&#39;s address for the next SYN.</span>
+<span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">replacement</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">new_socket_set</span><span class="p">();</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">ip</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Ipv4Addr</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">first</span><span class="w"> </span><span class="o">+</span><span class="w"> </span><span class="n">flow</span><span class="p">.</span><span class="n">listener</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">u32</span><span class="p">);</span>
+<span class="n">listen_on</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">replacement</span><span class="p">,</span><span class="w"> </span><span class="p">(</span><span class="n">ip</span><span class="p">,</span><span class="w"> </span><span class="n">PORT</span><span class="p">).</span><span class="n">into</span><span class="p">());</span>
+<span class="kd">let</span><span class="w"> </span><span class="n">sockets</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">mem</span><span class="p">::</span><span class="n">replace</span><span class="p">(</span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">listener</span><span class="p">.</span><span class="n">sockets</span><span class="p">,</span><span class="w"> </span><span class="n">replacement</span><span class="p">);</span>
+</code></pre></div>
+
+<p><code>std::mem::replace</code>。零拷贝，没有克隆，没有重新解析。TCP 状态机接着往下走，地址上的监听能力由替换品承接。</p>
+<p>这套做法有个隐含前提：整个连接过程中，guest 只在特定时刻才被唤醒。源码里用一个状态机把这个生命周期显式建模出来：</p>
+<div class="highlight"><pre><span></span><code><span class="k">enum</span><span class="w"> </span><span class="nc">Stage</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">Pending</span><span class="p">,</span><span class="w">    </span><span class="c1">// SYN 已回，等三次握手完成</span>
+<span class="w">    </span><span class="n">Queued</span><span class="p">,</span><span class="w">     </span><span class="c1">// 握手完成，但 guest 还在处理别的连接</span>
+<span class="w">    </span><span class="n">Reading</span><span class="p">,</span><span class="w">    </span><span class="c1">// guest 正在跑，阻塞在 recv 上</span>
+<span class="w">    </span><span class="n">Finished</span><span class="p">,</span><span class="w">   </span><span class="c1">// guest 跑完返回了</span>
+<span class="w">    </span><span class="n">Acked</span><span class="p">,</span><span class="w">      </span><span class="c1">// 主动关闭的 ACK 已发出</span>
+<span class="w">    </span><span class="n">Retained</span><span class="p">,</span><span class="w">   </span><span class="c1">// 停在 TIME_WAIT</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p><code>Retained</code> 这个状态值单独说。TIME_WAIT 是 TCP 里最烦人的东西：主动关闭的一方要挂 2MSL，而且它是按四元组独占的。在上限 1500 万个连接的场景下，TIME_WAIT 会把四元组表撑爆。源码的解法是设个硬上限：</p>
+<div class="highlight"><pre><span></span><code><span class="k">const</span><span class="w"> </span><span class="n">MAX_TIME_WAIT</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">65_536</span><span class="p">;</span>
+<span class="c1">// ...</span>
+<span class="k">if</span><span class="w"> </span><span class="n">state</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">State</span><span class="p">::</span><span class="n">TimeWait</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">connection</span><span class="p">.</span><span class="n">stage</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">Stage</span><span class="p">::</span><span class="n">Acked</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">overflow</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">time_wait</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="n">MAX_TIME_WAIT</span><span class="p">;</span>
+<span class="w">    </span><span class="k">if</span><span class="w"> </span><span class="o">!</span><span class="n">overflow</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="bp">self</span><span class="p">.</span><span class="n">time_wait</span><span class="w"> </span><span class="o">+=</span><span class="w"> </span><span class="mi">1</span><span class="p">;</span>
+<span class="w">        </span><span class="n">connection</span><span class="p">.</span><span class="n">stage</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Stage</span><span class="p">::</span><span class="n">Retained</span><span class="p">;</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>超过 65536 个 TIME_WAIT 就提前把连接对象扔了。这是对协议的故意违背，会带来一个真实后果：迟到的重复 FIN 包可能拿不到正确的 ACK。在真实服务器上这么干会被动挨打，但在一个"每个 IP 只有一个连接、连接活不过几毫秒"的 POC 里，代价可以接受。</p>
+<p>这类取舍才是这个项目最值得学的地方，而不是 1500 万那个数字。它把"协议保证"和"资源上限"的冲突摆到明面上，让你看见真实系统里每一个优雅语义背后都标着价格。</p>
+<p>内存上这个设计很关键。每个 listener 的 <code>SocketSet</code> 只放一个 socket，收发缓冲区各 64 字节：</p>
+<div class="highlight"><pre><span></span><code><span class="k">const</span><span class="w"> </span><span class="n">BUFFER_BYTES</span><span class="p">:</span><span class="w"> </span><span class="kt">usize</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">64</span><span class="p">;</span>
+<span class="n">SocketBuffer</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="fm">vec!</span><span class="p">[</span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">BUFFER_BYTES</span><span class="p">]),</span>
+<span class="n">SocketBuffer</span><span class="p">::</span><span class="n">new</span><span class="p">(</span><span class="fm">vec!</span><span class="p">[</span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="n">BUFFER_BYTES</span><span class="p">]),</span>
+</code></pre></div>
+
+<p>64 字节收发缓冲，这解释了最终数字为什么那么低。真实的 HTTP 服务器当然不能这么干，一个请求头就超了。但这是 POC，目标是验证"内存可以压到多少"，不是"能不能扛生产流量"。</p>
+<p>地址解析也不走路由表，直接算偏移：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="n">listener</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="kt">u32</span><span class="p">::</span><span class="n">from</span><span class="p">(</span><span class="n">ip</span><span class="p">.</span><span class="n">dst_addr</span><span class="p">()).</span><span class="n">checked_sub</span><span class="p">(</span><span class="bp">self</span><span class="p">.</span><span class="n">first</span><span class="p">)</span><span class="o">?</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="kt">usize</span><span class="p">;</span>
+<span class="k">if</span><span class="w"> </span><span class="n">listener</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="bp">self</span><span class="p">.</span><span class="n">listeners</span><span class="p">.</span><span class="n">len</span><span class="p">()</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nb">None</span><span class="p">;</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>目标 IP 减去 base IP 就是 guest 下标。一次减法代替一次路由查找。配合 <code>interface.set_any_ip(true)</code> 让 smoltcp 接受任意目的地址。我在 docs.rs 上确认过，<code>set_any_ip</code> 和 <code>poll_ingress_single</code> 都是 0.14.0 的公开 API。</p>
+<p>调度上下文 16 字节只是账的第一半。真正决定能不能塞下 1500 万个的，是"一个 guest 被换出去的时候，还有谁在替它持有状态"。</p>
+<p>在进程模型里，答案是内核：socket 对象、文件描述符表、等待队列、TCP 控制块，全挂在进程名下，进程被换出去这些结构照样占着。在用户态栈模型里，答案就是这个 <code>Task</code> 结构体加上 smoltcp 的 socket 对象。作者把主机侧的生命周期单独建模成一个 <code>Connection</code>，和 guest 的 <code>Task</code> 解耦：</p>
+<div class="highlight"><pre><span></span><code><span class="k">struct</span><span class="w"> </span><span class="nc">Connection</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">sockets</span><span class="p">:</span><span class="w"> </span><span class="nc">SocketSet</span><span class="o">&lt;&#39;</span><span class="nb">static</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">stage</span><span class="p">:</span><span class="w"> </span><span class="nc">Stage</span><span class="p">,</span>
+<span class="w">    </span><span class="n">wake_at</span><span class="p">:</span><span class="w"> </span><span class="nb">Option</span><span class="o">&lt;</span><span class="n">Instant</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>这个拆分是整个设计的关键。guest 是纯计算（跑 HTTP 解析、拼响应），它不知道 TCP 握手进展到哪一步；TCP 状态机是纯数据（收包、回 ACK、推进四元组），它不知道 guest 现在是否可调度。两边通过 <code>Stage</code> 这个中间状态握手，谁来跑由调度器根据 <code>ready</code> 队列和 <code>timers</code> 决定：</p>
+<div class="highlight"><pre><span></span><code><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">packet</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Packet</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">frame</span><span class="p">:</span><span class="w"> </span><span class="nb">None</span><span class="p">,</span>
+<span class="w">    </span><span class="n">capabilities</span><span class="p">:</span><span class="w"> </span><span class="nc">device</span><span class="p">.</span><span class="n">capabilities</span><span class="p">(),</span>
+<span class="w">    </span><span class="n">tx</span><span class="p">:</span><span class="w"> </span><span class="nc">device</span><span class="p">.</span><span class="n">transmit</span><span class="p">(</span><span class="n">now</span><span class="p">),</span>
+<span class="w">    </span><span class="n">acked</span><span class="p">:</span><span class="w"> </span><span class="nc">false</span><span class="p">,</span>
+<span class="p">};</span>
+<span class="bp">self</span><span class="p">.</span><span class="n">interface</span><span class="p">.</span><span class="n">poll_egress</span><span class="p">(</span><span class="n">now</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">packet</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="k">mut</span><span class="w"> </span><span class="n">connection</span><span class="p">.</span><span class="n">sockets</span><span class="p">);</span>
+</code></pre></div>
+
+<p>每次唤醒一个 guest 处理一条连接，<code>poll_egress</code> 只取一个 TX token。注释写得很清楚：每个 <code>SocketSet</code> 只有一个 TCP socket，所以一次 poll 一个 token 就够了。这种"按最坏情况的最小值来配置"的写法贯穿整个项目，也是它能压到 620 字节/空闲服务器的原因。</p>
+<p>顺便说，这也是它跑不快的原因之一：一次 poll 只能出一个包，想撑吞吐就得靠多核或者多队列，而 DPDK 忙轮询一个核就能吃到线速。原文的 benchmark 里 DPDK 明显领先，除了绕过内核，这个批量粒度的差异也是因素。</p>
+<h2>结果，以及我的三点保留</h2>
+<p>最终跑分：内核网络栈在约 250 万个服务器时内存耗尽，RPS 随服务器数增长而下降。换成 smoltcp 后，空闲服务器每台 620 字节、活跃约 1KB，跑到了 1600 万。</p>
+<p>DPDK 和 AF_XDP 更快，AF_XDP 紧随其后。</p>
+<p>把整篇文章的账合起来看，10GB 预算的分配大致是这样：</p>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>数量</th>
+<th>单价</th>
+<th>合计</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>调度上下文 <code>Task</code></td>
+<td>1500 万</td>
+<td>16 B</td>
+<td>220 MB</td>
+</tr>
+<tr>
+<td>空闲 listener 的 socket 对象</td>
+<td>1400 万</td>
+<td>620 B</td>
+<td>8.3 GB</td>
+</tr>
+<tr>
+<td>活跃连接（收发缓冲各 64B + 状态）</td>
+<td>100 万</td>
+<td>~1 KB</td>
+<td>1 GB</td>
+</tr>
+<tr>
+<td><strong>合计</strong></td>
+<td></td>
+<td></td>
+<td><strong>约 9.5 GB</strong></td>
+</tr>
+</tbody>
+</table>
+<p>（这张表是我按原文的单价和 10GB 预算倒推的，原文只给了单价和最终达成数，没给这张分解。所以它是自洽性检查，不是原文数据。）</p>
+<p>这张表解释了一件事：<strong>在这里省内存的主战场是空闲 listener，不是活跃连接。</strong> 1500 万里 1400 万是空闲的，它们占了 8.3GB，占绝对大头。作者的 620 字节几乎全花在 smoltcp 的 socket 结构本身，收发缓冲各 64 字节只是零头。</p>
+<p>所以这个 POC 真正的贡献是那个压缩比，1500 万只是副产品。它证明了<strong>空闲监听端的单位成本可以从 3.3KB 压到 620 字节，压缩比 5.3 倍</strong>。这个倍数是可以迁移的；1500 万这个绝对值不行，它由 10GB 预算和 620 字节共同决定。</p>
+<p>再看内核侧为什么在 250 万就崩：</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>内核栈</th>
+<th>smoltcp</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单位成本</td>
+<td>3384 B</td>
+<td>620 B</td>
+</tr>
+<tr>
+<td>10GB / 单位成本</td>
+<td>约 310 万</td>
+<td>约 1600 万</td>
+</tr>
+<tr>
+<td>实际崩溃点</td>
+<td>约 250 万</td>
+<td>未崩</td>
+</tr>
+</tbody>
+</table>
+<p>310 万和 250 万差的那 60 万，是内核栈本身、页表、slab 碎片、以及我前面测到的那些"看不见的"开销。理论值和实测值差 20%，这个偏差在任何容量规划里都该留余量。</p>
+<p>回到我自己的实测。它和这组数字方向一致：内核侧每条连接 3.3KB 是躲不掉的，而这笔账在 <code>ps</code> 里看不见。我测到的 1.7KB 是进程侧可见部分，内核那 2.2KB 的 <code>tcp_sock</code> 根本不进 RSS 统计。这也意味着<strong>光看进程内存判断容量会严重高估</strong>：你以为 10GB 能跑 300 万连接，实际上内核早就在别的地方吃掉了。</p>
+<p>不过我有三点保留。</p>
+<p>第一，620 字节/空闲服务器是在 64 字节收发缓冲的前提下得到的。原文的 benchmark 也没给出压测客户端的形态、连接持续时间和 RPS 的具体数值。这个数字证明了架构方向可行，但离生产还差得远。</p>
+<p>第二，作者自己在 README 里写了结论：用户态网络栈是对的方向，但更有价值的是<strong>多种网络栈实现并存</strong>。这句话比 1500 万这个数字有分量，它承认了没有一种栈能通吃。</p>
+<p>第三，也是最该记住的一条。原文里作者反复被自己的假设打脸：以为空闲连接不占内存，被 OOM 教育；以为 <code>socket()</code> 只是拿个 fd，结果是 3300 字节的内核对象。他自己说："LLM 对学习帮助很大，但太容易不加批判地接受它的答案，然后事后羞愧。"</p>
+<p>这个提醒在 2026 年格外具体：<code>codex "How much TCP connection takes?"</code> 得到的"空闲连接占用零字节"，被一次 OOM 三分钟就推翻了。</p>
+<h2>我的做法</h2>
+<p>我不会把 1500 万当作目标，但这个项目的中间产物对普通后端工作也有用。</p>
+<p><strong>一、容量规划别只看 RSS。</strong> 我在测 2000 个 socket 时，进程 RSS 只涨了 272KB，<code>net.inet.tcp.pcbcount</code> 从 58 跳到 2058。内核对象不在这两个数字中的任何一个里。Linux 上对应的观测点是 <code>/proc/slabinfo</code> 里的 <code>TCP</code> 和 <code>sock_inode_cache</code> 两行，做连接数评估时，这两个比 RSS 靠谱得多。</p>
+<p><strong>二、backlog 是被静默截断的。</strong> 我传 <code>listen(1024)</code>，实际只拿到 128。排查 accept 丢连接的问题时，先实测队列深度，再调参数。这段十行的脚本我直接留着复用：</p>
+<div class="highlight"><pre><span></span><code><span class="kn">import</span><span class="w"> </span><span class="nn">socket</span>
+<span class="n">srv</span> <span class="o">=</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">();</span> <span class="n">srv</span><span class="o">.</span><span class="n">setsockopt</span><span class="p">(</span><span class="n">socket</span><span class="o">.</span><span class="n">SOL_SOCKET</span><span class="p">,</span> <span class="n">socket</span><span class="o">.</span><span class="n">SO_REUSEADDR</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
+<span class="n">srv</span><span class="o">.</span><span class="n">bind</span><span class="p">((</span><span class="s2">&quot;127.0.0.1&quot;</span><span class="p">,</span> <span class="mi">0</span><span class="p">));</span> <span class="n">srv</span><span class="o">.</span><span class="n">listen</span><span class="p">(</span><span class="mi">1024</span><span class="p">)</span>
+<span class="n">addr</span> <span class="o">=</span> <span class="n">srv</span><span class="o">.</span><span class="n">getsockname</span><span class="p">()</span>
+<span class="n">keep</span> <span class="o">=</span> <span class="p">[]</span>
+<span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">300</span><span class="p">):</span>
+    <span class="n">c</span> <span class="o">=</span> <span class="n">socket</span><span class="o">.</span><span class="n">socket</span><span class="p">();</span> <span class="n">c</span><span class="o">.</span><span class="n">settimeout</span><span class="p">(</span><span class="mf">0.5</span><span class="p">)</span>
+    <span class="k">try</span><span class="p">:</span>
+        <span class="n">c</span><span class="o">.</span><span class="n">connect</span><span class="p">(</span><span class="n">addr</span><span class="p">);</span> <span class="n">keep</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">c</span><span class="p">)</span>
+    <span class="k">except</span> <span class="ne">OSError</span><span class="p">:</span>
+        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;backlog 实际深度: </span><span class="si">{</span><span class="n">i</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">);</span> <span class="k">break</span>
+</code></pre></div>
+
+<p>在我这台机器上输出 <code>backlog 实际深度: 128</code>。你在自己的环境跑一遍，数字大概率不同，但那才是你该信的那个数。</p>
+<p><strong>三、极端场景先问"我是不是在错误的抽象层"。</strong> 原文全程没有优化内核参数、没有调 <code>sysctl</code>、没有换更快的 allocator。它做的是把 TCP/IP 从内核搬出来。这种换层的判断成本高、收益也大，值得在调优调不动的时候停下来想一想。</p>
+<p><strong>四、用户态栈的成熟度比想象中高。</strong> smoltcp 0.14 累计 115 万次下载，gVisor 已经在生产环境跑了好几年。如果你的场景是嵌入式、高频交易、或者需要精确控制每个连接的内存，它已经不是玩具了。如果你的场景是普通 Web 服务，内核栈那些"浪费"的 3.3KB 换来的是二十年的 bug 修复和完整的工具链，这笔交易通常很划算。</p>
+<hr />
+<p>原文：<a href="https://kapteko.com/15-million-webservers/">15 million web servers on one VM</a>　源码：<a href="https://github.com/artemyarulin/AI10M/tree/main/poc/ten-million-webservers">AI10M/poc/ten-million-webservers</a></p>
+<div class="back"><a href="../">← Back to Home</a></div>
+</article>
+</main>
+<footer>Powered by GitHub Pages 2026</footer>
+</body>
+</html>
